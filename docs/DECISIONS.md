@@ -554,6 +554,104 @@ bumping the minor.
   becomes the bottleneck, a later decision can authorize per connection and
   frame type instead.
 
+## 0009: Brain/hands split: pi runs in the hub, the box executes tools
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #29
+- Supersedes: parts of 0004 and 0008, listed below. Those entries stay as
+  written (the log is append-only).
+
+### Context
+
+Owner direction (2026-11-15): settle the foundation before the M1 prototype.
+Through v0.2 the PRD put the pi agent loop inside the box (box-agent on the pi
+SDK) and gave each box a per-session model credential (PRD v0.2 §6.4).
+
+### Decision
+
+- **Brain in the hub, hands in the box.** The pi agent loop runs hub-side, in one
+  runner per session: an `AgentSession` from the pi SDK (`createAgentSession`).
+  The box is the session's tool executor: shell and files in `/workspace`, the
+  Chrome/CDP desktop, and VNC.
+- **pi's file and shell tools are routed to the box over the existing protocol's
+  `rpc`.** The runner loads one Hearth inline extension (through
+  `DefaultResourceLoader`'s `extensionFactories`) that registers `read`, `write`,
+  `edit`, `bash`, `ls`, `find` and `grep` under their built-in names, which
+  replaces the built-ins (pi `docs/extensions.md`, "Overriding Built-in Tools").
+  Their backends are pi's documented operations interfaces (`ReadOperations`,
+  `WriteOperations`, `EditOperations`, `BashOperations`, `LsOperations`,
+  `FindOperations`; "Remote Execution"), implemented as hub → box `rpc` calls.
+  `grep` overrides `execute()` instead, since `GrepOperations` only covers the
+  directory check. This is the pattern of pi's Gondolin example and of
+  "route selected tools into an isolated environment" in pi
+  `docs/containerization.md`, with the hub↔box connection in place of a VM.
+- **No new frame types.** Tool calls are `rpc` methods; their names and params
+  are added to `packages/protocol` (a minor version bump) when the tool RPC is
+  built. Each carries pi's tool call id and runs at most once per box boot. A
+  mutating call (write, edit, bash) whose box restarted or whose connection
+  dropped is never re-sent; the model gets a tool error saying the outcome is
+  unknown.
+- **The box holds no model credentials at all.** The model credential (an API
+  key from the SecretStore for the prototype, later the per-session Bifrost
+  virtual key) stays hub-side and is passed to pi in memory. This supersedes PRD
+  v0.2 §6.4's "the hub injects the virtual key into the box".
+- **The box starts lazily**, when a tool call (or the desktop view) first needs
+  it.
+- **Hibernate means "stop the box".** The runner's state is the event log: the
+  runner writes pi's finalized session entries as events and rebuilds its
+  session from them with `SessionManager.inMemory(cwd, options, entries)`.
+- **Only Hearth's own extension loads in the runner.** pi warns that with
+  tool-only isolation, extension tools that do not delegate run on the host, so
+  third-party extensions are not loaded, and the runner never forwards its
+  environment to commands in the box.
+
+Superseded parts of earlier entries:
+
+- **0004**, "pi runs on Bun, not Node": still true, but the place moves. pi on Bun
+  is now a hub concern; the M1 prototype starts with a spike proving the SDK path
+  the runner uses. The box image no longer needs pi; it keeps it until the image
+  is slimmed (#15), and from then the `dev.hearth.pi.version` label and the
+  `PI_VERSION` build check go with it. "Upgrading pi does not invalidate
+  snapshots" holds trivially once pi is out of the image.
+- **0008**, "Until pi lands (M1), box-agent answers commands explicitly": pi does
+  not land in the box. box-agent keeps answering `turn.start` as failed, and the
+  hub does not send it; turns, turn events and usage are written by the runner
+  in the hub. `turn.start`, `turn.event`, `turn.end` and `usage.report` stay in
+  protocol v1 unchanged, unused by the split; removing them would be a major
+  bump and needs its own entry. Whether `session.hibernate` / `hibernate.done`
+  stay as a "quiesce before stop" exchange is the session manager's call.
+
+Prior art: Anthropic's self-hosted Managed Agents
+(<https://platform.claude.com/docs/en/managed-agents/self-hosted>), where the
+brain and the hands are split, credentials stay out of the sandbox, and a
+sandbox starts only when a tool needs it; and pi's containerization guide.
+
+### Consequences
+
+- A box crash no longer loses the turn: the runner survives, the call in flight
+  ends visibly, and the next tool call goes to a fresh box on the same volume.
+  This replaces PRD v0.2 §6.3's "re-ask the turn from the start". A hub restart
+  still interrupts the turn in flight, which is surfaced (PRD §8.1, principle 7).
+- Costs: one extra hub↔box round trip per tool call, and the hub now runs pi, so
+  pi-on-Bun compatibility and pi's memory use are hub concerns. All runners share
+  the hub process for now (PRD §12, question 10).
+- pi's local discovery (context files such as `AGENTS.md`, skills) sees the hub's
+  file system, not the box's workspace; the runner needs a custom
+  `ResourceLoader` or does without them in the prototype (PRD §12, question 9).
+- Live shell output while a command runs needs a box → hub channel and is a
+  protocol minor bump after the prototype; until then a command answers once.
+- Approvals gate tool calls hub-side, through pi's `tool_call` event, before they
+  are dispatched; a denied call never reaches the box.
+- `apps/hub` depends on the pi packages, and the pin check covers it like any
+  workspace. `apps/box-agent` drops them when nothing in it uses pi.
+- The M1 prototype (PRD §11.1) builds on this: box listener and compose install
+  (#27, with #20), session manager and box supervision (#28), the pi-on-Bun
+  spike, the hub-side runner with tool RPC, a minimal web UI, a model API key
+  through the SecretStore, and a minimal local login with Host, Origin and
+  Content-Type checks on the API (#33), since a web page can now make pi run
+  commands.
+
 ## 0010: The hub API refuses foreign Host, cross-site Origin and non-JSON bodies
 
 - Date: 2026-11-15
