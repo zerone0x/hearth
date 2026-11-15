@@ -129,8 +129,8 @@ describe.skipIf(!enabled)("tool RPC through DockerBoxProvider and the box image"
     expect(exitCode).toBe(0);
     expect(Buffer.concat(chunks).toString()).toBe("/workspace\nhello from the hub\nno-token\n");
 
-    const escape = ops.read.readFile("/etc/passwd");
-    await expect(escape).rejects.toMatchObject({ code: "tool.path-escape" });
+    const outside = ops.read.readFile("/etc/passwd");
+    await expect(outside).rejects.toMatchObject({ code: "tool.path-escape" });
 
     const timedOut = ops.bash.exec("sleep 60", "/workspace", { onData: () => {}, timeout: 1 });
     await expect(timedOut).rejects.toThrow("timeout:1");
