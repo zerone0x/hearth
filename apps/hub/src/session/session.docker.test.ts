@@ -69,6 +69,7 @@ describe.skipIf(!enabled)("session lifecycle with Docker boxes", () => {
       log: (line) => console.log(line),
       sessions: {
         idleMs: 3_000,
+        runningGraceMs: 500,
         connectDeadlineMs: 120_000,
         exitPollMs: 500,
         superviseIntervalMs: 1_000,

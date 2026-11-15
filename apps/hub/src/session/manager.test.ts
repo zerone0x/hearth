@@ -685,6 +685,30 @@ describe("SessionManager", () => {
     open();
   });
 
+  test("an interrupted hibernate records a stop outcome even when the box row already says stopped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
+    dirs.push(dir);
+    const path = join(dir, "hub.db");
+    const first = rig({ idleMs: 5 }, path);
+    const s = await first.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    (await first.manager.ensureBox(s.id)).release();
+    await until(() => first.store.getSession(scope, s.id)?.state === "hibernated");
+    await until(() => first.store.runningOperations(scope).length === 0);
+    first.manager.stop();
+    // The hub died after the box row was written, before the operation was finished.
+    first.store.beginOperation(scope, s.id, "hibernate", Date.now());
+
+    const second = rig({}, path, first.boxes);
+    await second.manager.ready;
+    expect(second.boxes.calls.at(-1)).toBe(`stop ${boxId}`);
+    expect((await eventsOf(second, s.id, "session.operation")).at(-1)?.payload).toMatchObject({
+      kind: "hibernate",
+      outcome: "interrupted",
+      stop: "not-found",
+    });
+  });
+
   test("a stop that fails during restart recovery is recorded and logged, not swallowed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
     dirs.push(dir);
@@ -766,6 +790,45 @@ describe("SessionManager", () => {
     expect(
       auditActions(r.db, s.id).filter((a) => a === "session.run" || a === "session.idle"),
     ).toEqual(["session.idle", "session.run", "session.idle"]);
+  });
+
+  test("each release restarts the running grace", async () => {
+    const r = rig({ runningGraceMs: 150 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    (await r.manager.ensureBox(s.id)).release();
+    const first = Date.now();
+    await Bun.sleep(90);
+    (await r.manager.ensureBox(s.id)).release();
+    // The first release's grace ends at +150; the second one's at about +240.
+    await Bun.sleep(Math.max(0, first + 190 - Date.now()));
+    expect(r.store.getSession(scope, s.id)?.state).toBe("running");
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+  });
+
+  test("a grace step queued behind a new tool call leaves the session running", async () => {
+    const r = rig({ runningGraceMs: 20 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    const first = await r.manager.ensureBox(s.id);
+    // Hold the lifecycle queue so the grace step and the next ensureBox queue up together.
+    let open: () => void = () => {};
+    r.boxes.attachGate = new Promise((resolve) => {
+      open = resolve;
+    });
+    const supervising = r.manager.supervise(s.id);
+    await Bun.sleep(5);
+    first.release();
+    await Bun.sleep(50); // the grace timer fires and queues its step
+    const pending = r.manager.ensureBox(s.id);
+    await Bun.sleep(5);
+    r.boxes.attachGate = undefined;
+    open();
+    await supervising;
+    const second = await pending;
+    await Bun.sleep(10);
+    expect(r.store.getSession(scope, s.id)?.state).toBe("running");
+    expect(await statesOf(r, s.id)).toEqual(["creating", "idle", "waking", "running"]);
+    second.release();
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
   });
 
   test("with a running grace, the idle timer still hibernates after the configured idle time", async () => {

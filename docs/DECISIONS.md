@@ -913,6 +913,12 @@ its listener is #27.
   meanwhile cancels it. `session.hibernate` / `hibernate.done` frames are not
   used: the runner's state is in the hub, so there is nothing to quiesce in the
   box (this settles the question 0009 left open).
+- **Running grace.** A session stays `running` for `runningGraceMs`
+  (`DEFAULT_RUNNING_GRACE_MS`, 3 s) after its last lease is released; each
+  release restarts it. The back-to-back tool calls of one turn so write one
+  `running` and one `idle`, not an `idle → running` pair (two audit rows, two
+  `session.state` events) per call. The grace counts toward `idleMs`: the
+  hibernate still comes `idleMs` after the last call ended.
 - **One lifecycle step at a time per session**: wakes, hibernates, relaunches,
   state changes after a lease and archive run in a per-session queue, so a
   wake waits for a hibernate in flight and runs on the next box (PRD §6.3).
@@ -927,6 +933,16 @@ its listener is #27.
   `running` or `creating` one to `idle`, each with reason "the hub restarted".
   Nothing is resumed silently: the next tool call wakes it again, visibly
   (PRD §8.1 principle 7).
+- **No orphan box after a restart** (PRD §5: hibernated means the box is
+  stopped). Before that, recovery stops the box of every session that is not
+  `idle`/`running` and that was `waking`, had an operation in flight, or whose
+  box row still says `running` (a hibernate whose stop never reached the
+  provider). A stopped box's row becomes `stopped`, and the stop outcome
+  (`stop: "stopped" | "not-found"`) goes into the `interrupted` event and the
+  operation's detail; a box stopped with no operation in flight gets
+  `session.operation {kind: "recover"}`. A stop that fails is not swallowed:
+  `stop: "failed"` with its code and message in the event, a log line, and the
+  box row stays `running`, so the next wake stops it before it starts a new one.
 - **Box exit supervision (#28).** `BoxInfo` gains `exitCode` (present when the
   state is `exited`; Docker's `State.ExitCode`). Exits are found by inspecting
   the box (`BoxProvider.attach`): every `exitPollMs` (1 s) while a box boots,

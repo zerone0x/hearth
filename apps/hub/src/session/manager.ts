@@ -15,7 +15,10 @@
  *   waits for a hibernate still in flight (PRD §6.3).
  * - Wakes and hibernates are logged in `session_operation` before they act; a
  *   hub restart marks the ones still running interrupted and says so in the
- *   event log (PRD §8.1 principle 7).
+ *   event log (PRD §8.1 principle 7), after stopping any box left running
+ *   behind a session that is not idle or running.
+ * - A session stays `running` for a short grace after its last tool call, so
+ *   the calls of one turn do not each write `idle → running`.
  * - Supervision (#28): a box that exits is classified by its exit code
  *   (`exits.ts`) and either relaunched (bounded, `box.restarted`) or given up
  *   on (`box.failed`, session `failed`). Exits are found by polling
@@ -303,7 +306,6 @@ export class SessionManager {
     const rt = this.#rt(sessionId);
     rt.inFlight++;
     this.#clearIdle(rt);
-    this.#clearGrace(rt);
     let boxId: BoxId;
     try {
       boxId = await this.#serial(sessionId, async () => {
@@ -479,7 +481,8 @@ export class SessionManager {
     rt.inFlight = Math.max(0, rt.inFlight - 1);
     if (rt.inFlight > 0 || this.#stopped) return;
     // Stay `running` for the grace period: the next tool call of the turn
-    // usually comes before it ends (DEFAULT_RUNNING_GRACE_MS).
+    // usually comes before it ends (DEFAULT_RUNNING_GRACE_MS). Each release
+    // restarts it; a timer that fires during a call finds it in flight.
     this.#clearGrace(rt);
     rt.graceTimer = setTimeout(() => {
       rt.graceTimer = undefined;

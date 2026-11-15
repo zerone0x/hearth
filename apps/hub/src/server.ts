@@ -84,6 +84,7 @@ export interface HubOptions extends HubListenOptions {
     Pick<
       SessionManagerOptions,
       | "idleMs"
+      | "runningGraceMs"
       | "connectDeadlineMs"
       | "exitPollMs"
       | "superviseIntervalMs"
