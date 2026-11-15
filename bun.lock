@@ -43,6 +43,7 @@
       "devDependencies": {
         "@earendil-works/pi-ai": "1.5.2",
         "@earendil-works/pi-coding-agent": "1.5.2",
+        "@hearth/core": "workspace:*",
         "@tailwindcss/vite": "4.3.5",
         "@types/novnc__novnc": "1.6.0",
         "@types/react": "19.3.0",

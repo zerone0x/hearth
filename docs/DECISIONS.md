@@ -1348,3 +1348,78 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   filter already finds every input message boundary.
 - The web UI's noVNC must speak RFB 3.7/3.8 with security None, which is what
   noVNC does against Xvnc `-SecurityTypes None`.
+
+## 0017: Web UI: same-origin static assets, open asset paths, CSP, polled event log
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #46
+
+### Decision
+
+- **`apps/web`: React 19 + Vite 8 + Tailwind 4**, dependencies pinned
+  exactly. It has its own `tsconfig.json` (DOM lib, `jsx: react-jsx`,
+  `vite/client` types); the root `typecheck` runs both projects, and the root
+  project excludes `apps/web/src`. TypeScript 7 type-checks it (spike notes);
+  Vite transpiles without `tsc`. noVNC 1.7.0's root export gets a small
+  `declare module` shim over `@types/novnc__novnc` 1.6.0.
+- **Served by the hub, same origin.** `bun run build:web` writes
+  `apps/web/dist`; `startHub({ webRoot })` serves it on the public listener
+  (`HEARTH_WEB_DIR`, else `apps/web/dist` when built, else no UI). Same
+  origin is what makes the request guard (0010) and the `SameSite=Strict`,
+  `HttpOnly` login cookie (0014) work with no CORS. The UI routes in the URL
+  hash (`#/s/<id>`), so the hub serves one HTML file and needs no fallback.
+- **Open asset paths.** With a web root configured, the session guard (0014)
+  lets `GET`/`HEAD` outside `/v1/` through without a login: the login page is
+  one of those assets, and they hold nothing secret. The request guard still
+  runs first (a foreign `Host` gets 421), every `/v1/` path, known or not,
+  still needs a login (401), and other methods on asset paths still get 401.
+  A path that would leave the web root (`..`, encoded or not, a backslash, a
+  symlink out) gets 404. `OPEN_ROUTES` is unchanged.
+- **CSP on the HTML.** `index.html` is sent with
+  `Content-Security-Policy: default-src 'self'; script-src 'self';
+  style-src 'self'; img-src 'self' data: blob:; connect-src 'self';
+  font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self';
+  frame-ancestors 'none'` (`WEB_CSP`), plus `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and `Cache-Control: no-cache`. Every asset
+  gets `X-Content-Type-Options: nosniff`; hashed `/assets/*` get a year of
+  immutable cache. The build emits no inline script or style element
+  (`assetsInlineLimit: 0`, no module-preload polyfill), so the policy needs
+  no `'unsafe-inline'`; the e2e fails on any CSP console violation.
+  `connect-src 'self'` covers the same-origin desktop WebSocket.
+- **The client holds no secrets.** The cookie is `HttpOnly`; the setup token
+  is typed by the owner and sent once. Every API call sends
+  `Content-Type: application/json` (a body-less POST sends `{}`) and
+  `credentials: same-origin`.
+- **Chat = the event log, polled.** The session view reads
+  `GET /v1/sessions/:id/events?after=<cursor>` page by page and folds
+  `message.user`, `pi.*` and `runner.*` events into the chat (`chat.ts`, a
+  pure reducer that ignores events at or before its cursor). It polls from the
+  last cursor every 0.7 s while a turn runs and every 3 s otherwise. A reload
+  rebuilds the chat from the log and continues from its end, which is what
+  "closing and reopening the page continues the session" needs. A push
+  stream (SSE or WebSocket) can replace the poll later without changing the
+  reducer.
+- **Tool cards.** One collapsible `<details>` per `pi.tool_execution_*` call:
+  the tool, its command (bash) or path/pattern, the output (capped at 64 KiB
+  per card), and a status: running, done, error, outcome unknown (an error
+  result carrying `tool.outcome-unknown`, PRD §6.3) or interrupted (still
+  running when the turn ended).
+- **Desktop panel.** View-only noVNC on `GET /v1/sessions/:id/desktop`
+  (0016). The page opens the WebSocket itself and hands it to noVNC, so it
+  sees the close code: 4410 shows "Box asleep — send a message or click Wake
+  to reconnect", and Wake reconnects (which starts the box). The panel
+  connects only on a click, because opening the desktop starts the box.
+  Watching does not hold the box awake (orchestrator decision on #45); a
+  bounded "keep awake while viewing" lease is not part of this.
+- **e2e.** `apps/web/e2e/run.ts` drives Chromium (Playwright) against
+  `startHub` with the faux model, box-agent as a local process
+  (`LocalBoxProvider`, tests only) and a minimal RFB 3.8 server standing in
+  for Xvnc. CI runs it in the `web-e2e` job.
+
+### Consequences
+
+- The hub serves whatever is in the web root to anyone who can reach the
+  listener; it must only ever contain the built UI.
+- Polling costs one small request per 0.7–3 s per open session view.
+- No PWA, service worker or push yet (M3).

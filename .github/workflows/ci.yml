@@ -28,6 +28,35 @@ jobs:
       - name: Check
         run: bun run check
 
+  # Web UI e2e (#46, decision 0017): the built UI in Chromium against a real
+  # hub (faux model, box-agent as a local process, fake RFB server).
+  web-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Install Chromium for Playwright
+        working-directory: apps/web
+        run: timeout 300 bun x playwright install --with-deps --only-shell chromium
+      - name: Build the web UI
+        run: timeout 300 bun run build:web
+      - name: Web e2e (setup, login, session, tool card, desktop, reload, asleep, mobile)
+        env:
+          HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/web-e2e
+        run: timeout 300 bun run e2e:web
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-screenshots
+          path: ${{ runner.temp }}/web-e2e
+          if-no-files-found: ignore
+
   box-image:
     runs-on: ubuntu-latest
     timeout-minutes: 30
