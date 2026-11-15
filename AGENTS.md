@@ -22,6 +22,7 @@ to this file.
 | Path | What lives there |
 |---|---|
 | `apps/hub` | The hub process (Hono on Bun). Owns all state. |
+| `apps/web` | The web UI (React + Vite + Tailwind), built to static assets the hub serves (decision 0017). |
 | `apps/box-agent` | The process inside a box. Runs pi and dials out to the hub. |
 | `packages/protocol` | Hub-box wire protocol: pure types and encode/decode, no I/O. |
 | `packages/core` | Extension-point interfaces (PRD §7) and shared types. |
@@ -29,8 +30,15 @@ to this file.
 | `docs` | PRD, decision log, and other docs. |
 
 Workspaces export their TypeScript sources directly (`"exports": "./src/index.ts"`);
-there is no build step between workspaces. Tests sit next to the code as
+there is no build step between workspaces. The one build is `apps/web`
+(`bun run build:web`), whose `dist/` the hub serves; it has its own
+`tsconfig.json` (DOM types), checked by `bun run typecheck`. Tests sit next to the code as
 `*.test.ts`.
+
+## Web UI
+
+- `apps/web` is React + Tailwind (decision 0017); do not add Lit or other web-components UI libraries.
+- UI: use maintained packages wherever one fits (assistant-ui for chat, shadcn/ui primitives); do not build components from scratch.
 
 ## Boundary rules (PRD §7)
 
