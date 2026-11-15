@@ -8,7 +8,8 @@
  * `HEARTH_BOX_EGRESS=unrestricted` on purpose.
  */
 
-import { existsSync } from "node:fs";
+import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { HearthError } from "@hearth/core";
 
 /** Where `scripts/box-firewall.sh apply` writes its marker (tmpfs; cleared on reboot). */
@@ -32,18 +33,87 @@ export interface BoxEgressStatus {
 /** Reads the current egress status. Called on every `startBox`, so a later `apply` counts. */
 export type BoxEgressCheck = () => BoxEgressStatus;
 
-/** The marker check: `filtered` while `marker` exists, `unfiltered` otherwise. */
-export function markerEgressCheck(marker: string = DEFAULT_BOX_EGRESS_MARKER): BoxEgressCheck {
-  return () =>
-    existsSync(marker)
-      ? { state: "filtered", detail: `box firewall applied (${marker})` }
-      : {
-          state: "unfiltered",
-          detail:
-            `box firewall not applied: ${marker} is missing. Run ` +
-            "`sudo scripts/box-firewall.sh apply` (again after every reboot), or set " +
-            "HEARTH_BOX_EGRESS=unrestricted to start boxes with open host and LAN egress",
-        };
+/** Options for `markerEgressCheck`. */
+export interface MarkerTrust {
+  /**
+   * The uid that must own the marker and every directory above it (root also
+   * qualifies for the directories). Default 0: the firewall runs as root, on
+   * bare metal and as the compose one-shot alike. Tests pass their own uid.
+   */
+  readonly owner?: number;
+}
+
+const GROUP_OR_OTHER_WRITE = 0o022;
+const STICKY = 0o1000;
+
+/**
+ * Why the marker at `marker` cannot be trusted, or `undefined` when it can.
+ *
+ * The rule (docs/DECISIONS.md, 0023): the marker is a regular file (not a
+ * symlink) owned by `owner` and writable by nobody else, and every directory
+ * on its real path is owned by root or `owner` and is either writable by
+ * nobody else or sticky (`/tmp`), so no other user can create, replace or
+ * rename the marker or a directory above it. A hub that does not run as the
+ * owner therefore cannot forge the marker, whatever `HEARTH_BOX_EGRESS_MARKER`
+ * points at. A hub that runs as root (the compose install) is not held off by
+ * any file mode; there the guarantee is that the marker is root's, and compose
+ * mounts /run/hearth read-only into the hub.
+ */
+export function untrustedMarker(
+  marker: string,
+  owner = 0,
+  lstat: (path: string) => Stats = lstatSync,
+): string | undefined {
+  let file: Stats;
+  let dir: string;
+  try {
+    file = lstat(marker);
+    dir = realpathSync(dirname(resolve(marker)));
+  } catch {
+    return "missing";
+  }
+  if (!file.isFile()) return "it is not a regular file";
+  if (file.uid !== owner) return `it is owned by uid ${file.uid}, not ${owner}`;
+  if ((file.mode & GROUP_OR_OTHER_WRITE) !== 0) return "it is writable by group or others";
+  for (let at = dir; ; at = dirname(at)) {
+    let st: Stats;
+    try {
+      st = lstat(at);
+    } catch {
+      return `${at} cannot be read`;
+    }
+    if (st.uid !== owner && st.uid !== 0) return `${at} is owned by uid ${st.uid}`;
+    if ((st.mode & GROUP_OR_OTHER_WRITE) !== 0 && (st.mode & STICKY) === 0) {
+      return `${at} is writable by group or others`;
+    }
+    if (dirname(at) === at) return undefined;
+  }
+}
+
+/**
+ * The marker check: `filtered` while `marker` exists and passes
+ * `untrustedMarker`, `unfiltered` otherwise.
+ */
+export function markerEgressCheck(
+  marker: string = DEFAULT_BOX_EGRESS_MARKER,
+  trust: MarkerTrust = {},
+): BoxEgressCheck {
+  const owner = trust.owner ?? 0;
+  return () => {
+    const why = untrustedMarker(marker, owner);
+    if (why === undefined) return { state: "filtered", detail: `box firewall applied (${marker})` };
+    const fix =
+      "Run `sudo scripts/box-firewall.sh apply` (again after every reboot), or set " +
+      "HEARTH_BOX_EGRESS=unrestricted to start boxes with open host and LAN egress";
+    return {
+      state: "unfiltered",
+      detail:
+        why === "missing"
+          ? `box firewall not applied: ${marker} is missing. ${fix}`
+          : `box firewall marker ${marker} not trusted: ${why}. Only root may write the ` +
+            `marker and the directories above it. ${fix}`,
+    };
+  };
 }
 
 /** The explicit opt-out: boxes start with open egress. */
