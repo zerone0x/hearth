@@ -182,9 +182,7 @@ export class SqliteSessionStore {
       .query<
         { id: string; session_id: string | null; provider: string; state: string; image: string },
         [string, string]
-      >(
-        "SELECT id, session_id, provider, state, image FROM box WHERE workspace_id = ? AND id = ?",
-      )
+      >("SELECT id, session_id, provider, state, image FROM box WHERE workspace_id = ? AND id = ?")
       .get(scope.workspaceId, id);
     return row === null
       ? undefined
@@ -230,7 +228,13 @@ export class SqliteSessionStore {
   runningOperations(scope: WorkspaceScope): OperationRow[] {
     return this.#db
       .query<
-        { id: number; session_id: string; kind: OperationKind; status: OperationStatus; started_at: number },
+        {
+          id: number;
+          session_id: string;
+          kind: OperationKind;
+          status: OperationStatus;
+          started_at: number;
+        },
         [string]
       >(
         `SELECT id, session_id, kind, status, started_at FROM session_operation
@@ -249,7 +253,13 @@ export class SqliteSessionStore {
   operations(scope: WorkspaceScope, sessionId: SessionId): OperationRow[] {
     return this.#db
       .query<
-        { id: number; session_id: string; kind: OperationKind; status: OperationStatus; started_at: number },
+        {
+          id: number;
+          session_id: string;
+          kind: OperationKind;
+          status: OperationStatus;
+          started_at: number;
+        },
         [string, string]
       >(
         `SELECT id, session_id, kind, status, started_at FROM session_operation

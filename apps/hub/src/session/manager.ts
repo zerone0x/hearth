@@ -281,7 +281,10 @@ export class SessionManager {
    * ended. While any lease is held the session is `running` and is never
    * hibernated. Rejects with a classified `HearthError` when no box can be had.
    */
-  async ensureBox(sessionId: SessionId, principal: Principal = SYSTEM_PRINCIPAL): Promise<BoxLease> {
+  async ensureBox(
+    sessionId: SessionId,
+    principal: Principal = SYSTEM_PRINCIPAL,
+  ): Promise<BoxLease> {
     await this.ready;
     const boxes = this.#requireBoxes();
     const rt = this.#rt(sessionId);
@@ -389,7 +392,12 @@ export class SessionManager {
     }
     for (const s of this.#store.listSessions(this.#scope)) {
       if (s.state === "waking") {
-        await this.#transition(SYSTEM_PRINCIPAL, s, "hibernated", "the hub restarted during a wake");
+        await this.#transition(
+          SYSTEM_PRINCIPAL,
+          s,
+          "hibernated",
+          "the hub restarted during a wake",
+        );
       } else if (s.state === "creating" || s.state === "running") {
         await this.#transition(SYSTEM_PRINCIPAL, s, "idle", "the hub restarted");
       }
@@ -696,7 +704,12 @@ export class SessionManager {
     await this.#append(s.id, "session.state", { from, to, reason });
     const now = this.#now();
     this.#store.setSessionState(this.#scope, s.id, to, now);
-    return { ...s, state: to, lastActivityAt: now, archivedAt: to === "archived" ? now : s.archivedAt };
+    return {
+      ...s,
+      state: to,
+      lastActivityAt: now,
+      archivedAt: to === "archived" ? now : s.archivedAt,
+    };
   }
 
   async #authorize(

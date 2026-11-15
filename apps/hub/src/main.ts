@@ -2,7 +2,6 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
-import { DEFAULT_IDLE_MS } from "./session";
 import {
   type BoxNetworkProvider,
   DEFAULT_BOX_PORT,
@@ -11,6 +10,7 @@ import {
   parsePublicOrigin,
   startHub,
 } from "./server";
+import { DEFAULT_IDLE_MS } from "./session";
 
 /** Where the hub keeps its database when `HEARTH_DATA_DIR` is not set. */
 const DEFAULT_DATA_DIR = "data";

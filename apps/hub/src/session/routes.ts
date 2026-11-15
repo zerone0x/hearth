@@ -43,7 +43,11 @@ function failure(c: Context, error: unknown): Response {
 }
 
 function invalid(message: string): HearthError {
-  return new HearthError(message, { owner: "user", disposition: "give-up", code: "request.invalid" });
+  return new HearthError(message, {
+    owner: "user",
+    disposition: "give-up",
+    code: "request.invalid",
+  });
 }
 
 /** Validates the body of `POST /v1/sessions`: optional strings only. */
@@ -88,7 +92,10 @@ export function mountSessionRoutes(app: Hono, sessions: SessionManager): void {
   });
   app.get("/v1/sessions/:id", async (c) => {
     try {
-      return c.json({ ok: true, session: await sessions.get(LOCAL_PRINCIPAL, c.req.param("id")) }, 200);
+      return c.json(
+        { ok: true, session: await sessions.get(LOCAL_PRINCIPAL, c.req.param("id")) },
+        200,
+      );
     } catch (error) {
       return failure(c, error);
     }
