@@ -436,6 +436,16 @@ describe("cross-origin requests (decision 0010 guard, before the login)", () => 
     }
     expect(h.auth.setupRequired()).toBe(true);
   });
+
+  test("the request guard answers first: a foreign caller learns nothing about the login", async () => {
+    const h = await withPassword();
+    for (const headers of foreign) {
+      const status = headers["host"] === undefined ? 403 : 421;
+      // Without a cookie too: 403/421 from the 0010 guard, never 401.
+      expect((await echo(h, headers)).status).toBe(status);
+      expect((await post(h, "/v1/sessions", {}, headers)).status).toBe(status);
+    }
+  });
 });
 
 describe("prototype exit criterion (PRD §11.1): no session and no command without login", () => {
@@ -538,6 +548,33 @@ describe("timing-safe comparison", () => {
     expect(secretsEqual(secret, secret.slice(0, 10))).toBe(false);
     expect(secretsEqual(secret, "")).toBe(false);
     expect(secretsEqual("", "")).toBe(true);
+  });
+
+  test("secretsEqual takes as long for a first-byte miss as for a last-byte miss", () => {
+    // Large inputs make a short-circuiting comparison (`===`, a byte loop that
+    // stops early) differ by orders of magnitude; hashing both sides first
+    // costs the same either way. Medians and a wide margin keep load out.
+    const size = 1 << 20;
+    const secret = `${"s".repeat(size)}`;
+    const firstMiss = `x${"s".repeat(size - 1)}`;
+    const lastMiss = `${"s".repeat(size - 1)}x`;
+    const time = (b: string) => {
+      const t = Bun.nanoseconds();
+      secretsEqual(secret, b);
+      return Bun.nanoseconds() - t;
+    };
+    // Interleaved, so a burst of load hits both sides alike.
+    const first: number[] = [];
+    const last: number[] = [];
+    for (let i = 0; i < 41; i++) {
+      first.push(time(firstMiss));
+      last.push(time(lastMiss));
+    }
+    const median = (xs: number[]) => xs.sort((x, y) => x - y)[20] ?? 0;
+    const ratio = median(last) / median(first);
+    // A short-circuiting compare gives a ratio in the hundreds.
+    expect(ratio).toBeGreaterThan(0.1);
+    expect(ratio).toBeLessThan(10);
   });
 
   test("every admitted wrong password goes through the KDF's own comparison", async () => {
