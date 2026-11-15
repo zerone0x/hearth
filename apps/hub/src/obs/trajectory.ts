@@ -204,6 +204,13 @@ export function buildTrajectory(
     }
   }
 
+  // A label set after its turn ended still belongs on the turn's end record.
+  for (const [i, r] of out.entries()) {
+    const turnId = r["turn_id"];
+    if (r.kind === "turn_end" && typeof turnId === "string" && turnLabels.has(turnId)) {
+      out[i] = { ...r, labels: turnLabels.get(turnId) };
+    }
+  }
   const sessionId = options.sessionId;
   const header: TrajectoryRecord = {
     schema: TRAJECTORY_SCHEMA,

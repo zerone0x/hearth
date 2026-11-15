@@ -56,6 +56,12 @@ describe("Logger", () => {
     expect(lines.join("\n")).toContain(LOG_REDACTED);
   });
 
+  test("a known secret is redacted raw, not only inside a JSON string", () => {
+    expect(redactLine("plain plainSecretValue42 here", ["plainSecretValue42"])).toBe(
+      `plain ${LOG_REDACTED} here`,
+    );
+  });
+
   test("credential shapes are redacted without being known", () => {
     const line = redactLine(
       'Authorization: Bearer abcdefghijk.lmn sk-ant-REALKEY1234567890 {"token":"tok_123456789"} password=hunter22',

@@ -31,6 +31,7 @@ import {
 } from "@hearth/core";
 import { parseTraceparent, type RpcFrame, type RpcResultFrame } from "@hearth/protocol";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace";
 import { Hono } from "hono";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import type { HubEnv } from "../auth";
@@ -484,6 +485,29 @@ describe("no secret leaves the hub", () => {
   });
 });
 
+describe("span redaction", () => {
+  test("string attributes and error status messages are redacted before export", async () => {
+    const exporter = new InMemorySpanExporter();
+    const t = new Telemetry({ spanExporter: exporter, redact: (x) => redactSecrets(x, [SECRET]) });
+    const span = t.startSpan("s", { "a.start": `x ${SECRET}` });
+    t.endSpan(
+      span,
+      { "a.end": SECRET, n: 1 },
+      { type: "provider-error", message: `bad ${SECRET}` },
+    );
+    await t.flush();
+    const [done] = exporter.getFinishedSpans();
+    expect(done?.attributes).toMatchObject({
+      "a.start": "x [redacted]",
+      "a.end": "[redacted]",
+      n: 1,
+    });
+    expect(done?.status.message).toBe("bad [redacted]");
+    expect(JSON.stringify(done?.attributes)).not.toContain(SECRET);
+    await t.shutdown();
+  });
+});
+
 describe("labels", () => {
   test("labels are validated, authorized and land in the turn and session summary", async () => {
     const events = new MemoryEvents();
@@ -509,7 +533,13 @@ describe("labels", () => {
       turnId: "turn_1",
       payload: { turn_id: "turn_1", outcome: "done" },
     });
+    await events.append({}, "se_l", {
+      type: "runner.turn.start",
+      turnId: "turn_2",
+      payload: { turn_id: "turn_2", trace_id: "t2" },
+    });
     await t.label(LOCAL_PRINCIPAL, "se_l", { task_type: "bugfix", outcome: "success" });
+    // A label for turn 1, set while turn 2 runs, keeps turn 1's trace id.
     await t.label(LOCAL_PRINCIPAL, "se_l", { turn_id: "turn_1", verdict: "good" });
     await expect(t.label(LOCAL_PRINCIPAL, "se_l", { outcome: "great" })).rejects.toThrow(
       /outcome must be/,
@@ -522,7 +552,12 @@ describe("labels", () => {
     );
     const records = await t.trajectory(LOCAL_PRINCIPAL, "se_l");
     expect(records.at(-1)).toMatchObject({ labels: { task_type: "bugfix", outcome: "success" } });
-    expect(records.filter((r) => r.kind === "label")).toHaveLength(2);
+    const labels = records.filter((r) => r.kind === "label");
+    expect(labels).toHaveLength(2);
+    expect(labels[1]).toMatchObject({ turn_id: "turn_1", trace_id: "t" });
+    expect(records.find((r) => r.kind === "turn_end")).toMatchObject({
+      labels: { verdict: "good" },
+    });
     expect(decisions).toContain("session.label");
     expect(decisions).toContain("session.trajectory");
   });
