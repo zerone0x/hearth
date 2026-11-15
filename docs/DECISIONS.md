@@ -1671,25 +1671,56 @@ of box-agent's memory.
   and `runner.turn.end` (outcome `done`, `interrupted` or `failed`, duration,
   counts, tokens, cost). `message.user` now also carries the turn id, and is
   redacted like every other payload. `buildTrajectory` (apps/hub/src/obs)
-  turns a session's events into schema **`hearth.trajectory/1`** at read
+  turns a session's events into schema **`hearth.trajectory/2`** at read
   time, so the log stays the only source of truth and old sessions get the
   current projection.
-- **Schema `hearth.trajectory/1`**, JSON Lines. First a `session` header,
+- **Schema `hearth.trajectory/2`**, JSON Lines. First a `session` header,
   last a `summary`; in between, in event order, `user_input` (prompt or
   interrupt; approvals when M3 adds them), `turn_start`, `model_call`,
   `tool_call`, `turn_end`, `box` (session state, wake, hibernate, box failure
   and restart), `outcome_unknown`, `runner_failed` and `label`. Every record
   carries `session_id`, `seq`, `at`, `turn_id`, `step_id`, `tool_call_id`,
   `box_id`, `trace_id`, `span_id`, `pi_version` and `hub_version` (null when
-  they do not apply). A `model_call` adds provider, model, api, tokens (input,
-  output, cache read and write), cost, `latency_ms`, `ttft_ms` (time to the
-  first streamed event), stop reason and error class. A `tool_call` adds name,
+  they do not apply). A `model_call` adds provider, model, api, its
+  `request`, its `output`, tokens (input, output, cache read and write), cost,
+  `latency_ms`, `ttft_ms` (time to the first streamed event), stop reason and
+  error class. A `user_input` prompt is `prompt: {text, truncated, bytes,
+  sha256}`. A `tool_call` adds name,
   args, the result (text capped at 16 KiB with its byte count and sha256),
   `outcome` (`ok`, `error`, `aborted`, `timeout`, `denied`,
   `outcome-unknown`), exit code, `box_wait_ms` (box start or wake latency as
   the call saw it), duration, and each RPC it made (method, rpc id, span id,
-  duration, error code). Durations come from the monotonic clock. A breaking
-  change bumps the schema to `/2`; added fields do not.
+  duration, error code). Durations come from the monotonic clock, and a box
+  lease's wait is timed on the same clock as the tool call. A breaking change
+  bumps the schema; added fields do not.
+- **`/2`: enough to replay and debug a turn** (review of #82). `/1` had ids,
+  timings and tokens but not what the model was asked or what it answered.
+  - `request`, from pi's state at its `context` event (just before each
+    call) and the provider payload at `before_provider_request`: `provider`,
+    `model`, `api`, `thinking_level`, `max_tokens` and `temperature` (from
+    the payload, whatever the API calls them; null when pi did not set them,
+    the provider default), `reasoning` (the payload's `thinking`,
+    `reasoning` or `reasoning_effort`), `model_max_tokens` and
+    `context_window` (the model's definition), `tools` (names) and
+    `tools_sha256` (of the declarations sent: name, description,
+    parameters), `system_prompt: {bytes, sha256}` and `message_count` (the
+    messages in the context, system messages excluded). The system prompt
+    and tool schemas are hashed, not stored: they are the hub's and pi's,
+    and the hash tells a replay whether it has the same ones. The messages
+    themselves are in the event log (`pi.message_end`, `runner.entries`).
+  - `output`: `text` and `thinking` (each `{text, truncated, bytes, sha256}`
+    or null), `redacted_thinking_blocks` when the provider sent opaque ones,
+    and `tool_calls: [{id, name, args}]` for every call the model asked for.
+  - **Caps count bytes.** Every kept text (prompt, output text and thinking,
+    tool results, tool-call arguments over the cap) is redacted first, then
+    capped at 16 KiB of UTF-8 (`Buffer.byteLength`), cut back to a
+    code-point boundary so a CJK character or an emoji is never split; the
+    record keeps the byte count and the sha256 of the whole redacted text.
+    Redacting before the cut means a secret that straddles the cut is never
+    half kept. Arguments that fit are kept as JSON; over the cap they become
+    `{text, truncated, bytes, sha256}` of their JSON.
+  - Events written before `/2` project with `request: null` and
+    `output: null`.
 - **No third-party trajectory format.** The standard part is the OpenTelemetry
   export below (GenAI semantic conventions). For the JSONL we use our own
   documented schema rather than an agent-trajectory interchange format, since
@@ -1698,13 +1729,17 @@ of box-agent's memory.
 - **Outcome labels** are placeholders until Retro (PRD §6.8):
   `POST /v1/sessions/:id/labels {turn_id?, task_type?, outcome?, verdict?}`
   (`outcome` one of `success`, `partial`, `fail`, `abandoned`) appends a
-  `trajectory.label` event. The latest value per field wins, on the turn's
-  `turn_end` and in the summary.
+  `trajectory.label` event. Without `turn_id` it labels the session; with
+  one, it must name a turn of this session (a `runner.turn.start` in its
+  log), else 400. The latest value per field wins, on the turn's `turn_end`
+  and in the summary.
 - **API and CLI.** `GET /v1/sessions/:id/trajectory` returns
   `application/x-ndjson` behind the login guard, authorized as
   `session.trajectory`; labels are `session.label`. A web "copy" or download
   button is #77's to add. `bun apps/hub/src/trajectory-cli.ts [--db PATH]
-  <session-id>` dumps it from the database.
+  <session-id>` dumps it from the database; it resolves
+  `HEARTH_MODEL_KEY_REF` first, like the hub, so its output is redacted the
+  same way.
 - **Trace context on tool RPCs: protocol 1.2.** An `rpc` frame may carry a
   W3C `traceparent` (version 00). It is optional, so a 1.1 peer drops it, and
   a malformed one is dropped by the decoder rather than failing the call. The
@@ -1735,7 +1770,29 @@ of box-agent's memory.
   JSON-escaped, plus credential shapes (`Bearer …`, `sk-…`, `token=`,
   `password=`, `api_key=`). The trajectory API, the CLI and span attributes
   and status messages go through the same redactor; this is on top of the
-  runner's own redaction of what it stores (0015).
+  runner's own redaction of what it stores (0015). The hub registers its
+  secrets **at startup** (it resolves `HEARTH_MODEL_KEY_REF` before it
+  serves), not on the first turn: after a restart, a key that a build before
+  this change stored raw in `message.user` is still redacted by the API, the
+  CLI and the logs.
+- **Hub log lines get a level, a component and ids.** Hub components log
+  through a plain `(line) => void`; `obs/hub-log.ts` maps each line to a JSON
+  log line without changing its text (the compose install greps the
+  setup-token line, 0020): `warn` for `WARNING:` lines (box egress not
+  filtered, 0012) and for refusals a peer can cause (a rejected credential,
+  an ignored frame); `error` for hub and Docker failures (`could not`,
+  `failed`, `cannot`, `error`); `info` otherwise. The component comes from
+  the line's subject (`session`, `box`, `tool-rpc`, `runner`, `auth`,
+  `desktop`, else `hub`), and `session_id`, `box_id` and `turn_id` from the
+  ids the line names.
+- **Hub version.** `hub_version` is `HEARTH_VERSION` when the build sets it
+  (the hub image's `HEARTH_VERSION` build argument, compose passes it
+  through), else `apps/hub/package.json`'s version plus the git commit of the
+  checkout (`0.0.0+g<sha>`), else the package version: two builds can be told
+  apart in a trajectory.
+- **Shutdown never hangs on a collector.** `Telemetry.shutdown()` flushes
+  both providers, never rejects, and gives up after 5 s; the hub logs a
+  warning when the last export did not finish and exits 0.
 - **Bun.** The packages run on Bun 1.4.4 unchanged: `TracerProvider`,
   `BatchSpanProcessor`, `MeterProvider`, `PeriodicExportingMetricReader` and
   both OTLP/HTTP exporters were checked against an in-process `Bun.serve`
@@ -1749,12 +1806,18 @@ of box-agent's memory.
 
 - Retention: the event log is append-only (0006), so a retention period for
   trajectories needs a migration that drops the delete triggers and a new
-  decision. Not in this change; until then trajectories live as long as the
+  decision. Deferred to #83. Until then trajectories live as long as the
   session's events, and leave the hub only through the API, the CLI or a
   configured OTLP exporter.
+- A model call's request records hashes of the system prompt and tool
+  declarations, not their text: replaying a turn exactly needs the same hub
+  and pi build (`hub_version`, `pi_version`), which the hashes confirm.
 - box-agent has no exporter of its own (it has no network but the hub); its
   side of a call is in its logs, joined by the trace id. Box-side spans can
   later travel to the hub on the connection.
 - Sessions recorded before this change have no `runner.turn.*` or
   `runner.step` events; their trajectory has the user inputs, box records and
   summary only.
+- The session manager's `box.restarted`, `box.failed` and wake
+  `session.operation` events now carry `boxId`, so the trajectory's box
+  records name the box.

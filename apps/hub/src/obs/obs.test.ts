@@ -670,6 +670,13 @@ describe("model calls carry their request and output (schema /2)", () => {
       reasoning: { type: "enabled", budget_tokens: 1024 },
       system_prompt: { bytes: 3 },
     });
+    // A call pi made without a fresh context (none today) gets no stale request.
+    t.onEvent({ type: "turn_start" } as never);
+    const next = t.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "stop", usage: USAGE },
+    } as never);
+    expect(next?.payload["request"]).toBeNull();
     expect(payloadParams({ max_output_tokens: 10, reasoning: { effort: "high" } })).toEqual({
       max_tokens: 10,
       temperature: null,
