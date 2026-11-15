@@ -1,8 +1,17 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { HearthError } from "@hearth/core";
 import { decodeFrame, encodeFrame, type Frame } from "@hearth/protocol";
 import { BoxAgent } from "./connection";
 import type { OutboundFrame } from "./outbox";
+
+/** The real `WebSocket`, captured before any test swaps it. */
+const RealWebSocket = globalThis.WebSocket;
+
+// A test that times out never reaches the `finally` of `catchingSocketErrors`,
+// so the swap is also undone after every test.
+afterEach(() => {
+  globalThis.WebSocket = RealWebSocket;
+});
 
 test("every failed dial is logged with its attempt number, next delay and reason", async () => {
   // A port that was free a moment ago: nothing listens on it now.
@@ -215,12 +224,15 @@ for (const kind of ["turn.start", "session.hibernate"] as const) {
       await retried;
       expect(answers(hub.received)).toEqual(["c1", "c2"]);
 
-      // Once answered, c2 is recorded: a further re-send is not answered again.
+      // Once answered, c2 is recorded: a further re-send is neither answered
+      // again nor refused again. c2 is not acked, so the full outbox would
+      // refuse it (and log it) if it were not recognised as already answered.
       const pong = hub.next(isPong(3));
       hub.connection().send(command(kind, "c2"));
       hub.connection().send({ type: "ping", nonce: 3 });
       await pong;
       expect(answers(hub.received)).toEqual(["c1", "c2"]);
+      expect(lines.filter((line) => line.includes(`refused ${kind} c2`))).toHaveLength(1);
     } finally {
       agent.stop();
       await hub.stop();
