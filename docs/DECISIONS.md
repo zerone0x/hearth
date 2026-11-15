@@ -2120,3 +2120,25 @@ boundary React unmounts the whole tree: a blank page with no way out.
   element, which `style-src 'self'` blocks, so the registry thread passes
   `modal={false}` (a marked local edit, listed in `apps/web/README.md`).
   Only Refresh (regenerate) is gated on the runtime's reload capability.
+
+## 0027: Runner restart: a finished but unpersisted tool call is marked outcome-unknown
+
+Status: accepted. Clarifies 0015 ("Hub restart mid-tool"); behavior unchanged.
+
+When one assistant message holds two tool calls and the hub restarts after the
+first call finished but before its result was stored as `runner.entry`, the
+rebuilt runner treats that call like any call with no stored result: it gets
+the `RESTART_OUTCOME_UNKNOWN` error result, even though the event log may
+already hold its `pi.tool_execution_end`.
+
+- **Kept as is, not recovered from the log.** The safe direction: the model is
+  told to check the box before it repeats the call, and nothing re-runs it.
+  Recovering would trust a second record (`pi.tool_execution_end` has no
+  `runner.entry`, so the result's message shape and ordering would have to be
+  rebuilt by hand) for a rare window, with a wrong-result risk that outweighs
+  one extra check by the model.
+- The rule is therefore simple: a call has a result only when its result entry
+  is persisted.
+
+Test follow-ups from #75 (JSON-escaped secret redaction and the failed
+`runner.context` call result) are in `runner.test.ts`.

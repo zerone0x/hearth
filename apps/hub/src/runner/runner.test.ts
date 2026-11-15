@@ -1003,6 +1003,11 @@ describe("lease and AGENTS.md refresh (review of #63)", () => {
     expect(h.sessions.inFlight).toBe(0);
     expect(runner.status).toBe("failed");
     expect(runner.failure).toContain("disk full writing runner.context");
+    // The failed call's own result is the append error (prepare rethrows it).
+    const [first] = toolResults(runner.messages);
+    expect(first?.id).toBe("c1");
+    expect(first?.isError).toBe(true);
+    expect(first?.text).toContain("disk full writing runner.context");
     expect(h.events.types("se_a")).toContain("runner.failed");
     expect(h.sessions.failed).toEqual([
       { sessionId: "se_a", reason: "runner failed: disk full writing runner.context" },
@@ -1070,13 +1075,14 @@ describe("model key redaction (review of #63)", () => {
     h: Harness,
     logs: string[],
     tools: SessionRunnersOptions["tools"] = h.rpc,
+    secrets: SecretStore = keyed,
   ): Promise<SessionRunners> {
     const runners = new SessionRunners({
       authorizer: allowAll,
       events: h.events,
       sessions: h.sessions,
       tools,
-      secrets: keyed,
+      secrets,
       config: { provider: "faux", model: h.faux.getModel().id, apiKeyRef: "env:X" },
       modelRuntime: h.runtime,
       boxCwd: h.root,
@@ -1152,6 +1158,42 @@ describe("model key redaction (review of #63)", () => {
       expect(JSON.stringify(h.sessions.failed)).not.toContain(KEY);
     } finally {
       prompt.mockRestore();
+    }
+  });
+
+  test("a key with JSON-escapable characters is redacted raw and escaped everywhere", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const tricky = 'sk-"a\\b-9f8e7d6c';
+    const escaped = JSON.stringify(tricky).slice(1, -1);
+    expect(escaped).not.toBe(tricky);
+    const runners = await keyedRunners(h, logs, h.rpc, {
+      ...noSecrets,
+      resolve: async () => new SecretValue(tricky),
+    });
+    // Provider error: the key is stored inside JSON strings (escaped) and in the
+    // failure text (raw).
+    h.faux.setResponses([
+      () => {
+        throw new Error(`401 bad key ${tricky}`);
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    const failed = JSON.stringify(h.sessions.failed);
+    const stored = JSON.stringify([...h.events.all.values()]);
+    expect(stored).toContain(REDACTED);
+    expect(runner.failure ?? "").not.toContain("a\\b");
+    for (const text of [
+      stored,
+      logs.join("\n"),
+      JSON.stringify(runner.messages),
+      runner.failure ?? "",
+      failed,
+    ]) {
+      expect(text).not.toContain(tricky);
+      expect(text).not.toContain(escaped);
     }
   });
 });
