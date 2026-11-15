@@ -201,8 +201,13 @@ check_dns() {
     IFS=','
     echo "${allowed[*]}${allowed[*]:+,}${unreachable[*]}"
   )"
+  # Whether this breaks DNS depends on where Docker's embedded DNS sends the
+  # query from: from the box's network it is rejected here; from the host's
+  # own namespace (what CI's runner does) it never crosses these rules.
   echo "WARNING: the host resolves names through ${unreachable[*]} ($file)," \
-    "a private address boxes cannot reach, so DNS in boxes fails. Allow it:" >&2
+    "a private address these rules keep boxes from reaching. If Docker forwards" \
+    "box DNS from the box's network, names do not resolve in boxes. Check with" \
+    "'docker exec <box> getent hosts github.com'; if it fails, apply with:" >&2
   echo "  HEARTH_BOX_EGRESS_ALLOW=\"$line\" scripts/box-firewall.sh apply" >&2
 }
 
