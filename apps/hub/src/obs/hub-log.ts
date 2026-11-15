@@ -20,7 +20,7 @@ import type { Logger, LogLevel } from "@hearth/core";
 
 const ERROR_WORDS = /\b(could not|cannot|failed|failure|error)\b/i;
 const WARN_WORDS =
-  /\b(rejected|ignored|unknown id|is not from boot|no hello|interrupted by a hub restart|skipped)\b/i;
+  /\b(rejected|ignored|unknown id|is not from boot|no hello|interrupted by a hub restart|skipped|connection dead)\b/i;
 
 const COMPONENTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/^tool rpc\b/, "tool-rpc"],

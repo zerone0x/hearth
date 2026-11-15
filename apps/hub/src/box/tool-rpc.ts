@@ -11,7 +11,9 @@
  *   `rpc` id; the box runs an id at most once per boot, so it answers from the
  *   running call or its kept answer. When the box comes back with a **new
  *   boot**, the call's outcome is unknown: the client fails it with
- *   `tool.outcome-unknown` and never re-sends it (PRD §8.2.1).
+ *   `tool.outcome-unknown` and never re-sends it (PRD §8.2.1). A connection
+ *   the hub's heartbeat declares **dead** (decision 0028) fails its calls
+ *   with `tool.outcome-unknown` at once.
  * - **pi's error strings.** `BashOperations.exec` rejects with exactly
  *   `aborted` on abort and `timeout:<seconds>` on the command's timeout, the
  *   messages pi's bash tool turns into "Command aborted" and "Command timed
@@ -148,6 +150,7 @@ export class ToolRpcClient {
     this.#log = options.log ?? ((line) => console.error(line));
     this.#unlisten = this.#boxes.listen({
       connected: (boxId, bootId) => this.#onConnected(boxId, bootId),
+      dead: (boxId, bootId, death) => this.#onDead(boxId, bootId, death.misses * death.intervalMs),
       rpcResult: (_boxId, frame) => this.#onResult(frame),
     });
   }
@@ -360,6 +363,27 @@ export class ToolRpcClient {
     if (pending === undefined) return frame.id.startsWith("tool_");
     pending.settle(frame);
     return true;
+  }
+
+  /**
+   * The hub's heartbeat declared the box's connection dead (decision 0028).
+   * Unlike a plain close, nothing says the box will come back soon, or at all,
+   * so the calls sent on it fail now with `tool.outcome-unknown` instead of
+   * waiting out their deadlines: a mutating call gives up (it may have run),
+   * a read-only one may be retried (`classifyToolError`). None is re-sent.
+   */
+  #onDead(boxId: BoxId, bootId: string | undefined, silentMs: number): void {
+    for (const pending of [...this.#pending.values()]) {
+      if (pending.boxId !== boxId || pending.bootId !== bootId) continue;
+      pending.settle(
+        toolError(
+          pending.method,
+          "tool.outcome-unknown",
+          `Box ${boxId}'s connection was declared dead (no frame for ${silentMs} ms) during ` +
+            `${pending.method}; its outcome is unknown and it was not re-sent`,
+        ),
+      );
+    }
   }
 
   #onConnected(boxId: BoxId, bootId: string): void {

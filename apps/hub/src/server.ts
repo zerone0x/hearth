@@ -15,6 +15,7 @@ import {
   BOX_SOCKET_PATH,
   type BoxConnection,
   BoxConnections,
+  type BoxConnectionsOptions,
 } from "./box/connections";
 import type { IssuedJoinToken } from "./box/credentials";
 import {
@@ -138,6 +139,8 @@ export interface HubOptions extends HubListenOptions {
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
   readonly echoDeadlineMs?: number;
+  /** The hub's heartbeat on box connections (see `BoxConnections`, decision 0028). Tests change it. */
+  readonly heartbeat?: BoxConnectionsOptions["heartbeat"];
   /** Image of session boxes (`HEARTH_BOX_IMAGE`). Defaults to `DEFAULT_BOX_IMAGE`. */
   readonly boxImage?: string;
   /** Session manager timings and bounds (idle time, relaunch bounds); see `SessionManagerOptions`. */
@@ -210,6 +213,7 @@ export function startHub(options: HubOptions) {
     ...(options.log === undefined ? {} : { log: options.log }),
     ...(options.onApplied === undefined ? {} : { onApplied: options.onApplied }),
     ...(options.echoDeadlineMs === undefined ? {} : { echoDeadlineMs: options.echoDeadlineMs }),
+    ...(options.heartbeat === undefined ? {} : { heartbeat: options.heartbeat }),
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const boxEgress = options.boxEgress ?? markerEgressCheck();

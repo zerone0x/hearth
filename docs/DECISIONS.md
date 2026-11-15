@@ -2243,3 +2243,107 @@ already hold its `pi.tool_execution_end`.
 
 Test follow-ups from #75 (JSON-escaped secret redaction and the failed
 `runner.context` call result) are in `runner.test.ts`.
+
+## 0028: Heartbeat on the hub-box connection: protocol ping/pong, separate clocks, counted misses
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #31
+
+### Context
+
+Nothing checked that the hub-box WebSocket was alive. `ping`/`pong` were in
+protocol 1.0 for liveness (0002), and both ends answered a `ping`, but nobody
+sent one. A path that goes silent without a FIN or RST (a NAT timeout, a
+frozen or paused box, a host that sleeps, a lost route) left the box-agent
+"connected" forever with its outbox filling, and the hub until Bun's implicit
+120 s idle timeout (PRD §8.1 principles 1 and 4).
+
+### Decision
+
+- **Protocol frames, not WebSocket control frames.** Each end sends the
+  protocol's own `ping` and treats **any** frame from the peer as proof of
+  life. Bun's server can send WebSocket pings (`sendPings`, `idleTimeout`),
+  but the box dials with the standard `WebSocket` client, which can neither
+  send a ping nor see a pong, so the box could not run its own check.
+  `ping`/`pong` have been in the protocol since 1.0, so there is **no version
+  bump**: a peer that answers `ping` already interoperates, and a peer that
+  never pings is still watched by the other end.
+- **Separate clocks.** The hub runs one heartbeat per open connection and
+  the box-agent runs its own, each on its own timer (`HeartbeatClock`,
+  injected; `setInterval` outside tests). Neither depends on the other's
+  pings: a one-way silence is caught by the side that hears nothing.
+- **Failures are counted, not timed.** `Heartbeat` (`packages/protocol`, no
+  I/O) beats every `HEARTBEAT_INTERVAL_MS` (5 s). A beat that heard no frame
+  since the previous beat is a miss; any frame resets the count. After
+  `HEARTBEAT_MAX_MISSES` (3) misses in a row the connection is dead: between
+  15 s and 20 s (`heartbeatBoundMs`) after the last frame. The hub counts a
+  frame as heard when it arrives, before it is queued behind an apply, so a
+  slow store never makes a live box look dead. The count starts after the
+  handshake; the handshake has its own deadlines (`HELLO_DEADLINE_MS`,
+  `HANDSHAKE_DEADLINE_MS`).
+- **Failure owner on the hub.** `BoxConnections` declares the connection
+  dead: it logs `box <id> connection dead: …` (level `warn`), calls the new
+  listener method `dead` before `disconnected`, fails the connection's own
+  calls (`echo`) with `box.connection-dead` (retry), and terminates the socket
+  (no closing handshake a dead path would never answer; close code 4005,
+  `heartbeatTimeout`, where a close is sent). It appends a
+  `box.connection-dead` event (`boxId`, `bootId`, `detectedBy: "hub"`,
+  `misses`, `intervalMs`, `closeCode`) to the box's session log, which the
+  trajectory shows as a `box` record (0021).
+- **Tool RPCs fail at once.** Unlike a plain close (0011: a same-boot
+  reconnect re-sends), a dead connection says nothing about when, or whether,
+  the box comes back. `ToolRpcClient` fails every call it sent on that
+  connection (same box, same boot) with `tool.outcome-unknown` and never
+  re-sends it: a mutating call gives up (it may have run), a read-only one is
+  `retry` (`classifyToolError`). Calls on other boxes or boots are untouched.
+- **The session manager is told** as for any disconnect (0013): the socket
+  is terminated, so Bun runs the box socket's close handler at once (it
+  calls `boxClosed`) instead of after a closing handshake a dead path never
+  answers.
+- **The box reconnects.** On the box side a dead connection is dropped and
+  retried through the usual backoff (`reconnectDelay`); the outbox
+  redelivers after the next handshake (0008). Calls still running in the box
+  keep running; the hub has already failed them.
+
+### Proof
+
+- `heartbeat.test.ts` (protocol): miss counting, reset on a frame,
+  consecutive misses only, once-only `dead`, stop and restart.
+- `apps/hub/src/box/heartbeat.test.ts`: on an injected clock, a silent box
+  stays connected through 2 beats and is dead on the 3rd; `dead` before
+  `disconnected`; the socket dropped without a close frame (1006) and the
+  session manager told at once; an ordinary close stops the beats; an `echo` in flight fails with
+  `box.connection-dead` and `retry`; the event and its trajectory record; a
+  box that pongs, or sends any frame, stays connected; frames queued behind
+  a store whose append blocks keep the box alive for twice the bound.
+- `heartbeat-long-call.test.ts`: a real hub and box-agent, both clocks
+  injected, through a tool call that sends no frame for 10 beats (50 s of
+  injected time): neither end declares the connection dead.
+- `tool-rpc.test.ts`: dead fails calls of that box and boot only, with the
+  dispositions above, and nothing is re-sent on reconnect.
+- `apps/box-agent/src/connection.test.ts`: a hub that goes silent after
+  `welcome` is dead on the 3rd beat, the agent closes the old socket and
+  redials; a hub that pongs, or sends any other frame, keeps it connected.
+- `heartbeat.docker.test.ts` (CI, box-provider job): `docker pause` on a real
+  box with the hub at 1 s × 3; the hub declares it dead within
+  `heartbeatBoundMs` plus 1.5 s of slack, records it and fails an `echo` in
+  flight; after `docker unpause` the same boot reconnects and answers.
+
+### Consequences
+
+- Each connection carries a `ping`/`pong` pair every 5 s in each direction
+  while idle: a few hundred bytes a minute.
+- A box frozen for longer than the bound (a debugger, a host suspend) loses
+  its connection and its in-flight tool calls; it reconnects when it thaws.
+- The numbers are constants with options for tests, not owner settings. A
+  remote or cross-host box (E5) may need its own values; that is a change of
+  these defaults, not of the scheme.
+- The `box.connection-dead` event carries no turn or trace id.
+  `BoxConnections` does not know which runner turn is using the box (the
+  turn runs in the hub and reaches the box only through tool RPCs), so the
+  trajectory gives the record the trace id of the session's last turn, as
+  for the other box events. The turn itself records the failed tool calls
+  (`tool.outcome-unknown`) under its own trace id. Passing the active turn
+  down to `BoxConnections` is left for when a turn-scoped box record is
+  needed.

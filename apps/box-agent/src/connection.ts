@@ -15,6 +15,9 @@ import {
   decodeFrame,
   encodeFrame,
   type Frame,
+  Heartbeat,
+  type HeartbeatClock,
+  type HeartbeatSettings,
   isDuplicateCommand,
   PROTOCOL_VERSION,
   type ProtocolVersion,
@@ -31,6 +34,14 @@ export const RECONNECT_BASE_MS = 250;
 export const RECONNECT_MAX_MS = 10_000;
 /** A connection that gets no `welcome` or `reject` within this time is dropped and retried. */
 export const HANDSHAKE_DEADLINE_MS = 10_000;
+
+/** The repeating timer `setInterval` gives; the heartbeat uses it outside tests. */
+export const SYSTEM_HEARTBEAT_CLOCK: HeartbeatClock = {
+  every(ms, beat) {
+    const timer = setInterval(beat, ms);
+    return () => clearInterval(timer);
+  },
+};
 
 /**
  * Reject reasons that retrying with the same credential cannot fix: the agent
@@ -77,6 +88,11 @@ export interface BoxAgentOptions {
   readonly tools?: Omit<ToolExecutorOptions, "send" | "log">;
   /** Where the desktop relay finds Xvnc, and its bounds (decision 0016). Tests change them. */
   readonly vnc?: Omit<VncRelayOptions, "send" | "backlog" | "log">;
+  /**
+   * The box's own heartbeat on the open connection (decision 0028), on its own
+   * clock, separate from the hub's. Tests inject the clock.
+   */
+  readonly heartbeat?: HeartbeatSettings & { readonly clock?: HeartbeatClock };
 }
 
 /** How the agent ended: stopped on request, or refused by the hub for good. */
@@ -107,6 +123,7 @@ export class BoxAgent {
   #connects = 0;
   readonly #tools: ToolExecutor | undefined;
   readonly #vnc: VncRelay;
+  readonly #heartbeat: Heartbeat;
 
   constructor(options: BoxAgentOptions) {
     this.#options = options;
@@ -131,6 +148,14 @@ export class BoxAgent {
               if (this.#phase === "open") this.#write(frame);
             },
           });
+    this.#heartbeat = new Heartbeat({
+      ...options.heartbeat,
+      clock: options.heartbeat?.clock ?? SYSTEM_HEARTBEAT_CLOCK,
+      ping: (nonce) => {
+        if (this.#phase === "open") this.#write({ type: "ping", nonce });
+      },
+      dead: (misses) => this.#dead(misses),
+    });
     this.#vnc = new VncRelay({
       ...options.vnc,
       log: this.#log,
@@ -218,6 +243,7 @@ export class BoxAgent {
       if (this.#socket !== socket) return;
       this.#socket = undefined;
       clearTimeout(this.#timer);
+      this.#heartbeat.stop();
       this.#vnc.closeAll();
       if (this.#phase === "ended") return;
       const lost = this.#phase === "open";
@@ -233,6 +259,28 @@ export class BoxAgent {
       // A `close` event follows; the retry, and its log line, happen there.
       lastError = (event as ErrorEvent).message || undefined;
     });
+  }
+
+  /**
+   * The heartbeat heard nothing from the hub for `misses` beats: the path is
+   * dead though no close came (decision 0028). Drop the socket, stop listening
+   * to it, and reconnect through the usual backoff; the outbox redelivers
+   * after the next handshake.
+   */
+  #dead(misses: number): void {
+    if (this.#phase !== "open") return;
+    const socket = this.#socket;
+    this.#socket = undefined;
+    this.#vnc.closeAll();
+    try {
+      socket?.close(4005, "heartbeat timeout");
+    } catch {
+      // Closing a dead socket can throw; it is dropped either way.
+    }
+    this.#retry(
+      `connection dead (no frame from the hub for ${misses} heartbeats of ${this.#heartbeat.intervalMs} ms)`,
+      true,
+    );
   }
 
   /**
@@ -288,6 +336,7 @@ export class BoxAgent {
     if (this.#phase === "ended") return;
     this.#phase = "ended";
     clearTimeout(this.#timer);
+    this.#heartbeat.stop();
     this.#tools?.abortAll();
     this.#vnc.closeAll();
     const socket = this.#socket;
@@ -297,6 +346,8 @@ export class BoxAgent {
   }
 
   #onMessage(data: string | ArrayBuffer): void {
+    // Any frame proves the path is alive.
+    this.#heartbeat.heard();
     const decoded = decodeFrame(data);
     if (!decoded.ok) {
       this.#log(
@@ -312,6 +363,7 @@ export class BoxAgent {
         this.#phase = "open";
         this.#attempt = 0;
         this.#connects += 1;
+        this.#heartbeat.start();
         this.#log(`box-agent: connected (boot ${this.bootId}, ${this.outbox.size} to redeliver)`);
         for (const pending of this.outbox.pending()) this.#write(pending);
         return;

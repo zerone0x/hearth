@@ -60,6 +60,8 @@ interface HubConnection {
  */
 function fakeHub(script: (hub: HubConnection, connection: number) => void) {
   const received: Frame[] = [];
+  /** The close code of each box connection that ended, in order. */
+  const closes: number[] = [];
   const waiters: { match: (frame: Frame) => boolean; resolve: (frame: Frame) => void }[] = [];
   let connections = 0;
   let current: HubConnection | undefined;
@@ -93,6 +95,9 @@ function fakeHub(script: (hub: HubConnection, connection: number) => void) {
         connection.send({ type: "welcome", version: frame.version, boxId: frame.boxId });
         script(connection, connections);
       },
+      close(_ws, code) {
+        closes.push(code);
+      },
     },
   });
   const next = (match: (frame: Frame) => boolean): Promise<Frame> =>
@@ -109,6 +114,7 @@ function fakeHub(script: (hub: HubConnection, connection: number) => void) {
   return {
     url: `ws://127.0.0.1:${server.port}/v1/box/socket`,
     received,
+    closes,
     next,
     connection: () => {
       if (current === undefined) throw new Error("no box connected");
@@ -343,3 +349,145 @@ for (const [name, makeFailure] of unexpectedFailures) {
     });
   });
 }
+
+/** A clock whose beats run only when the test calls `beat()`. */
+function manualClock() {
+  const timers = new Map<number, { ms: number; fn: () => void }>();
+  let next = 0;
+  return {
+    timers,
+    every(ms: number, fn: () => void) {
+      const id = next++;
+      timers.set(id, { ms, fn });
+      return () => timers.delete(id);
+    },
+    beat() {
+      for (const t of [...timers.values()]) t.fn();
+    },
+  };
+}
+
+function heartbeatAgent(url: string, lines: string[], clock: ReturnType<typeof manualClock>) {
+  return new BoxAgent({
+    hubUrl: url,
+    boxId: "box_heartbeat",
+    joinToken: "hjt_test",
+    reconnectBaseMs: 10,
+    reconnectMaxMs: 20,
+    random: () => 0,
+    log: (line) => lines.push(line),
+    heartbeat: { intervalMs: 2_000, maxMisses: 3, clock },
+  });
+}
+
+async function until(check: () => boolean, what: string): Promise<void> {
+  const end = Date.now() + 3_000;
+  while (!check()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(5);
+  }
+}
+
+test("a hub that goes silent after welcome is declared dead after maxMisses beats, and the agent redials (#31)", async () => {
+  // The hub welcomes and then never sends another frame, without closing.
+  const hub = fakeHub(() => {});
+  const clock = manualClock();
+  const lines: string[] = [];
+  const agent = heartbeatAgent(hub.url, lines, clock);
+  try {
+    agent.start();
+    await until(() => agent.connected, "connected");
+    expect([...clock.timers.values()].map((t) => t.ms)).toEqual([2_000]);
+    clock.beat();
+    clock.beat();
+    // The box pings on each beat that is not the last.
+    await until(() => hub.received.filter((f) => f.type === "ping").length === 2, "two pings");
+    expect(agent.connected).toBe(true);
+    clock.beat();
+    expect(agent.connected).toBe(false);
+    expect(clock.timers.size).toBe(0);
+    expect(lines).toContain(
+      `box-agent: connection dead (no frame from the hub for 3 heartbeats of 2000 ms) to ${hub.url}; reconnecting in 5 ms`,
+    );
+    // It redials through the backoff and says hello again.
+    await until(() => agent.connects === 2, "a second handshake");
+    expect(hub.received.filter((f) => f.type === "hello").length).toBe(2);
+    // The box closed the dead socket itself rather than leave it open beside
+    // the new one.
+    await until(() => hub.closes.length === 1, "the old socket to close");
+    expect(hub.closes).toEqual([4005]);
+    // A fresh count on the new connection.
+    expect(clock.timers.size).toBe(1);
+  } finally {
+    agent.stop();
+    await agent.done;
+    await hub.stop();
+  }
+});
+
+test("a hub that answers pings keeps the box connected beat after beat", async () => {
+  const hub = fakeHub(() => {});
+  const clock = manualClock();
+  const lines: string[] = [];
+  const agent = heartbeatAgent(hub.url, lines, clock);
+  try {
+    agent.start();
+    await until(() => agent.connected, "connected");
+    for (let i = 1; i <= 8; i++) {
+      clock.beat();
+      const ping = await hub.next((f) => f.type === "ping");
+      if (ping.type === "ping") hub.connection().send({ type: "pong", nonce: ping.nonce });
+      await Bun.sleep(20);
+    }
+    expect(agent.connected).toBe(true);
+    expect(agent.connects).toBe(1);
+    expect(lines.some((l) => l.includes("connection dead"))).toBe(false);
+  } finally {
+    agent.stop();
+    await agent.done;
+    await hub.stop();
+  }
+});
+
+test("stop() ends the heartbeat", async () => {
+  const hub = fakeHub(() => {});
+  const clock = manualClock();
+  const agent = heartbeatAgent(hub.url, [], clock);
+  agent.start();
+  await until(() => agent.connected, "connected");
+  expect(clock.timers.size).toBe(1);
+  agent.stop();
+  await agent.done;
+  expect(clock.timers.size).toBe(0);
+  await hub.stop();
+});
+
+test("any frame from the hub, not only pong, resets the box's miss count (#31)", async () => {
+  const hub = fakeHub(() => {});
+  const clock = manualClock();
+  const lines: string[] = [];
+  const agent = heartbeatAgent(hub.url, lines, clock);
+  try {
+    agent.start();
+    await until(() => agent.connected, "connected");
+    // The hub never answers the box's pings; it pings the box on its own
+    // clock instead. Twice the bound in beats, a hub frame before each.
+    for (let i = 0; i < 6; i++) {
+      hub.connection().send({ type: "ping", nonce: 1_000 + i });
+      await hub.next(isPong(1_000 + i));
+      clock.beat();
+    }
+    expect(agent.connected).toBe(true);
+    expect(agent.connects).toBe(1);
+    expect(lines.some((l) => l.includes("connection dead"))).toBe(false);
+    // Silence after that is still caught.
+    clock.beat();
+    clock.beat();
+    clock.beat();
+    expect(agent.connected).toBe(false);
+  } finally {
+    agent.stop();
+    await agent.done;
+    await hub.stop();
+  }
+});

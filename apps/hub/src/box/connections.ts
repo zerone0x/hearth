@@ -27,6 +27,9 @@ import {
   decodeFrame,
   encodeFrame,
   type Frame,
+  Heartbeat,
+  type HeartbeatClock,
+  type HeartbeatSettings,
   type HelloFrame,
   PROTOCOL_VERSION,
   type RejectFrame,
@@ -65,6 +68,8 @@ export const CLOSE_CODES = {
   applyFailed: 4003,
   /** No `hello` arrived within `HELLO_DEADLINE_MS`. */
   helloTimeout: 4004,
+  /** No frame arrived for `maxMisses` heartbeats (decision 0028). */
+  heartbeatTimeout: 4005,
   /** The hub is shutting down. */
   shutdown: 1001,
 } as const;
@@ -73,7 +78,24 @@ export const CLOSE_CODES = {
 export interface BoxSocket {
   send(data: string | Uint8Array): unknown;
   close(code?: number, reason?: string): void;
+  /**
+   * Drop the connection without a closing handshake. A dead path never
+   * answers one, so a connection declared dead is terminated, not closed.
+   */
+  terminate?(): void;
 }
+
+/** The repeating timer `setInterval` gives; heartbeats use it outside tests. */
+export const SYSTEM_HEARTBEAT_CLOCK: HeartbeatClock = {
+  every(ms, beat) {
+    const timer = setInterval(beat, ms);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  },
+};
+
+/** Event type the hub appends to a session's log when its box connection dies. */
+export const CONNECTION_DEAD_EVENT = "box.connection-dead";
 
 /** Reported after each applied delivery, before its ack is sent. */
 export interface AppliedDelivery {
@@ -93,6 +115,18 @@ export interface BoxConnectionsOptions {
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC. Defaults to `ECHO_DEADLINE_MS`; tests shorten it. */
   readonly echoDeadlineMs?: number;
+  /**
+   * The hub's heartbeat on each open connection (decision 0028): interval,
+   * misses before the connection is dead, and its clock. Tests inject the clock.
+   */
+  readonly heartbeat?: HeartbeatSettings & { readonly clock?: HeartbeatClock };
+}
+
+/** Why a connection was declared dead. */
+export interface ConnectionDeath {
+  /** Consecutive heartbeats that heard nothing. */
+  readonly misses: number;
+  readonly intervalMs: number;
 }
 
 /**
@@ -106,6 +140,11 @@ export interface BoxConnectionListener {
   rpcResult?(boxId: BoxId, frame: RpcResultFrame): boolean;
   /** A box sent `stream.data` or `stream.close` (decision 0016). Return true when it was yours. */
   stream?(boxId: BoxId, frame: StreamDataFrame | StreamCloseFrame): boolean;
+  /**
+   * The hub's heartbeat declared `boxId`'s open connection dead (decision
+   * 0028). Called before `disconnected`; calls in flight on it fail now.
+   */
+  dead?(boxId: BoxId, bootId: string | undefined, death: ConnectionDeath): void;
   /** A box's open connection ended (closed, superseded, or the hub shut down). */
   disconnected?(boxId: BoxId, bootId: string | undefined): void;
 }
@@ -128,6 +167,7 @@ export class BoxConnection {
   readonly pending = new Map<string, PendingRpc>();
   queue: Promise<void> = Promise.resolve();
   helloTimer: ReturnType<typeof setTimeout> | undefined;
+  heartbeat: Heartbeat | undefined;
 
   constructor(socket: BoxSocket) {
     this.socket = socket;
@@ -174,6 +214,7 @@ export class BoxConnections {
   readonly #log: (line: string) => void;
   readonly #onApplied: ((applied: AppliedDelivery) => void) | undefined;
   readonly #echoDeadlineMs: number;
+  readonly #heartbeat: HeartbeatSettings & { readonly clock: HeartbeatClock };
   readonly #byBox = new Map<BoxId, BoxConnection>();
   readonly #all = new Set<BoxConnection>();
   readonly #waiters = new Map<BoxId, Set<() => void>>();
@@ -188,6 +229,10 @@ export class BoxConnections {
     this.#log = options.log ?? ((line) => console.error(line));
     this.#onApplied = options.onApplied;
     this.#echoDeadlineMs = options.echoDeadlineMs ?? ECHO_DEADLINE_MS;
+    this.#heartbeat = {
+      ...options.heartbeat,
+      clock: options.heartbeat?.clock ?? SYSTEM_HEARTBEAT_CLOCK,
+    };
   }
 
   /** True when `boxId` has a connection that finished its handshake. */
@@ -273,6 +318,8 @@ export class BoxConnections {
   }
 
   message(conn: BoxConnection, message: WireMessage): void {
+    // Any frame proves the path is alive, even one queued behind a slow apply.
+    conn.heartbeat?.heard();
     conn.queue = conn.queue.then(
       () => this.#handle(conn, message),
       () => this.#handle(conn, message),
@@ -477,6 +524,12 @@ export class BoxConnections {
     conn.principal = principal;
     conn.bootId = hello.bootId;
     this.#byBox.set(hello.boxId, conn);
+    conn.heartbeat = new Heartbeat({
+      ...this.#heartbeat,
+      ping: (nonce) => conn.send({ type: "ping", nonce }),
+      dead: (misses) => this.#dead(conn, misses),
+    });
+    conn.heartbeat.start();
     conn.send({
       type: "welcome",
       version: PROTOCOL_VERSION,
@@ -577,20 +630,74 @@ export class BoxConnections {
     this.#close(conn, CLOSE_CODES.rejected, reject.reason);
   }
 
-  #close(conn: BoxConnection, code: number, reason: string): void {
-    if (conn.state === "closed") return;
-    this.#forget(conn, reason);
+  /**
+   * The heartbeat heard nothing for `misses` beats: the path is dead (a NAT
+   * timeout, a paused or frozen box, a lost route), even though no FIN or RST
+   * came. Say so in the log and the session's event log, tell the listeners
+   * (the tool RPC client fails its calls, the session manager looks at the
+   * box), fail this connection's own calls, and drop the socket.
+   */
+  #dead(conn: BoxConnection, misses: number): void {
+    if (conn.state !== "open") return;
+    const binding = conn.binding;
+    const bootId = conn.bootId;
+    const intervalMs = conn.heartbeat?.intervalMs ?? 0;
+    const death: ConnectionDeath = { misses, intervalMs };
+    const boxId = binding?.boxId;
+    this.#log(
+      `box ${boxId} connection dead: no frame for ${misses} heartbeats of ${intervalMs} ms; dropping it`,
+    );
+    if (boxId !== undefined) {
+      for (const listener of this.#listeners) listener.dead?.(boxId, bootId, death);
+    }
+    this.#close(conn, CLOSE_CODES.heartbeatTimeout, "heartbeat timeout", {
+      code: "box.connection-dead",
+      message: `its connection was declared dead after ${misses} missed heartbeats`,
+    });
+    if (binding !== undefined) void this.#recordDeath(binding, bootId, death);
+  }
+
+  /** The death in the session's event log, so the trajectory shows it (decision 0021). */
+  async #recordDeath(
+    binding: BoxBinding,
+    bootId: string | undefined,
+    death: ConnectionDeath,
+  ): Promise<void> {
     try {
-      conn.socket.close(code, reason);
+      await this.#events.append({ workspaceId: binding.workspaceId }, binding.sessionId, {
+        type: CONNECTION_DEAD_EVENT,
+        payload: {
+          boxId: binding.boxId,
+          bootId: bootId ?? null,
+          detectedBy: "hub",
+          misses: death.misses,
+          intervalMs: death.intervalMs,
+          closeCode: CLOSE_CODES.heartbeatTimeout,
+        },
+      });
+    } catch (error) {
+      this.#log(
+        `box ${binding.boxId}: could not record its dead connection in session ${binding.sessionId}: ${String(error)}`,
+      );
+    }
+  }
+
+  #close(conn: BoxConnection, code: number, reason: string, failure?: PendingFailure): void {
+    if (conn.state === "closed") return;
+    this.#forget(conn, reason, failure);
+    try {
+      if (failure !== undefined && conn.socket.terminate !== undefined) conn.socket.terminate();
+      else conn.socket.close(code, reason);
     } catch {
       // Already closed by the peer.
     }
   }
 
-  #forget(conn: BoxConnection, reason: string): void {
+  #forget(conn: BoxConnection, reason: string, failure?: PendingFailure): void {
     if (conn.state === "closed") return;
     conn.state = "closed";
     clearTimeout(conn.helloTimer);
+    conn.heartbeat?.stop();
     this.#all.delete(conn);
     const boxId = conn.binding?.boxId;
     if (boxId !== undefined && this.#byBox.get(boxId) === conn) {
@@ -601,15 +708,22 @@ export class BoxConnections {
     for (const [id, pending] of conn.pending) {
       clearTimeout(pending.timer);
       pending.reject(
-        new HearthError(`Box ${boxId} disconnected before answering ${id}`, {
-          owner: "box",
-          disposition: "retry",
-          code: "box.disconnected",
-        }),
+        new HearthError(
+          failure === undefined
+            ? `Box ${boxId} disconnected before answering ${id}`
+            : `Box ${boxId} did not answer ${id}: ${failure.message}`,
+          { owner: "box", disposition: "retry", code: failure?.code ?? "box.disconnected" },
+        ),
       );
     }
     conn.pending.clear();
   }
+}
+
+/** How the calls of a connection that is dropped on purpose fail. */
+interface PendingFailure {
+  readonly code: string;
+  readonly message: string;
 }
 
 function notConnected(boxId: BoxId): HearthError {

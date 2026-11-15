@@ -96,6 +96,38 @@ async function rejection(promise: Promise<unknown>): Promise<Error> {
 }
 
 describe("ToolRpcClient against a fake box", () => {
+  test("a connection declared dead fails its calls with tool.outcome-unknown at once (decision 0028)", async () => {
+    const boxes = new FakeBoxes(workspace());
+    const client = new ToolRpcClient({ boxes, log: () => {} });
+    boxes.dropAnswers = true;
+    const exec = client.call("box_1", "call_d", "tool.exec", {
+      command: "sleep 30",
+      cwd: boxes.root,
+      timeoutMs: 60_000,
+    });
+    const read = client.call("box_1", "call_d", "tool.exists", { path: boxes.root });
+    expect(client.pending).toBe(2);
+    // Another boot's death does not touch these calls.
+    for (const l of boxes.listeners) l.dead?.("box_1", "boot_other", { misses: 3, intervalMs: 1 });
+    // Neither does another box's.
+    for (const l of boxes.listeners) l.dead?.("box_2", "boot_1", { misses: 3, intervalMs: 1 });
+    expect(client.pending).toBe(2);
+    for (const l of boxes.listeners) l.dead?.("box_1", "boot_1", { misses: 3, intervalMs: 1_000 });
+    const execError = (await rejection(exec)) as HearthError;
+    const readError = (await rejection(read)) as HearthError;
+    expect(execError.code).toBe("tool.outcome-unknown");
+    expect(execError.disposition).toBe("give-up");
+    expect(execError.message).toContain("no frame for 3000 ms");
+    expect(readError.code).toBe("tool.outcome-unknown");
+    expect(readError.disposition).toBe("retry");
+    expect(client.pending).toBe(0);
+    // Not re-sent when the box comes back on the same boot.
+    const sent = boxes.sent.length;
+    boxes.reconnect(false);
+    expect(boxes.sent.length).toBe(sent);
+    boxes.executor.abortAll();
+  });
+
   test("pi-shaped operations round trip", async () => {
     const boxes = new FakeBoxes(workspace());
     const client = new ToolRpcClient({ boxes, log: () => {} });

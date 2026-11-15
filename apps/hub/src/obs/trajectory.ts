@@ -44,7 +44,14 @@ export type TrajectoryRecord = Record<string, unknown> & {
 
 type Payload = Record<string, unknown>;
 
-const BOX_EVENTS = new Set(["session.state", "session.operation", "box.failed", "box.restarted"]);
+const BOX_EVENTS = new Set([
+  "session.state",
+  "session.operation",
+  "box.failed",
+  "box.restarted",
+  // The hub declared the box connection dead (decision 0028).
+  "box.connection-dead",
+]);
 
 function obj(value: unknown): Payload {
   return value !== null && typeof value === "object" && !Array.isArray(value)
