@@ -335,10 +335,15 @@ export function startHub(options: HubOptions) {
 
   // The runner (decision 0015): one pi session per hub session, tools routed
   // to the session's box through the tool RPC.
-  const toolRpc = new ToolRpcClient({
-    boxes,
-    ...(options.log === undefined ? {} : { log: options.log }),
-  });
+  // Only with a runner: the client claims every `tool_` rpc answer, so a second
+  // client on the same connections (tests) would lose its answers to this one.
+  const toolRpc =
+    options.runner === undefined
+      ? undefined
+      : new ToolRpcClient({
+          boxes,
+          ...(options.log === undefined ? {} : { log: options.log }),
+        });
   const runners =
     options.runner === undefined
       ? undefined
@@ -350,7 +355,7 @@ export function startHub(options: HubOptions) {
             ensureBox: (sessionId) => sessions.ensureBox(sessionId),
             get: (principal, sessionId) => sessions.get(principal, sessionId),
           },
-          tools: toolRpc,
+          tools: toolRpc as ToolRpcClient,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
@@ -378,7 +383,7 @@ export function startHub(options: HubOptions) {
     sessions,
     /** The pi runners (decision 0015), when `runner` is configured. */
     runners,
-    /** The tool RPC client the runners use. */
+    /** The tool RPC client the runners use, when `runner` is configured. */
     toolRpc,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
     issueJoinToken(boxId: string, sessionId: string, ttlMs?: number): Promise<IssuedJoinToken> {
@@ -442,7 +447,7 @@ export function startHub(options: HubOptions) {
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
       sessions.stop();
-      toolRpc.close();
+      toolRpc?.close();
       void runners?.close();
       boxes.shutdown();
       stopped = (async () => {

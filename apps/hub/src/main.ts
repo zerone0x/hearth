@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { createDefaultSecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
+import type { RunnerConfig } from "./runner";
 import {
   type BoxNetworkProvider,
   DEFAULT_BOX_PORT,
@@ -45,6 +47,24 @@ export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>)
   return Math.round(minutes * 60_000);
 }
 
+/**
+ * The runner's model (decision 0015): `HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL`
+ * and `HEARTH_MODEL_KEY_REF`, a SecretStore reference such as
+ * `env:ANTHROPIC_API_KEY`. Without `HEARTH_MODEL` the runner is off.
+ */
+export function runnerConfigFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): RunnerConfig | undefined {
+  const model = env["HEARTH_MODEL"];
+  if (model === undefined || model === "") return undefined;
+  const provider = env["HEARTH_MODEL_PROVIDER"];
+  if (provider === undefined || provider === "") {
+    throw new Error("HEARTH_MODEL_PROVIDER must be set when HEARTH_MODEL is");
+  }
+  const keyRef = env["HEARTH_MODEL_KEY_REF"];
+  return { provider, model, ...(keyRef ? { apiKeyRef: keyRef } : {}) };
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -56,7 +76,11 @@ if (import.meta.main) {
   // Box egress gate (0012): the firewall marker, or HEARTH_BOX_EGRESS=unrestricted.
   const boxEgress = boxEgressFromEnv(process.env);
   mkdirSync(dataDir, { recursive: true });
+  const runnerConfig = runnerConfigFromEnv(process.env);
   const hub = startHub({
+    ...(runnerConfig === undefined
+      ? {}
+      : { runner: { config: runnerConfig, secrets: createDefaultSecretStore() } }),
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
     port: parsePort(process.env["HEARTH_PORT"]),
     // Box listeners bind each box network's gateway on this port (0012).
