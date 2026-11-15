@@ -11,7 +11,10 @@
  * - whether box-agent's `environ`, `maps` and `mem` open, and whether
  *   `ptrace(PTRACE_ATTACH)` on it succeeds (none may: it is non-dumpable);
  * - a control: Xvnc's `environ` is readable and holds `HEARTH_BOX_ID`, so the
- *   scan does read other processes and a refusal is not an accident.
+ *   scan does read other processes and a refusal is not an accident;
+ * - the variable names in the desktop Chromium's `environ` (#92): only the
+ *   entrypoint's clean set, no `HEARTH_*` from the boot env. The command first
+ *   waits for Chromium's CDP, so the browser is up when the scan runs.
  *
  * The token the hub minted is read from the container's config (the host
  * side) and handed to the scan reversed, so the scan's own command line does
@@ -61,7 +64,7 @@ def read(pid, name):
             return f.read()
     except OSError as e:
         return e.errno
-report = {"tokenIn": [], "agent": None, "xvncEnviron": None, "tokenFile": os.path.exists("/run/hearth/join-token"), "processes": []}
+report = {"tokenIn": [], "agent": None, "xvncEnviron": None, "chromiumEnv": None, "tokenFile": os.path.exists("/run/hearth/join-token"), "processes": []}
 for entry in os.listdir("/proc"):
     if not entry.isdigit() or int(entry) in me:
         continue
@@ -91,10 +94,16 @@ for entry in os.listdir("/proc"):
             "mem": "readable" if isinstance(read(pid, "mem"), bytes) else "refused",
             "ptrace": "attached" if attached == 0 else os.strerror(ptrace_errno),
         }
+    argv = cmdline.split(b"\0")
+    if argv[0].endswith(b"chromium") and b"--remote-debugging-port=9222" in argv and not any(a.startswith(b"--type=") for a in argv):
+        report["chromiumEnv"] = sorted(kv.split(b"=", 1)[0].decode() for kv in environ.split(b"\0") if kv) if isinstance(environ, bytes) else os.strerror(environ)
     if cmdline.startswith(b"Xvnc\0"):
         report["xvncEnviron"] = "refused" if not isinstance(environ, bytes) else ("has-box-id" if b"\0HEARTH_BOX_ID=" in b"\0" + environ else "no-box-id")
 print(json.dumps(report))
 `;
+
+/** Waits up to 60 s for the desktop Chromium's CDP on loopback. */
+const WAIT_FOR_CDP = `for _ in $(seq 1 120); do python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=1)" 2>/dev/null && break; sleep 0.5; done`;
 
 interface ScanReport {
   readonly tokenIn: string[];
@@ -105,6 +114,8 @@ interface ScanReport {
     readonly ptrace: string;
   } | null;
   readonly xvncEnviron: string | null;
+  /** The variable names in the desktop Chromium's environ (#92). */
+  readonly chromiumEnv: string[] | string | null;
   readonly tokenFile: boolean;
   /** The program name (argv[0] basename) of each process the scan read. */
   readonly processes: string[];
@@ -174,7 +185,7 @@ describe.skipIf(!enabled)("box-agent's secrets through /proc in a real box", () 
     const out: Buffer[] = [];
     const reversed = [...(token ?? "")].reverse().join("");
     const { exitCode } = await ops.bash.exec(
-      `python3 - '${reversed}' <<'HEARTH_SCAN'\n${SCAN}\nHEARTH_SCAN`,
+      `${WAIT_FOR_CDP}\npython3 - '${reversed}' <<'HEARTH_SCAN'\n${SCAN}\nHEARTH_SCAN`,
       "/workspace",
       { onData: (data) => out.push(data), timeout: 60 },
     );
@@ -184,8 +195,21 @@ describe.skipIf(!enabled)("box-agent's secrets through /proc in a real box", () 
     console.log(`proc scan: ${JSON.stringify(report)}`);
 
     // The scan saw the box's processes, and could read another process's environ.
-    expect(report.processes).toEqual(expect.arrayContaining(["tini", "Xvnc", "openbox", "bun"]));
+    expect(report.processes).toEqual(
+      expect.arrayContaining(["tini", "Xvnc", "openbox", "bun", "chromium"]),
+    );
     expect(report.xvncEnviron).toBe("has-box-id");
+    // The desktop's Chromium (#92, decision 0026) starts from a clean
+    // environment: readable to the command, and nothing of the boot env in it.
+    expect(report.chromiumEnv).toEqual([
+      "DISPLAY",
+      "HOME",
+      "LANG",
+      "LOGNAME",
+      "PATH",
+      "SHELL",
+      "USER",
+    ]);
     // No process carries the join token, and its file is gone.
     expect(report.tokenIn).toEqual([]);
     expect(report.tokenFile).toBe(false);

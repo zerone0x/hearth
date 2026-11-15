@@ -92,6 +92,75 @@ async function inspect(containerId: string) {
   };
 }
 
+/**
+ * Run in the box (python3, as the box's uid): waits up to 60 s for the
+ * desktop's Chromium (the browser process: CDP flags, no `--type=`) and its
+ * CDP `/json/version` on 127.0.0.1:9222, then reports the process's uids,
+ * environment variable names and flags, whether every CDP listener is on
+ * loopback, and which Chromium processes hold argv[1] (the join token).
+ */
+const CHROMIUM_SCAN = String.raw`
+import json, os, sys, time, urllib.request
+token = sys.argv[1].encode()
+def read(pid, name):
+    try:
+        with open(f"/proc/{pid}/{name}", "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+def browser():
+    for e in os.listdir("/proc"):
+        if e.isdigit():
+            argv = read(e, "cmdline").split(b"\0")
+            if argv and argv[0].endswith(b"chromium") and any(a.startswith(b"--remote-debugging-port=") for a in argv) and not any(a.startswith(b"--type=") for a in argv):
+                return int(e), [a.decode() for a in argv[1:] if a]
+    return None, []
+version = None
+for _ in range(120):
+    pid, flags = browser()
+    try:
+        version = json.load(urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2))
+    except Exception:
+        version = None
+    if pid and version:
+        break
+    time.sleep(0.5)
+uids = [l.split()[1:] for l in read(pid, "status").decode().splitlines() if l.startswith("Uid:")] if pid else []
+env = [kv.split(b"=", 1)[0].decode() for kv in read(pid, "environ").split(b"\0") if kv] if pid else []
+token_in = []
+for e in os.listdir("/proc"):
+    if e.isdigit() and b"chromium" in read(e, "cmdline").split(b"\0")[0]:
+        if token in read(e, "environ") or token in read(e, "cmdline"):
+            token_in.append(e)
+port = "%04X" % 9222
+listeners = []
+for table in ("tcp", "tcp6"):
+    for line in read("self", "net/" + table).decode().splitlines()[1:]:
+        f = line.split()
+        if f[3] == "0A" and f[1].endswith(":" + port):
+            listeners.append(f[1].split(":")[0])
+loopback = lambda a: (len(a) == 8 and a.endswith("7F")) or a == "00000000000000000000000001000000"
+print(json.dumps({
+    "browser": (version or {}).get("Browser"),
+    "pid": pid,
+    "uids": uids[0] if uids else [],
+    "envKeys": sorted(env),
+    "flags": flags,
+    "tokenIn": token_in,
+    "loopbackOnly": bool(listeners) and all(loopback(a) for a in listeners),
+}))
+`;
+
+interface DesktopChromium {
+  readonly browser: string | null;
+  readonly pid: number | null;
+  readonly uids: string[];
+  readonly envKeys: string[];
+  readonly flags: string[];
+  readonly tokenIn: string[];
+  readonly loopbackOnly: boolean;
+}
+
 describe.skipIf(!enabled)("DockerBoxProvider against a real daemon", () => {
   afterAll(async () => {
     for (const box of await provider.adopt()) await provider.destroy(box.boxId);
@@ -132,6 +201,59 @@ describe.skipIf(!enabled)("DockerBoxProvider against a real daemon", () => {
     ]);
     expect(page.out).toContain("hearth-provider");
   }, 120_000);
+
+  test("Chromium's own sandbox cannot start under the box's sandbox (decision 0026)", async () => {
+    const info = await provider.attach("a");
+    const page = await exec(info?.providerRef as string, [
+      "timeout",
+      "60",
+      "chromium",
+      "--headless",
+      "--disable-gpu",
+      "--user-data-dir=/tmp/sandbox-probe",
+      "--dump-dom",
+      "data:text/html,<p>hearth-sandboxed</p>",
+    ]);
+    console.log(`chromium with its sandbox: exit ${page.code}: ${page.out.slice(0, 400)}`);
+    expect(page.out).not.toContain("hearth-sandboxed");
+    expect(page.code).not.toBe(0);
+  }, 120_000);
+
+  test("the desktop's Chromium: CDP on loopback, uid 1000, a clean environment, restarted when it exits", async () => {
+    const ref = (await provider.attach("a"))?.providerRef as string;
+    const scan = async (): Promise<DesktopChromium> => {
+      const res = await exec(ref, ["python3", "-c", CHROMIUM_SCAN, "join-a"]);
+      const line = res.out.split(/\r?\n/).find((l) => l.startsWith("{"));
+      if (line === undefined) throw new Error(`the scan printed no report: ${res.out}`);
+      return JSON.parse(line) as DesktopChromium;
+    };
+    const first = await scan();
+    console.log(`desktop chromium: ${JSON.stringify(first)}`);
+    expect(first.browser).toMatch(/Chrom/);
+    expect(first.pid).toBeGreaterThan(1);
+    expect(first.uids).toEqual(["1000", "1000", "1000", "1000"]);
+    expect(first.loopbackOnly).toBe(true);
+    // Only the variables the entrypoint hands it: nothing from the boot env.
+    expect(first.envKeys).toEqual(["DISPLAY", "HOME", "LANG", "LOGNAME", "PATH", "SHELL", "USER"]);
+    expect(first.tokenIn).toEqual([]);
+    expect(first.flags).toEqual(
+      expect.arrayContaining(["--remote-debugging-address=127.0.0.1", "--no-sandbox"]),
+    );
+    expect(first.flags.some((f) => f.startsWith("--user-data-dir=/home/hearth/"))).toBe(true);
+
+    // Closed (SIGTERM, as a window close or the agent would end it): the
+    // supervisor starts a new one, and CDP answers again.
+    await exec(ref, ["kill", String(first.pid)]);
+    let second = await scan();
+    for (let i = 0; i < 20 && second.pid === first.pid; i++) {
+      await Bun.sleep(500);
+      second = await scan();
+    }
+    expect(second.pid).not.toBe(first.pid);
+    expect(second.browser).toMatch(/Chrom/);
+    const log = await exec(ref, ["cat", "/tmp/chromium.log"]);
+    expect(log.out).toContain("chromium exited");
+  }, 180_000);
 
   test("the box has egress", async () => {
     const info = await provider.attach("a");
