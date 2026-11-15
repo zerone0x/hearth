@@ -37,6 +37,18 @@ whose `Host` is `localhost`, `127.0.0.1`, `[::1]` or the bound address, whose
 public origin, e.g. `HEARTH_PUBLIC_ORIGIN=https://hearth.example`: its host and
 origin are then allowed too.
 
+Every route except `/healthz` also needs a login session (decision 0014). On
+first run the hub logs a one-time setup token; set the owner password with it,
+then sign in. Both answer with an `HttpOnly`, `SameSite=Strict` session cookie:
+
+```sh
+curl -c jar -H 'content-type: application/json' http://127.0.0.1:8787/v1/auth/setup \
+  -d '{"setupToken":"hst_...","password":"at least 12 characters"}'
+curl -c jar -H 'content-type: application/json' http://127.0.0.1:8787/v1/auth/login \
+  -d '{"password":"at least 12 characters"}'
+curl -b jar -X POST -H 'content-type: application/json' http://127.0.0.1:8787/v1/auth/logout
+```
+
 ## Layout
 
 ```

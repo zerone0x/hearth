@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_WORKSPACE_ID } from "@hearth/core";
+import { SESSION_COOKIE } from "../auth";
 import { DEFAULT_DOCKER_API_VERSION, DEFAULT_DOCKER_SOCKET } from "../box/docker/config";
 import { DockerEngine } from "../box/docker/engine";
 import { DockerBoxProvider } from "../box/docker/provider";
@@ -83,7 +84,11 @@ describe.skipIf(!enabled)("session lifecycle with Docker boxes", () => {
     // Create through the API: no box starts.
     const res = await fetch(new URL("/v1/sessions", h.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        // The session API is behind the login (decision 0014).
+        cookie: `${SESSION_COOKIE}=${h.auth.issueSession(sessionPrincipal).token}`,
+      },
       body: JSON.stringify({ title: "docker" }),
     });
     expect(res.status).toBe(201);

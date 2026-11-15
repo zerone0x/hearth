@@ -16,6 +16,7 @@ export {
   SqliteEventStore,
   type SqliteEventStoreOptions,
 } from "./event-store";
+export { SqliteLoginStore } from "./login-store";
 export { MIGRATIONS, type Migration, migrate, SCHEMA_VERSION } from "./migrations";
 export {
   type BoxRow,
