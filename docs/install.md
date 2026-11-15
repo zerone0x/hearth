@@ -147,8 +147,9 @@ session's box, so the first answer takes longer.
 
 The firewall rules and the marker are gone after a reboot. Docker restarts the
 hub, but the hub starts no box (`box.egress-unfiltered`) until the firewall
-runs again. Run the install again, or let systemd do it at boot (adjust the
-path):
+runs again. A firewalld reload or restart can drop the rules too, while the
+marker stays. Run the install again, or let systemd do it at boot and after
+every firewalld restart (adjust the path):
 
 ```ini
 # /etc/systemd/system/hearth.service
@@ -156,12 +157,13 @@ path):
 Description=Hearth (docker compose)
 After=docker.service firewalld.service
 Requires=docker.service
-ReloadPropagatedFrom=firewalld.service
+PartOf=firewalld.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/hearth/deploy
+ExecStart=/usr/bin/docker compose run --rm box-firewall apply
 ExecStart=/usr/bin/docker compose up -d --wait hub
 ExecReload=/usr/bin/docker compose run --rm box-firewall apply
 
@@ -169,8 +171,28 @@ ExecReload=/usr/bin/docker compose run --rm box-firewall apply
 WantedBy=multi-user.target
 ```
 
-`sudo systemctl enable --now hearth`. A firewalld reload drops the rules too;
-`ReloadPropagatedFrom` re-applies them.
+`PartOf=firewalld.service` runs the unit again when firewalld restarts: the
+firewall is applied, and the running hub is left as it is. `firewall-cmd
+--reload` goes to firewalld over D-Bus and never reaches systemd, so on a host
+with firewalld also run the watcher (it needs `dbus-monitor`, Debian's
+`dbus-bin`):
+
+```ini
+# /etc/systemd/system/hearth-firewalld-watch.service
+[Unit]
+Description=Re-apply the Hearth box firewall after a firewalld reload
+After=dbus.service hearth.service
+
+[Service]
+ExecStart=/opt/hearth/scripts/firewalld-reload-watch.sh /usr/bin/systemctl reload hearth.service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`sudo systemctl enable --now hearth hearth-firewalld-watch`.
 
 ## Upgrade
 
