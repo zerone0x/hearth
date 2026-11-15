@@ -206,7 +206,7 @@ function stripEncodings(message: Uint8Array): Uint8Array {
   const outView = new DataView(out.buffer);
   out[0] = RFB_CLIENT.setEncodings;
   outView.setUint16(2, kept.length);
-  kept.forEach((encoding, i) => outView.setInt32(4 + 4 * i, encoding));
+  for (const [i, encoding] of kept.entries()) outView.setInt32(4 + 4 * i, encoding);
   return out;
 }
 

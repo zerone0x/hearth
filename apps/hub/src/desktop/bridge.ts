@@ -214,20 +214,23 @@ export class DesktopBridge {
   message(viewer: Viewer, data: string | Uint8Array): void {
     if (viewer.closed || !this.#reauth(viewer)) return;
     if (typeof data === "string") {
-      return this.#close(viewer, DESKTOP_CLOSE.protocol, "RFB travels in binary messages");
+      this.#close(viewer, DESKTOP_CLOSE.protocol, "RFB travels in binary messages");
+      return;
     }
     let forward: Uint8Array;
     try {
       forward = viewer.filter.push(data);
     } catch (error) {
       if (!(error instanceof RfbViolation)) throw error;
-      return this.#close(viewer, DESKTOP_CLOSE.protocol, error.message);
+      this.#close(viewer, DESKTOP_CLOSE.protocol, error.message);
+      return;
     }
     if (forward.byteLength === 0) return;
     viewer.held.push(forward);
     viewer.heldBytes += forward.byteLength;
     if (viewer.heldBytes > this.#toBoxLimit) {
-      return this.#close(viewer, DESKTOP_CLOSE.protocol, "the viewer sent too much while held");
+      this.#close(viewer, DESKTOP_CLOSE.protocol, "the viewer sent too much while held");
+      return;
     }
     this.flush(viewer);
   }
@@ -253,7 +256,10 @@ export class DesktopBridge {
         seq: viewer.sendSeq,
         data,
       });
-      if (!sent) return this.#close(viewer, DESKTOP_CLOSE.boxGone, "the box disconnected", false);
+      if (!sent) {
+        this.#close(viewer, DESKTOP_CLOSE.boxGone, "the box disconnected", false);
+        return;
+      }
       viewer.sendSeq = (viewer.sendSeq + 1) >>> 0;
     }
   }

@@ -94,12 +94,20 @@ export class VncRelay {
   open(frame: StreamOpenFrame): void {
     const id = frame.streamId;
     if (frame.kind !== "vnc") {
-      return this.#refuse(id, `${frame.kind} streams are not served by this box-agent`);
+      this.#refuse(id, `${frame.kind} streams are not served by this box-agent`);
+      return;
     }
-    if (id % 2 !== 0) return this.#refuse(id, "the hub opens even stream ids");
-    if (this.#streams.has(id)) return this.#refuse(id, `stream ${id} is already open`);
+    if (id % 2 !== 0) {
+      this.#refuse(id, "the hub opens even stream ids");
+      return;
+    }
+    if (this.#streams.has(id)) {
+      this.#refuse(id, `stream ${id} is already open`);
+      return;
+    }
     if (this.#streams.size >= MAX_VNC_STREAMS) {
-      return this.#refuse(id, `at most ${MAX_VNC_STREAMS} desktop streams may be open`);
+      this.#refuse(id, `at most ${MAX_VNC_STREAMS} desktop streams may be open`);
+      return;
     }
     const host = this.#options.host ?? DEFAULT_VNC_HOST;
     const port = this.#options.port ?? DEFAULT_VNC_PORT;
@@ -109,7 +117,8 @@ export class VncRelay {
     try {
       socket = connect(host, port);
     } catch (error) {
-      return this.#refuse(id, `cannot reach the desktop: ${String(error)}`);
+      this.#refuse(id, `cannot reach the desktop: ${String(error)}`);
+      return;
     }
     const stream: RelayStream = {
       id,
