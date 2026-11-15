@@ -1763,3 +1763,50 @@ event log, view-only noVNC desktop, the e2e) stays.
   drift.
 - The e2e needs Docker, so it runs only in CI (`compose-e2e`), like the other
   Docker suites.
+
+## 0022: The guard's principal reaches every authorize; a box echo is authorized against the box's workspace
+
+- Date: 2026-11-15
+- Status: accepted
+- Issues: #61, #50
+
+### Context
+
+Decision 0014 put a login guard in front of every API route and said that the
+principal of the login session is what handlers pass to `authorize`. The
+session routes (#42) predate it and still passed `LOCAL_PRINCIPAL`. In v1 every
+login yields the owner, so the two are the same principal today, and the
+mistake was invisible; with more principals the audit log would record the
+owner for every session action.
+
+Separately, `box.echo` built its resource from the caller's workspace, not the
+box's. `authorize` never saw a cross-workspace echo, allowed it and audited it
+as allowed; the hub then refused it with its own check (409
+`box.not-connected`). The outcome was right, but the policy and the audit log
+were not (PRD §7 E3, E10).
+
+### Decision
+
+- **Every handler behind the login guard takes the principal from the guard**
+  (`c.get("principal")`): session routes, runner routes, the desktop upgrade
+  (which keeps it in the viewer ticket, so later re-checks compare against the
+  principal that was authorized), and the box echo. Nothing behind the guard
+  names `LOCAL_PRINCIPAL`; the manager's audit rows carry the same principal.
+- **`box.echo` is authorized against the box's workspace**: the workspace of
+  the box's join binding once it said hello, else the caller's (a box that is
+  not connected is refused as such by the RPC). A cross-workspace echo is
+  denied and audited as denied by `authorize` itself.
+- **The HTTP answer to that denial stays 409 `box.not-connected`**, not 403:
+  it is what a caller sees for a box that is not there, so it does not reveal
+  that a box with that id exists in another workspace. A denial for a box of
+  the caller's own workspace stays 403 `authz.denied`.
+- **The hub's own workspace check after `authorize` stays**, so a policy that
+  wrongly allows a cross-workspace echo still sends nothing to the box.
+
+### Consequences
+
+- A test (`apps/hub/src/principal.test.ts`) drives each route family through
+  the real hub with a guard that returns a principal other than the owner, and
+  checks that this principal reaches `authorize` and every audit row.
+- Routes added behind the guard later follow the same rule; the test is the
+  place to add their family.

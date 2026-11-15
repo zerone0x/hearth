@@ -294,20 +294,31 @@ export class BoxConnections {
   /**
    * `echo` round trip (the M0 exit criterion). Calls `authorize` first, then
    * sends `rpc` `echo` and resolves with what the box sent back.
+   *
+   * The resource workspace is the box's own (its join binding), so `authorize`
+   * sees, denies and audits an echo to a box of another workspace (#50,
+   * decision 0022). That denial answers `box.not-connected`, as for a box that
+   * is not there, so a caller cannot learn that a box exists elsewhere. A box
+   * that has not said hello has no binding yet; it is checked against the
+   * caller's workspace, and `rpc` then refuses it as not connected.
    */
   async echo(principal: Principal, boxId: BoxId, params: JsonValue): Promise<JsonValue> {
+    const boxWorkspace = this.#byBox.get(boxId)?.binding?.workspaceId ?? principal.workspaceId;
     const decision = await this.#authorizer.authorize(principal, "box.echo", {
-      workspaceId: principal.workspaceId,
+      workspaceId: boxWorkspace,
       type: "box",
       id: boxId,
     });
     if (!decision.allowed) {
+      if (boxWorkspace !== principal.workspaceId) throw notConnected(boxId);
       throw new HearthError(`box.echo denied: ${decision.reason}`, {
         owner: "user",
         disposition: "give-up",
         code: "authz.denied",
       });
     }
+    // Checked again after `authorize`: the box may have reconnected meanwhile,
+    // and a policy that allowed a cross-workspace echo must not reach it either.
     const conn = this.#byBox.get(boxId);
     if (conn?.binding !== undefined && conn.binding.workspaceId !== principal.workspaceId) {
       throw notConnected(boxId);
