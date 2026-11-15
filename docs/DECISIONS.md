@@ -1764,7 +1764,7 @@ event log, view-only noVNC desktop, the e2e) stays.
 - The e2e needs Docker, so it runs only in CI (`compose-e2e`), like the other
   Docker suites.
 
-## 0022: The guard's principal reaches every authorize; a box echo is authorized against the box's workspace
+## 0022: The guard's principal reaches every authorize; a box echo and the desktop are authorized against the resource's workspace
 
 - Date: 2026-11-15
 - Status: accepted
@@ -1785,6 +1785,9 @@ as allowed; the hub then refused it with its own check (409
 `box.not-connected`). The outcome was right, but the policy and the audit log
 were not (PRD §7 E3, E10).
 
+The desktop bridge had the same flaw: it authorized `desktop.view` against the
+caller's workspace, not the session's.
+
 ### Decision
 
 - **Every handler behind the login guard takes the principal from the guard**
@@ -1793,20 +1796,32 @@ were not (PRD §7 E3, E10).
   principal that was authorized), and the box echo. Nothing behind the guard
   names `LOCAL_PRINCIPAL`; the manager's audit rows carry the same principal.
 - **`box.echo` is authorized against the box's workspace**: the workspace of
-  the box's join binding once it said hello, else the caller's (a box that is
-  not connected is refused as such by the RPC). A cross-workspace echo is
+  the box's join binding once it said hello, else the caller's (such a box
+  is not visible; see below). A cross-workspace echo is
   denied and audited as denied by `authorize` itself.
-- **The HTTP answer to that denial stays 409 `box.not-connected`**, not 403:
-  it is what a caller sees for a box that is not there, so it does not reveal
-  that a box with that id exists in another workspace. A denial for a box of
-  the caller's own workspace stays 403 `authz.denied`.
-- **The hub's own workspace check after `authorize` stays**, so a policy that
-  wrongly allows a cross-workspace echo still sends nothing to the box.
+- **`desktop.view` is authorized against the session's workspace** (the
+  session manager's scope, as the runner does), not the caller's.
+- **A box the caller cannot see answers 409 `box.not-connected`, whatever the
+  policy decided.** A box is visible when it is connected and its binding is
+  the caller's workspace. An unknown id, a box that has not said hello and a
+  box of another workspace all get the same status and body, under any
+  policy, so the answer never reveals that a box with that id exists in
+  another workspace. `authorize` still runs first and its audit row still
+  says what it saw (allowed=0 with its reason for another workspace's box).
+  Only a denial for a visible box answers 403 `authz.denied`.
+- **Visibility is checked after `authorize`**, so a box that connected or left
+  meanwhile is judged as it is now, and a policy that wrongly allows a
+  cross-workspace echo still sends nothing to the box.
 
 ### Consequences
 
 - A test (`apps/hub/src/principal.test.ts`) drives each route family through
   the real hub with a guard that returns a principal other than the owner, and
   checks that this principal reaches `authorize` and every audit row.
+  Another of its tests signs in a principal of another workspace and checks
+  that `desktop.view` is denied against the session's workspace.
+- `apps/hub/src/authz.test.ts` compares an echo to an unknown id with one to
+  another workspace's box, under an allow-all policy and one that denies
+  `box.echo`: same status, same body, and the audit rows of both.
 - Routes added behind the guard later follow the same rule; the test is the
   place to add their family.
