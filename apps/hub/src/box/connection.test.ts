@@ -136,6 +136,7 @@ describe("join and echo", () => {
 
     const res = await fetch(new URL("/v1/boxes/box_echo/echo", h.url), {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: "hello box", n: [1, 2, 3] }),
       signal: AbortSignal.timeout(STEP_MS),
     });
@@ -173,6 +174,7 @@ describe("join and echo", () => {
     const h = hub(tempDb());
     const res = await fetch(new URL("/v1/boxes/box_nobody/echo", h.url), {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify("hi"),
       signal: AbortSignal.timeout(STEP_MS),
     });
@@ -596,6 +598,7 @@ describe("echo deadline", () => {
     const started = performance.now();
     const res = await fetch(new URL("/v1/boxes/box_mute/echo", h.url), {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify("anyone there?"),
       signal: AbortSignal.timeout(DEADLINE_MS + 2_000),
     });

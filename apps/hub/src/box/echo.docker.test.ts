@@ -111,6 +111,7 @@ describe.skipIf(!enabled)("echo through DockerBoxProvider and the box image", ()
     // Over HTTP too, the way the M0 demo calls it.
     const res = await fetch(new URL(`/v1/boxes/${spec.boxId}/echo`, hub.url), {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify("ping"),
       signal: AbortSignal.timeout(10_000),
     });

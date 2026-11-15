@@ -553,3 +553,58 @@ bumping the minor.
 - Auditing every applied frame costs one extra durable write per event. If that
   becomes the bottleneck, a later decision can authorize per connection and
   frame type instead.
+
+## 0010: The hub API refuses foreign Host, cross-site Origin and non-JSON bodies
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #33
+
+### Decision
+
+Binding to loopback (PRD §10) does not keep browsers out. Any page the owner
+opens can send a "simple" cross-origin POST (`text/plain`) to
+`http://127.0.0.1:8787` (CSRF), and a DNS-rebinding page can also read the
+answers. So a middleware in `createApp` (`apps/hub/src/app.ts`) checks every
+request except `GET /healthz`, in this order, before any handler or
+`authorize` runs:
+
+- **Host.** The host name of `Host` (port ignored, case-insensitive) must be
+  `localhost`, `127.0.0.1`, `[::1]`, the address the hub binds (`HEARTH_HOST`)
+  or the host of `HEARTH_PUBLIC_ORIGIN`. Anything else, or a malformed `Host`,
+  gets `421 request.foreign-host`. This is what stops DNS rebinding: the
+  rebound page's requests carry the attacker's host name.
+- **Origin.** If `Origin` is present it must equal the request's own origin
+  (scheme + `Host` as the hub sees them) or `HEARTH_PUBLIC_ORIGIN` exactly;
+  `null`, another port on localhost and every other site get
+  `403 request.cross-origin`. Without `Origin`, `Sec-Fetch-Site: cross-site`
+  or `same-site` gets the same 403; `same-origin`, `none` (typed URL) and no
+  header (curl, scripts) pass.
+- **Content type.** `POST`, `PUT` and `PATCH` must send
+  `Content-Type: application/json` (parameters such as `charset` allowed),
+  otherwise `415 request.unsupported-media-type`. JSON is not a CORS-simple
+  type, so a cross-site page cannot send such a request without a preflight,
+  and the hub answers no preflight with CORS headers. A future route that
+  takes another body type (an upload) needs a new decision to be exempted.
+
+`HEARTH_PUBLIC_ORIGIN` is the public origin of a reverse proxy in front of the
+hub, e.g. `https://hearth.example`. `parsePublicOrigin` normalizes it the way
+browsers send `Origin` and rejects paths, queries, fragments, credentials and
+non-http(s) schemes, so a typo fails at startup. It works whether the proxy
+keeps the public `Host` or rewrites it to the loopback address. Unset means
+loopback only.
+
+Out of scope: `/healthz` takes no input and returns no workspace data
+(decision 0001), and the box socket (`/v1/box/socket`) is routed in
+`server.ts` before the app and authenticates in its `hello` (decision 0008);
+its listener is #27.
+
+### Consequences
+
+- Non-browser clients on the host (curl, scripts) keep working as long as they
+  send `Content-Type: application/json`.
+- The hub sends no CORS headers. A UI served from an origin other than the
+  hub's own or `HEARTH_PUBLIC_ORIGIN` cannot call the API; allowing one needs
+  a new decision.
+- This is not authentication. Login still has to come before the API is
+  exposed beyond the owner's machine.
