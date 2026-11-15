@@ -544,7 +544,14 @@ describe("startHub", () => {
       expect({ method, status: res.status }).toEqual({ method, status: 404 });
     }
     // Near-misses are not /healthz: they get the listener's own refusal, not the app's.
-    for (const path of ["/healthz/", "/HEALTHZ", "/healthzz", "/healthz/../v1/sessions"]) {
+    for (const path of [
+      "/healthz/",
+      "/HEALTHZ",
+      "/healthzz",
+      "/healthz/../v1/sessions",
+      "/v1/../healthz",
+      "/x/healthz",
+    ]) {
       const res = parseAnswer(
         await raw(
           port,
