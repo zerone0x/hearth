@@ -7,7 +7,7 @@
  */
 
 import { HearthError, LOCAL_PRINCIPAL } from "@hearth/core";
-import type { Context, Hono } from "hono";
+import type { Context, Env, Hono } from "hono";
 import type { CreateSessionInput, SessionManager } from "./manager";
 
 function statusFor(error: HearthError): 400 | 403 | 404 | 409 | 500 {
@@ -68,7 +68,7 @@ export function parseCreateSession(body: unknown): CreateSessionInput {
   return input;
 }
 
-export function mountSessionRoutes(app: Hono, sessions: SessionManager): void {
+export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: SessionManager): void {
   app.post("/v1/sessions", async (c) => {
     try {
       let body: unknown;

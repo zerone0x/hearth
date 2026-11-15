@@ -27,7 +27,11 @@ POST /v1/boxes/box_demo/echo -> 200 {"ok":true,"result":{"message":"hello from t
 ```sh
 HEARTH_DATA_DIR=/tmp/hearth-data bun run --filter @hearth/hub start
 # in another shell:
-curl -s -X POST http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
+# sign in first (decision 0014; the first run logs a setup token, see README):
+curl -s -c jar -H 'content-type: application/json' http://127.0.0.1:8787/v1/auth/login \
+  -d '{"password":"<owner password>"}'
+curl -s -b jar -X POST -H 'content-type: application/json' \
+  http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
 ```
 
 Today this can only answer `409` with `box.not-connected`. The hub has the

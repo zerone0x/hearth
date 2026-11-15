@@ -10,6 +10,7 @@ import {
   LOCAL_PRINCIPAL,
 } from "@hearth/core";
 import { type AppOptions, createApp } from "./app";
+import { AuthService, SESSION_COOKIE } from "./auth";
 import { BOX_SOCKET_PATH, type BoxConnections } from "./box/connections";
 import {
   type BoxEgressCheck,
@@ -19,6 +20,7 @@ import {
   UNRESTRICTED_EGRESS,
 } from "./box/egress";
 import { BOX_ENV, type BoxNetworkProvider, parsePort, parsePublicOrigin, startHub } from "./server";
+import { openDatabase, SqliteLoginStore } from "./store";
 
 const FILTERED: BoxEgressCheck = () => ({ state: "filtered", detail: "test" });
 const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
@@ -71,14 +73,23 @@ describe("GET /healthz", () => {
     expect(await res.json()).toEqual({ status: "ok", protocol: "1.1" });
   });
 
-  test("unknown routes are 404", async () => {
+  test("every other route, known or not, needs a session (decision 0014)", async () => {
     const res = await createApp().request("/nope");
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(401);
   });
 });
 
-/** An app whose `echo` answers its params and records the calls that got past the guard. */
-function guardedApp(options?: AppOptions) {
+/** Something that answers `request` like a Hono app. */
+interface Requester {
+  request(input: string | Request, init?: RequestInit): Response | Promise<Response>;
+}
+
+/**
+ * An app whose `echo` answers its params and records the calls that got past
+ * the guard. Its `request` sends a live session cookie unless the request
+ * already has a `cookie` header: these tests are about the request guard.
+ */
+function guardedApp(options?: AppOptions): { app: Requester; calls: JsonValue[] } {
   const calls: JsonValue[] = [];
   const boxes = {
     echo: async (_principal: unknown, _boxId: string, params: JsonValue) => {
@@ -86,14 +97,26 @@ function guardedApp(options?: AppOptions) {
       return params;
     },
   } as unknown as BoxConnections;
-  return { app: createApp({ boxes }, options), calls };
+  const auth = new AuthService({ store: new SqliteLoginStore(openDatabase(":memory:")) });
+  const cookie = `${SESSION_COOKIE}=${auth.issueSession(LOCAL_PRINCIPAL).token}`;
+  const app = createApp({ boxes, auth }, options);
+  return {
+    app: {
+      request(input, init) {
+        const req =
+          typeof input === "string"
+            ? new Request(`http://localhost${input}`, init)
+            : new Request(input, init);
+        if (!req.headers.has("cookie")) req.headers.set("cookie", cookie);
+        return app.request(req);
+      },
+    },
+    calls,
+  };
 }
 
 /** POST /v1/boxes/box_1/echo with a JSON body; `headers` override the defaults. */
-async function echo(
-  app: ReturnType<typeof createApp>,
-  headers: Record<string, string>,
-): Promise<Response> {
+async function echo(app: Requester, headers: Record<string, string>): Promise<Response> {
   return await app.request("/v1/boxes/box_1/echo", {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
@@ -279,6 +302,38 @@ describe("startHub", () => {
     return server;
   }
 
+  /** A `cookie` header with a fresh login session on `hub`. */
+  function signedIn(hub: ReturnType<typeof startHub>): { cookie: string } {
+    return { cookie: `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}` };
+  }
+
+  test("the session API (decision 0013) is behind the login (decision 0014)", async () => {
+    const hub = start();
+    const routes: [string, string][] = [
+      ["POST", "/v1/sessions"],
+      ["GET", "/v1/sessions"],
+      ["GET", "/v1/sessions/ses_none"],
+      ["POST", "/v1/sessions/ses_none/archive"],
+    ];
+    const call = (method: string, path: string, headers: Record<string, string> = {}) =>
+      fetch(new URL(path, hub.url), {
+        method,
+        headers: { "content-type": "application/json", ...headers },
+        ...(method === "POST" ? { body: JSON.stringify({}) } : {}),
+        signal: AbortSignal.timeout(5_000),
+      });
+    for (const [method, path] of routes) {
+      const res = await call(method, path);
+      expect({ method, path, status: res.status }).toEqual({ method, path, status: 401 });
+      expect(await res.json()).toMatchObject({ ok: false, error: { code: "auth.required" } });
+    }
+    expect(await hub.sessions.list(LOCAL_PRINCIPAL)).toHaveLength(0);
+    // With a login session the same routes reach the session manager.
+    const session = signedIn(hub);
+    expect((await call("GET", "/v1/sessions", session)).status).toBe(200);
+    expect((await call("GET", "/v1/sessions/ses_none", session)).status).toBe(404);
+  });
+
   test("serves /healthz over a real socket on loopback", async () => {
     const hub = start();
     expect(hub.server.hostname).toBe("127.0.0.1");
@@ -290,10 +345,11 @@ describe("startHub", () => {
 
   test("the auditor's probes are refused over a real socket", async () => {
     const hub = start({ publicOrigin: "https://hearth.example" });
+    const session = signedIn(hub);
     const post = (headers: Record<string, string>) =>
       fetch(new URL("/v1/boxes/box_none/echo", hub.url), {
         method: "POST",
-        headers: { "content-type": "application/json", ...headers },
+        headers: { "content-type": "application/json", ...session, ...headers },
         body: JSON.stringify({ x: 1 }),
         signal: AbortSignal.timeout(5_000),
       });
@@ -321,7 +377,11 @@ describe("startHub", () => {
     const hub = start({ hostname: "0.0.0.0" });
     const res = await fetch(new URL("/v1/boxes/box_none/echo", hub.url), {
       method: "POST",
-      headers: { "content-type": "application/json", host: `0.0.0.0:${hub.url.port}` },
+      headers: {
+        "content-type": "application/json",
+        host: `0.0.0.0:${hub.url.port}`,
+        ...signedIn(hub),
+      },
       body: "1",
       signal: AbortSignal.timeout(5_000),
     });
@@ -340,11 +400,17 @@ describe("startHub", () => {
 
   test("the public listener does not serve the box socket", async () => {
     const hub = start();
-    // Through the guard to the app's 404: never the upgrade handler (426).
+    // Through the guard to the app: never the upgrade handler (426). Without a
+    // session that is 401 (decision 0014), with one the app's 404.
     const socket = await fetch(new URL(BOX_SOCKET_PATH, hub.url), {
       signal: AbortSignal.timeout(5_000),
     });
-    expect(socket.status).toBe(404);
+    expect(socket.status).toBe(401);
+    const signedInSocket = await fetch(new URL(BOX_SOCKET_PATH, hub.url), {
+      headers: signedIn(hub),
+      signal: AbortSignal.timeout(5_000),
+    });
+    expect(signedInSocket.status).toBe(404);
     const opened = await new Promise<string>((resolve) => {
       const ws = new WebSocket(new URL(BOX_SOCKET_PATH, hub.url.href.replace("http", "ws")));
       ws.onopen = () => {

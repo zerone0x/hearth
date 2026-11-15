@@ -8,6 +8,7 @@ import {
   type Principal,
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
+import { AuthService } from "./auth";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -27,6 +28,7 @@ import {
   SqliteAuditSink,
   SqliteBoxCredentialStore,
   SqliteEventStore,
+  SqliteLoginStore,
   SqliteSessionStore,
 } from "./store";
 
@@ -152,8 +154,15 @@ export function startHub(options: HubOptions) {
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const boxEgress = options.boxEgress ?? markerEgressCheck();
+  // The local login (decision 0014). Until the owner sets a password, the
+  // setup token is logged: only whoever reads the hub's output can claim it.
+  const auth = new AuthService({ store: new SqliteLoginStore(db) });
+  const setupToken = auth.setupToken();
+  if (setupToken !== undefined) {
+    options.log?.(`first run: set the owner password with setup token ${setupToken}`);
+  }
   const app = createApp(
-    { boxes },
+    { boxes, auth },
     {
       allowedHosts: [...LOOPBACK_HOSTS, hostname],
       ...(options.provider === undefined ? {} : { boxEgress }),
@@ -334,6 +343,8 @@ export function startHub(options: HubOptions) {
     events,
     credentials,
     boxes,
+    /** The local login: owner password and login sessions (decision 0014). */
+    auth,
     /** The session manager: sessions, lazy box start, hibernate, supervision (decision 0013). */
     sessions,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
