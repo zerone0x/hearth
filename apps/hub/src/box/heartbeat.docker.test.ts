@@ -129,8 +129,9 @@ describe.skipIf(!enabled)("heartbeat: a paused box is declared dead within the b
     expect(error).toBeInstanceOf(HearthError);
     expect((error as HearthError).code).toBe("box.connection-dead");
     expect(lines.some((l) => l.startsWith(`box ${spec.boxId} connection dead`))).toBe(true);
-    const events = (await hub.events.read({ workspaceId: spec.workspaceId }, spec.sessionId, 0, 100))
-      .events;
+    const events = (
+      await hub.events.read({ workspaceId: spec.workspaceId }, spec.sessionId, 0, 100)
+    ).events;
     expect(events.map((e) => e.type)).toContain(CONNECTION_DEAD_EVENT);
 
     await containerCall(containerId as string, "unpause");

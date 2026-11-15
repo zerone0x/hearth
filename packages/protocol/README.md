@@ -74,7 +74,7 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
 | `rpc.result` | both | fire-and-forget | Answer to the `rpc` with the same `id`: a result or an error |
 | `delivery.ack` | H→B | fire-and-forget | A delivery was applied (written), not just received |
 | `desktop.lock` | H→B | fire-and-forget | Current desktop lock holder and lease (PRD §8.3) |
-| `ping` / `pong` | both | fire-and-forget | Liveness |
+| `ping` / `pong` | both | fire-and-forget | Liveness: each end pings on its own heartbeat and treats any frame as alive ([Heartbeat](#heartbeat)) |
 | `stream.open` | both | fire-and-forget | Open a byte stream of kind `vnc` or `file` |
 | `stream.data` | both | fire-and-forget | Stream bytes, ordered by `seq` within the stream |
 | `stream.close` | both | fire-and-forget | End a stream: `done`, `cancelled`, `error` or `revoked` |
@@ -256,3 +256,15 @@ stream. A `file` stream names a path relative to the box workspace; the decoder
 rejects absolute paths, drive letters, `..` segments, and control or bidi
 characters (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069), which could
 make a path display as a different one.
+
+## Heartbeat
+
+Each end runs its own `Heartbeat` (`src/heartbeat.ts`, decision 0028) once
+the handshake is done: every `HEARTBEAT_INTERVAL_MS` (5 s) it checks whether
+any frame came from the peer since the previous beat, and sends a `ping`. A
+beat that heard nothing is a miss; any frame resets the count. After
+`HEARTBEAT_MAX_MISSES` (3) misses in a row the connection is dead, between
+`3 × 5 s` and `heartbeatBoundMs()` (20 s) after the last frame. The hub then
+drops the connection (close code 4005 where one is sent) and fails its calls;
+the box drops it and reconnects with backoff. A peer must answer `ping` with
+`pong`; it does not have to ping on its own.

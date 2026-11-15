@@ -229,7 +229,10 @@ export class BoxConnections {
     this.#log = options.log ?? ((line) => console.error(line));
     this.#onApplied = options.onApplied;
     this.#echoDeadlineMs = options.echoDeadlineMs ?? ECHO_DEADLINE_MS;
-    this.#heartbeat = { ...options.heartbeat, clock: options.heartbeat?.clock ?? SYSTEM_HEARTBEAT_CLOCK };
+    this.#heartbeat = {
+      ...options.heartbeat,
+      clock: options.heartbeat?.clock ?? SYSTEM_HEARTBEAT_CLOCK,
+    };
   }
 
   /** True when `boxId` has a connection that finished its handshake. */

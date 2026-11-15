@@ -173,7 +173,10 @@ describe("hub heartbeat", () => {
       intervalMs: 1_000,
       closeCode: CLOSE_CODES.heartbeatTimeout,
     });
-    const trajectory = buildTrajectory(events, { sessionId: "ses_silent", versions: { pi: "p", hub: "h" } });
+    const trajectory = buildTrajectory(events, {
+      sessionId: "ses_silent",
+      versions: { pi: "p", hub: "h" },
+    });
     expect(trajectory).toContainEqual(
       expect.objectContaining({ kind: "box", op: CONNECTION_DEAD_EVENT, box_id: "box_silent" }),
     );
@@ -187,10 +190,7 @@ describe("hub heartbeat", () => {
     for (let i = 1; i <= 8; i++) {
       clock.beat();
       // Let the pong come back before the next beat.
-      await until(
-        () => box.frames.filter((f) => f.type === "ping").length === i,
-        `ping ${i}`,
-      );
+      await until(() => box.frames.filter((f) => f.type === "ping").length === i, `ping ${i}`);
       await Bun.sleep(20);
     }
     expect(h.boxes.isConnected("box_alive")).toBe(true);
