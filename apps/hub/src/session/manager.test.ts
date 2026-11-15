@@ -554,6 +554,35 @@ describe("SessionManager", () => {
     expect(await statesOf(r, s.id)).toEqual(["creating", "idle"]);
   });
 
+  test("fail moves the session to failed through the state machine and stops its box (#43)", async () => {
+    const r = rig();
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    const lease = await r.manager.ensureBox(s.id);
+    expect(r.boxes.running.has(s.boxId as string)).toBe(true);
+    const failed = await r.manager.fail(s.id, "runner failed: boom");
+    expect(failed.state).toBe("failed");
+    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("failed");
+    const last = (await eventsOf(r, s.id, "session.state")).at(-1);
+    expect(last?.payload).toEqual({ from: "running", to: "failed", reason: "runner failed: boom" });
+    expect(auditActions(r.db, s.id)).toContain("session.fail");
+    expect(r.boxes.calls).toContain(`stop ${s.boxId}`);
+    expect(r.boxes.running.has(s.boxId as string)).toBe(false);
+    // The lease of the failed turn ends without moving the session out of failed.
+    lease.release();
+    await Bun.sleep(5);
+    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("failed");
+    // Failing again is a no-op: one failed transition only.
+    await r.manager.fail(s.id, "again");
+    expect((await statesOf(r, s.id)).filter((x) => x === "failed")).toHaveLength(1);
+    const tool = (await r.manager.ensureBox(s.id).catch((e: unknown) => e)) as HearthError;
+    expect(tool.code).toBe("session.unavailable");
+    // An archived session cannot fail.
+    const other = await r.manager.create(LOCAL_PRINCIPAL);
+    await r.manager.archive(LOCAL_PRINCIPAL, other.id);
+    const refused = (await r.manager.fail(other.id, "x").catch((e: unknown) => e)) as HearthError;
+    expect(refused.code).toBe("session.illegal-transition");
+  });
+
   test("illegal transitions are refused: archive twice, tool call on an archived session", async () => {
     const r = rig();
     const s = await r.manager.create(LOCAL_PRINCIPAL);

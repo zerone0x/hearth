@@ -29,6 +29,8 @@ import {
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
+import { ToolRpcClient } from "./box/tool-rpc";
+import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
 import {
   openDatabase,
@@ -82,6 +84,11 @@ export interface HubOptions extends HubListenOptions {
   /** Path of the hub's SQLite database. Created and migrated on start. */
   readonly dbPath: string;
   readonly log?: (line: string) => void;
+  /**
+   * The hub-side pi runner (#43, decision 0015): model, key reference,
+   * deny-list, extension allowlist. Without it the message routes are not served.
+   */
+  readonly runner?: Omit<SessionRunnersOptions, "authorizer" | "events" | "sessions" | "tools">;
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
@@ -360,6 +367,33 @@ export function startHub(options: HubOptions) {
     ...(options.log === undefined ? {} : { log: options.log }),
   });
   mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
+  // The runner (decision 0015): one pi session per hub session, tools routed
+  // to the session's box through the tool RPC.
+  // Only with a runner: the client claims every `tool_` rpc answer, so a second
+  // client on the same connections (tests) would lose its answers to this one.
+  const toolRpc =
+    options.runner === undefined
+      ? undefined
+      : new ToolRpcClient({
+          boxes,
+          ...(options.log === undefined ? {} : { log: options.log }),
+        });
+  const runners =
+    options.runner === undefined
+      ? undefined
+      : new SessionRunners({
+          ...options.runner,
+          authorizer,
+          events,
+          sessions: {
+            ensureBox: (sessionId) => sessions.ensureBox(sessionId),
+            get: (principal, sessionId) => sessions.get(principal, sessionId),
+            fail: (sessionId, reason) => sessions.fail(sessionId, reason),
+          },
+          tools: toolRpc as ToolRpcClient,
+          ...(options.log === undefined ? {} : { log: options.log }),
+        });
+  if (runners !== undefined) mountRunnerRoutes(app, runners);
 
   const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
@@ -382,6 +416,10 @@ export function startHub(options: HubOptions) {
     auth,
     /** The session manager: sessions, lazy box start, hibernate, supervision (decision 0013). */
     sessions,
+    /** The pi runners (decision 0015), when `runner` is configured. */
+    runners,
+    /** The tool RPC client the runners use, when `runner` is configured. */
+    toolRpc,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
     issueJoinToken(boxId: string, sessionId: string, ttlMs?: number): Promise<IssuedJoinToken> {
       return credentials.issueJoinToken(scope, boxId, sessionId, ttlMs);
@@ -445,6 +483,8 @@ export function startHub(options: HubOptions) {
       if (stopped !== undefined) return stopped;
       sessions.stop();
       desktop?.shutdown();
+      toolRpc?.close();
+      void runners?.close();
       boxes.shutdown();
       stopped = (async () => {
         await sessions.ready.catch(() => undefined);
