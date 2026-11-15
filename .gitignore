@@ -8,3 +8,6 @@ coverage/
 *.sqlite
 *.sqlite-*
 .DS_Store
+/data/
+*.db
+*.db-*

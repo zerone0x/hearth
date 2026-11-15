@@ -13,15 +13,17 @@ describe("describeBoxAgent", () => {
     );
   });
 
-  test("the stub entry point runs and exits cleanly", async () => {
+  test("the entry point without a boot environment exits with a clear message", async () => {
     const proc = Bun.spawn([process.execPath, `${import.meta.dir}/main.ts`], {
+      env: { PATH: process.env["PATH"] ?? "" },
       stdout: "pipe",
       stderr: "pipe",
     });
     const timer = setTimeout(() => proc.kill(), 10_000);
-    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
     clearTimeout(timer);
-    expect(code).toBe(0);
-    expect(out).toContain("hearth box-agent (protocol 1.0, pi ");
+    expect(code).toBe(2);
+    expect(err).toContain("hearth box-agent (protocol 1.0, pi ");
+    expect(err).toContain("HEARTH_HUB_URL and HEARTH_BOX_ID must be set");
   });
 });

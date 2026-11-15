@@ -5,6 +5,10 @@
  */
 
 export { SqliteAuditSink } from "./audit-sink";
+export {
+  SqliteBoxCredentialStore,
+  type SqliteBoxCredentialStoreOptions,
+} from "./box-credentials";
 export { BUSY_TIMEOUT_MS, type OpenDatabaseOptions, openDatabase } from "./database";
 export {
   MAX_EVENT_PAYLOAD_BYTES,

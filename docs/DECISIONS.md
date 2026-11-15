@@ -463,3 +463,93 @@ bumping the minor.
 - The hub's session manager wires the provider in; this change does not start it.
 - Process snapshots stay `not-supported` until a provider implements them (P2).
 - Supervising the desktop processes inside the box is #15.
+
+## 0008: Hub-box connection: join tokens, ack on apply, box-agent outbox
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #7
+
+### Decision
+
+- **One WebSocket endpoint, `/v1/box/socket`.** The upgrade itself carries no
+  credential; the first frame must be `hello`, within `HELLO_DEADLINE_MS`
+  (10 s). The hub checks the version first (`rejectHello` / `checkHelloVersion`,
+  so another major gets `version-mismatch` naming both versions), then
+  authenticates the credential, then calls `authorize(box principal,
+  "box.connect", box)` before it registers the connection or sends `welcome`.
+  Authentication has to come before `authorize`, since it is what yields the
+  principal. Every refused handshake gets a `reject` and close code 4001.
+- **Join tokens and credentials.** `hjt_` + 256 random bits (join token) and
+  `hbc_` + 256 random bits (per-box credential); the prefix tells the hub which
+  one a `hello` carries. Only SHA-256 hashes are stored (migration 3:
+  `box_join_token`, `box_credential`); with 256-bit random secrets a plain hash
+  is enough, no salt or KDF. A token is bound to one box and one session,
+  expires after `JOIN_TOKEN_TTL_MS` (5 minutes: a container start and one
+  dial), and is redeemed once, atomically, in a `BEGIN IMMEDIATE` transaction
+  that also replaces the box's credential, so a new boot revokes the previous
+  boot's credential. The credential is sent once, in `welcome`. Rejections tell
+  the box only `bad-credential`; the reason (`unknown`, `used`, `expired`,
+  `wrong-box`) goes to the hub log.
+- **The credential lives in box-agent memory only.** A box-agent restart is a
+  new boot and needs a new join token from `BoxProvider.start` (the per-boot
+  env). If the `welcome` carrying the credential is lost, the box's next
+  `hello` repeats the spent token and is refused: box-agent exits with code 3
+  and the hub's reason, and the hub decides what happens to the box (PRD §8: a
+  box dropping off means the hub decides). Box-agent also stops on
+  `version-mismatch`, `unknown-box` and `malformed-hello`, which retrying cannot
+  fix; it retries on `internal`, a closed socket and a handshake timeout.
+- **Ack on apply.** For each at-least-once frame, in arrival order per
+  connection: `authorize(box principal, "event.append", session)`, check that
+  the frame's session is the one the box's token was bound to and that its
+  `bootId` is the connection's, `EventStore.append` with the delivery key, then
+  `delivery.ack`. The stored event is the frame without `bootId`/`deliveryId`,
+  with the frame type as the event type. A frame that fails any step is not
+  acked; the hub logs it and closes the socket (4003), so the box redelivers
+  after reconnecting and the failure stays visible instead of being dropped.
+- **Box-agent outbox.** Bounded by `MAX_OUTBOX_FRAMES` (1024). A full outbox
+  refuses the new frame with a `box`-owned `outbox.full` error (no id is used
+  up), never a silent drop. After every `welcome` the agent resends everything
+  unacked in `deliveryId` order with the original `bootId` and `deliveryId`.
+- **Reconnect backoff with "equal jitter".** Attempt `n` waits half of
+  `min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2^n)` plus a random share of the
+  other half (250 ms base, 10 s cap); a successful handshake resets `n`. Never
+  zero, so a box cannot spin on a dead hub.
+- **Until pi lands (M1), box-agent answers commands explicitly**: `turn.start`
+  ends the turn with `turn.end` `failed` (owner `box`, `give-up`) and
+  `session.hibernate` answers `hibernate.done` `failed`, both deduplicated with
+  `isDuplicateCommand`. `rpc` `echo` returns its params; any other method gets
+  `unknown-method`.
+- **Echo endpoint: `POST /v1/boxes/:boxId/echo`**, body = the JSON params.
+  There is no login before M1, so the caller is `LOCAL_PRINCIPAL`; the hub
+  listens on loopback by default. It calls `authorize(principal, "box.echo",
+  box)` first and has a named deadline, `ECHO_DEADLINE_MS` (5 s). It answers
+  `409 box.not-connected`, `504 rpc.deadline` or `502 rpc.error` with the
+  classified failure.
+- **Hub startup** opens the database (`HEARTH_DATA_DIR`, default `data`, file
+  `hearth.db`), then wires `SqliteAuditSink`, `AllowAllAuthorizer`,
+  `SqliteEventStore` and `SqliteBoxCredentialStore` into the connection handler.
+  `launchBox` authorizes `box.start`, issues a join token and calls
+  `BoxProvider.start` with `HEARTH_HUB_URL` (the box socket URL as the box sees
+  it), `HEARTH_BOX_ID` and `HEARTH_JOIN_TOKEN`. Box-agent reads the token
+  through the `SecretStore` (`env:HEARTH_JOIN_TOKEN`), not `process.env`.
+- **How a Docker box reaches the hub.** Each box has its own bridge network
+  (decision 0007), and the host is that network's gateway. The Docker e2e
+  (`apps/hub/src/box/echo.docker.test.ts`, run by the CI `box-provider` job
+  against `hearth-box:ci` with its real default command) has the hub listen on
+  `0.0.0.0` and passes `ws://<gateway IP of the box's network>:<port>/v1/box/socket`,
+  read from the network after `provider.create`. No `host-gateway` alias or
+  provider change is needed. The production hub address (hub in compose,
+  PRD §8) is chosen in the deploy work; the provider passes whatever URL it is given.
+- **Without a boot environment, the box image's default command exits 2**,
+  naming the missing `HEARTH_HUB_URL` / `HEARTH_BOX_ID`; `scripts/box-smoke.sh`
+  checks that instead of a clean exit.
+
+### Consequences
+
+- Session state on reconnect (re-sending commands from `hello.state`, ending a
+  turn of an old boot visibly) is the session manager's job; this change stores
+  and acks what boxes send and answers `echo`.
+- Auditing every applied frame costs one extra durable write per event. If that
+  becomes the bottleneck, a later decision can authorize per connection and
+  frame type instead.

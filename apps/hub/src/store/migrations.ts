@@ -141,6 +141,33 @@ export const MIGRATIONS: readonly Migration[] = [
       BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
     `,
   },
+  {
+    // Box join tokens and per-box credentials (#7). Only SHA-256 hashes of
+    // both are stored; the raw values exist only in the hub's memory while it
+    // hands them out and in the box.
+    version: 3,
+    name: "box join tokens and per-box credentials",
+    sql: `
+      CREATE TABLE box_join_token (
+        token_hash TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        box_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER
+      ) STRICT;
+      CREATE INDEX box_join_token_by_box ON box_join_token (workspace_id, box_id);
+
+      CREATE TABLE box_credential (
+        box_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        session_id TEXT NOT NULL,
+        credential_hash TEXT NOT NULL,
+        issued_at INTEGER NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */
