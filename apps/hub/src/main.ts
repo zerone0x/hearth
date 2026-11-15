@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { createDefaultSecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
@@ -53,7 +53,7 @@ export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>)
  * `env:ANTHROPIC_API_KEY` or `file:/run/secrets/model_key`. Without
  * `HEARTH_MODEL` the runner is off. `HEARTH_MODELS_FILE` (decision 0020) is a
  * pi `models.json` for providers pi does not ship, such as an
- * OpenAI-compatible endpoint; it must be an absolute path to an existing file.
+ * OpenAI-compatible endpoint; it must be an absolute path to an existing regular file (not a directory).
  */
 export function runnerConfigFromEnv(
   env: Readonly<Record<string, string | undefined>>,
@@ -67,7 +67,7 @@ export function runnerConfigFromEnv(
   const keyRef = env["HEARTH_MODEL_KEY_REF"];
   const modelsFile = env["HEARTH_MODELS_FILE"];
   if (modelsFile !== undefined && modelsFile !== "") {
-    if (!isAbsolute(modelsFile) || !existsSync(modelsFile)) {
+    if (!isAbsolute(modelsFile) || !statSync(modelsFile, { throwIfNoEntry: false })?.isFile()) {
       throw new Error(`HEARTH_MODELS_FILE must be an absolute path to a file, got "${modelsFile}"`);
     }
   }

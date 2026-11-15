@@ -87,7 +87,7 @@ describe("runnerConfigFromEnv: HEARTH_MODELS_FILE", () => {
     expect(runnerConfigFromEnv({ ...base, HEARTH_MODELS_FILE: "" })?.modelsFile).toBeUndefined();
   });
 
-  test("a relative or missing file is refused at startup", () => {
+  test("a relative or missing file, or a directory, is refused at startup", () => {
     const base = { HEARTH_MODEL_PROVIDER: "faux-http", HEARTH_MODEL: "faux-1" };
     // Relative, although it names an existing file from here.
     const existing = relative(process.cwd(), modelsFile(tempDir(), "http://127.0.0.1:1"));
@@ -97,6 +97,11 @@ describe("runnerConfigFromEnv: HEARTH_MODELS_FILE", () => {
     expect(() =>
       runnerConfigFromEnv({ ...base, HEARTH_MODELS_FILE: join(tempDir(), "missing.json") }),
     ).toThrow(/HEARTH_MODELS_FILE/);
+    // An absolute path that exists but is a directory (a bind mount of the
+    // wrong path makes one).
+    expect(() => runnerConfigFromEnv({ ...base, HEARTH_MODELS_FILE: tempDir() })).toThrow(
+      /HEARTH_MODELS_FILE/,
+    );
   });
 });
 
