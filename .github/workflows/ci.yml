@@ -65,7 +65,7 @@ jobs:
       - name: Lint Dockerfile
         run: docker run --rm -i hadolint/hadolint:v2.15.1 < apps/box-agent/Dockerfile
       - name: Lint shell scripts
-        run: shellcheck scripts/box-smoke.sh scripts/box-firewall.sh apps/box-agent/image/entrypoint.sh
+        run: shellcheck scripts/box-smoke.sh scripts/box-firewall.sh scripts/firewalld-reload-watch.sh apps/box-agent/image/entrypoint.sh
       - name: Build and smoke-test the box image
         run: scripts/box-smoke.sh
 
