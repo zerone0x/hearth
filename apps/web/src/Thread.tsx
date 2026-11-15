@@ -26,7 +26,13 @@ import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.a
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { type HearthToolStatus, hearthToolStatus, TOOL_STATUS_LABEL, toolTarget } from "./hearthPi";
+import {
+  type HearthToolStatus,
+  hearthToolStatus,
+  TOOL_STATUS_LABEL,
+  toolTarget,
+  wasInterrupted,
+} from "./hearthPi";
 
 const STATUS_VARIANT: Record<
   HearthToolStatus,
@@ -41,7 +47,10 @@ const STATUS_VARIANT: Record<
 
 /** A tool call: assistant-ui's collapsible tool UI with Hearth's status and target. */
 export const ToolCard: ToolCallMessagePartComponent = (part) => {
-  const status = hearthToolStatus(part);
+  const interrupted = useAuiState((s) =>
+    wasInterrupted(s.message.metadata.custom, part.toolCallId),
+  );
+  const status = hearthToolStatus(part, interrupted);
   const label = TOOL_STATUS_LABEL[status];
   const target = toolTarget(part.toolName, part.args);
   return (

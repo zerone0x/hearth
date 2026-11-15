@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, Fragment, useEffect, useMemo, useState } from "react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { type FormEvent, Fragment, lazy, Suspense, useEffect, useState } from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -15,15 +16,14 @@ import {
 } from "@/components/ui/item";
 import { Label } from "@/components/ui/label";
 import { api } from "./api";
-import { DesktopPanel } from "./Desktop";
-import { emptyChat, isRunning, projectChat } from "./hearthPi";
-import { keys, useAuth, useChat, useSession, useSessions } from "./queries";
-import { ChatRuntime, Thread } from "./Thread";
+import { ErrorAlert } from "./ErrorAlert";
+import { keys, useAuth, useSessions } from "./queries";
 
-function errorText(error: unknown): string | undefined {
-  if (error === null || error === undefined) return undefined;
-  return error instanceof Error ? error.message : String(error);
-}
+/**
+ * The session page (chat, markdown, desktop) is its own chunk: sign-in and the
+ * session list load without it (#84).
+ */
+const SessionPage = lazy(() => import("./SessionPage"));
 
 /** The route is in the hash (`#/s/<id>`), so the hub serves one HTML file. */
 function useRoute(): string {
@@ -34,16 +34,6 @@ function useRoute(): string {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   return hash.replace(/^#/, "") || "/";
-}
-
-function ErrorAlert({ error }: { error: unknown }) {
-  const text = errorText(error);
-  if (text === undefined) return null;
-  return (
-    <Alert variant="destructive" role="alert">
-      <AlertDescription>{text}</AlertDescription>
-    </Alert>
-  );
 }
 
 export function App() {
@@ -65,20 +55,56 @@ export function App() {
       </Shell>
     );
   }
+  const signOut = (
+    <Button variant="link" onClick={() => logout.mutate()}>
+      Sign out
+    </Button>
+  );
   const match = /^\/s\/([^/]+)$/.exec(route);
   if (match?.[1] !== undefined) {
-    return <SessionPage sessionId={decodeURIComponent(match[1])} />;
+    // A chunk that fails to load (a hub upgrade replaced the hashed files while
+    // the tab was open) must not blank the app: the shell stays, with a way out.
+    return (
+      <ErrorBoundary
+        fallback={
+          <Shell action={signOut}>
+            <SessionPageFailed />
+          </Shell>
+        }
+      >
+        <Suspense fallback={<Shell action={signOut}>Loading…</Shell>}>
+          <SessionPage sessionId={decodeURIComponent(match[1])} />
+        </Suspense>
+      </ErrorBoundary>
+    );
   }
   return (
-    <Shell
-      action={
-        <Button variant="link" onClick={() => logout.mutate()}>
-          Sign out
-        </Button>
-      }
-    >
+    <Shell action={signOut}>
       <SessionList />
     </Shell>
+  );
+}
+
+/**
+ * React.lazy keeps a failed import, so only a page reload fetches the chunk again
+ * (and the new index.html, after a hub upgrade).
+ */
+function SessionPageFailed() {
+  return (
+    <Alert variant="destructive">
+      <AlertTitle>The session page did not load.</AlertTitle>
+      <AlertDescription>
+        <p>The hub may have been upgraded since this tab opened.</p>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
+          <Button variant="link" size="sm" asChild>
+            <a href="#/">Sessions</a>
+          </Button>
+        </div>
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -227,77 +253,5 @@ function SessionList() {
         </ItemGroup>
       )}
     </>
-  );
-}
-
-function SessionPage({ sessionId }: { sessionId: string }) {
-  const client = useQueryClient();
-  const session = useSession(sessionId);
-  const chat = useChat(sessionId, client);
-  const [showDesktop, setShowDesktop] = useState(false);
-  const state = useMemo(() => chat.data ?? emptyChat(sessionId), [chat.data, sessionId]);
-  const messages = useMemo(() => projectChat(state), [state]);
-  const running = isRunning(state);
-
-  // The reply arrives through the event log: poll it now rather than at the next tick.
-  const refetchChat = () => client.refetchQueries({ queryKey: keys.events(sessionId) });
-  const send = useMutation({
-    mutationFn: (text: string) => api.send(sessionId, text),
-    onSuccess: refetchChat,
-  });
-  const interrupt = useMutation({
-    mutationFn: () => api.interrupt(sessionId),
-    onSuccess: refetchChat,
-  });
-
-  const error = send.error ?? interrupt.error ?? chat.error ?? session.error;
-  return (
-    <div className="flex h-dvh flex-col">
-      <header className="flex items-center gap-3 border-b bg-card px-4 py-2">
-        <Button variant="link" size="sm" className="px-0" asChild>
-          <a href="#/">Sessions</a>
-        </Button>
-        <h1 className="min-w-0 flex-1 truncate font-semibold">
-          {session.data?.title || sessionId}
-        </h1>
-        <span className="text-muted-foreground text-xs" data-testid="session-state">
-          {running ? "working" : (session.data?.state ?? "")}
-        </span>
-        <Button
-          variant="link"
-          size="sm"
-          className="lg:hidden"
-          onClick={() => setShowDesktop((v) => !v)}
-        >
-          {showDesktop ? "Hide desktop" : "Desktop"}
-        </Button>
-      </header>
-      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <div className="flex min-h-0 flex-1 flex-col">
-          {error === null ? null : (
-            <div className="px-4 pt-3">
-              <ErrorAlert error={error} />
-            </div>
-          )}
-          <ChatRuntime
-            messages={messages}
-            isRunning={running}
-            onSend={async (text) => {
-              await send.mutateAsync(text);
-            }}
-            onInterrupt={async () => {
-              await interrupt.mutateAsync();
-            }}
-          >
-            <Thread />
-          </ChatRuntime>
-        </div>
-        <aside
-          className={`${showDesktop ? "flex" : "hidden"} h-72 flex-col p-3 lg:flex lg:h-auto lg:w-[45%] lg:border-l`}
-        >
-          <DesktopPanel sessionId={sessionId} />
-        </aside>
-      </div>
-    </div>
   );
 }
