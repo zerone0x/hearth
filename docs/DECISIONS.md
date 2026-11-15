@@ -1461,3 +1461,82 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   guard (0010) refuses it before the asset handler runs, even for `GET /`. Typing the URL, a bookmark or a same-origin link
   (`Sec-Fetch-Site: none` or `same-origin`) works. This is left as it is:
   relaxing 0010 for navigations is a separate decision.
+
+## 0018: Box-agent's secrets are closed to the commands it runs
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #57
+
+### Context
+
+Every process in a box runs as uid 1000: box-agent, Xvnc, Openbox and every
+tool command. A same-uid process can read another's `/proc/<pid>/environ`,
+`maps` and (with `ptrace_scope` 0) `mem`, and attach to it with `ptrace`. The
+hub hands the join token to the box in the container's environment (decision
+0008), so before this change a command could read it from tini's, Xvnc's,
+Openbox's or box-agent's environ, and could read the per-box credential out
+of box-agent's memory.
+
+### Decision
+
+- **The join token leaves the environment before any other process starts.**
+  The image's entrypoint now runs as PID 1 (the image's `ENTRYPOINT` is the
+  script, no longer tini). When `HEARTH_JOIN_TOKEN` is set it writes the token
+  to `/run/hearth/join-token` (directory `0700`, file `0600`, uid 1000) with a
+  shell builtin, exports `HEARTH_JOIN_TOKEN_FILE`, and re-execs itself under
+  tini with `env -u HEARTH_JOIN_TOKEN`. tini (with `-s` when it is not PID 1)
+  then starts Xvnc, Openbox and box-agent with environments that never held
+  the token. `docker run --rm hearth-box` with no token still re-execs under
+  tini, so PID 1 is always tini once the box runs.
+- **box-agent reads the file and deletes it** (`takeJoinToken` in
+  `apps/box-agent/src/boot.ts`) before it dials, so the file is gone before
+  the first tool call, and removes `HEARTH_JOIN_TOKEN` and
+  `HEARTH_JOIN_TOKEN_FILE` from `process.env`. Outside the image (tests, the
+  hub's demo) the token may still come from `HEARTH_JOIN_TOKEN`.
+- **box-agent is non-dumpable.** Its first act is `prctl(PR_SET_DUMPABLE, 0)`
+  through `bun:ffi` (libc), checked with `PR_GET_DUMPABLE`. The kernel then
+  makes its `/proc/<pid>/` files root's and refuses same-uid `ptrace`, so
+  without `CAP_SYS_PTRACE` (no box process has it: `CapDrop ALL`) a command can
+  read neither its environment, memory map nor memory, whatever `ptrace_scope`
+  says. If the call fails on Linux box-agent exits 2 instead of running
+  unprotected. `execve` resets the flag, so the commands box-agent starts are
+  dumpable and the executor's run-marker sweep (decision 0011) still reads
+  their environ.
+- **No separate uid for tool commands, for now.** Switching uid needs
+  `CAP_SETUID`/`CAP_SETGID`, which `CapDrop ALL` removes, and
+  `no-new-privileges` disables setuid helpers (`sudo`, a setuid wrapper), so it
+  cannot work under the sandbox of decision 0007 as it stands. Making it work
+  means adding those two capabilities back to box-agent (as ambient
+  capabilities passed to `setpriv`), and moving ownership of the existing
+  `/workspace` and `/home/hearth` volumes, which box-agent also writes
+  (`tool.write`), to a shared group or to the tool uid. That widens the
+  privileges of the one process that holds the credential, to protect against
+  the reads that non-dumpable already blocks.
+- **Proof.** `apps/box-agent/src/boot.test.ts` runs the real `main.ts` as a
+  same-uid child and checks its `environ`, `maps` and `mem` are refused and the
+  token file is gone, with a plain Bun process as the readable control.
+  `apps/hub/src/box/proc-secrets.docker.test.ts` (CI `box-provider` job) runs a
+  `/proc` scan as a tool command in a real box: no process's environ or
+  cmdline holds the token, the file is gone, box-agent's environ and maps are
+  refused, `mem` and `ptrace` fail, and Xvnc's environ is readable as the
+  control.
+
+### Consequences
+
+- What a command can still see: `HEARTH_HUB_URL`, `HEARTH_BOX_ID` and the
+  other provider variables in tini's, Xvnc's and Openbox's environ. They are
+  not secrets: the box id and hub URL alone do not authenticate.
+- Same uid still means a command can signal box-agent (kill it, which ends
+  the box's connection; the session manager sees the exit, decision 0013) and
+  can read or change anything box-agent writes to disk. box-agent writes no
+  credential to disk.
+- The token stays visible on the host (`docker inspect`), which is trusted;
+  it is single-use and expires after five minutes (decision 0008), so the file
+  and environment steps above narrow its window inside the box rather than
+  being the only guard.
+- An image built before this change still has tini as `ENTRYPOINT`; the hub
+  has no way to tell, so a box on an old image keeps the old exposure until
+  the image is rebuilt.
+- A separate uid for commands stays open; revisit it if a box ever holds a
+  secret on disk or in a process other than box-agent.
