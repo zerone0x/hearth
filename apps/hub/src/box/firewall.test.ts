@@ -106,6 +106,9 @@ describe.skipIf(!available)("box-firewall.sh in a network namespace", () => {
       "10.0.0.0/33",
       "300.1.1.1",
       "1.2.3.4/x",
+      // iptables reads a leading-zero octet as octal: 010.0.0.1 would be 8.0.0.1.
+      "010.0.0.1/32",
+      "192.168.1.01",
     ];
     const r = inNetns(`
       HEARTH_BOX_EGRESS_ALLOW=192.168.50.0/24 bash "$fw" apply >/dev/null 2>&1 || exit 10
@@ -130,6 +133,37 @@ describe.skipIf(!available)("box-firewall.sh in a network namespace", () => {
     expect(errors).toContain("'not-a-cidr' is not an IPv4 address or CIDR");
     expect(errors).toContain("refusing '0.0.0.0/0'");
     expect(errors).toContain("IPv4 only");
+    expect(errors).toContain("'010.0.0.1/32' is not an IPv4 address or CIDR");
+    expect(errors).toContain("no leading zeros");
+  });
+
+  test("a newline in the allow list is refused, not a silent end of the list", () => {
+    const r = inNetns(
+      `
+      bash "$fw" apply >/dev/null 2>&1 || exit 10
+      save >"$M/before"
+      HEARTH_BOX_EGRESS_ALLOW="$LIST" bash "$fw" apply 2>"$M/err"
+      echo "code=$?"
+      save >"$M/after"
+      [ -e "$HEARTH_BOX_EGRESS_MARKER" ] && echo marker=kept || echo marker=gone
+    `,
+      { LIST: "192.168.1.1/32\n192.168.2.0/24" },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("code=2");
+    expect(r.stdout).toContain("marker=kept");
+    expect(read("err")).toContain("got a newline");
+    expect(read("after")).toBe(read("before"));
+    expect(read("after")).not.toContain("192.168.1.1");
+  });
+
+  test("the address iptables installs is the one in the allow list", () => {
+    const r = inNetns(`bash "$fw" apply >/dev/null 2>&1 || exit 10; save >"$M/rules"`, {
+      HEARTH_BOX_EGRESS_ALLOW: "10.0.0.1/32, 192.168.0.0/16",
+    });
+    expect(r.code).toBe(0);
+    expect(read("rules")).toContain("-A HEARTH-BOX-FWD -d 10.0.0.1/32 -j RETURN");
+    expect(readFileSync(marker(), "utf8")).toContain("allow=10.0.0.1/32,192.168.0.0/16");
   });
 
   test("a rule set the kernel refuses mid-transaction leaves the previous rules intact and no marker", () => {

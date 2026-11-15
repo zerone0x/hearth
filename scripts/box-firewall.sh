@@ -26,7 +26,9 @@
 #   HEARTH_BOX_PORT            the hub's box listener port (default 8788)
 #   HEARTH_BOX_EGRESS_ALLOW    comma-separated IPv4 addresses or CIDRs to let
 #                              through anyway, e.g. a LAN DNS resolver
-#                              ("192.168.1.1/32"). A /0 is refused.
+#                              ("192.168.1.1/32"), on one line. A /0, an
+#                              octet with a leading zero and a newline are
+#                              refused.
 #   HEARTH_BOX_EGRESS_MARKER   the marker path (default
 #                              /run/hearth/box-egress.applied); the hub reads
 #                              the same variable
@@ -57,12 +59,18 @@ fail() {
 }
 
 # The IPv4 address $1 as an integer, or failure if it is not dotted-quad IPv4.
+# An octet with a leading zero ("010") is refused: this script would read it as
+# decimal 10, but iptables (inet_aton) reads it as octal 8 and would install a
+# different address than the one checked and recorded in the marker.
 ip_to_int() {
   local -a o
   [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
   o=("${BASH_REMATCH[@]:1}")
   local x
-  for x in "${o[@]}"; do ((10#$x <= 255)) || return 1; done
+  for x in "${o[@]}"; do
+    [[ "$x" == 0 || "$x" != 0* ]] || return 1
+    ((10#$x <= 255)) || return 1
+  done
   echo $(((10#${o[0]} << 24) | (10#${o[1]} << 16) | (10#${o[2]} << 8) | 10#${o[3]}))
 }
 
@@ -75,7 +83,8 @@ check_cidr() {
     *) ip="$entry" prefix=32 ;;
   esac
   if ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || ((10#$prefix > 32)) || ! ip_to_int "$ip" >/dev/null; then
-    fail "HEARTH_BOX_EGRESS_ALLOW: '$entry' is not an IPv4 address or CIDR"
+    fail "HEARTH_BOX_EGRESS_ALLOW: '$entry' is not an IPv4 address or CIDR" \
+      "(dotted-quad decimal, no leading zeros)"
   fi
   ((10#$prefix > 0)) ||
     fail "HEARTH_BOX_EGRESS_ALLOW: refusing '$entry', it would let boxes reach everything"
@@ -99,6 +108,11 @@ esac
 ((10#$port >= 1 && 10#$port <= 65535)) || fail "HEARTH_BOX_PORT must be 1-65535, got '$port'"
 port=$((10#$port))
 allowed=()
+# `read` below takes only the first line: entries after a newline would be
+# dropped without a word, so a newline is an error, not a separator.
+case "$allow" in
+  *$'\n'*) fail "HEARTH_BOX_EGRESS_ALLOW must be one line of comma-separated entries, got a newline" ;;
+esac
 if [ -n "$allow" ]; then
   IFS=',' read -r -a entries <<<"$allow"
   for entry in "${entries[@]}"; do
