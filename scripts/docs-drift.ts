@@ -8,7 +8,7 @@
  *   names a test file that exists and a test name that is in it.
  */
 
-/** A configuration variable name: `HEARTH_X` or `OTEL_X`, not a `HEARTH_${...}` template prefix. */
+/** A `HEARTH_*` or `OTEL_*` variable name; a template prefix such as `OTEL_..._${signal}` is not one. */
 const CONFIG_VAR = /\b(?:HEARTH|OTEL)_[A-Z0-9_]*[A-Z0-9]\b/g;
 
 export interface SourceFile {
