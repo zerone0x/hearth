@@ -35,6 +35,10 @@ it.
 
 ## Summary
 
+**Stack constraint (owner ruling, 2026-11-15):** Hearth's web UI is React +
+Tailwind. Lit and other web-components UI libraries are ruled out, whatever their
+other merits. Every candidate below is judged against that.
+
 - **eve's chat UI cannot be reused "directly".** It is not a package. It is app code
   inside a Next.js template (`components/chat/*.tsx` plus `app/_components/*.tsx`),
   typed against eve's own message model (`EveMessage` from `eve/react`) and fed by
@@ -54,7 +58,8 @@ it.
   flags.
 - **AI Elements is out:** typed against the AI SDK's `UIMessage`/`ToolUIPart`,
   documented as Next.js + AI SDK only, and deprecated at the end of this month.
-- **pi's own web UI is out:** `@earendil-works/pi-web-ui` is no longer in the pi
+- **pi's own web UI is out (ruled out by owner: stack is React + Tailwind):** it is
+  built on Lit web components. Independently of that, `@earendil-works/pi-web-ui` is no longer in the pi
   repo (last npm release 0.75.3, May 2026, against pi-ai 0.75; Hearth pins 1.5.2),
   it is Lit web components, and it runs the agent in the browser with keys in
   IndexedDB, the opposite of Hearth's brain-in-the-hub model (0009).
@@ -170,7 +175,7 @@ tool-group pattern from eve.** Details, costs and risks below.
 - **Verdict.** Not worth adopting weeks before its deprecation; its successor in
   shadcn/ui was not read (unverified).
 
-### 3. pi's own web UI (`@earendil-works/pi-web-ui`)
+### 3. pi's own web UI (`@earendil-works/pi-web-ui`) — ruled out by owner: stack is React + Tailwind
 
 - **Not in the repo any more.** `pi-mono@463e17f:packages/` has `agent, ai, chord,
   codemode, coding-agent, durable, env, evals, mcp, schema, telemetry, tui` and no
@@ -184,7 +189,8 @@ tool-group pattern from eve.** Details, costs and risks below.
   (`src/components/MessageList.ts:12-15`), which is the closest native fit, but it is
   Lit (not React), unmaintained, version-skewed, and ships artifacts, a JS REPL and
   sandboxed iframes Hearth does not want.
-- **Verdict.** Not adoptable. The useful pi-native layer is now assistant-ui's
+- **Verdict.** Ruled out by owner: stack is React + Tailwind, and pi-web-ui is Lit.
+  It would not be adoptable anyway for the reasons above. The useful pi-native layer is now assistant-ui's
   `react-pi` (next section).
 
 ### 4. assistant-ui (primary candidate)
@@ -283,7 +289,7 @@ backend contract Hearth does not want, so it was not evaluated further
 
 ## Comparison
 
-| | Hearth today (PR #66) | eve chat template | AI Elements | pi-web-ui | assistant-ui + react-pi |
+| | Hearth today (PR #66) | eve chat template | AI Elements | pi-web-ui (ruled out by owner: stack is React + Tailwind) | assistant-ui + react-pi |
 |---|---|---|---|---|---|
 | Ships as | our code, 359 lines | Next.js app code (template) | shadcn registry source | npm (Lit) | npm (React) + optional shadcn source |
 | License | ours | archived repo: none; maintained copy: Apache-2.0 | Apache-2.0 | MIT | MIT |
@@ -314,8 +320,14 @@ that idea, not its code.
 driven by `useExternalStoreRuntime` and Hearth's existing cursor polling.
 **Borrow patterns only** from eve: grouped tool rows with a counted summary, error
 > running > done group status, auto-open when a call needs input, and a
-"Thinking…" row only until output arrives. **Do not adopt** AI Elements or
-pi-web-ui.
+"Thinking…" row only until output arrives. **Do not adopt** AI Elements;
+pi-web-ui is ruled out by owner (stack is React + Tailwind).
+
+This assumes the owner's stack: React 19 + Tailwind 4, as Hearth's `apps/web`
+already is. assistant-ui fits it directly: its primitives are unstyled React
+components, and its styled layer is shadcn-style source with Tailwind 4 classes,
+so Hearth either copies those components in or keeps its own Tailwind classes on
+the primitives (the spike does the latter).
 
 What we gain: grouping, markdown, reasoning blocks, approval
 primitives for M3, a composer with accessible controls, and a reducer maintained
@@ -403,7 +415,9 @@ for Hearth's one-session-per-page UI anyway.
 1. Replace `chat.ts`'s reducer and `ChatList` with `@assistant-ui/react` +
    `@assistant-ui/react-pi` (pinned exactly) fed by the existing `/events?after=`
    polling via `useExternalStoreRuntime`; keep the 64 KiB clip and Hearth's tool-card
-   look.
+   look. Stack: React + Tailwind only (owner ruling); style the primitives with
+   Tailwind classes or assistant-ui's shadcn-style Tailwind components, and add no
+   Lit or other web-components library.
 2. Map `runner.failed`, `runner.interrupted` and `runner.outcome-unknown` onto
    message errors and tool-part status, add eve-style grouped tool rows and
    markdown. Enable zod jitless mode before anything imports zod once the UI
