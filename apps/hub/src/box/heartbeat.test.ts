@@ -104,6 +104,9 @@ async function fakeBox(url: string, boxId: string, token: string, answerPings: b
     get closed() {
       return closeCode !== undefined;
     },
+    get closeCode() {
+      return closeCode;
+    },
   };
 }
 
@@ -139,9 +142,11 @@ describe("hub heartbeat", () => {
     clock.beat();
     expect(h.boxes.isConnected("box_silent")).toBe(false);
     expect(deaths).toEqual([{ misses: 3, intervalMs: 1_000 }]);
-    // `dead` comes first, then `disconnected`; the session manager is told.
+    // `dead` comes first, then `disconnected`. The socket was terminated, not
+    // closed with a handshake a dead path never answers, so the server's close
+    // handler ran at once and the session manager was told.
     expect(disconnects).toEqual(["box_silent:1"]);
-    expect(told).toContain("box_silent");
+    expect(told).toEqual(["box_silent"]);
     // The call fails now with a typed error, not at its deadline.
     const error = await echo.then(
       () => undefined,
@@ -153,6 +158,8 @@ describe("hub heartbeat", () => {
     // The hub's beats stopped with the connection.
     expect(clock.timers.size).toBe(0);
     await until(() => box.closed, "the box's socket to close");
+    // No close frame: the hub dropped the TCP connection.
+    expect(box.closeCode).toBe(1006);
 
     // The event log and the trajectory record the death.
     // (The append is asynchronous; poll the log, bounded.)
@@ -194,6 +201,11 @@ describe("hub heartbeat", () => {
       await Bun.sleep(20);
     }
     expect(h.boxes.isConnected("box_alive")).toBe(true);
+    expect(clock.timers.size).toBe(1);
+    // A connection that closes the ordinary way stops its heartbeat too.
+    box.ws.close();
+    await until(() => !h.boxes.isConnected("box_alive"), "the disconnect");
+    expect(clock.timers.size).toBe(0);
   });
 
   test("a frame other than pong also counts as alive", async () => {

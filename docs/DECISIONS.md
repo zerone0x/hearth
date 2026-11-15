@@ -2297,9 +2297,10 @@ frozen or paused box, a host that sleeps, a lost route) left the box-agent
   connection (same box, same boot) with `tool.outcome-unknown` and never
   re-sends it: a mutating call gives up (it may have run), a read-only one is
   `retry` (`classifyToolError`). Calls on other boxes or boots are untouched.
-- **The session manager is told** through the same `dead` listener
-  (`boxClosed`), without waiting for the socket's close event, and looks at
-  the box as for any disconnect (0013).
+- **The session manager is told** as for any disconnect (0013): the socket
+  is terminated, so Bun runs the box socket's close handler at once (it
+  calls `boxClosed`) instead of after a closing handshake a dead path never
+  answers.
 - **The box reconnects.** On the box side a dead connection is dropped and
   retried through the usual backoff (`reconnectDelay`); the outbox
   redelivers after the next handshake (0008). Calls still running in the box
@@ -2311,7 +2312,8 @@ frozen or paused box, a host that sleeps, a lost route) left the box-agent
   consecutive misses only, once-only `dead`, stop and restart.
 - `apps/hub/src/box/heartbeat.test.ts`: on an injected clock, a silent box
   stays connected through 2 beats and is dead on the 3rd; `dead` before
-  `disconnected`; the session manager told; an `echo` in flight fails with
+  `disconnected`; the socket dropped without a close frame (1006) and the
+  session manager told at once; an ordinary close stops the beats; an `echo` in flight fails with
   `box.connection-dead`; the event and its trajectory record; a box that
   pongs, or sends any frame, stays connected.
 - `tool-rpc.test.ts`: dead fails calls of that box and boot only, with the

@@ -426,10 +426,6 @@ export function startHub(options: HubOptions) {
           },
         }),
   });
-  // A connection the heartbeat declared dead (decision 0028): the box may be
-  // frozen or gone, so the manager looks now, without waiting for the socket's
-  // close event, which a dead path can delay.
-  boxes.listen({ dead: (boxId) => sessions.boxClosed(boxId) });
   mountSessionRoutes(app, sessions);
   // Trajectories and outcome labels (decision 0021): served with or without a runner.
   mountTrajectoryRoutes(
