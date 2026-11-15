@@ -445,6 +445,69 @@ describe("box.echo denied", () => {
       { resource_workspace_id: OTHER_WORKSPACE_ID, allowed: 1 },
     ]);
   });
+
+  // A box the caller cannot see answers alike whether it is absent or in
+  // another workspace, whatever the policy decides: an unknown id and another
+  // workspace's box are indistinguishable (#50, decision 0022). Each audit row
+  // still says which workspace `authorize` saw.
+  for (const policy of [
+    { name: "allow-all", denied: [] as Action[], unknownAllowed: 1, unknownReason: null },
+    {
+      name: "deny box.echo",
+      denied: ["box.echo"] as Action[],
+      unknownAllowed: 0,
+      unknownReason: "denied by test",
+    },
+  ]) {
+    test(`${policy.name}: an unknown box and another workspace's box get the same answer`, async () => {
+      const t = setup(policy.denied);
+      const { token } = await t.credentials.issueJoinToken(
+        { workspaceId: OTHER_WORKSPACE_ID },
+        "box_b",
+        "ses_b",
+      );
+      const { socket } = await t.connect([hello("box_b", token)]);
+      expect(t.boxes.isConnected("box_b")).toBe(true);
+
+      const unknown = await echoOverHttp(t, "box_x");
+      const elsewhere = await echoOverHttp(t, "box_b");
+
+      // Same status and body, once the id the caller sent is masked.
+      const masked = (res: typeof unknown, id: string) => ({
+        status: res.status,
+        body: JSON.parse(JSON.stringify(res.body).replaceAll(id, "<id>")) as unknown,
+      });
+      expect(masked(unknown, "box_x")).toEqual(masked(elsewhere, "box_b"));
+      expect(unknown.status).toBe(409);
+      expect(unknown.body).toMatchObject({ ok: false, error: { code: "box.not-connected" } });
+      expect(socket.types()).toEqual(["welcome"]);
+
+      const row = {
+        workspace_id: DEFAULT_WORKSPACE_ID,
+        principal_id: LOCAL_PRINCIPAL.id,
+        action: "box.echo",
+        resource_type: "box",
+      };
+      expect(t.auditRows("box.echo")).toEqual([
+        // An unknown box has no binding: checked against the caller's workspace.
+        {
+          ...row,
+          resource_workspace_id: DEFAULT_WORKSPACE_ID,
+          resource_id: "box_x",
+          allowed: policy.unknownAllowed,
+          reason: policy.unknownReason,
+        },
+        {
+          ...row,
+          resource_workspace_id: OTHER_WORKSPACE_ID,
+          resource_id: "box_b",
+          allowed: 0,
+          reason:
+            policy.denied.length === 0 ? "resource is in another workspace" : "denied by test",
+        },
+      ]);
+    });
+  }
 });
 
 describe("box.start denied", () => {

@@ -297,10 +297,16 @@ export class BoxConnections {
    *
    * The resource workspace is the box's own (its join binding), so `authorize`
    * sees, denies and audits an echo to a box of another workspace (#50,
-   * decision 0022). That denial answers `box.not-connected`, as for a box that
-   * is not there, so a caller cannot learn that a box exists elsewhere. A box
-   * that has not said hello has no binding yet; it is checked against the
-   * caller's workspace, and `rpc` then refuses it as not connected.
+   * decision 0022). A box that has not said hello, or is not there, has no
+   * binding; it is checked against the caller's workspace.
+   *
+   * A box the caller cannot see (not connected, or connected for another
+   * workspace) answers `box.not-connected` whatever the policy decided, so the
+   * answer never tells an unknown id from another workspace's box. Only a
+   * connected box of the caller's own workspace can answer `authz.denied`.
+   * Visibility is checked after `authorize`, so the box may have connected or
+   * gone meanwhile, and a policy that allowed a cross-workspace echo still
+   * sends nothing to the box.
    */
   async echo(principal: Principal, boxId: BoxId, params: JsonValue): Promise<JsonValue> {
     const boxWorkspace = this.#byBox.get(boxId)?.binding?.workspaceId ?? principal.workspaceId;
@@ -309,19 +315,16 @@ export class BoxConnections {
       type: "box",
       id: boxId,
     });
+    const conn = this.#byBox.get(boxId);
+    if (conn?.state !== "open" || conn.binding?.workspaceId !== principal.workspaceId) {
+      throw notConnected(boxId);
+    }
     if (!decision.allowed) {
-      if (boxWorkspace !== principal.workspaceId) throw notConnected(boxId);
       throw new HearthError(`box.echo denied: ${decision.reason}`, {
         owner: "user",
         disposition: "give-up",
         code: "authz.denied",
       });
-    }
-    // Checked again after `authorize`: the box may have reconnected meanwhile,
-    // and a policy that allowed a cross-workspace echo must not reach it either.
-    const conn = this.#byBox.get(boxId);
-    if (conn?.binding !== undefined && conn.binding.workspaceId !== principal.workspaceId) {
-      throw notConnected(boxId);
     }
     return await this.rpc(boxId, "echo", params, this.#echoDeadlineMs);
   }
