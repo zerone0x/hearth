@@ -23,3 +23,4 @@ export {
   STRIPPED_ENCODINGS,
   ViewOnlyFilter,
 } from "./rfb";
+export { DESKTOP_PATH, type DesktopSocketData, mountDesktopRoute, type Upgrader } from "./routes";

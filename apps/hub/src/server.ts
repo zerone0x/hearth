@@ -22,6 +22,13 @@ import {
   markerEgressCheck,
   requireBoxEgress,
 } from "./box/egress";
+import {
+  DESKTOP_CLOSE,
+  DesktopBridge,
+  type DesktopSocketData,
+  mountDesktopRoute,
+  type Upgrader,
+} from "./desktop";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
 import {
   openDatabase,
@@ -172,12 +179,31 @@ export function startHub(options: HubOptions) {
 
   // The public listener: the UI/API only, on loopback by default (PRD §10).
   // It never upgrades to the box socket; that path is a 404 here.
-  let server: Bun.Server<undefined>;
+  // Its only WebSocket is the desktop of a session (decision 0016), accepted
+  // by the route after the request and session guards ran.
+  let server: Bun.Server<DesktopSocketData>;
+  let desktop: DesktopBridge | undefined;
   try {
-    server = Bun.serve({
+    server = Bun.serve<DesktopSocketData>({
       hostname,
       port: options.port ?? DEFAULT_PORT,
-      fetch: (req) => app.fetch(req),
+      fetch: (req, srv) => app.fetch(req, srv),
+      websocket: {
+        open(ws) {
+          if (desktop === undefined) return ws.close(DESKTOP_CLOSE.shutdown, "not ready");
+          const viewer = desktop.attach(ws, ws.data.ticket);
+          if (viewer !== undefined) ws.data.viewer = viewer;
+        },
+        message(ws, message) {
+          if (ws.data.viewer !== undefined) desktop?.message(ws.data.viewer, message);
+        },
+        drain(ws) {
+          if (ws.data.viewer !== undefined) desktop?.flush(ws.data.viewer);
+        },
+        close(ws) {
+          if (ws.data.viewer !== undefined) desktop?.closed(ws.data.viewer);
+        },
+      },
     });
   } catch (cause) {
     db.close();
@@ -326,6 +352,15 @@ export function startHub(options: HubOptions) {
   });
   mountSessionRoutes(app, sessions);
 
+  // The desktop stream (decision 0016): behind the login guard, owner only.
+  desktop = new DesktopBridge({
+    boxes,
+    sessions,
+    authorizer,
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+  mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
+
   const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
     /** The public listener: UI/API only. */
@@ -409,6 +444,7 @@ export function startHub(options: HubOptions) {
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
       sessions.stop();
+      desktop?.shutdown();
       boxes.shutdown();
       stopped = (async () => {
         await sessions.ready.catch(() => undefined);
