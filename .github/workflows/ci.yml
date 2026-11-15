@@ -37,3 +37,29 @@ jobs:
         run: shellcheck scripts/box-smoke.sh apps/box-agent/image/entrypoint.sh
       - name: Build and smoke-test the box image
         run: scripts/box-smoke.sh
+
+  # DockerBoxProvider against a real daemon (issue #6, decision 0007). Builds the
+  # box image again (jobs do not share the local image store), derives an idle
+  # variant that keeps the box running, and runs the HEARTH_DOCKER_TESTS suite.
+  box-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Build the box image
+        run: |
+          pi_version="$(jq -er '.dependencies["@earendil-works/pi-coding-agent"]' apps/box-agent/package.json)"
+          timeout 1500 docker build -f apps/box-agent/Dockerfile \
+            --build-arg "PI_VERSION=${pi_version}" -t hearth-box:ci .
+          printf 'FROM hearth-box:ci\nCMD ["sleep", "infinity"]\n' |
+            docker build -t hearth-box:ci-idle -
+      - name: Docker integration tests
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_IMAGE: hearth-box:ci-idle
+        run: timeout 900 bun test apps/hub/src/box/docker/provider.docker.test.ts
