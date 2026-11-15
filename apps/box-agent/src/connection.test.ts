@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
+import { HearthError } from "@hearth/core";
 import { decodeFrame, encodeFrame, type Frame } from "@hearth/protocol";
 import { BoxAgent } from "./connection";
+import type { OutboundFrame } from "./outbox";
 
 test("every failed dial is logged with its attempt number, next delay and reason", async () => {
   // A port that was free a moment ago: nothing listens on it now.
@@ -212,9 +214,120 @@ for (const kind of ["turn.start", "session.hibernate"] as const) {
       hub.connection().send(command(kind, "c2"));
       await retried;
       expect(answers(hub.received)).toEqual(["c1", "c2"]);
+
+      // Once answered, c2 is recorded: a further re-send is not answered again.
+      const pong = hub.next(isPong(3));
+      hub.connection().send(command(kind, "c2"));
+      hub.connection().send({ type: "ping", nonce: 3 });
+      await pong;
+      expect(answers(hub.received)).toEqual(["c1", "c2"]);
     } finally {
       agent.stop();
       await hub.stop();
     }
+  });
+}
+
+/** A box agent whose `send()` throws `failure` while it is set. */
+class FailingAgent extends BoxAgent {
+  failure: Error | undefined;
+
+  override send(frame: OutboundFrame) {
+    if (this.failure !== undefined) throw this.failure;
+    return super.send(frame);
+  }
+}
+
+/**
+ * Run `body` with a global `WebSocket` whose `message` listeners hand any
+ * error they throw to `caught` instead of letting it escape as an uncaught
+ * error, so a test can see what the agent's message handler throws.
+ */
+async function catchingSocketErrors(caught: unknown[], body: () => Promise<void>): Promise<void> {
+  const Original = globalThis.WebSocket;
+  class CatchingWebSocket extends Original {
+    override addEventListener(...args: Parameters<WebSocket["addEventListener"]>): void {
+      const [type, listener, options] = args;
+      if (type !== "message" || typeof listener !== "function") {
+        super.addEventListener(...args);
+        return;
+      }
+      super.addEventListener(
+        type,
+        (event: Event) => {
+          try {
+            listener.call(this, event);
+          } catch (error) {
+            caught.push(error);
+          }
+        },
+        options,
+      );
+    }
+  }
+  globalThis.WebSocket = CatchingWebSocket;
+  try {
+    await body();
+  } finally {
+    globalThis.WebSocket = Original;
+  }
+}
+
+const unexpectedFailures = [
+  ["a plain Error", () => new Error("a bug in send")],
+  [
+    "a HearthError other than outbox.full",
+    () =>
+      new HearthError("another box failure", {
+        owner: "box",
+        disposition: "give-up",
+        code: "box.other",
+      }),
+  ],
+] as const;
+
+for (const [name, makeFailure] of unexpectedFailures) {
+  test(`${name} from send() while answering turn.start is rethrown, not logged as refused`, async () => {
+    const hub = fakeHub((conn, connection) => {
+      if (connection !== 1) return;
+      conn.send(command("turn.start", "t1"));
+      conn.send({ type: "ping", nonce: 1 });
+    });
+    const lines: string[] = [];
+    const caught: unknown[] = [];
+    const failure = makeFailure();
+    await catchingSocketErrors(caught, async () => {
+      const agent = new FailingAgent({
+        hubUrl: hub.url,
+        boxId: "box_commands",
+        joinToken: "hjt_test",
+        reconnectBaseMs: 10,
+        reconnectMaxMs: 20,
+        random: () => 0,
+        log: (line) => lines.push(line),
+      });
+      agent.failure = failure;
+      try {
+        const pong = hub.next(isPong(1));
+        agent.start();
+        await pong;
+        // The error surfaces from the message handler, unchanged.
+        expect(caught).toHaveLength(1);
+        expect(caught[0]).toBe(failure);
+        expect(lines.filter((line) => line.includes("refused"))).toEqual([]);
+        expect(answers(hub.received)).toEqual([]);
+
+        // t1 was not recorded: once send() works, its re-send is answered.
+        agent.failure = undefined;
+        const answer = hub.next((frame) => answered(frame) === "t1");
+        hub.connection().send(command("turn.start", "t1"));
+        await answer;
+        expect(answers(hub.received)).toEqual(["t1"]);
+        expect(caught).toHaveLength(1);
+      } finally {
+        agent.stop();
+        await hub.stop();
+      }
+    });
   });
 }
