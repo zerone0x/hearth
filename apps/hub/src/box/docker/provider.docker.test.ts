@@ -138,9 +138,9 @@ describe.skipIf(!enabled)("DockerBoxProvider against a real daemon", () => {
     const res = await exec(info?.providerRef as string, [
       "bun",
       "-e",
-      "const r = await fetch('https://github.com', { signal: AbortSignal.timeout(20000) }); console.log('status', r.status)",
+      "const r = await fetch('https://github.com', { signal: AbortSignal.timeout(20000) }); console.log('status=' + String(r.status))",
     ]);
-    expect(res.out).toContain("status 200");
+    expect(res.out).toContain("status=200");
   }, 120_000);
 
   test("boxes cannot reach each other", async () => {
