@@ -7,6 +7,7 @@ import {
   createDefaultSecretStore,
   displayRef,
   fingerprint,
+  MAX_DISPLAYED_ENV_NAME_LENGTH,
   parseSecretRef,
   ResolvingSecretStore,
   redactRef,
@@ -18,6 +19,11 @@ import {
 const RAW = "sk-very-secret-value-123";
 /** Shaped like a GitHub token: only `[A-Za-z0-9_]`, so it passes the env-name lookup pattern. */
 const GHP = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+/** An AWS access key id: all caps, so it matches the conventional env-name pattern. */
+const AKIA = "AKIAIOSFODNN7EXAMPLE";
+const ASIA = "ASIAIOSFODNN7EXAMPLE";
+/** All caps, over the displayed-name length cap, no known prefix. */
+const LONG_CAPS = "QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTY";
 
 let dir: string;
 beforeAll(async () => {
@@ -135,8 +141,9 @@ describe("env: and file: resolution", () => {
   test("a conventional variable name is shown, an unconventional one is not", async () => {
     expect(displayRef("env:HEARTH_TOKEN")).toBe("env:HEARTH_TOKEN");
     expect(displayRef("env:_X9")).toBe("env:_X9");
-    expect(displayRef(`env:${"A".repeat(64)}`)).toBe(`env:${"A".repeat(64)}`);
-    expect(displayRef(`env:${"A".repeat(65)}`)).toBe(redactRef(`env:${"A".repeat(65)}`));
+    const longest = "A".repeat(MAX_DISPLAYED_ENV_NAME_LENGTH);
+    expect(displayRef(`env:${longest}`)).toBe(`env:${longest}`);
+    expect(displayRef(`env:${longest}A`)).toBe(redactRef(`env:${longest}A`));
     expect(displayRef("env:lower_case")).toBe(redactRef("env:lower_case"));
     expect(displayRef(`env:${GHP}`)).toBe(redactRef(`env:${GHP}`));
     expect(displayRef(RAW)).toBe(redactRef(RAW));
@@ -172,6 +179,36 @@ describe("env: and file: resolution", () => {
     const error = (await attempt.catch((e: unknown) => e)) as SecretError;
     expect(error.message).not.toContain(RAW);
     expect(error.ref).not.toContain(RAW);
+  });
+});
+
+describe("all-caps token shapes", () => {
+  const planted = [
+    ["an AWS AKIA key id", AKIA],
+    ["an AWS ASIA key id", ASIA],
+    ["an AWS key id after a prefix", `PROD_${AKIA}`],
+    ["a long all-caps string", LONG_CAPS],
+  ] as const;
+
+  for (const [name, value] of planted) {
+    test(`${name} is never displayed`, async () => {
+      const ref = `env:${value}`;
+      expect(displayRef(ref)).toBe(redactRef(ref));
+      // Unset, then set but blank: both errors are redacted.
+      for (const env of [{}, { [value]: " " }]) {
+        const error = (await createDefaultSecretStore({ env })
+          .resolve(ref)
+          .catch((e: unknown) => e)) as SecretError;
+        expect(error.ref).toBe(redactRef(ref));
+        expect(error.message).not.toContain(value);
+      }
+      const report = await createDefaultSecretStore({ env: {} }).preflight([ref]);
+      expect(JSON.stringify(report)).not.toContain(value);
+    });
+  }
+
+  test("a short conventional name containing AKIA is still shown", () => {
+    expect(displayRef("env:AKIA_KEY")).toBe("env:AKIA_KEY");
   });
 });
 
@@ -346,6 +383,40 @@ describe("preflight", () => {
     if (report.ok) return;
     expect(report.failures.map((f) => f.code)).toEqual(["secret.not-found", "secret.empty"]);
     expect(report.failures.map((f) => f.ref)).toEqual(pasted.map((ref) => redactRef(ref)));
+    expect(JSON.stringify(report)).not.toContain(GHP);
+  });
+
+  test("a resolver failure on a token-shaped reference does not show the reference", async () => {
+    const broken: SecretResolver = {
+      scheme: "env",
+      resolve: async () => {
+        throw new Error("boom");
+      },
+    };
+    const store = new ResolvingSecretStore({ resolvers: [broken] });
+    const ref = `env:${GHP}`;
+    // The resolver-failed SecretError in the store's read.
+    const error = (await store.resolve(ref).catch((e: unknown) => e)) as SecretError;
+    expect(error.code).toBe("secret.unreadable");
+    expect(error.ref).toBe(redactRef(ref));
+    expect(error.message).toBe(`Secret ${redactRef(ref)}: resolver failed`);
+    expect(error.message).not.toContain(GHP);
+  });
+
+  test("a non-SecretError from the read does not show a token-shaped reference", async () => {
+    // A resolver returning a non-string makes the store's own `trim` throw a
+    // TypeError, which reaches the preflight fallback.
+    const broken: SecretResolver = {
+      scheme: "env",
+      resolve: async () => undefined as unknown as string,
+    };
+    const store = new ResolvingSecretStore({ resolvers: [broken] });
+    const ref = `env:${GHP}`;
+    const report = await store.preflight([ref]);
+    expect(report.ok).toBe(false);
+    if (report.ok) return;
+    expect(report.failures[0]?.ref).toBe(redactRef(ref));
+    expect(report.failures[0]?.message).toBe(`Secret ${redactRef(ref)}: lookup failed`);
     expect(JSON.stringify(report)).not.toContain(GHP);
   });
 

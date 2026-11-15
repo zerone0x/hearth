@@ -31,7 +31,7 @@ export type SecretErrorCode =
  * How a reference appears in messages. A reference that does not parse, names
  * an unknown scheme, has a body its scheme rejects (`env:` not followed by a
  * variable name, `file:` not followed by an absolute path), or is an `env:`
- * reference whose name is not conventional (see `displayRef`) may be a raw
+ * reference whose name is not conventional or is token-shaped (see `displayRef`) may be a raw
  * secret pasted where a reference belongs, so it is shown only as a fingerprint.
  */
 export function redactRef(ref: SecretRef): string {
@@ -42,12 +42,28 @@ export function redactRef(ref: SecretRef): string {
 const SECRET_REF = /^([a-z][a-z0-9-]*):(.+)$/s;
 
 /**
- * The `env:` names shown as written: uppercase letters, digits and `_`, at most
- * 64 characters. A lowercase or mixed-case name is still looked up, but a
- * token made of `[A-Za-z0-9_]` (e.g. `ghp_…`) pasted after `env:` also matches
- * the lookup pattern, so anything unconventional is shown only by fingerprint.
+ * The longest `env:` name shown as written. Real variable names are short; a
+ * longer all-caps name is more likely a pasted high-entropy token.
  */
-const CONVENTIONAL_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,63}$/;
+export const MAX_DISPLAYED_ENV_NAME_LENGTH = 40;
+
+/**
+ * The `env:` names shown as written: uppercase letters, digits and `_`, at most
+ * `MAX_DISPLAYED_ENV_NAME_LENGTH` characters. A lowercase or mixed-case name is
+ * still looked up, but a token made of `[A-Za-z0-9_]` (e.g. `ghp_…`) pasted
+ * after `env:` also matches the lookup pattern, so anything unconventional is
+ * shown only by fingerprint.
+ */
+const CONVENTIONAL_ENV_NAME = new RegExp(
+  `^[A-Z_][A-Z0-9_]{0,${MAX_DISPLAYED_ENV_NAME_LENGTH - 1}}$`,
+);
+
+/**
+ * A known all-caps token shape: an AWS access key id (`AKIA`/`ASIA` plus 16
+ * characters), alone or after an `_`. It fits the conventional pattern and the
+ * length cap, so it is excluded explicitly.
+ */
+const AWS_KEY_ID = /(?:^|_)(?:AKIA|ASIA)[A-Z0-9]{16}/;
 
 /**
  * How a reference appears in messages and in `SecretError.ref`: as written when
@@ -57,7 +73,10 @@ const CONVENTIONAL_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,63}$/;
 export function displayRef(ref: SecretRef): string {
   const match = SECRET_REF.exec(ref);
   if (!match?.[1] || !match[2]) return redactRef(ref);
-  if (match[1] === "env" && !CONVENTIONAL_ENV_NAME.test(match[2])) return redactRef(ref);
+  if (match[1] === "env") {
+    const name = match[2];
+    if (!CONVENTIONAL_ENV_NAME.test(name) || AWS_KEY_ID.test(name)) return redactRef(ref);
+  }
   return ref;
 }
 
