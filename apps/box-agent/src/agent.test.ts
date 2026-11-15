@@ -23,7 +23,7 @@ describe("describeBoxAgent", () => {
     const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
     clearTimeout(timer);
     expect(code).toBe(2);
-    expect(err).toContain("hearth box-agent (protocol 1.1, pi ");
+    expect(err).toContain("hearth box-agent (protocol 1.2, pi ");
     expect(err).toContain("HEARTH_HUB_URL and HEARTH_BOX_ID must be set");
   });
 });

@@ -364,19 +364,23 @@ export class SessionRunner {
     this.#status = "running";
     this.#interrupted = false;
     const start = this.tracer.startTurn();
-    const turnId = this.tracer.turnId;
+    const turnId = String(start.payload["turn_id"]);
     try {
       await this.#o.events.append(this.#o.scope, this.sessionId, {
+        type: start.type,
+        turnId,
+        payload: jsonSafe(start.payload, this.#o.redact),
+      });
+      await this.#o.events.append(this.#o.scope, this.sessionId, {
         type: "message.user",
-        ...(turnId === undefined ? {} : { turnId }),
-        payload: { text },
+        turnId,
+        payload: { text: this.#redact(text) },
       });
     } catch (error) {
       this.#status = "idle";
       this.tracer.endTurn("error", "could not record the message");
       throw error;
     }
-    this.#record(start.type, start.payload);
     this.#turn = this.#runTurn(text);
   }
 
