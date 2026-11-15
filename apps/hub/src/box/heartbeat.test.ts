@@ -154,6 +154,9 @@ describe("hub heartbeat", () => {
     );
     expect(error).toBeInstanceOf(HearthError);
     expect((error as HearthError).code).toBe("box.connection-dead");
+    // The box may come back on a new connection, so the caller may retry.
+    expect((error as HearthError).disposition).toBe("retry");
+    expect((error as HearthError).owner).toBe("box");
     expect(lines.some((l) => l.includes("box box_silent connection dead"))).toBe(true);
     // The hub's beats stopped with the connection.
     expect(clock.timers.size).toBe(0);
@@ -224,5 +227,56 @@ describe("hub heartbeat", () => {
     clock.beat();
     clock.beat();
     expect(h.boxes.isConnected("box_chatty")).toBe(false);
+  });
+
+  test("frames queued behind a slow store still count as alive", async () => {
+    const { h, clock, url } = setup();
+    const { token } = await h.issueJoinToken("box_slow", "ses_slow");
+    // The store's append blocks until the test lets it go, so every frame
+    // after the first waits in the connection's apply queue.
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const append = h.events.append.bind(h.events);
+    let appends = 0;
+    h.events.append = async (...args: Parameters<typeof append>) => {
+      appends += 1;
+      await blocked;
+      return append(...args);
+    };
+    const deaths: ConnectionDeath[] = [];
+    h.boxes.listen({ dead: (_boxId, _bootId, death) => deaths.push(death) });
+    const box = await fakeBox(url, "box_slow", token, false);
+    await until(() => h.boxes.isConnected("box_slow"), "connected");
+    const turnEvent = (deliveryId: number) =>
+      encodeFrame({
+        type: "turn.event",
+        bootId: "boot_box_slow",
+        deliveryId,
+        sessionId: "ses_slow",
+        turnId: "turn_slow",
+        seq: deliveryId,
+        event: { kind: "text", text: `event ${deliveryId}` },
+      });
+    box.ws.send(turnEvent(1));
+    await until(() => appends === 1, "the first append to block");
+    // Twice the bound in beats, a frame before each; none of them is applied
+    // yet, and the hub must not take the stalled store for a dead box.
+    for (let i = 0; i < 6; i++) {
+      box.ws.send(turnEvent(i + 2));
+      await Bun.sleep(20);
+      clock.beat();
+    }
+    expect(appends).toBe(1);
+    expect(deaths).toEqual([]);
+    expect(h.boxes.isConnected("box_slow")).toBe(true);
+    // The store recovers: every frame is applied and acked on the same connection.
+    release();
+    await until(
+      () => box.frames.filter((f) => f.type === "delivery.ack").length === 7,
+      "seven acks",
+    );
+    expect(h.boxes.isConnected("box_slow")).toBe(true);
   });
 });

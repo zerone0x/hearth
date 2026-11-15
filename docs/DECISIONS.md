@@ -2314,13 +2314,17 @@ frozen or paused box, a host that sleeps, a lost route) left the box-agent
   stays connected through 2 beats and is dead on the 3rd; `dead` before
   `disconnected`; the socket dropped without a close frame (1006) and the
   session manager told at once; an ordinary close stops the beats; an `echo` in flight fails with
-  `box.connection-dead`; the event and its trajectory record; a box that
-  pongs, or sends any frame, stays connected.
+  `box.connection-dead` and `retry`; the event and its trajectory record; a
+  box that pongs, or sends any frame, stays connected; frames queued behind
+  a store whose append blocks keep the box alive for twice the bound.
+- `heartbeat-long-call.test.ts`: a real hub and box-agent, both clocks
+  injected, through a tool call that sends no frame for 10 beats (50 s of
+  injected time): neither end declares the connection dead.
 - `tool-rpc.test.ts`: dead fails calls of that box and boot only, with the
   dispositions above, and nothing is re-sent on reconnect.
 - `apps/box-agent/src/connection.test.ts`: a hub that goes silent after
-  `welcome` is dead on the 3rd beat, and the agent redials; a hub that pongs
-  keeps it connected.
+  `welcome` is dead on the 3rd beat, the agent closes the old socket and
+  redials; a hub that pongs, or sends any other frame, keeps it connected.
 - `heartbeat.docker.test.ts` (CI, box-provider job): `docker pause` on a real
   box with the hub at 1 s × 3; the hub declares it dead within
   `heartbeatBoundMs` plus 1.5 s of slack, records it and fails an `echo` in
@@ -2335,3 +2339,11 @@ frozen or paused box, a host that sleeps, a lost route) left the box-agent
 - The numbers are constants with options for tests, not owner settings. A
   remote or cross-host box (E5) may need its own values; that is a change of
   these defaults, not of the scheme.
+- The `box.connection-dead` event carries no turn or trace id.
+  `BoxConnections` does not know which runner turn is using the box (the
+  turn runs in the hub and reaches the box only through tool RPCs), so the
+  trajectory gives the record the trace id of the session's last turn, as
+  for the other box events. The turn itself records the failed tool calls
+  (`tool.outcome-unknown`) under its own trace id. Passing the active turn
+  down to `BoxConnections` is left for when a turn-scoped box record is
+  needed.
