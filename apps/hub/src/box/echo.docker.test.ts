@@ -3,7 +3,8 @@
  * production defaults (#27, #20; decision 0012): the public API on loopback,
  * the box socket on a box listener bound to the gateway of the box's own
  * network, and the box started by `hub.startBox` through `DockerBoxProvider`.
- * Then the box probes its egress.
+ * Then the box probes its egress, with fetch and through the desktop's
+ * Chromium over CDP.
  *
  * Runs only with HEARTH_DOCKER_TESTS=1 (AGENTS.md) and needs the box image with
  * its real default command (desktop, then box-agent):
@@ -107,6 +108,36 @@ async function probe(containerId: string, url: string): Promise<string> {
   return line;
 }
 
+/**
+ * The same probe through the desktop's Chromium (#92, decision 0026): open
+ * `url` in a new tab over CDP (loopback, port 9222), and answer `reached` when
+ * the tab's title matches `title` (the page itself loaded), else
+ * `blocked <title>` (Chromium's error page) once 15 s have passed.
+ */
+async function browserProbe(containerId: string, url: string, title: RegExp): Promise<string> {
+  const script = `
+const base = "http://127.0.0.1:9222";
+const want = new RegExp(${JSON.stringify(title.source)});
+for (let i = 0; i < 40; i++) {
+  try { if ((await fetch(base + "/json/version")).ok) break } catch {}
+  await Bun.sleep(500);
+}
+const tab = await (await fetch(base + "/json/new?" + encodeURIComponent(${JSON.stringify(url)}), { method: "PUT" })).json();
+let seen = "";
+for (let i = 0; i < 30 && !want.test(seen); i++) {
+  await Bun.sleep(500);
+  const list = await (await fetch(base + "/json/list")).json();
+  seen = list.find((t) => t.id === tab.id)?.title ?? "(tab gone)";
+}
+await fetch(base + "/json/close/" + tab.id);
+console.log(want.test(seen) ? "reached" : "blocked " + seen);
+`;
+  const out = await exec(containerId, ["bun", "-e", script]);
+  const line = out.split(/\r?\n/).find((l) => l.startsWith("reached") || l.startsWith("blocked"));
+  if (line === undefined) throw new Error(`browser probe of ${url} printed no verdict: ${out}`);
+  return line;
+}
+
 /** The host's address on its own uplink: not loopback, not a Docker bridge or veth. */
 function hostAddress(): string {
   for (const [name, addresses] of Object.entries(networkInterfaces())) {
@@ -203,22 +234,28 @@ describe.skipIf(!enabled)("echo and egress through a hub on production defaults"
       hostViaGateway: await probe(box, `http://${gateway}:${hostService.port}/`),
       lan: await probe(box, lanUrl as string),
       metadata: await probe(box, "http://169.254.169.254/metadata/instance"),
+      // The desktop's browser is under the same rules as tools (#92).
+      browserInternet: await browserProbe(box, "https://github.com/", /GitHub/),
+      browserLan: await browserProbe(box, lanUrl as string, /^Directory listing for/),
     };
     console.log(`egress (${egress}) from ${host}, gateway ${gateway}:`, verdicts);
 
     // The box listener answers its socket path (426 to a plain GET).
     expect(verdicts.hub).toBe("reached 426");
     expect(verdicts.internet).toStartWith("reached");
+    expect(verdicts.browserInternet).toBe("reached");
     // The API is on loopback only: never reachable from a box.
     expect(verdicts.publicApi).toStartWith("blocked");
     if (egress === "open") {
       expect(verdicts.hostIp).toBe("reached 200");
       expect(verdicts.hostViaGateway).toBe("reached 200");
       expect(verdicts.lan).toBe("reached 200");
+      expect(verdicts.browserLan).toBe("reached");
     } else {
       expect(verdicts.hostIp).toStartWith("blocked");
       expect(verdicts.hostViaGateway).toStartWith("blocked");
       expect(verdicts.lan).toStartWith("blocked");
+      expect(verdicts.browserLan).toStartWith("blocked");
       expect(verdicts.metadata).toStartWith("blocked");
     }
   }, 300_000);

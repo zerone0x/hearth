@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Hearth box</title>
+<style>
+  body { margin: 0; font: 16px/1.5 "DejaVu Sans", "Liberation Sans", sans-serif; background: #f7f4ef; color: #1f2933; }
+  /* The accent band: compose-e2e looks for this colour on the desktop to know the browser drew this page. */
+  header { background: #d9480f; color: #ffffff; padding: 28px 40px; }
+  header h1 { margin: 0; font-size: 28px; font-weight: 600; }
+  main { padding: 24px 40px; max-width: 760px; }
+  code { background: #ebe5dc; padding: 1px 6px; border-radius: 4px; }
+  a { color: #b03a0a; }
+</style>
+</head>
+<body>
+<header><h1>Hearth box</h1></header>
+<main>
+  <p>This is the session's box: its own desktop, browser and files.</p>
+  <p>Session: <code id="session">unknown</code></p>
+  <p>Files: <a href="file:///workspace/"><code>/workspace</code></a> holds the session's files and
+    persists across hibernate, like this browser's profile in <code>/home/hearth</code>.</p>
+  <p>If this window closes, it opens again by itself.</p>
+</main>
+<script>
+  const params = new URLSearchParams(location.hash.slice(1));
+  const session = params.get("session");
+  if (session) document.getElementById("session").textContent = session;
+</script>
+</body>
+</html>

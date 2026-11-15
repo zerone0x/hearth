@@ -26,6 +26,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Browser, type BrowserContext, chromium, type Page } from "playwright";
+import { desktopProblem, desktopStats } from "./desktop-pixels";
 import type { FauxReply, FauxRequest } from "./faux-model";
 
 const BASE = new URL(process.env["HEARTH_URL"] ?? "http://127.0.0.1:8787/");
@@ -267,7 +268,7 @@ async function install(browser: Browser): Promise<void> {
     check(after.length === 0, `the canaries were not removed: ${after.join(", ")}`);
   }
 
-  step("5. the box's desktop is visible");
+  step("5. the box's desktop is visible and drawn: the browser on its start page");
   const desktop = page.getByRole("region", { name: "Desktop" });
   await desktop.getByRole("button", { name: "Open desktop" }).click();
   // Open: the status overlay and its buttons are gone, and noVNC drew the
@@ -281,8 +282,34 @@ async function install(browser: Browser): Promise<void> {
   });
   check(size[0] === 1280 && size[1] === 800, `desktop framebuffer is ${size.join("x")}`);
   check(await canvas.isVisible(), "the desktop canvas is not visible");
-  await page.waitForTimeout(1000);
+  // Something is drawn (#92): not one colour, and the box's Chromium shows its
+  // start page. Sampled every 8 px; the browser may still be starting, so poll.
+  let problem: string | null = "not sampled yet";
+  for (let i = 0; i < 60 && problem !== null; i++) {
+    if (i > 0) await page.waitForTimeout(1000);
+    const rgb = await canvas.evaluate((c) => {
+      const el = c as unknown as {
+        width: number;
+        height: number;
+        getContext(kind: "2d"): {
+          getImageData(x: number, y: number, w: number, h: number): { data: ArrayLike<number> };
+        } | null;
+      };
+      const data = el.getContext("2d")?.getImageData(0, 0, el.width, el.height).data;
+      const out: number[] = [];
+      if (data === undefined) return out;
+      for (let y = 4; y < el.height; y += 8) {
+        for (let x = 4; x < el.width; x += 8) {
+          const at = (y * el.width + x) * 4;
+          out.push(data[at] ?? 0, data[at + 1] ?? 0, data[at + 2] ?? 0);
+        }
+      }
+      return out;
+    });
+    problem = desktopProblem(desktopStats(rgb));
+  }
   await shot(page, "3-desktop");
+  check(problem === null, `the desktop is not drawn: ${problem}`);
 
   step("6. closing and reopening the page continues the session");
   await page.close();

@@ -303,6 +303,10 @@ jobs:
           docker compose logs --no-color || true
           cat "$RUNNER_TEMP/faux-model.log" || true
           docker ps -a
+          for box in $(docker ps -q --filter label=dev.hearth.managed=true); do
+            echo "chromium.log of ${box}:"
+            docker exec "${box}" cat /tmp/chromium.log || true
+          done
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
