@@ -688,6 +688,24 @@ describe("model calls carry their request and output (schema /2)", () => {
     expect(SENT_PAYLOADS).toEqual([JSON.stringify(PAYLOAD), JSON.stringify(PAYLOAD)]);
   });
 
+  test("replay: a prompt that changes mid-runner (AGENTS.md edited) is re-sent with its new text", async () => {
+    const root = tempDir();
+    const files = [{ path: join(root, "AGENTS.md"), content: "Version one." }];
+    const s = await setup({ contextFiles: files });
+    await turn(s, "hi", [fauxAssistantMessage("ok")]);
+    files[0] = { path: join(root, "AGENTS.md"), content: "Version two, changed." };
+    await turn(s, "again", [fauxAssistantMessage("ok")]);
+    const prompts = trajectory(s)
+      .filter((r) => r.kind === "model_call")
+      .map((r) => (r["request"] as { system_prompt: Record<string, unknown> }).system_prompt);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]?.["sha256"]).not.toBe(prompts[0]?.["sha256"]);
+    expect((prompts[0]?.["text"] as { text: string } | undefined)?.text).toContain("Version one.");
+    expect((prompts[1]?.["text"] as { text: string } | undefined)?.text).toContain(
+      "Version two, changed.",
+    );
+  });
+
   test("replay: the system prompt's text, redacted, once per version; AGENTS.md as a context record", async () => {
     const root = tempDir();
     const agents = { path: join(root, "AGENTS.md"), content: `Deploy key: ${SECRET}. Be brief.` };

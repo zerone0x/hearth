@@ -1910,7 +1910,9 @@ event log, view-only noVNC desktop, the e2e) stays.
   (the hub image's `HEARTH_VERSION` build argument, compose passes it
   through), else `apps/hub/package.json`'s version plus the git commit of the
   checkout (`0.0.0+g<sha>`), else the package version: two builds can be told
-  apart in a trajectory.
+  apart in a trajectory. `GET /healthz` also reports it, without login (the
+  0010 exemption). It names only a commit of this public repository and
+  whether the tree was dirty, never a path or host name.
 - **Shutdown never hangs on a collector.** `Telemetry.shutdown()` flushes
   both providers, never rejects, and gives up after 5 s; the hub logs a
   warning when the last export did not finish and exits 0.
