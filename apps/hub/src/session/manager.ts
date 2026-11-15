@@ -59,6 +59,12 @@ export interface SessionBoxes {
 
 /** Hibernate after this long without a tool call (PRD §6.3: default 15 minutes). */
 export const DEFAULT_IDLE_MS = 15 * 60_000;
+/**
+ * A session stays `running` this long after its last tool call ended, so the
+ * back-to-back tool calls of one turn do not each write `running → idle →
+ * running` (two audit rows and two `session.state` events per call).
+ */
+export const DEFAULT_RUNNING_GRACE_MS = 3_000;
 /** Named deadline for a started box to connect: container start, desktop start, one dial. */
 export const DEFAULT_CONNECT_DEADLINE_MS = 120_000;
 /** How often a booting box is inspected for an early exit. */
@@ -81,6 +87,8 @@ export interface SessionManagerOptions {
   /** Image every session's box runs. */
   readonly image: string;
   readonly idleMs?: number;
+  /** How long `running` outlasts the last tool call (`DEFAULT_RUNNING_GRACE_MS`). */
+  readonly runningGraceMs?: number;
   readonly connectDeadlineMs?: number;
   readonly exitPollMs?: number;
   /** 0 turns the periodic sweep off (tests drive `supervise` directly). */
@@ -133,6 +141,8 @@ class Runtime {
   pending = 0;
   chain: Promise<unknown> = Promise.resolve();
   idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Moves a `running` session with no call in flight to `idle` when it fires. */
+  graceTimer: ReturnType<typeof setTimeout> | undefined;
   attempts = { credential: 0, crash: 0 };
   connectedAt: EpochMs | undefined;
 }
@@ -178,6 +188,7 @@ export class SessionManager {
   readonly #boxes: SessionBoxes | undefined;
   readonly #image: string;
   readonly #idleMs: number;
+  readonly #graceMs: number;
   readonly #connectDeadlineMs: number;
   readonly #exitPollMs: number;
   readonly #maxCredential: number;
@@ -199,6 +210,7 @@ export class SessionManager {
     this.#boxes = options.boxes;
     this.#image = options.image;
     this.#idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
+    this.#graceMs = options.runningGraceMs ?? DEFAULT_RUNNING_GRACE_MS;
     this.#connectDeadlineMs = options.connectDeadlineMs ?? DEFAULT_CONNECT_DEADLINE_MS;
     this.#exitPollMs = options.exitPollMs ?? DEFAULT_EXIT_POLL_MS;
     this.#maxCredential = options.maxCredentialRelaunches ?? DEFAULT_MAX_CREDENTIAL_RELAUNCHES;
@@ -261,6 +273,7 @@ export class SessionManager {
       const s = this.#mustGet(sessionId);
       const row = await this.#transition(principal, s, "archived", "archived");
       this.#clearIdle(this.#rt(sessionId));
+      this.#clearGrace(this.#rt(sessionId));
       const box = s.boxId === null ? undefined : this.#store.getBox(this.#scope, s.boxId);
       if (this.#boxes !== undefined && box !== undefined && box.state !== "stopped") {
         try {
@@ -290,6 +303,7 @@ export class SessionManager {
     const rt = this.#rt(sessionId);
     rt.inFlight++;
     this.#clearIdle(rt);
+    this.#clearGrace(rt);
     let boxId: BoxId;
     try {
       boxId = await this.#serial(sessionId, async () => {
@@ -374,21 +388,55 @@ export class SessionManager {
   stop(): void {
     this.#stopped = true;
     if (this.#sweep !== undefined) clearInterval(this.#sweep);
-    for (const rt of this.#runtimes.values()) this.#clearIdle(rt);
+    for (const rt of this.#runtimes.values()) {
+      this.#clearIdle(rt);
+      this.#clearGrace(rt);
+    }
   }
 
   // -- lifecycle ------------------------------------------------------------------
 
+  /**
+   * After a hub restart no box may be left running behind a session that says
+   * it has none (PRD §5: hibernated means the box is stopped). The box of every
+   * session caught mid-wake or mid-hibernate, and of every session that is not
+   * `idle`/`running` but whose box row says `running`, is stopped first, and
+   * the outcome goes into the `interrupted` event. A stop that fails leaves the
+   * box row `running` (the next wake stops it again), and is logged and recorded.
+   */
   async #recover(): Promise<void> {
-    for (const op of this.#store.runningOperations(this.#scope)) {
-      this.#store.finishOperation(op.id, "interrupted", this.#now(), { reason: "hub restarted" });
+    const interrupted = this.#store.runningOperations(this.#scope);
+    const withOp = new Set(interrupted.map((op) => op.sessionId));
+    const stops = new Map<SessionId, { [key: string]: JsonValue }>();
+    for (const s of this.#store.listSessions(this.#scope)) {
+      if (s.state === "idle" || s.state === "running" || s.boxId === null) continue;
+      const box = this.#store.getBox(this.#scope, s.boxId);
+      if (s.state !== "waking" && !withOp.has(s.id) && box?.state !== "running") continue;
+      stops.set(s.id, await this.#recoverStop(s.id, s.boxId, box !== undefined));
+    }
+    for (const op of interrupted) {
+      const stop = stops.get(op.sessionId) ?? {};
+      this.#store.finishOperation(op.id, "interrupted", this.#now(), {
+        reason: "hub restarted",
+        ...stop,
+      });
       await this.#append(op.sessionId, "session.operation", {
         operation: op.id,
         kind: op.kind,
         outcome: "interrupted",
         reason: "the hub restarted while it was in flight",
+        ...stop,
       });
       this.#log(`session ${op.sessionId}: ${op.kind} interrupted by a hub restart`);
+    }
+    for (const [sessionId, stop] of stops) {
+      if (withOp.has(sessionId)) continue;
+      await this.#append(sessionId, "session.operation", {
+        kind: "recover",
+        outcome: "done",
+        reason: "the hub restarted with this session's box still running",
+        ...stop,
+      });
     }
     for (const s of this.#store.listSessions(this.#scope)) {
       if (s.state === "waking") {
@@ -405,24 +453,59 @@ export class SessionManager {
     for (const s of this.#store.listSessions(this.#scope, ["idle"])) this.#scheduleIdle(s.id);
   }
 
+  /** Stop one box during recovery; say what happened, never throw. */
+  async #recoverStop(
+    sessionId: SessionId,
+    boxId: BoxId,
+    hasRow: boolean,
+  ): Promise<{ [key: string]: JsonValue }> {
+    if (this.#boxes === undefined) {
+      this.#log(`session ${sessionId}: cannot stop box ${boxId} after a restart: no provider`);
+      return { stop: "failed", code: "box.no-provider" };
+    }
+    try {
+      const outcome = await this.#boxes.stop(boxId);
+      if (hasRow) this.#store.setBoxState(this.#scope, boxId, "stopped");
+      return { stop: outcome };
+    } catch (error) {
+      const e = asHearthError(error);
+      this.#log(`session ${sessionId}: could not stop box ${boxId} after a restart: ${e.message}`);
+      return { stop: "failed", code: e.code, message: e.message };
+    }
+  }
+
   #release(sessionId: SessionId): void {
     const rt = this.#rt(sessionId);
     rt.inFlight = Math.max(0, rt.inFlight - 1);
     if (rt.inFlight > 0 || this.#stopped) return;
-    void this.#serial(sessionId, async () => {
-      if (rt.inFlight > 0) return;
-      const s = this.#mustGet(sessionId);
-      if (s.state === "running") {
-        await this.#transition(SYSTEM_PRINCIPAL, s, "idle", "no tool call in flight");
-      }
-      this.#scheduleIdle(sessionId);
-    }).catch((error: unknown) => {
-      this.#log(`session ${sessionId}: could not go idle: ${String(error)}`);
-    });
+    // Stay `running` for the grace period: the next tool call of the turn
+    // usually comes before it ends (DEFAULT_RUNNING_GRACE_MS).
+    this.#clearGrace(rt);
+    rt.graceTimer = setTimeout(() => {
+      rt.graceTimer = undefined;
+      if (this.#stopped) return;
+      void this.#serial(sessionId, async () => {
+        if (rt.inFlight > 0) return;
+        const s = this.#mustGet(sessionId);
+        if (s.state === "running") {
+          await this.#transition(SYSTEM_PRINCIPAL, s, "idle", "no tool call in flight");
+        }
+        // The grace period counts toward the idle time.
+        this.#scheduleIdle(sessionId, Math.max(0, this.#idleMs - this.#graceMs));
+      }).catch((error: unknown) => {
+        this.#log(`session ${sessionId}: could not go idle: ${String(error)}`);
+      });
+    }, this.#graceMs);
+    rt.graceTimer.unref?.();
+  }
+
+  #clearGrace(rt: Runtime): void {
+    if (rt.graceTimer !== undefined) clearTimeout(rt.graceTimer);
+    rt.graceTimer = undefined;
   }
 
   /** Arm the hibernate timer of an idle session whose box was started. */
-  #scheduleIdle(sessionId: SessionId): void {
+  #scheduleIdle(sessionId: SessionId, delayMs: number = this.#idleMs): void {
     const rt = this.#rt(sessionId);
     this.#clearIdle(rt);
     if (this.#stopped || this.#boxes === undefined || rt.inFlight > 0) return;
@@ -436,12 +519,16 @@ export class SessionManager {
       void this.#serial(sessionId, async () => {
         const current = this.#mustGet(sessionId);
         // Only stop the box when no tool call is in flight (PRD §6.3).
-        if (rt.inFlight > 0 || current.state !== "idle") return;
+        if (rt.inFlight > 0) {
+          this.#log(`session ${sessionId}: hibernate skipped, a tool call is in flight`);
+          return;
+        }
+        if (current.state !== "idle") return;
         await this.#hibernate(current);
       }).catch((error: unknown) => {
         this.#log(`session ${sessionId}: hibernate failed: ${String(error)}`);
       });
-    }, this.#idleMs);
+    }, delayMs);
     rt.idleTimer.unref?.();
   }
 

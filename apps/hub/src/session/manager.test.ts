@@ -33,6 +33,7 @@ class FakeBoxes implements SessionBoxes {
   stopGate: Promise<void> | undefined;
   attachGate: Promise<void> | undefined;
   startError: HearthError | undefined;
+  stopError: HearthError | undefined;
   readonly #waiters = new Map<string, Set<() => void>>();
 
   async start(_principal: unknown, spec: BoxSpec): Promise<BoxInfo> {
@@ -48,6 +49,7 @@ class FakeBoxes implements SessionBoxes {
   async stop(boxId: string): Promise<StopOutcome> {
     this.calls.push(`stop ${boxId}`);
     if (this.stopGate !== undefined) await this.stopGate;
+    if (this.stopError !== undefined) throw this.stopError;
     const was = this.running.has(boxId) || this.exited.has(boxId);
     this.running.delete(boxId);
     this.exited.delete(boxId);
@@ -125,7 +127,12 @@ interface Rig {
   make(overrides?: Partial<SessionManagerOptions>): SessionManager;
 }
 
-function rig(overrides: Partial<SessionManagerOptions> = {}, dbPath?: string): Rig {
+/** `shared` keeps the same provider across a hub restart (a second rig on the same file). */
+function rig(
+  overrides: Partial<SessionManagerOptions> = {},
+  dbPath?: string,
+  shared?: FakeBoxes,
+): Rig {
   let path = dbPath;
   if (path === undefined) {
     const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
@@ -135,7 +142,7 @@ function rig(overrides: Partial<SessionManagerOptions> = {}, dbPath?: string): R
   const db = openDatabase(path);
   const events = new SqliteEventStore(db);
   const store = new SqliteSessionStore(db);
-  const boxes = new FakeBoxes();
+  const boxes = shared ?? new FakeBoxes();
   const make = (more: Partial<SessionManagerOptions> = {}) => {
     const m = new SessionManager({
       authorizer: new AllowAllAuthorizer({ audit: new SqliteAuditSink(db) }),
@@ -144,6 +151,7 @@ function rig(overrides: Partial<SessionManagerOptions> = {}, dbPath?: string): R
       boxes,
       image: "img",
       idleMs: 60_000,
+      runningGraceMs: 0,
       exitPollMs: 2,
       connectDeadlineMs: 200,
       superviseIntervalMs: 0,
@@ -608,6 +616,204 @@ describe("SessionManager", () => {
       to: "idle",
       reason: "the hub restarted",
     });
+  });
+
+  test("a hub restart mid-wake stops the box it started (same provider across the restart)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
+    dirs.push(dir);
+    const path = join(dir, "hub.db");
+    const first = rig({ connectDeadlineMs: 60_000 }, path);
+    const s = await first.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    first.boxes.plan.push("hang");
+    void first.manager.ensureBox(s.id).catch(() => {});
+    await until(() => first.boxes.running.has(boxId));
+    await until(() => first.store.runningOperations(scope).length === 1);
+    first.manager.stop();
+
+    const second = rig({ superviseIntervalMs: 5, idleMs: 20 }, path, first.boxes);
+    await second.manager.ready;
+    await Bun.sleep(50);
+    expect(second.store.getSession(scope, s.id)?.state).toBe("hibernated");
+    expect(second.boxes.running.has(boxId)).toBe(false);
+    expect(second.store.getBox(scope, boxId)?.state).toBe("stopped");
+    expect((await eventsOf(second, s.id, "session.operation")).at(-1)?.payload).toMatchObject({
+      kind: "wake",
+      outcome: "interrupted",
+      stop: "stopped",
+    });
+    const detail = second.db
+      .query<{ d: string }, [string]>(
+        "SELECT detail_json AS d FROM session_operation WHERE session_id = ?",
+      )
+      .get(s.id);
+    expect(JSON.parse(detail?.d ?? "null")).toMatchObject({ stop: "stopped" });
+  });
+
+  test("a hub restart mid-hibernate, before the stop reached the provider, stops the box", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
+    dirs.push(dir);
+    const path = join(dir, "hub.db");
+    const first = rig({ idleMs: 20 }, path);
+    const s = await first.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    (await first.manager.ensureBox(s.id)).release();
+    let open: () => void = () => {};
+    first.boxes.stopGate = new Promise((resolve) => {
+      open = resolve;
+    });
+    await until(() => first.store.runningOperations(scope).length === 1);
+    first.manager.stop();
+    first.boxes.stopGate = undefined;
+    expect(first.boxes.running.has(boxId)).toBe(true); // the stop never reached the provider
+
+    const second = rig({ superviseIntervalMs: 5, idleMs: 20 }, path, first.boxes);
+    await second.manager.ready;
+    await Bun.sleep(50);
+    expect(second.store.getSession(scope, s.id)?.state).toBe("hibernated");
+    expect(second.boxes.running.has(boxId)).toBe(false);
+    expect(second.store.getBox(scope, boxId)?.state).toBe("stopped");
+    expect(second.store.operations(scope, s.id).map((o) => `${o.kind}:${o.status}`)).toEqual([
+      "wake:done",
+      "hibernate:interrupted",
+    ]);
+    expect((await eventsOf(second, s.id, "session.operation")).at(-1)?.payload).toMatchObject({
+      kind: "hibernate",
+      outcome: "interrupted",
+      stop: "stopped",
+    });
+    open();
+  });
+
+  test("a stop that fails during restart recovery is recorded and logged, not swallowed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
+    dirs.push(dir);
+    const path = join(dir, "hub.db");
+    const first = rig({ connectDeadlineMs: 60_000 }, path);
+    const s = await first.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    first.boxes.plan.push("hang");
+    void first.manager.ensureBox(s.id).catch(() => {});
+    await until(() => first.boxes.running.has(boxId));
+    await until(() => first.store.runningOperations(scope).length === 1);
+    first.manager.stop();
+    first.boxes.stopError = new HearthError("engine gone", {
+      owner: "box",
+      disposition: "retry",
+      code: "box.provider-unavailable",
+    });
+
+    const lines: string[] = [];
+    const second = rig({ log: (line) => lines.push(line) }, path, first.boxes);
+    await second.manager.ready;
+    expect((await eventsOf(second, s.id, "session.operation")).at(-1)?.payload).toMatchObject({
+      kind: "wake",
+      outcome: "interrupted",
+      stop: "failed",
+      code: "box.provider-unavailable",
+      message: "engine gone",
+    });
+    expect(second.store.getBox(scope, boxId)?.state).toBe("running");
+    expect(lines.some((l) => l.includes(`could not stop box ${boxId}`))).toBe(true);
+    // The next wake stops the leftover runtime before it starts a new one.
+    first.boxes.stopError = undefined;
+    (await second.manager.ensureBox(s.id)).release();
+    expect(second.boxes.calls.slice(-2)).toEqual([`stop ${boxId}`, `start ${boxId}`]);
+  });
+
+  test("a hub restart stops the box of a hibernated session whose box row still says running", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-sessions-"));
+    dirs.push(dir);
+    const path = join(dir, "hub.db");
+    const first = rig({ idleMs: 5 }, path);
+    const s = await first.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    (await first.manager.ensureBox(s.id)).release();
+    await until(() => first.store.getBox(scope, boxId)?.state === "stopped");
+    first.manager.stop();
+    // A box row left running with no operation in flight (say, a crash between two writes).
+    first.store.setBoxState(scope, boxId, "running");
+    first.boxes.running.add(boxId);
+
+    const second = rig({}, path, first.boxes);
+    await second.manager.ready;
+    expect(second.boxes.running.has(boxId)).toBe(false);
+    expect(second.store.getBox(scope, boxId)?.state).toBe("stopped");
+    expect((await eventsOf(second, s.id, "session.operation")).at(-1)?.payload).toMatchObject({
+      kind: "recover",
+      stop: "stopped",
+    });
+    // An idle session's box is left alone.
+    const other = await second.manager.create(LOCAL_PRINCIPAL);
+    (await second.manager.ensureBox(other.id)).release();
+    await until(() => second.store.getSession(scope, other.id)?.state === "idle");
+    second.manager.stop();
+    const third = rig({}, path, first.boxes);
+    await third.manager.ready;
+    expect(third.boxes.running.has(other.boxId as string)).toBe(true);
+  });
+
+  test("back-to-back tool calls inside the running grace write no idle/running pair", async () => {
+    const r = rig({ runningGraceMs: 60 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    for (let i = 0; i < 5; i++) {
+      (await r.manager.ensureBox(s.id)).release();
+      await Bun.sleep(5);
+    }
+    expect(r.store.getSession(scope, s.id)?.state).toBe("running");
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+    expect(await statesOf(r, s.id)).toEqual(["creating", "idle", "waking", "running", "idle"]);
+    expect(
+      auditActions(r.db, s.id).filter((a) => a === "session.run" || a === "session.idle"),
+    ).toEqual(["session.idle", "session.run", "session.idle"]);
+  });
+
+  test("with a running grace, the idle timer still hibernates after the configured idle time", async () => {
+    const r = rig({ runningGraceMs: 40, idleMs: 150 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    (await r.manager.ensureBox(s.id)).release();
+    const released = Date.now();
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+    await Bun.sleep(Math.max(0, released + 100 - Date.now()));
+    expect(r.store.getSession(scope, s.id)?.state).toBe("idle");
+    await until(() => r.store.getSession(scope, s.id)?.state === "hibernated");
+    expect(Date.now() - released).toBeGreaterThanOrEqual(140);
+    expect(r.store.getBox(scope, s.boxId as string)?.state).toBe("stopped");
+  });
+
+  test("a relaunch by supervision does not let the old idle timer hibernate the new box", async () => {
+    const r = rig({ idleMs: 50, connectDeadlineMs: 60_000 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    const boxId = s.boxId as string;
+    (await r.manager.ensureBox(s.id)).release();
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+    await Bun.sleep(10);
+    r.boxes.plan.push("hang");
+    r.boxes.exit(boxId, 1);
+    const supervising = r.manager.supervise(s.id); // relaunch, held until connect below
+    await until(() => r.boxes.running.has(boxId));
+    await Bun.sleep(70); // the old idle deadline passes during the relaunch
+    r.boxes.connect(boxId);
+    await supervising;
+    await Bun.sleep(15);
+    expect(r.store.getSession(scope, s.id)?.state).toBe("idle");
+    expect(r.boxes.running.has(boxId)).toBe(true);
+    await until(() => r.store.getSession(scope, s.id)?.state === "hibernated");
+  });
+
+  test("a short tool call clears the armed idle timer instead of racing it", async () => {
+    const lines: string[] = [];
+    const r = rig({ idleMs: 40, log: (line) => lines.push(line) });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    (await r.manager.ensureBox(s.id)).release();
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+    await Bun.sleep(20);
+    const lease = await r.manager.ensureBox(s.id); // the idle timer was due during this call
+    await Bun.sleep(50);
+    lease.release();
+    await until(() => r.store.getSession(scope, s.id)?.state === "idle");
+    expect(lines.filter((l) => l.includes("hibernate skipped"))).toEqual([]);
+    await until(() => r.store.getSession(scope, s.id)?.state === "hibernated");
   });
 
   test("without a provider, sessions work and ensureBox says box.no-provider", async () => {
