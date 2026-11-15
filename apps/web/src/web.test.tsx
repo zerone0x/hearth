@@ -224,6 +224,8 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     const cardOf = (status: string) =>
       html.split('data-testid="tool-card"').find((c) => c.includes(`data-status="${status}"`));
     expect(cardOf("outcome-unknown")).toContain("Failed tool");
+    // Its status badge is as loud as an error's: the outcome must be checked in the box.
+    expect(cardOf("outcome-unknown")).toMatch(/data-slot="badge"[^>]*data-variant="destructive"/);
     expect(cardOf("error")).toContain("Failed tool");
     expect(cardOf("interrupted")).toContain("Cancelled tool");
     // "Interrupted." is information, not an alert.

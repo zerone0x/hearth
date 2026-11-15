@@ -158,6 +158,8 @@ describe("tool card in a DOM", () => {
         <Thread />
       </ChatRuntime>,
     );
+    // The composer does not take focus on load, so a phone keyboard stays down.
+    expect(document.activeElement).not.toBe(screen.getByRole("textbox", { name: "Message" }));
     const trigger = screen.getByRole("button", { name: "Tool call write: outcome unknown" });
     expect(screen.queryByText(/The box restarted during this call/)).toBeNull();
     fireEvent.click(trigger);
