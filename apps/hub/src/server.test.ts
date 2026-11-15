@@ -527,6 +527,35 @@ describe("startHub", () => {
       await raw(port, "GET /%68ealthz?probe=1 HTTP/1.1\r\nHost: :80\r\nconnection: close\r\n\r\n"),
     );
     expect(encoded.status).toBe(200);
+    // A fragment is not part of the path either.
+    const fragment = parseAnswer(
+      await raw(port, "GET /healthz#x HTTP/1.1\r\nHost: :80\r\nconnection: close\r\n\r\n"),
+    );
+    expect(fragment.status).toBe(200);
+    // Only GET/HEAD /healthz is served: other methods keep base's 404, so the
+    // forwarded request must keep its method (and headers and body).
+    for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
+      const res = parseAnswer(
+        await raw(
+          port,
+          `${method} /healthz HTTP/1.1\r\nHost: :80\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}`,
+        ),
+      );
+      expect({ method, status: res.status }).toEqual({ method, status: 404 });
+    }
+    // Near-misses are not /healthz: they get the listener's own refusal, not the app's.
+    for (const path of ["/healthz/", "/HEALTHZ", "/healthzz", "/healthz/../v1/sessions"]) {
+      const res = parseAnswer(
+        await raw(
+          port,
+          `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:99999\r\norigin: https://evil.example\r\nconnection: close\r\n\r\n`,
+        ),
+      );
+      expect({ path, status: res.status }).toEqual({ path, status: 421 });
+      expect(JSON.parse(res.body)).toMatchObject({
+        error: { code: "request.foreign-host", message: "the Host header is missing or malformed" },
+      });
+    }
   });
 
   test("a box listener serves the box socket and nothing else, whatever Host and Origin", async () => {
