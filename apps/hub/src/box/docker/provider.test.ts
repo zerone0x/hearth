@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BoxSpec, HearthError } from "@hearth/core";
 import { dockerBoxConfigFromEnv } from "./config";
-import { FakeDockerEngine } from "./fake-engine";
+import { FakeDockerEngine, type FakeNetwork } from "./fake-engine";
 import { DockerBoxProvider, LABEL } from "./provider";
 
 const IMAGE = "ghcr.io/zerone0x/hearth-box:test";
@@ -121,6 +121,7 @@ describe("start", () => {
     expect(create?.query.get("name")).toBe("t-box-bx_1");
     const body = create?.body as Record<string, unknown>;
     expect(body["Image"]).toBe(IMAGE);
+    expect(body["User"]).toBe("1000:1000");
     expect(body["Labels"]).toMatchObject({
       team: "a",
       [LABEL.boxId]: "bx_1",
@@ -252,6 +253,212 @@ describe("start", () => {
         : undefined;
     expect((await provider.start(spec, boot)).state).toBe("running");
     expect(fake.calls("POST", /^\/containers\/create$/)).toHaveLength(2);
+  });
+});
+
+describe("labels, user and create failures", () => {
+  test("a user label under dev.hearth. is dropped, never set on any object", async () => {
+    fake.images.set(IMAGE, {});
+    await provider.start(
+      {
+        ...spec,
+        labels: {
+          team: "a",
+          [LABEL.piVersion]: "9.9.9",
+          [LABEL.createdAt]: "1",
+          [LABEL.volumeRole]: "home",
+          [LABEL.managed]: "false",
+          "dev.hearth.extra": "x",
+        },
+      },
+      boot,
+    );
+    const container = [...fake.containers.values()][0]?.Config.Labels ?? {};
+    expect(container[LABEL.piVersion]).toBeUndefined();
+    expect(container[LABEL.createdAt]).toBeUndefined();
+    expect(container[LABEL.volumeRole]).toBeUndefined();
+    for (const labels of [
+      container,
+      fake.networks.get("t-box-bx_1")?.Labels ?? {},
+      fake.volumes.get("t-box-bx_1")?.Labels ?? {},
+      fake.volumes.get("t-box-bx_1-home")?.Labels ?? {},
+    ]) {
+      expect(labels["team"]).toBe("a");
+      expect(labels[LABEL.managed]).toBe("true");
+      expect(labels["dev.hearth.extra"]).toBeUndefined();
+    }
+    expect(fake.volumes.get("t-box-bx_1")?.Labels[LABEL.volumeRole]).toBe("workspace");
+    expect(fake.volumes.get("t-box-bx_1")?.Labels[LABEL.createdAt]).toBe("1700000000000");
+  });
+
+  test("a 404 from containers/create says which object is missing", async () => {
+    await provider.create(spec);
+    // The image disappears after it was inspected.
+    fake.override = (r) => {
+      if (r.method === "POST" && r.path === "/containers/create") fake.images.delete(IMAGE);
+      return undefined;
+    };
+    expect(await rejection(provider.start(spec, boot))).toMatchObject({
+      owner: "box",
+      disposition: "give-up",
+      code: "box.image-missing",
+    });
+
+    // The box's network disappears after create built it.
+    fake.images.set(IMAGE, { [LABEL.piVersion]: "1.5.2" });
+    fake.override = (r) => {
+      if (r.method === "POST" && r.path === "/containers/create") fake.networks.clear();
+      return undefined;
+    };
+    expect(await rejection(provider.start(spec, boot))).toMatchObject({
+      owner: "box",
+      disposition: "retry-cold",
+      code: "box.network-missing",
+    });
+    // A cold retry builds the network again.
+    fake.override = undefined;
+    expect((await provider.start(spec, boot)).state).toBe("running");
+    expect(fake.networks.has("t-box-bx_1")).toBe(true);
+
+    // Neither is missing: the runtime refused the create.
+    await provider.stop("bx_1");
+    fake.override = (r) =>
+      r.method === "POST" && r.path === "/containers/create"
+        ? Response.json({ message: "no such device" }, { status: 404 })
+        : undefined;
+    expect(await rejection(provider.start(spec, boot))).toMatchObject({
+      owner: "box",
+      disposition: "retry-cold",
+      code: "box.create-failed",
+    });
+  });
+});
+
+/**
+ * Same-named objects that are not this box's: unlabeled, labeled for another
+ * instance, and labeled for another box of this instance. None may be started,
+ * stopped, attached to, mounted or removed.
+ */
+const FOREIGN: Record<string, Record<string, string>> = {
+  unlabeled: {},
+  "another instance": {
+    [LABEL.managed]: "true",
+    [LABEL.instance]: "other",
+    [LABEL.boxId]: "bx_1",
+  },
+  "another box": { [LABEL.managed]: "true", [LABEL.instance]: "t", [LABEL.boxId]: "bx_9" },
+};
+
+const NET = "t-box-bx_1";
+const NET_ID = "nforeign0000";
+const foreignNetwork = (labels: Record<string, string>): FakeNetwork => ({
+  Id: NET_ID,
+  Name: NET,
+  Labels: { ...labels },
+  Options: {},
+  Internal: false,
+});
+
+/**
+ * Requests that remove, connect to, mount or attach a container to the network or
+ * volume `name` (or `id`). Container names never collide with these here.
+ */
+function touching(kind: "networks" | "volumes", name: string, id: string) {
+  return fake.requests.filter((r) => {
+    const [, root, ref, verb] = r.path.split("/");
+    const hit = root === kind && (ref === name || ref === id);
+    if (hit && (r.method === "DELETE" || verb !== undefined)) return true;
+    if (r.method === "POST" && r.path === "/containers/create") {
+      const host = ((r.body ?? {}) as { HostConfig?: Record<string, unknown> }).HostConfig ?? {};
+      const mounts = (host["Mounts"] ?? []) as { Source: string }[];
+      return kind === "networks"
+        ? host["NetworkMode"] === name || host["NetworkMode"] === id
+        : mounts.some((m) => m.Source === name);
+    }
+    return false;
+  });
+}
+
+const createCalls = () => fake.requests.filter((r) => r.path === "/containers/create");
+
+describe("ownership of same-named objects", () => {
+  for (const [kind, labels] of Object.entries(FOREIGN)) {
+    describe(kind, () => {
+      test("a foreign home volume is never mounted or removed", async () => {
+        const home = { Name: "t-box-bx_1-home", CreatedAt: "", Labels: { ...labels } };
+        fake.volumes.set(home.Name, home);
+        for (const call of [
+          () => provider.create(spec),
+          () => provider.start(spec, boot),
+          () => provider.destroy("bx_1"),
+        ]) {
+          expect(await rejection(call())).toMatchObject({ code: "box.name-conflict" });
+        }
+        expect(fake.containers.size).toBe(0);
+        expect(createCalls()).toEqual([]);
+        expect(touching("volumes", home.Name, home.Name)).toEqual([]);
+        expect(fake.volumes.get(home.Name)).toEqual({ ...home, Labels: { ...labels } });
+      });
+
+      test("a foreign network found by create or start is never used", async () => {
+        fake.networks.set(NET, foreignNetwork(labels));
+        expect(await rejection(provider.create(spec))).toMatchObject({ code: "box.name-conflict" });
+        expect(await rejection(provider.start(spec, boot))).toMatchObject({
+          code: "box.name-conflict",
+        });
+        expect(createCalls()).toEqual([]);
+        expect(touching("networks", NET, NET_ID)).toEqual([]);
+        expect(fake.networks.get(NET)).toEqual(foreignNetwork(labels));
+      });
+
+      test("destroy never removes a foreign network", async () => {
+        // Alone, and next to this box's own volumes.
+        fake.networks.set(NET, foreignNetwork(labels));
+        expect(await rejection(provider.destroy("bx_1"))).toMatchObject({
+          code: "box.name-conflict",
+        });
+        fake.networks.clear();
+        await provider.create(spec);
+        fake.networks.set(NET, foreignNetwork(labels));
+        expect(await rejection(provider.destroy("bx_1"))).toMatchObject({
+          code: "box.name-conflict",
+        });
+        expect(touching("networks", NET, NET_ID)).toEqual([]);
+        expect(fake.networks.get(NET)).toEqual(foreignNetwork(labels));
+      });
+
+      test("a foreign network created between inspect and create is never used", async () => {
+        // The race: the inspect finds nothing, then someone creates the name, so
+        // networks/create answers 409.
+        fake.override = (r) => {
+          if (r.method === "POST" && r.path === "/networks/create") {
+            fake.networks.set(NET, foreignNetwork(labels));
+          }
+          return undefined;
+        };
+        expect(await rejection(provider.start(spec, boot))).toMatchObject({
+          code: "box.name-conflict",
+        });
+        expect(fake.requests.filter((r) => r.path === "/networks/create")).toHaveLength(1);
+        expect(createCalls()).toEqual([]);
+        expect(touching("networks", NET, NET_ID)).toEqual([]);
+        expect(fake.networks.get(NET)).toEqual(foreignNetwork(labels));
+      });
+    });
+  }
+
+  test("a network this box's own hub created during the race is used", async () => {
+    fake.override = (r) => {
+      if (r.method === "POST" && r.path === "/networks/create") {
+        fake.networks.set(
+          NET,
+          foreignNetwork({ [LABEL.managed]: "true", [LABEL.instance]: "t", [LABEL.boxId]: "bx_1" }),
+        );
+      }
+      return undefined;
+    };
+    expect((await provider.start(spec, boot)).state).toBe("running");
+    expect(createCalls()).toHaveLength(1);
   });
 });
 

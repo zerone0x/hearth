@@ -202,14 +202,26 @@ describe.skipIf(!enabled)("DockerBoxProvider against a real daemon", () => {
       expect(await provider.destroy(id)).toBe("not-found");
       expect(await provider.attach(id)).toBeUndefined();
     }
-    const volumes = await engine.request({
-      method: "GET",
-      path: "/volumes",
-      query: { filters: JSON.stringify({ label: [`${LABEL.instance}=${instance}`] }) },
-      ok: [200],
-      timeoutMs: 10_000,
-      endpoint: "volume.list",
-    });
-    expect((volumes.body as { Volumes: unknown[] | null }).Volumes ?? []).toEqual([]);
+    // Nothing of this instance is left, by label or by name.
+    const list = async (path: string, filter: Record<string, string[]>) => {
+      const res = await engine.request({
+        method: "GET",
+        path,
+        query: { all: true, filters: JSON.stringify(filter) },
+        ok: [200],
+        timeoutMs: 10_000,
+        endpoint: "list",
+      });
+      const body = res.body as unknown[] | { Volumes: unknown[] | null };
+      return Array.isArray(body) ? body : (body.Volumes ?? []);
+    };
+    for (const filter of [
+      { label: [`${LABEL.instance}=${instance}`] },
+      { name: [`${instance}-box-`] },
+    ]) {
+      expect(await list("/volumes", filter)).toEqual([]);
+      expect(await list("/networks", filter)).toEqual([]);
+      expect(await list("/containers/json", filter)).toEqual([]);
+    }
   }, 120_000);
 });

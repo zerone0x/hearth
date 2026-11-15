@@ -27,7 +27,18 @@ import {
 import { DEFAULT_DOCKER_BOX_CONFIG, type DockerBoxProviderConfig, NAME_PART } from "./config";
 import { DockerApiError, DockerEngine } from "./engine";
 
-/** Labels the provider sets. User labels from `BoxSpec.labels` cannot override them. */
+/**
+ * The provider's label namespace. User labels from `BoxSpec.labels` under it are
+ * dropped (not rejected: `BoxInfo.labels` carries these, and a caller passing them
+ * back must not fail), so they can neither override `LABEL` nor add look-alikes
+ * (decision 0007).
+ */
+export const RESERVED_LABEL_PREFIX = "dev.hearth.";
+
+/** The uid:gid every box runs as, whatever the image says (decision 0007). */
+export const BOX_USER = "1000:1000";
+
+/** Labels the provider sets, all under `RESERVED_LABEL_PREFIX`. */
 export const LABEL = {
   managed: "dev.hearth.managed",
   instance: "dev.hearth.instance",
@@ -293,15 +304,7 @@ export class DockerBoxProvider implements BoxProvider {
         }
         throw asHubFailure(error);
       }
-      if (res.status === 404) {
-        throw fail(
-          `image ${spec.image} is missing`,
-          "box",
-          "give-up",
-          "box.image-missing",
-          res.text,
-        );
-      }
+      if (res.status === 404) throw await this.#createNotFound(spec, res.text);
       if (res.status === 409) {
         // A container with this name appeared (a leftover still being removed).
         if (attempt >= 1) {
@@ -337,6 +340,37 @@ export class DockerBoxProvider implements BoxProvider {
       throw asHubFailure(error);
     }
     return this.#mustInfo(spec.boxId);
+  }
+
+  /**
+   * `containers/create` answers 404 for a missing image and for a missing network
+   * alike; look at both to tell which. The image is `box`/`give-up`, as when it is
+   * missing before the create. The network is the box's own, gone between
+   * `#create` and here (removed by hand or by a prune): the box's runtime is
+   * suspect but the hub is fine, so it is `box`/`retry-cold`; the next `start`
+   * runs `#create`, which builds the network again.
+   */
+  async #createNotFound(spec: BoxSpec, text: string): Promise<HearthError> {
+    if ((await this.#inspectImage(spec.image)) === undefined) {
+      return fail(`image ${spec.image} is missing`, "box", "give-up", "box.image-missing", text);
+    }
+    const network = this.objectName(spec.boxId);
+    if ((await this.#get<NetworkJson>(`/networks/${network}`, "network.inspect")) === undefined) {
+      return fail(
+        `network ${network} vanished before the container was created`,
+        "box",
+        "retry-cold",
+        "box.network-missing",
+        text,
+      );
+    }
+    return fail(
+      `creating the container failed: ${text.slice(0, 200)}`,
+      "box",
+      "retry-cold",
+      "box.create-failed",
+      text,
+    );
   }
 
   async #stop(boxId: BoxId, graceMs: number): Promise<StopOutcome> {
@@ -426,8 +460,11 @@ export class DockerBoxProvider implements BoxProvider {
   // --- Docker objects ---
 
   #labels(spec: BoxSpec, extra: Record<string, string>): Record<string, string> {
+    const user = Object.entries(spec.labels ?? {}).filter(
+      ([key]) => !key.startsWith(RESERVED_LABEL_PREFIX),
+    );
     return {
-      ...spec.labels,
+      ...Object.fromEntries(user),
       [LABEL.managed]: "true",
       [LABEL.instance]: this.config.instance,
       [LABEL.boxId]: spec.boxId,
@@ -452,6 +489,7 @@ export class DockerBoxProvider implements BoxProvider {
     const network = this.objectName(spec.boxId);
     return {
       Image: spec.image,
+      User: BOX_USER,
       Env: env,
       Labels: this.#labels(spec, piVersion === undefined ? {} : { [LABEL.piVersion]: piVersion }),
       ExposedPorts: {},
@@ -485,7 +523,7 @@ export class DockerBoxProvider implements BoxProvider {
       this.#checkOwned(spec.boxId, existing.Labels, `network ${name}`);
       return;
     }
-    await this.#engine.request({
+    const res = await this.#engine.request({
       method: "POST",
       path: "/networks/create",
       body: {
@@ -496,11 +534,19 @@ export class DockerBoxProvider implements BoxProvider {
         Labels: this.#labels(spec, {}),
         Options: { "com.docker.network.bridge.enable_icc": "false" },
       },
-      // 409: created concurrently by someone else; it is checked on the next attach.
+      // 409: a same-named network appeared since the inspect.
       ok: [201, 409],
       timeoutMs: this.config.requestTimeoutMs,
       endpoint: "network.create",
     });
+    if (res.status === 409) {
+      // Someone else may have made it: check it is ours before anything uses it.
+      const raced = await this.#get<NetworkJson>(`/networks/${name}`, "network.inspect");
+      if (raced === undefined) {
+        throw fail(`network ${name} conflicted and then vanished`, "hub", "retry", "box.vanished");
+      }
+      this.#checkOwned(spec.boxId, raced.Labels, `network ${name}`);
+    }
   }
 
   async #ensureVolume(

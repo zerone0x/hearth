@@ -385,7 +385,12 @@ bumping the minor.
   to `hearth`) and labeled `dev.hearth.managed`, `dev.hearth.instance`,
   `dev.hearth.box.id`, `dev.hearth.workspace.id`, `dev.hearth.session.id` and
   `dev.hearth.image`; the container also carries the image's
-  `dev.hearth.pi.version`. User labels never override these.
+  `dev.hearth.pi.version`, and the volumes `dev.hearth.created-at` and
+  `dev.hearth.volume.role`. The `dev.hearth.` prefix is the provider's: user
+  labels (`BoxSpec.labels`) under it are dropped before any object is labeled, so
+  they can neither override these nor add their own. Dropped rather than rejected,
+  because `BoxInfo.labels` carries the provider's labels and a caller that passes
+  them back in a spec must not fail.
   - A bridge network of its own: egress allowed (not `Internal`), inter-container
     traffic off, no published or exposed ports. Boxes on different networks cannot
     reach each other; the CI integration test checks this.
@@ -405,14 +410,22 @@ bumping the minor.
   of an existing box returns it unchanged; `start` of a running box leaves it
   alone; an exited or half-created container is removed and replaced; `stop`
   answers `already-stopped` or `not-found`; `destroy` of a missing box answers
-  `not-found`. An object with a box's name that lacks this instance's labels is
-  never adopted, changed or removed (`box.name-conflict`).
+  `not-found`. An object with a box's name that lacks this instance's and this
+  box's labels is never adopted, started, stopped, mounted, attached to or removed
+  (`box.name-conflict`). That includes a network that appears between the
+  provider's inspect and its create: a `409` from `networks/create` is inspected
+  again and checked before the network is used.
 - **Failure owners.** A missing or refusing socket and daemon timeouts are
   `hub`/`retry`; permission denied on the socket is `hub`/`give-up`; unexpected
   daemon answers about its own objects are `hub`. A missing image (or a failed
   pull) is `box`/`give-up`; the runtime refusing to create or start the container
   is `box`/`retry-cold`, and the failed container is removed first. A missing
-  image is pulled once unless `HEARTH_BOX_PULL=never`.
+  image is pulled once unless `HEARTH_BOX_PULL=never`. `containers/create`
+  answers `404` for a missing image and a missing network alike, so the provider
+  inspects both: the image is `box`/`give-up` (`box.image-missing`); the box's own
+  network, gone since `create` built it, is `box`/`retry-cold`
+  (`box.network-missing`), because the hub is fine and a cold `start` builds the
+  network again; neither is `box`/`retry-cold` (`box.create-failed`).
 - **`adopt`** lists containers and volumes with `dev.hearth.managed=true` and this
   instance's label, so a hub restart finds hibernated boxes too, and two hubs (or
   a test run) on one daemon never adopt each other's boxes.
@@ -420,7 +433,8 @@ bumping the minor.
   provider sets `HEARTH_CHROMIUM_SANDBOX=off` in the box's environment, for
   box-agent to read when it launches Chromium. Every box runs with all
   capabilities dropped, `no-new-privileges`, Docker's default seccomp and
-  AppArmor profiles, as uid 1000, with no published ports. Reasoning:
+  AppArmor profiles, as `1000:1000` (set on the container, so it does not depend
+  on the image's `USER`), with no published ports. Reasoning:
   - Chromium's sandbox needs either a setuid helper (blocked by
     `no-new-privileges`, and not shipped by Debian) or unprivileged user
     namespaces, which Docker's default seccomp profile denies. Enabling it means a
