@@ -375,10 +375,13 @@ describe("SessionManager", () => {
     expect(err).toBeInstanceOf(HearthError);
     expect((err as HearthError).code).toBe("box.config");
     expect((err as HearthError).disposition).toBe("give-up");
-    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("failed");
+    const after = await r.manager.get(LOCAL_PRINCIPAL, s.id);
+    expect(after.state).toBe("failed");
+    // The trajectory's box record names the box that failed (decision 0021).
+    expect(after.boxId).toEqual(expect.any(String));
     const failed = await eventsOf(r, s.id, "box.failed");
     expect(failed.map((e) => e.payload)).toMatchObject([
-      { cause: "config", code: "box.config", exitCode: 2 },
+      { cause: "config", code: "box.config", exitCode: 2, boxId: after.boxId },
     ]);
     expect(await eventsOf(r, s.id, "box.restarted")).toEqual([]);
     expect(r.boxes.calls.filter((c) => c.startsWith("start"))).toHaveLength(1);

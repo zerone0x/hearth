@@ -66,7 +66,8 @@ services:
       context: ..
       dockerfile: deploy/hub.Dockerfile
       args:
-        # Stamped on trajectories (decision 0021); e.g. HEARTH_VERSION=$(git rev-parse --short HEAD).
+        # Stamped on trajectories and /healthz (decision 0021); docs/install.md
+        # writes `git describe --always --dirty` into .env as HEARTH_VERSION.
         HEARTH_VERSION: ${HEARTH_VERSION:-}
     network_mode: host
     # Root in the container: see SECURITY above (decision 0020).

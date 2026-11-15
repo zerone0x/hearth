@@ -70,7 +70,7 @@ export class Trajectories {
   async trajectory(principal: Principal, sessionId: SessionId): Promise<TrajectoryRecord[]> {
     await this.#authorize(principal, "session.trajectory", sessionId);
     const events = await readAllEvents(this.#o.events, this.#scope, sessionId);
-    return buildTrajectory(events, { sessionId, versions: this.#o.versions });
+    return buildTrajectory(events, { sessionId, versions: this.#o.versions, redact: redactHub });
   }
 
   async label(principal: Principal, sessionId: SessionId, input: unknown): Promise<void> {

@@ -243,6 +243,15 @@ jobs:
           sudo iptables -S HEARTH-BOX-FWD
           cat /run/hearth/box-egress.applied
           curl -fsS http://127.0.0.1:8787/healthz
+      - name: The hub reports the build install.md stamped (not 0.0.0)
+        working-directory: deploy
+        run: |
+          want="$(sed -n 's/^HEARTH_VERSION=//p' .env)"
+          got="$(curl -fsS http://127.0.0.1:8787/healthz | jq -r .version)"
+          echo "want=${want} got=${got}"
+          test -n "$want"
+          test "$got" = "$want"
+          case "$got" in 0.0.0*) exit 1 ;; esac
       - name: "install.md: setup token"
         working-directory: deploy
         run: |
@@ -257,6 +266,14 @@ jobs:
         working-directory: deploy
         run: |
           timeout 900 "$RUN_BLOCK" -x "$DOC" install:upgrade
+      - name: After the upgrade the hub reports the build install.md stamped
+        working-directory: deploy
+        run: |
+          want="$(sed -n 's/^HEARTH_VERSION=//p' .env)"
+          got="$(curl -fsS http://127.0.0.1:8787/healthz | jq -r .version)"
+          echo "want=${want} got=${got}"
+          test -n "$want"
+          test "$got" = "$want"
       - name: After the upgrade the session continues
         run: timeout 300 bun deploy/e2e/prototype.ts upgrade
       - name: "install.md: uninstall"

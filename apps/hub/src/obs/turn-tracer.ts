@@ -32,7 +32,7 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from "@opentelemetry/semantic-conventions/incubating";
 import type { RpcOutcome, RpcTrace } from "../box/tool-rpc";
-import { capJson, capText, type Redact } from "./cap";
+import { type CappedText, capJson, capText, type Redact } from "./cap";
 import { spanIds, type Telemetry } from "./telemetry";
 
 export { MAX_TEXT_BYTES } from "./cap";
@@ -61,8 +61,11 @@ export interface TurnTracerOptions {
 
 /**
  * What one model request asked for (schema `hearth.trajectory/2`): enough to
- * replay it against the same model, without storing the system prompt or the
- * tool schemas themselves (they are hashed; the event log has the messages).
+ * replay it against the same model. The system prompt's text (redacted, capped
+ * like every kept text) is on the first model call of a runner and on each
+ * call where it changed; later calls carry only its size and hash, which name
+ * the earlier text. Tool schemas are hashed; the messages are the earlier
+ * records of the trajectory.
  */
 export interface ModelRequest {
   provider: string;
@@ -80,7 +83,7 @@ export interface ModelRequest {
   tools: string[];
   /** sha256 of the tool declarations (name, description, parameters) as sent. */
   tools_sha256: string;
-  system_prompt: { bytes: number; sha256: string };
+  system_prompt: { bytes: number; sha256: string; text?: CappedText };
   /** Messages in the request's context, system messages excluded. */
   message_count: number;
 }
@@ -312,6 +315,8 @@ export class TurnTracer {
   readonly #tools = new Map<string, ToolState>();
   readonly #redact: Redact;
   #turn: Turn | undefined;
+  /** sha256 of the last system prompt whose text a model call carried. */
+  #promptSha: string | undefined;
 
   constructor(options: TurnTracerOptions) {
     this.#o = options;
@@ -444,6 +449,8 @@ export class TurnTracer {
     const turn = this.#turn;
     if (turn === undefined) return;
     turn.request = modelRequest(snapshot);
+    // Redacted before it is capped; dropped at the call's end if an earlier call has it.
+    turn.request.system_prompt.text = capText(snapshot.systemPrompt, this.#redact);
   }
 
   /** The provider payload (`before_provider_request`): the sampling and limit fields pi set. */
@@ -479,6 +486,11 @@ export class TurnTracer {
     turn.model = undefined;
     const request = turn.request ?? null;
     turn.request = undefined;
+    if (request !== null) {
+      // The prompt's text once per version: later calls name it by its hash.
+      if (request.system_prompt.sha256 === this.#promptSha) delete request.system_prompt.text;
+      else this.#promptSha = request.system_prompt.sha256;
+    }
     const now = this.#clock.mono();
     const usage = (m["usage"] ?? {}) as Usage;
     const tokens = {

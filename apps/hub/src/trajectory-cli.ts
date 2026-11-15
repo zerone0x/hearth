@@ -47,6 +47,7 @@ export async function dumpTrajectory(
     const records = buildTrajectory(events, {
       sessionId,
       versions: { pi: PI_VERSION, hub: HUB_VERSION },
+      redact: redactHub,
     });
     return redactHub(toJsonl(records));
   } finally {

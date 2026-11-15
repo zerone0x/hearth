@@ -11,13 +11,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOCAL_PRINCIPAL, Logger, type SecretStore } from "@hearth/core";
+import { ExportResultCode } from "@opentelemetry/core";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import type { SpanExporter } from "@opentelemetry/sdk-trace";
 import { Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { registerStartupSecrets } from "../main";
 import { openDatabase, SqliteEventStore } from "../store";
 import { dumpTrajectory } from "../trajectory-cli";
 import { hubLines, lineFields, lineLevel } from "./hub-log";
-import { redactHub, registerKnownSecrets } from "./redaction";
+import { redactHub } from "./redaction";
 import { mountTrajectoryRoutes, Trajectories } from "./routes";
 import { Telemetry } from "./telemetry";
 import { gitShaOf, HUB_VERSION, hubVersion } from "./version";
@@ -174,7 +177,15 @@ describe("secrets known from startup (a key stored raw by an older build)", () =
     const path = await legacyDb(key);
     // A fresh process has registered nothing yet.
     expect(redactHub(key)).toBe(key);
-    expect(await registerKnownSecrets(store({ "file:/k": key }), ["file:/k"])).toBe(1);
+    // What main.ts runs before the hub starts: the configured model key.
+    const warned: string[] = [];
+    const log = { warn: (m: string) => warned.push(m) };
+    await registerStartupSecrets(store({ "file:/k": key }), undefined, log);
+    expect(redactHub(key)).toBe(key);
+    await registerStartupSecrets(store({ "file:/k": key }), { apiKeyRef: "file:/k" }, log);
+    expect(redactHub(key)).toBe("[redacted]");
+    await registerStartupSecrets(store({}), { apiKeyRef: "file:/gone" }, log);
+    expect(warned).toEqual([expect.stringContaining("file:/gone")]);
     const db = openDatabase(path);
     closers.push(() => db.close());
     const app = new Hono<HubEnv>();
@@ -224,6 +235,21 @@ describe("telemetry shutdown", () => {
     const started = performance.now();
     const result = await t.shutdown(300);
     expect(result).toEqual({ ok: false, error: expect.stringContaining("300 ms") });
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  test("an exporter whose shutdown fails at once: shutdown resolves with the error, not the timeout", async () => {
+    const exporter: SpanExporter = {
+      export: (_spans, done) => done({ code: ExportResultCode.SUCCESS }),
+      shutdown: () => Promise.reject(new Error("exporter broke")),
+      forceFlush: () => Promise.resolve(),
+    };
+    const t = new Telemetry({ spanExporter: exporter });
+    t.endSpan(t.startSpan("s", {}));
+    const started = performance.now();
+    // Resolves (never rejects), says why, and well before the timeout.
+    const result = await t.shutdown(5_000);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("exporter broke") });
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 

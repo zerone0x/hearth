@@ -47,14 +47,33 @@ import type { BoxConnectionListener } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
 import { type CompiledDenyRule, compileDenyList } from "../runner/policy";
 import { redactSecrets, SessionRunner } from "../runner/runner";
-import { capText, MAX_TEXT_BYTES, utf8Head } from "./cap";
+import { capJson, capText, MAX_TEXT_BYTES, utf8Head } from "./cap";
 import { registerSecret } from "./redaction";
 import { mountTrajectoryRoutes, Trajectories } from "./routes";
 import { Telemetry } from "./telemetry";
 import { buildTrajectory, type TrajectoryRecord, toJsonl } from "./trajectory";
-import { payloadParams, TurnTracer } from "./turn-tracer";
+import { modelOutput, payloadParams, TurnTracer } from "./turn-tracer";
+import { HUB_VERSION } from "./version";
 
 const SECRET = "sk-hearth-test-SECRET-0123456789abcdef";
+const redactTest = (text: string) => redactSecrets(text, [SECRET]);
+
+/** Fails when `text` keeps any prefix of SECRET of 4 or more characters. */
+function expectNoSecretPrefix(text: string): void {
+  for (let n = 4; n <= SECRET.length; n++) {
+    if (text.includes(SECRET.slice(0, n))) {
+      throw new Error(`a ${n}-character prefix of the secret survived: ${SECRET.slice(0, n)}`);
+    }
+  }
+}
+
+/**
+ * A secret across the 16 KiB cut, in a text that is still over the cap after
+ * redaction: capping first would keep `sk-hearth-`, redacting first keeps
+ * `[redacted]` and cuts the tail.
+ */
+const STRADDLE = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}${"b".repeat(100)}`;
+const STRADDLE_HEAD = `${"a".repeat(MAX_TEXT_BYTES - 10)}[redacted]`;
 const dirs: string[] = [];
 const closers: Array<() => unknown> = [];
 
@@ -190,6 +209,9 @@ const USAGE: Usage = {
 /** What a real provider would build; pi-ai's faux provider builds no payload. */
 const PAYLOAD = { model: "faux-1", max_tokens: 2048, temperature: 0.3 };
 
+/** Each provider payload as it would go on the wire, after every extension's hook. */
+const SENT_PAYLOADS: string[] = [];
+
 /**
  * The faux provider, with `USAGE` on every final message, and the
  * `onPayload` hook called the way pi-ai's HTTP providers call it.
@@ -201,7 +223,10 @@ function withFixedUsage(faux: FauxProviderHandle): Provider {
     (model, context, options) => {
       const out: AssistantMessageEventStream = createAssistantMessageEventStream();
       void (async () => {
-        await options?.onPayload?.(structuredClone(PAYLOAD), model);
+        const built = structuredClone(PAYLOAD);
+        // pi-ai sends what onPayload returns, or the payload it built when it returns undefined.
+        const sent = (await options?.onPayload?.(built, model)) ?? built;
+        SENT_PAYLOADS.push(JSON.stringify(sent));
         const source = inner(model, context, options);
         for await (const event of source) {
           if (event.type === "done") event.message.usage = structuredClone(USAGE);
@@ -246,6 +271,8 @@ interface SetupOptions {
   /** A rebuilt runner (hub restart): the old one's event log and pi entries. */
   events?: MemoryEvents;
   entries?: FileEntry[];
+  /** AGENTS.md files the runner gives pi (what the session manager read from the box). */
+  contextFiles?: Array<{ path: string; content: string }>;
 }
 
 /** Each box lease takes `leaseWaitMs` on the test clock, plus one tick. */
@@ -296,6 +323,9 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     model: faux.getModel(),
     denyList: options.denyList ?? [],
     ...(options.entries === undefined ? {} : { entries: options.entries }),
+    ...(options.contextFiles === undefined
+      ? {}
+      : { contextFiles: () => options.contextFiles ?? [] }),
     boxCwd: root,
     log: logger.lines("error"),
     redact,
@@ -640,6 +670,87 @@ describe("model calls carry their request and output (schema /2)", () => {
     expect(toJsonl(records)).not.toContain(SECRET);
   });
 
+  test("hearth-trace is passive: the provider payload is byte-identical to the one built without it", async () => {
+    SENT_PAYLOADS.length = 0;
+    const s = await setup();
+    await turn(s, "hi", [call("bash", { command: "echo 1" }, "c_1"), fauxAssistantMessage("ok")]);
+    // No other extension hooks the payload in this setup, so what the provider
+    // would send is what it built: hearth-trace only reads it.
+    expect(SENT_PAYLOADS).toEqual([JSON.stringify(PAYLOAD), JSON.stringify(PAYLOAD)]);
+  });
+
+  test("replay: the system prompt's text, redacted, once per version; AGENTS.md as a context record", async () => {
+    const root = tempDir();
+    const agents = { path: join(root, "AGENTS.md"), content: `Deploy key: ${SECRET}. Be brief.` };
+    const s = await setup({ contextFiles: [agents] });
+    await turn(s, "hi", [call("bash", { command: "echo 1" }, "c_1"), fauxAssistantMessage("ok")]);
+    await turn(s, "again", [fauxAssistantMessage("ok")]);
+    const prompt = s.runner.systemPrompt;
+    expect(prompt).toContain(SECRET);
+    const [first, ...rest] = trajectory(s)
+      .filter((r) => r.kind === "model_call")
+      .map((r) => (r["request"] as { system_prompt: Record<string, unknown> }).system_prompt);
+    expect(rest).toHaveLength(2);
+    expect(first).toEqual({
+      bytes: Buffer.byteLength(prompt, "utf8"),
+      sha256: createHash("sha256").update(prompt).digest("hex"),
+      text: capText(prompt, redactTest),
+    });
+    expect((first?.["text"] as { text: string } | undefined)?.text).toContain(
+      "Deploy key: [redacted]. Be brief.",
+    );
+    // Later calls with the same prompt name it by its hash only.
+    for (const r of rest) expect(r).toEqual({ bytes: first?.["bytes"], sha256: first?.["sha256"] });
+    expectNoSecretPrefix(toJsonl(trajectory(s)));
+
+    // The AGENTS.md the session manager read (runner.context, stored as read):
+    // redacted before it is capped, with its size and hash.
+    const events = new MemoryEvents();
+    await events.append({}, "se_obs", {
+      type: "runner.context",
+      payload: { files: [{ path: "/w/AGENTS.md", content: STRADDLE }] },
+    });
+    const records = buildTrajectory(events.list, {
+      sessionId: "se_obs",
+      versions: { pi: "p", hub: "h" },
+      redact: redactTest,
+    });
+    expect(records.find((r) => r.kind === "context")).toMatchObject({
+      files: [{ path: "/w/AGENTS.md", content: capText(STRADDLE, redactTest) }],
+    });
+    expect(capText(STRADDLE, redactTest)).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
+    expectNoSecretPrefix(toJsonl(records));
+  });
+
+  test("the runner records the configured hub version (HEARTH_VERSION) on every turn", async () => {
+    const s = await setup();
+    await turn(s, "hi", [fauxAssistantMessage("ok")]);
+    const start = s.events.list.find((e) => e.type === "runner.turn.start");
+    expect(start?.payload).toMatchObject({ hub_version: HUB_VERSION });
+    expect(trajectory(s).find((r) => r.kind === "turn_start")).toMatchObject({
+      hub_version: HUB_VERSION,
+    });
+    if (process.env["HEARTH_VERSION_PROBE"] !== undefined) {
+      expect(HUB_VERSION).toBe(process.env["HEARTH_VERSION_PROBE"]);
+      return;
+    }
+    // The same test in a hub built with HEARTH_VERSION set (deploy/hub.Dockerfile).
+    const probe = "9.9.9-probe";
+    const r = Bun.spawnSync(
+      [process.execPath, "test", import.meta.path, "-t", "records the configured hub version"],
+      {
+        cwd: join(import.meta.dir, "..", ".."),
+        env: { ...process.env, HEARTH_VERSION: probe, HEARTH_VERSION_PROBE: probe },
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 60_000,
+      },
+    );
+    const out = `${r.stdout.toString()}${r.stderr.toString()}`;
+    expect(out).toContain("1 pass");
+    expect(r.exitCode).toBe(0);
+  }, 90_000);
+
   test("provider payload fields: max tokens, temperature and reasoning, whatever the API calls them", () => {
     const t = new TurnTracer({
       sessionId: "se_p",
@@ -719,16 +830,76 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
   });
 
   test("a secret straddling the cut is redacted before the cut, so no prefix of it is kept", () => {
-    const text = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}`;
-    const c = capText(text, (x) => redactSecrets(x, [SECRET]));
-    expect(c.text).not.toContain(SECRET.slice(0, 10));
-    expect(c.truncated).toBe(false);
+    const c = capText(STRADDLE, redactTest);
+    // Still over the cap after redaction, so the cut really happens.
+    expect(c.truncated).toBe(true);
+    expect(c.bytes).toBe(MAX_TEXT_BYTES + 100);
+    expect(c.text).toBe(STRADDLE_HEAD);
+    expectNoSecretPrefix(c.text);
+    expect(c.sha256).toBe(createHash("sha256").update(redactTest(STRADDLE)).digest("hex"));
+  });
+
+  test("tool-call arguments: redacted (keys too) before the cut, by bytes, 16 KiB kept whole", () => {
+    // A secret across the cut of over-cap arguments.
+    const big = capJson({ command: STRADDLE }, redactTest) as {
+      truncated: boolean;
+      text: string;
+      bytes: number;
+    };
+    expect(big.truncated).toBe(true);
+    expect(big.text).toBe(`{"command":"${STRADDLE_HEAD}`.slice(0, MAX_TEXT_BYTES));
+    expectNoSecretPrefix(big.text);
+    // The boundary: JSON of exactly 16 KiB is kept as the value; one byte more is cut.
+    const overhead = Buffer.byteLength(JSON.stringify({ c: "" }));
+    const exact = { c: "x".repeat(MAX_TEXT_BYTES - overhead) };
+    expect(Buffer.byteLength(JSON.stringify(exact))).toBe(MAX_TEXT_BYTES);
+    expect(capJson(exact)).toEqual(exact);
+    expect(capJson({ c: `${exact.c}x` })).toMatchObject({
+      truncated: true,
+      bytes: MAX_TEXT_BYTES + 1,
+    });
+    // Bytes, not characters: 6000 CJK characters are 18 000 bytes.
+    const cjk = { c: "中".repeat(6000) };
+    expect(JSON.stringify(cjk).length).toBeLessThan(MAX_TEXT_BYTES);
+    const cut = capJson(cjk) as { truncated: boolean; text: string; bytes: number };
+    expect(cut.truncated).toBe(true);
+    expect(cut.bytes).toBe(Buffer.byteLength(JSON.stringify(cjk)));
+    expect(Buffer.byteLength(cut.text)).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(cut.text).not.toContain("\uFFFD");
+    const emoji = capJson({ c: "😀".repeat(5000) }) as { truncated: boolean; text: string };
+    expect(emoji.truncated).toBe(true);
+    expect(emoji.text).toMatch(/^\{"c":"(😀)+$/u);
+    // Object keys are redacted too: a model can put a secret in a key.
+    expect(capJson({ [SECRET]: { [`x-${SECRET}`]: [SECRET] } }, redactTest)).toEqual({
+      "[redacted]": { "x-[redacted]": ["[redacted]"] },
+    });
+  });
+
+  test("model output: over-cap text, thinking and arguments are redacted before the cut", () => {
+    const out = modelOutput(
+      [
+        { type: "thinking", thinking: STRADDLE },
+        { type: "thinking", thinking: "", redacted: true },
+        { type: "thinking", thinking: "", redacted: true },
+        { type: "text", text: STRADDLE },
+        { type: "toolCall", id: "c_1", name: "bash", arguments: { command: STRADDLE } },
+      ],
+      redactTest,
+    );
+    expect(out["thinking"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
+    expect(out["text"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
+    expect(out["tool_calls"]).toMatchObject([{ id: "c_1", args: { truncated: true } }]);
+    // Provider-redacted thinking has no text; the trajectory counts the blocks.
+    expect(out["redacted_thinking_blocks"]).toBe(2);
+    expectNoSecretPrefix(JSON.stringify(out));
+    expect(modelOutput([{ type: "text", text: "x" }])).not.toHaveProperty(
+      "redacted_thinking_blocks",
+    );
   });
 
   test("through the runner: a secret across the cut of a tool result is redacted before the cut", async () => {
     const s = await setup();
-    const big = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}`;
-    writeFileSync(join(s.root, "big.txt"), big);
+    writeFileSync(join(s.root, "big.txt"), STRADDLE);
     await turn(s, "read it", [
       call("read", { path: "big.txt" }, "c_r"),
       fauxAssistantMessage("ok"),
@@ -736,10 +907,38 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
     const records = trajectory(s);
     const tool = records.find((r) => r.kind === "tool_call") as Record<string, unknown>;
     const result = tool["result"] as { text: string; truncated: boolean; sha256: string };
-    expect(toJsonl(records)).not.toContain(SECRET.slice(0, 10));
-    expect(result.text.endsWith("[redacted]")).toBe(true);
-    // The hash is of the redacted text the trajectory has, so a reader can check it.
-    expect(result.sha256).toBe(createHash("sha256").update(result.text).digest("hex"));
+    expect(result.truncated).toBe(true);
+    expect(result.text).toBe(STRADDLE_HEAD);
+    expectNoSecretPrefix(toJsonl(records));
+    // The size and hash are of the whole redacted result, not the raw one.
+    expect(result).toMatchObject({ bytes: MAX_TEXT_BYTES + 100 });
+    expect(result.sha256).toBe(createHash("sha256").update(redactTest(STRADDLE)).digest("hex"));
+  });
+
+  test("through the runner: over-cap thinking, text and tool-call arguments with a secret across the cut", async () => {
+    const s = await setup();
+    await turn(s, "go", [
+      fauxAssistantMessage(
+        [
+          fauxThinking(STRADDLE),
+          fauxText(STRADDLE),
+          fauxToolCall("bash", { command: `: ${STRADDLE}` }, { id: "c_s" }),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("done"),
+    ]);
+    const records = trajectory(s);
+    const first = records.find((r) => r.kind === "model_call") as Record<string, unknown>;
+    const output = first["output"] as Record<string, unknown>;
+    expect(output["thinking"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
+    expect(output["text"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
+    const [toolCall] = output["tool_calls"] as Array<{
+      args: { truncated: boolean; text: string };
+    }>;
+    expect(toolCall?.args.truncated).toBe(true);
+    expect(toolCall?.args.text).toBe(`{"command":": ${STRADDLE_HEAD}`.slice(0, MAX_TEXT_BYTES));
+    expectNoSecretPrefix(toJsonl(records));
   });
 
   test("through the runner: a CJK tool result and a long answer are capped by bytes", async () => {

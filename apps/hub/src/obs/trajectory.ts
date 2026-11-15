@@ -2,8 +2,8 @@
  * The session trajectory (decision 0021): a projection of the append-only
  * event log, schema `hearth.trajectory/2`, one JSON object per line.
  *
- * Lines, in event order: one `session` header; `user_input`, `turn_start`,
- * `model_call`, `tool_call`, `turn_end`, `box`, `outcome_unknown`,
+ * Lines, in event order: one `session` header; `user_input`, `context` (the
+ * AGENTS.md files the runner read from the box), `turn_start`, `model_call`, `tool_call`, `turn_end`, `box`, `outcome_unknown`,
  * `runner_failed` and `label` records; one `summary` at the end. Every record
  * carries `session_id`, `seq`, `at` (wall clock), `turn_id`, `step_id`,
  * `tool_call_id`, `box_id`, `trace_id`, `span_id`, `pi_version` and
@@ -12,7 +12,7 @@
  *
  * `/2` (rework of #80): a `model_call` carries its `request` (model, thinking
  * level, max tokens, temperature, tool names and hash, system prompt size and
- * hash, message count) and its `output` (text, thinking, tool calls with their
+ * hash, and its text on the first call of each prompt version, message count) and its `output` (text, thinking, tool calls with their
  * arguments); `user_input` prompts and every kept text are capped at 16 KiB of
  * UTF-8 with their byte count and sha256. Events written before `/2` project
  * with `request: null` and `output: null`.
@@ -22,7 +22,7 @@
  */
 
 import type { StoredEvent } from "@hearth/core";
-import { capText } from "./cap";
+import { capText, type Redact } from "./cap";
 
 export const TRAJECTORY_SCHEMA = "hearth.trajectory/2";
 
@@ -65,6 +65,11 @@ export interface TrajectoryOptions {
   /** Used before the first turn records its own. */
   readonly versions: { readonly pi: string; readonly hub: string };
   readonly now?: () => number;
+  /**
+   * Applied to texts the runner did not redact when it wrote them (the
+   * AGENTS.md content of `runner.context`), before they are capped.
+   */
+  readonly redact?: Redact;
 }
 
 /** Build the trajectory from a session's events, oldest first. */
@@ -203,6 +208,23 @@ export function buildTrajectory(
           tool_call_ids: p["toolCallIds"] ?? [],
         });
         break;
+      case "runner.context": {
+        // What pi read as context files: the system prompt is built from them.
+        const files = Array.isArray(p["files"]) ? (p["files"] as unknown[]) : [];
+        out.push({
+          ...base(e),
+          kind: "context",
+          files: files.map((f) => {
+            const file = obj(f);
+            const content = str(file["content"]);
+            return {
+              path: str(file["path"]),
+              content: content === null ? null : capText(content, options.redact),
+            };
+          }),
+        });
+        break;
+      }
       case "runner.failed":
         out.push({ ...base(e), kind: "runner_failed", error: p["message"] ?? null });
         break;

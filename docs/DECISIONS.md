@@ -1811,11 +1811,22 @@ event log, view-only noVNC desktop, the e2e) stays.
     `reasoning` or `reasoning_effort`), `model_max_tokens` and
     `context_window` (the model's definition), `tools` (names) and
     `tools_sha256` (of the declarations sent: name, description,
-    parameters), `system_prompt: {bytes, sha256}` and `message_count` (the
-    messages in the context, system messages excluded). The system prompt
-    and tool schemas are hashed, not stored: they are the hub's and pi's,
-    and the hash tells a replay whether it has the same ones. The messages
-    themselves are in the event log (`pi.message_end`, `runner.entries`).
+    parameters), `system_prompt: {bytes, sha256, text?}` and
+    `message_count` (the messages in the context, system messages
+    excluded). The system prompt's `text` (`{text, truncated, bytes,
+    sha256}`, redacted and capped like every kept text) is on the first
+    model call a runner makes and on each call whose prompt changed; later
+    calls carry only `bytes` and `sha256` (of the unredacted prompt), which
+    name the earlier text. The prompt is built from the AGENTS.md files and
+    the working directory, so a build alone cannot rebuild it. Tool schemas
+    are hashed, not stored: they are the hub's and pi's code, and the hash
+    tells a replay whether it has the same ones. The messages are the
+    trajectory's own records (`user_input`, the `output` of each
+    `model_call`, each `tool_call`'s `result`).
+  - A `context` record for each `runner.context` event: the AGENTS.md
+    files the runner read from the box, `[{path, content}]`, each content
+    redacted (the hub's sink redactor; the event stores it as read) and
+    capped with its size and hash.
   - `output`: `text` and `thinking` (each `{text, truncated, bytes, sha256}`
     or null), `redacted_thinking_blocks` when the provider sent opaque ones,
     and `tool_calls: [{id, name, args}]` for every call the model asked for.
@@ -1825,8 +1836,10 @@ event log, view-only noVNC desktop, the e2e) stays.
     code-point boundary so a CJK character or an emoji is never split; the
     record keeps the byte count and the sha256 of the whole redacted text.
     Redacting before the cut means a secret that straddles the cut is never
-    half kept. Arguments that fit are kept as JSON; over the cap they become
-    `{text, truncated, bytes, sha256}` of their JSON.
+    half kept. Arguments that fit are kept as JSON, with every string
+    redacted, object keys included (a model can put a secret in a key);
+    over the cap they become `{text, truncated, bytes, sha256}` of their
+    redacted JSON.
   - Events written before `/2` project with `request: null` and
     `output: null`.
 - **No third-party trajectory format.** The standard part is the OpenTelemetry
@@ -1917,9 +1930,17 @@ event log, view-only noVNC desktop, the e2e) stays.
   decision. Deferred to #83. Until then trajectories live as long as the
   session's events, and leave the hub only through the API, the CLI or a
   configured OTLP exporter.
-- A model call's request records hashes of the system prompt and tool
-  declarations, not their text: replaying a turn exactly needs the same hub
-  and pi build (`hub_version`, `pi_version`), which the hashes confirm.
+- Replay from the trajectory alone: the user inputs, the system prompt's
+  text (once per version), the AGENTS.md context, each call's settings and
+  the model's output and tool results are in it. Tool declarations are
+  hashed, so an exact replay also needs the same hub and pi build
+  (`hub_version`, `pi_version`), which `tools_sha256` confirms. Texts over
+  16 KiB (and any secret) are kept as a head with the size and hash of the
+  whole, so such a call can be checked but not rebuilt byte for byte; a
+  secret is never stored, by design.
+- The trajectory route and the CLI pass `redactHub` to the projection, so
+  the `runner.context` content, stored as read, is redacted before its cut
+  as well as after.
 - box-agent has no exporter of its own (it has no network but the hub); its
   side of a call is in its logs, joined by the trace id. Box-side spans can
   later travel to the hub on the connection.

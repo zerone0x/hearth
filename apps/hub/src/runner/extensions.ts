@@ -28,7 +28,12 @@ export interface ExtensionSelection {
 }
 
 /** Names reserved for the runner's own extensions; an allowlist cannot shadow them. */
-export const RESERVED_EXTENSION_NAMES: ReadonlySet<string> = new Set(["hearth-tools", "codemode"]);
+export const RESERVED_EXTENSION_NAMES: ReadonlySet<string> = new Set([
+  "hearth-tools",
+  "codemode",
+  // The trajectory observer (decision 0021): runs last and must stay passive.
+  "hearth-trace",
+]);
 
 export function selectExtensions(
   available: readonly PinnedExtension[],

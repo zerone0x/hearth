@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { createDefaultSecretStore } from "@hearth/core";
+import { createDefaultSecretStore, type SecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
 import { hubLines } from "./obs/hub-log";
@@ -105,6 +105,22 @@ export function webRootFromEnv(
   return existsSync(join(fallback, "index.html")) ? fallback : undefined;
 }
 
+/**
+ * Register the secrets the hub resolves for its own use (the model key) with
+ * the sink-side redactor, before the first turn: the API, the logs and spans
+ * redact the key from the start, also in events an older build stored raw
+ * (decision 0021). A reference that does not resolve is a warning.
+ */
+export async function registerStartupSecrets(
+  secrets: SecretStore,
+  runnerConfig: Pick<RunnerConfig, "apiKeyRef"> | undefined,
+  log: { warn(message: string): void },
+): Promise<void> {
+  if (runnerConfig?.apiKeyRef !== undefined) {
+    await registerKnownSecrets(secrets, [runnerConfig.apiKeyRef], (m) => log.warn(m));
+  }
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -122,11 +138,7 @@ if (import.meta.main) {
   const obs = observabilityFromEnv(process.env);
   const log = obs.logger.child({}, "hub");
   const secrets = createDefaultSecretStore();
-  // Known before the first turn: the API, the logs and spans redact the model
-  // key from the start, also in events an older build stored raw (0021).
-  if (runnerConfig?.apiKeyRef !== undefined) {
-    await registerKnownSecrets(secrets, [runnerConfig.apiKeyRef], (m) => log.warn(m));
-  }
+  await registerStartupSecrets(secrets, runnerConfig, log);
   const hub = startHub({
     ...(runnerConfig === undefined
       ? {}
