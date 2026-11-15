@@ -6,7 +6,8 @@
  *   `session.events`, `session.configure`), then checks the session exists.
  * - The model key comes from the `SecretStore` and is applied in memory with
  *   `ModelRuntime.setRuntimeApiKey`: the `direct` model gateway of PRD §6.4.
- *   No auth file, no hub environment variable reaches pi.
+ *   No auth file, no hub environment variable reaches pi. The key is
+ *   redacted from everything the runners store or log.
  * - AGENTS.md: the hub keeps the last copy read from the box (`runner.context`
  *   in the event log) and refreshes it on the first box lease of each turn. It
  *   never starts a box just to read it.

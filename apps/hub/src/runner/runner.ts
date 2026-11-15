@@ -132,7 +132,11 @@ function orphanedToolCalls(branch: readonly unknown[]): Array<{ id: string; name
     if (message.role === "toolResult" && typeof message.toolCallId === "string") {
       answered.add(message.toolCallId);
     } else if (message.role === "assistant" && Array.isArray(message.content)) {
-      for (const part of message.content as Array<{ type?: string; id?: unknown; name?: unknown }>) {
+      for (const part of message.content as Array<{
+        type?: string;
+        id?: unknown;
+        name?: unknown;
+      }>) {
         if (part.type === "toolCall" && typeof part.id === "string") {
           calls.push({ id: part.id, name: typeof part.name === "string" ? part.name : "unknown" });
         }

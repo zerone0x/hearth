@@ -9,7 +9,9 @@ provider and need no model key.
 The key never goes to pi through the environment: the hub resolves
 `HEARTH_MODEL_KEY_REF` through its `SecretStore` (`env:NAME` reads `NAME`) and
 hands the value to pi in memory (`ModelRuntime.setRuntimeApiKey`). Without
-`HEARTH_MODEL` the runner is off and the message routes are not served.
+`HEARTH_MODEL` the runner is off and the message routes are not served. A
+provider error that echoes the key is stored and logged with the key replaced
+by `[redacted]`.
 
 ```sh
 bun install
@@ -48,6 +50,20 @@ curl -s -b jar $HUB/v1/sessions/$SID/runner
 | `HEARTH_MODEL_KEY_REF` | SecretStore reference of the provider key |
 | `runner.config.denyList` (`startHub`) | `[{tool, pattern?, reason?}]`: a call whose bash command or path matches never leaves the hub |
 | `runner.config.extensionAllowlist` | `[{name, version}]` of bundled extensions allowed to load; empty by default |
+
+### The deny-list is best-effort, not a boundary
+
+`tool` is a tool name or `*` for any tool. A rule without `pattern` blocks
+every call of its tool. A `pattern` is tested against the bash command, the
+path, or the input as JSON for other tools. A path is also tested in its
+normalized form, resolved against `/workspace` with `//`, `.` and `..`
+collapsed, so `/workspace/../etc/passwd`, `//etc/passwd` and
+`../../etc/passwd` all match `^/etc/`.
+
+A regex over a shell command cannot stop a determined model. These get past
+an `rm\s+-rf` rule and are known: `rm -fr`, `rm -r -f`, `X=rm; $X -rf`,
+`bash -c "r""m -rf"`, `base64 -d | sh`. Write content is not tested, only the
+path. The box is the boundary; approvals with a human in the loop are M3.
 
 ## Tests
 
