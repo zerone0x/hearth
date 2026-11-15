@@ -1381,7 +1381,7 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   packages wherever one fits (assistant-ui for chat, shadcn/ui primitives)
   instead of components built from scratch. The chat view, tool cards and
   pages in this change are hand-written; #77 replaces them with those
-  packages after this change merges.
+  packages after this change merges (done: 0019).
 - **`apps/web`: React 19 + Vite 8 + Tailwind 4**, dependencies pinned
   exactly. It has its own `tsconfig.json` (DOM lib, `jsx: react-jsx`,
   `vite/client` types); the root `typecheck` runs both projects, and the root
@@ -1461,3 +1461,76 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   guard (0010) refuses it before the asset handler runs, even for `GET /`. Typing the URL, a bookmark or a same-origin link
   (`Sec-Fetch-Site: none` or `same-origin`) works. This is left as it is:
   relaxing 0010 for navigations is a separate decision.
+
+## 0019: Web UI on maintained packages: assistant-ui chat, shadcn/ui primitives, TanStack Query
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #77 (follows 0017; design input `docs/research/chat-ui.md`, #67)
+
+### Context
+
+0017 shipped a hand-written UI (`chat.ts`, `components.tsx`) and recorded the
+owner rule: React + Tailwind only (no Lit), and maintained packages wherever
+one fits instead of components built from scratch. This entry replaces the
+hand-written parts. Everything else in 0017 (same origin, CSP, cursor-polled
+event log, view-only noVNC desktop, the e2e) stays.
+
+### Decision
+
+- **Chat: `@assistant-ui/react` 0.15.36 + `@assistant-ui/react-pi` 0.0.33.**
+  react-pi's browser entry has a pure reducer (`reducePiThreadState`) over
+  pi's AgentSession events and a projection (`projectPiThreadMessages`) into
+  assistant-ui messages. The runner records those same events as
+  `pi.<type>` with a monotonic `seq`, so `apps/web/src/hearthPi.ts` only
+  strips the prefix and keeps the seq. It adds what pi has no notion of:
+  `message.user` shows as a pending user message until pi's own user
+  `message_start` arrives (cleared by `agent_end` and `runner.failed`);
+  `runner.failed` and `runner.interrupted` become system messages placed
+  where they happened; the 64 KiB tool-output cap; Hearth's tool states
+  (done, error, outcome unknown, interrupted). The app owns the state and
+  hands it to `useExternalStoreRuntime`; no AI SDK, no pi runtime in the
+  browser, no `usePiRuntime` (its thread-list runtime adds ~220 kB and a
+  transport Hearth does not use). react-pi's optional peer
+  `@earendil-works/pi-coding-agent` is satisfied by the 1.5.2 pin.
+- **Tool cards: assistant-ui's tool-call UI.** `ToolFallback` (and its
+  collapsible) from assistant-ui's shadcn registry
+  (`https://r.assistant-ui.com/tool-fallback.json`), rendered for every tool
+  through `MessagePrimitive.Parts` and composed with Hearth's status badge and
+  the call's target (bash command, else path or pattern).
+- **Primitives: shadcn/ui** (Radix + Tailwind 4, new-york style, stone base
+  colour): button, input, textarea, label, badge, alert, card, added with
+  the shadcn CLI (`components.json`). shadcn ships source by design, so
+  `src/components/ui/` and `src/components/assistant-ui/` are registry
+  source kept as the CLI wrote it (biome skips both). Theme tokens are CSS
+  variables in `src/index.css`. No toast package: sonner injects a
+  `<style>` element, which `style-src 'self'` forbids; errors show as
+  `Alert`s.
+- **Data fetching: `@tanstack/react-query` 5.107.1** for auth status,
+  sessions, the session, and the event-log poll (`refetchInterval` 0.7 s
+  while a turn runs, 3 s otherwise; `readNewEvents` reads every page after
+  the cursor and folds it in). Mutations for setup, login, logout, create,
+  archive, send and interrupt. A 401 from any query or mutation sets the
+  auth query to signed-out, which shows the login form. 4xx is not retried.
+- **CSP unchanged.** All of the above pass 0017's policy: Radix sets CSS
+  variables through `style` props (CSSOM, allowed by `style-src 'self'`),
+  `tw-shimmer` (a dependency of the tool UI) is CSS only, and nothing injects
+  `<style>` or evaluates code. zod (an assistant-ui dependency) is put in
+  jitless mode before anything else loads (`src/zod-jitless.ts`), so its
+  `new Function` probe never runs. The e2e stays fail-closed on any
+  `securitypolicyviolation` and passed with none.
+- **Every new dependency pinned exactly**, as 0017 requires.
+- **Stable accessible names** (the compose exit e2e, #47, drives these with
+  `getByRole`/`getByLabel`; changing one is a breaking change). The list is
+  in `apps/web/README.md`.
+
+### Consequences
+
+- The JS bundle grows from 422.9 kB (130.0 kB gzip) to about 903 kB
+  (272 kB gzip), mostly assistant-ui and Radix. Splitting noVNC or the chat
+  into lazy chunks can come later.
+- assistant-ui is pre-1.0 and changes often; exact pins plus the e2e catch
+  breakage on upgrade. Registry source is updated by re-running the CLI.
+- Markdown in assistant messages (`@assistant-ui/react-markdown`) and M3
+  approvals (react-pi maps pi extension UI requests to tool approvals) are
+  available but not part of this change.
