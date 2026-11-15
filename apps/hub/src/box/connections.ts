@@ -86,6 +86,8 @@ export interface BoxConnectionsOptions {
   readonly log?: (line: string) => void;
   /** Observes every applied delivery before it is acked (logging, tests). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
+  /** Deadline of the `echo` RPC. Defaults to `ECHO_DEADLINE_MS`; tests shorten it. */
+  readonly echoDeadlineMs?: number;
 }
 
 interface PendingRpc {
@@ -151,6 +153,7 @@ export class BoxConnections {
   readonly #credentials: BoxCredentialStore;
   readonly #log: (line: string) => void;
   readonly #onApplied: ((applied: AppliedDelivery) => void) | undefined;
+  readonly #echoDeadlineMs: number;
   readonly #byBox = new Map<BoxId, BoxConnection>();
   readonly #all = new Set<BoxConnection>();
   readonly #waiters = new Map<BoxId, Set<() => void>>();
@@ -163,6 +166,7 @@ export class BoxConnections {
     this.#credentials = options.credentials;
     this.#log = options.log ?? ((line) => console.error(line));
     this.#onApplied = options.onApplied;
+    this.#echoDeadlineMs = options.echoDeadlineMs ?? ECHO_DEADLINE_MS;
   }
 
   /** True when `boxId` has a connection that finished its handshake. */
@@ -253,7 +257,7 @@ export class BoxConnections {
     if (conn?.binding !== undefined && conn.binding.workspaceId !== principal.workspaceId) {
       throw notConnected(boxId);
     }
-    return await this.rpc(boxId, "echo", params, ECHO_DEADLINE_MS);
+    return await this.rpc(boxId, "echo", params, this.#echoDeadlineMs);
   }
 
   /** Send an `rpc` to a connected box and wait for its `rpc.result`, up to `deadlineMs`. */

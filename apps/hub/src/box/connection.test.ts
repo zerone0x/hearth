@@ -44,7 +44,12 @@ function tempDb(): string {
 
 function hub(
   dbPath: string,
-  options: { port?: number; onApplied?: (a: AppliedDelivery) => void } = {},
+  options: {
+    port?: number;
+    onApplied?: (a: AppliedDelivery) => void;
+    echoDeadlineMs?: number;
+    log?: (line: string) => void;
+  } = {},
 ) {
   const started = startHub({ dbPath, port: options.port ?? 0, log: () => {}, ...options });
   hubs.push(started);
@@ -353,3 +358,253 @@ describe("at-least-once across a hub restart", () => {
 function range(n: number): number[] {
   return Array.from({ length: n }, (_, i) => i + 1);
 }
+
+// -- a raw box: a plain WebSocket that speaks the protocol by hand -----------
+
+/** How long a raw socket waits for the hub to close it. */
+const CLOSE_WAIT_MS = 3_000;
+
+interface RawFrame {
+  readonly type?: unknown;
+  readonly [key: string]: unknown;
+}
+
+interface RawBox {
+  readonly ws: WebSocket;
+  readonly frames: RawFrame[];
+  send(frame: RawFrame): void;
+  /** The close code, or `"still open"` when the hub did not close within `CLOSE_WAIT_MS`. */
+  closed(): Promise<number | "still open">;
+  /** Resolves with the first received frame that matches. */
+  frame(match: (f: RawFrame) => boolean): Promise<RawFrame>;
+}
+
+async function rawSocket(h: Hub): Promise<RawBox> {
+  const ws = new WebSocket(h.boxSocketUrl);
+  const frames: RawFrame[] = [];
+  const listeners = new Set<() => void>();
+  let closeCode: number | undefined;
+  ws.addEventListener("message", (e) => {
+    if (typeof e.data === "string") frames.push(JSON.parse(e.data));
+    for (const wake of [...listeners]) wake();
+  });
+  ws.addEventListener("close", (e) => {
+    closeCode = e.code;
+    for (const wake of [...listeners]) wake();
+  });
+  await new Promise((resolve) => ws.addEventListener("open", resolve));
+  const until = <T>(get: () => T | undefined, ms: number, onTimeout: () => T): Promise<T> =>
+    new Promise((resolve, reject) => {
+      const check = () => {
+        const value = get();
+        if (value === undefined) return;
+        listeners.delete(check);
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        listeners.delete(check);
+        try {
+          resolve(onTimeout());
+        } catch (error) {
+          reject(error);
+        }
+      }, ms);
+      listeners.add(check);
+      check();
+    });
+  return {
+    ws,
+    frames,
+    send: (frame) => ws.send(JSON.stringify(frame)),
+    closed: () =>
+      until<number | "still open">(
+        () => closeCode,
+        CLOSE_WAIT_MS,
+        () => "still open",
+      ),
+    frame: (match) =>
+      until(
+        () => frames.find(match),
+        STEP_MS,
+        () => {
+          throw new Error(`no matching frame; got ${JSON.stringify(frames)}`);
+        },
+      ),
+  };
+}
+
+function hello(boxId: string, credential: string, bootId = "boot_raw"): RawFrame {
+  return {
+    type: "hello",
+    version: { major: 1, minor: 0 },
+    boxId,
+    bootId,
+    credential,
+    state: { sessionId: null, turnId: null, lastDeliveryId: 0 },
+  };
+}
+
+/** A raw box that sent `hello` and got `welcome`. */
+async function rawJoin(h: Hub, boxId: string, credential: string, bootId = "boot_raw") {
+  const box = await rawSocket(h);
+  box.send(hello(boxId, credential, bootId));
+  const answer = await box.frame((f) => f.type === "welcome" || f.type === "reject");
+  expect(answer.type).toBe("welcome");
+  return { box, credential: (answer["credential"] as string | undefined) ?? credential };
+}
+
+function turnEvent(sessionId: string, deliveryId: number, bootId = "boot_raw"): RawFrame {
+  return {
+    type: "turn.event",
+    bootId,
+    deliveryId,
+    sessionId,
+    turnId: "turn_1",
+    seq: deliveryId,
+    event: { kind: "text", text: `event ${deliveryId}` },
+  };
+}
+
+const isAck = (f: RawFrame) => f.type === "delivery.ack";
+const ackedIds = (box: RawBox) => box.frames.filter(isAck).map((f) => f["deliveryId"]);
+
+async function stored(h: Hub, sessionId: string): Promise<number> {
+  return (await h.events.read({ workspaceId: "ws_default" }, sessionId, 0, 100)).events.length;
+}
+
+describe("applying box frames", () => {
+  test("every applied frame is authorized as event.append, and audited", async () => {
+    const dbPath = tempDb();
+    const h = hub(dbPath);
+    const { token } = await h.issueJoinToken("box_audit", "ses_audit");
+    const { box } = await rawJoin(h, "box_audit", token);
+    box.send(turnEvent("ses_audit", 1));
+    box.send(turnEvent("ses_audit", 2));
+    await box.frame((f) => isAck(f) && f["deliveryId"] === 2);
+    expect(ackedIds(box)).toEqual([1, 2]);
+    expect(auditActions(dbPath)).toEqual(["box.connect", "event.append", "event.append"]);
+    expect(await stored(h, "ses_audit")).toBe(2);
+  });
+
+  test("a frame for another session is not acked or stored, and the socket closes 4003", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_bound", "ses_bound");
+    const { box } = await rawJoin(h, "box_bound", token);
+    box.send(turnEvent("ses_someone_else", 1));
+    expect(await box.closed()).toBe(4003);
+    expect(ackedIds(box)).toEqual([]);
+    expect(await stored(h, "ses_someone_else")).toBe(0);
+    expect(await stored(h, "ses_bound")).toBe(0);
+  });
+
+  test("a frame stamped with another boot id is not acked or stored, and the socket closes 4003", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_boot", "ses_boot");
+    const { box } = await rawJoin(h, "box_boot", token, "boot_current");
+    box.send(turnEvent("ses_boot", 1, "boot_stale"));
+    expect(await box.closed()).toBe(4003);
+    expect(ackedIds(box)).toEqual([]);
+    expect(await stored(h, "ses_boot")).toBe(0);
+  });
+
+  test("a second socket for the same box closes the first with 4002", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_twice", "ses_twice");
+    const first = await rawJoin(h, "box_twice", token);
+    const second = await rawJoin(h, "box_twice", first.credential);
+    expect(await first.box.closed()).toBe(4002);
+    expect(h.boxes.isConnected("box_twice")).toBe(true);
+    // The new socket is the live one: its frames are applied and acked.
+    second.box.send(turnEvent("ses_twice", 1));
+    await second.box.frame(isAck);
+  });
+
+  test("junk and oversized frames after the handshake are dropped and logged, not acked", async () => {
+    const lines: string[] = [];
+    const h = hub(tempDb(), { log: (l) => lines.push(l) });
+    const { token } = await h.issueJoinToken("box_junk", "ses_junk");
+    const { box } = await rawJoin(h, "box_junk", token);
+    box.ws.send(new Uint8Array([0xff, 0x00, 0x13, 0x37]));
+    // Oversized: a turn id far past MAX_ID_LENGTH.
+    box.send({ ...turnEvent("ses_junk", 1), turnId: "t".repeat(10_000) });
+    box.send(turnEvent("ses_junk", 2));
+    await box.frame(isAck);
+    expect(ackedIds(box)).toEqual([2]);
+    expect(lines.filter((l) => l.includes("dropped an undecodable frame"))).toHaveLength(2);
+    expect(await stored(h, "ses_junk")).toBe(1);
+  });
+});
+
+describe("hostile handshakes", () => {
+  async function refused(h: Hub, first: RawFrame | Uint8Array): Promise<RawFrame[]> {
+    const box = await rawSocket(h);
+    if (first instanceof Uint8Array) box.ws.send(first);
+    else box.send(first);
+    expect(await box.closed()).toBe(4001);
+    return box.frames;
+  }
+
+  test("an expired join token is rejected with bad-credential", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_late", "ses_late", 1);
+    await Bun.sleep(20);
+    const frames = await refused(h, hello("box_late", token));
+    expect(frames[0]).toMatchObject({ type: "reject", reason: "bad-credential" });
+    expect(h.boxes.isConnected("box_late")).toBe(false);
+  });
+
+  test("box A's join token presented by box B is rejected", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_a", "ses_a");
+    const frames = await refused(h, hello("box_b", token));
+    expect(frames[0]).toMatchObject({ type: "reject", reason: "bad-credential" });
+    expect(h.boxes.isConnected("box_a")).toBe(false);
+    expect(h.boxes.isConnected("box_b")).toBe(false);
+  });
+
+  test("a reliable frame before hello is refused and not stored", async () => {
+    const h = hub(tempDb());
+    await h.issueJoinToken("box_eager", "ses_eager");
+    const frames = await refused(h, turnEvent("ses_eager", 1));
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ type: "reject", reason: "malformed-hello" });
+    expect(await stored(h, "ses_eager")).toBe(0);
+  });
+
+  test("binary junk instead of hello is refused", async () => {
+    const h = hub(tempDb());
+    const frames = await refused(h, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+    expect(frames[0]).toMatchObject({ type: "reject" });
+  });
+
+  test("an oversized hello is refused", async () => {
+    const h = hub(tempDb());
+    const { token } = await h.issueJoinToken("box_big", "ses_big");
+    const frames = await refused(h, hello("box_big", token + "x".repeat(10_000)));
+    expect(frames[0]).toMatchObject({ type: "reject", reason: "malformed-hello" });
+    expect(h.boxes.isConnected("box_big")).toBe(false);
+  });
+});
+
+describe("echo deadline", () => {
+  test("a box that never answers gets 504 rpc.deadline once the deadline passes", async () => {
+    const DEADLINE_MS = 300;
+    const h = hub(tempDb(), { echoDeadlineMs: DEADLINE_MS });
+    const { token } = await h.issueJoinToken("box_mute", "ses_mute");
+    const { box } = await rawJoin(h, "box_mute", token);
+    const started = performance.now();
+    const res = await fetch(new URL("/v1/boxes/box_mute/echo", h.url), {
+      method: "POST",
+      body: JSON.stringify("anyone there?"),
+      signal: AbortSignal.timeout(DEADLINE_MS + 2_000),
+    });
+    const elapsed = performance.now() - started;
+    expect(res.status).toBe(504);
+    expect(await res.json()).toMatchObject({ ok: false, error: { code: "rpc.deadline" } });
+    expect(elapsed).toBeGreaterThanOrEqual(DEADLINE_MS - 5);
+    expect(elapsed).toBeLessThan(DEADLINE_MS + 1_500);
+    // The box got the rpc; it just never answered.
+    expect(box.frames.some((f) => f.type === "rpc" && f["method"] === "echo")).toBe(true);
+  });
+});

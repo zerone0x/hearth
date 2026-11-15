@@ -26,11 +26,16 @@ POST /v1/boxes/box_demo/echo -> 200 {"ok":true,"result":{"message":"hello from t
 
 ```sh
 HEARTH_DATA_DIR=/tmp/hearth-data bun run --filter @hearth/hub start
-# in another shell, once a box is connected:
+# in another shell:
 curl -s -X POST http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
 ```
 
-A box that is not connected answers `409` with `box.not-connected`.
+Today this can only answer `409` with `box.not-connected`. A standalone hub
+has no way yet to get a box connected to it: it listens on loopback only, so a
+box on its own bridge network cannot reach it, and nothing in `main.ts` starts
+or watches boxes. Those are follow-ups: #27 (a listener boxes can reach) and
+#28 (box supervision). Until they land, the echo round trip runs in the two
+setups below, where the test starts the box itself.
 
 ### With Docker and the real box image
 
@@ -54,4 +59,9 @@ bun test apps/hub/src/box/connection.test.ts
 
 Join, echo, a reused join token rejected with `bad-credential`, another
 protocol major rejected with `version-mismatch`, and a hub killed mid-stream and
-restarted with no lost and no duplicated events.
+restarted with no lost and no duplicated events. Raw-socket tests cover the
+hub's own checks: `event.append` is authorized and audited per frame, a frame
+for another session or boot is not acked and closes the socket with 4003, a
+second socket for a box closes the first with 4002, an unanswered echo returns
+`504` `rpc.deadline`, and hostile handshakes (expired token, another box's
+token, a frame before `hello`, binary junk, oversized fields) are refused.

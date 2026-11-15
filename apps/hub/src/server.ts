@@ -29,6 +29,8 @@ export interface HubOptions extends HubListenOptions {
   readonly log?: (line: string) => void;
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
+  /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
+  readonly echoDeadlineMs?: number;
 }
 
 export const DEFAULT_HOSTNAME = "127.0.0.1";
@@ -61,6 +63,7 @@ export function startHub(options: HubOptions) {
     credentials,
     ...(options.log === undefined ? {} : { log: options.log }),
     ...(options.onApplied === undefined ? {} : { onApplied: options.onApplied }),
+    ...(options.echoDeadlineMs === undefined ? {} : { echoDeadlineMs: options.echoDeadlineMs }),
   });
   const app = createApp({ boxes });
 

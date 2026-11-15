@@ -147,11 +147,11 @@ export class BoxAgent {
     try {
       socket = new WebSocket(this.#options.hubUrl);
     } catch (error) {
-      this.#log(`box-agent: cannot dial ${this.#options.hubUrl}: ${String(error)}`);
-      this.#retry();
+      this.#retry(`cannot dial: ${String(error)}`);
       return;
     }
     this.#socket = socket;
+    let lastError: string | undefined;
     socket.binaryType = "arraybuffer";
     socket.addEventListener("open", () => {
       if (this.#socket !== socket) return;
@@ -177,19 +177,33 @@ export class BoxAgent {
       if (this.#socket !== socket) return;
       this.#onMessage(event.data as string | ArrayBuffer);
     });
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", (event) => {
       if (this.#socket !== socket) return;
       this.#socket = undefined;
       clearTimeout(this.#timer);
       if (this.#phase === "ended") return;
-      this.#retry();
+      const lost = this.#phase === "open";
+      const how = lost
+        ? "connection lost"
+        : this.#phase === "handshake"
+          ? "closed before welcome"
+          : "could not connect";
+      const detail = [`code ${event.code}`, event.reason, lastError].filter(Boolean).join(", ");
+      this.#retry(`${how} (${detail})`, lost);
     });
-    socket.addEventListener("error", () => {
-      // A `close` event follows; the retry happens there.
+    socket.addEventListener("error", (event) => {
+      // A `close` event follows; the retry, and its log line, happen there.
+      lastError = (event as ErrorEvent).message || undefined;
     });
   }
 
-  #retry(): void {
+  /**
+   * Schedule the next dial. Every failed attempt is logged with its number,
+   * the delay before the next one and why it failed, so an unreachable hub is
+   * never retried silently (PRD §8.1 principle 1). The delay is capped at
+   * `RECONNECT_MAX_MS`, which bounds the log to a few lines a minute.
+   */
+  #retry(reason: string, lost = false): void {
     if (this.#phase === "ended") return;
     this.#phase = "waiting";
     const delay = reconnectDelay(
@@ -199,6 +213,11 @@ export class BoxAgent {
       this.#options.reconnectMaxMs,
     );
     this.#attempt += 1;
+    this.#log(
+      lost
+        ? `box-agent: ${reason} to ${this.#options.hubUrl}; reconnecting in ${delay} ms`
+        : `box-agent: dial attempt ${this.#attempt} to ${this.#options.hubUrl} failed: ${reason}; next attempt in ${delay} ms`,
+    );
     this.#timer = setTimeout(() => this.#dial(), delay);
   }
 
