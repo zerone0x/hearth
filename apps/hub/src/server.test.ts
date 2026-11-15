@@ -546,7 +546,8 @@ describe("box egress gate (decision 0012)", () => {
     const markerDir = mkdtempSync(join(tmpdir(), "hearth-marker-"));
     try {
       const marker = join(markerDir, "box-egress.applied");
-      const hub = start(markerEgressCheck(marker), calls);
+      // The test user stands in for root as the marker's owner (decision 0023).
+      const hub = start(markerEgressCheck(marker, { owner: process.getuid?.() ?? 0 }), calls);
       await expect(hub.startBox(LOCAL_PRINCIPAL, spec)).rejects.toMatchObject({
         code: "box.egress-unfiltered",
       });
