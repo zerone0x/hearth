@@ -105,7 +105,7 @@ describe("marker trust", () => {
   });
 
   test("the directories are checked on the real path, so /var/run -> /run works", () => {
-    const marker = writeMarker();
+    writeMarker();
     symlinkSync(join(dir, "run"), join(dir, "var-run"));
     expect(untrustedMarker(join(dir, "var-run", "box-egress.applied"), me)).toBeUndefined();
     chmodSync(join(dir, "run"), 0o777);
