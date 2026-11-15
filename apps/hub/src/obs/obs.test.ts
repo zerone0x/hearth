@@ -781,6 +781,15 @@ describe("model calls carry their request and output (schema /2)", () => {
       reasoning: { type: "enabled", budget_tokens: 1024 },
       system_prompt: { bytes: 3 },
     });
+    // Two contexts before one call (a context rebuilt before it was sent): the last one counts.
+    t.onEvent({ type: "turn_start" } as never);
+    t.onRequest({ provider: "x", model: "m", systemPrompt: "sys", tools: [], messageCount: 3 });
+    t.onRequest({ provider: "x", model: "m2", systemPrompt: "sys", tools: [], messageCount: 5 });
+    const rebuilt = t.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "stop", usage: USAGE },
+    } as never);
+    expect(rebuilt?.payload["request"]).toMatchObject({ model: "m2", message_count: 5 });
     // A call pi made without a fresh context (none today) gets no stale request.
     t.onEvent({ type: "turn_start" } as never);
     const next = t.onEvent({
