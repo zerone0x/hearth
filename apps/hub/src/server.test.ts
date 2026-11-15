@@ -2,10 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JsonValue } from "@hearth/core";
+import { type JsonValue, LOCAL_PRINCIPAL } from "@hearth/core";
 import { type AppOptions, createApp } from "./app";
 import { BOX_SOCKET_PATH, type BoxConnections } from "./box/connections";
-import { parsePort, parsePublicOrigin, startHub } from "./server";
+import { BOX_ENV, type BoxNetworkProvider, parsePort, parsePublicOrigin, startHub } from "./server";
 
 describe("GET /healthz", () => {
   test("returns 200 from the app", async () => {
@@ -271,7 +271,7 @@ describe("startHub", () => {
     expect(res.status).toBe(409);
   });
 
-  test("/healthz and the box socket path ignore Host and Origin", async () => {
+  test("/healthz ignores Host and Origin", async () => {
     const hub = start();
     const foreign = { host: "attacker.example", origin: "https://evil.example" };
     const health = await fetch(new URL("/healthz", hub.url), {
@@ -279,12 +279,113 @@ describe("startHub", () => {
       signal: AbortSignal.timeout(5_000),
     });
     expect(health.status).toBe(200);
-    // A plain GET on the socket path still reaches the upgrade handler (426), not the guard.
+  });
+
+  test("the public listener does not serve the box socket", async () => {
+    const hub = start();
+    // Through the guard to the app's 404: never the upgrade handler (426).
     const socket = await fetch(new URL(BOX_SOCKET_PATH, hub.url), {
-      headers: foreign,
       signal: AbortSignal.timeout(5_000),
     });
+    expect(socket.status).toBe(404);
+    const opened = await new Promise<string>((resolve) => {
+      const ws = new WebSocket(new URL(BOX_SOCKET_PATH, hub.url.href.replace("http", "ws")));
+      ws.onopen = () => {
+        ws.close();
+        resolve("open");
+      };
+      ws.onerror = () => resolve("refused");
+    });
+    expect(opened).toBe("refused");
+  });
+
+  test("a box listener serves the box socket and nothing else, whatever Host and Origin", async () => {
+    const hub = start();
+    const url = new URL(hub.listenForBoxes("127.0.0.1").replace("ws", "http"));
+    expect(url.port).not.toBe(hub.url.port);
+    expect(hub.listenForBoxes("127.0.0.1")).toBe(url.href.replace("http", "ws"));
+    const foreign = { host: "attacker.example", origin: "https://evil.example" };
+    const socket = await fetch(url, { headers: foreign, signal: AbortSignal.timeout(5_000) });
     expect(socket.status).toBe(426);
+    for (const path of ["/healthz", "/v1/boxes/box_none/echo"]) {
+      const res = await fetch(new URL(path, url), {
+        method: path === "/healthz" ? "GET" : "POST",
+        headers: { "content-type": "application/json" },
+        ...(path === "/healthz" ? {} : { body: "{}" }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(res.status).toBe(404);
+    }
+  });
+
+  test("box listeners never bind every interface", () => {
+    const hub = start();
+    for (const any of ["0.0.0.0", "::", "[::]", ""]) {
+      expect(() => hub.listenForBoxes(any)).toThrow("box-network address");
+    }
+    expect(hub.boxListeners.size).toBe(0);
+  });
+
+  test("by default the hub has no box listener and the public listener is loopback", () => {
+    const hub = start();
+    expect(hub.server.hostname).toBe("127.0.0.1");
+    expect(hub.boxListeners.size).toBe(0);
+  });
+
+  test("startBox creates the box, listens on its hub address, then boots it with that URL", async () => {
+    const calls: string[] = [];
+    let bootEnv: Readonly<Record<string, string>> = {};
+    const info = {
+      boxId: "bx",
+      workspaceId: "ws_default",
+      sessionId: "se",
+      state: "running" as const,
+      image: "img",
+      volumeRef: "v",
+      labels: {},
+      createdAt: 0,
+    };
+    const provider: BoxNetworkProvider = {
+      name: "stub",
+      create: async () => {
+        calls.push("create");
+        return info;
+      },
+      hubAddress: async (boxId) => {
+        calls.push(`hubAddress ${boxId}`);
+        return "127.0.0.1";
+      },
+      start: async (_spec, boot) => {
+        calls.push("start");
+        bootEnv = boot.env;
+        return info;
+      },
+      stop: async () => "stopped",
+      destroy: async () => "destroyed",
+      snapshot: async () => ({ kind: "not-supported" }),
+      attach: async () => info,
+      adopt: async () => [info],
+    };
+    dir = mkdtempSync(join(tmpdir(), "hearth-server-"));
+    server = startHub({ port: 0, boxPort: 0, provider, dbPath: join(dir, "hub.db") });
+    const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
+    await server.startBox(LOCAL_PRINCIPAL, spec);
+    expect(calls).toEqual(["create", "hubAddress bx", "start"]);
+    const listener = server.boxListeners.get("127.0.0.1");
+    expect(listener).toBeDefined();
+    expect(bootEnv[BOX_ENV.hubUrl]).toBe(`ws://127.0.0.1:${listener?.port}${BOX_SOCKET_PATH}`);
+    expect(bootEnv[BOX_ENV.joinToken]).toMatch(/^hjt_/);
+    expect(await server.listenForRunningBoxes()).toEqual(["bx"]);
+    expect(server.boxListeners.size).toBe(1);
+  });
+
+  test("startBox without a provider fails as the hub's", async () => {
+    const hub = start();
+    const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
+    await expect(hub.startBox(LOCAL_PRINCIPAL, spec)).rejects.toMatchObject({
+      code: "box.no-provider",
+      owner: "hub",
+    });
   });
 });
 

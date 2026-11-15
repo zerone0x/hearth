@@ -1,12 +1,13 @@
 import {
   AllowAllAuthorizer,
+  type BoxId,
   type BoxProvider,
   type BoxSpec,
   DEFAULT_WORKSPACE_ID,
   HearthError,
   type Principal,
 } from "@hearth/core";
-import { createApp, LOOPBACK_HOSTS } from "./app";
+import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -29,7 +30,27 @@ export interface HubListenOptions {
   readonly publicOrigin?: string;
 }
 
+/**
+ * A `BoxProvider` that also knows where its boxes can reach the hub: the
+ * address on the box's own network that the hub binds its box listener to
+ * (docs/DECISIONS.md, 0012). `DockerBoxProvider` answers with the gateway of
+ * the box's bridge network.
+ */
+export interface BoxNetworkProvider extends BoxProvider {
+  /** The IP address on `boxId`'s network where the hub listens for that box. Needs `create` first. */
+  hubAddress(boxId: BoxId): Promise<string>;
+}
+
 export interface HubOptions extends HubListenOptions {
+  /**
+   * TCP port of the box listeners (`HEARTH_BOX_PORT`). Every box listener binds
+   * one box-network address on this port; the host firewall lets boxes reach
+   * the host on this port only (docs/DECISIONS.md, 0012). 0 picks a free port
+   * per listener (tests only).
+   */
+  readonly boxPort?: number;
+  /** Starts boxes for `startBox`. Without one, `startBox` fails with `box.no-provider`. */
+  readonly provider?: BoxNetworkProvider;
   /** Path of the hub's SQLite database. Created and migrated on start. */
   readonly dbPath: string;
   readonly log?: (line: string) => void;
@@ -41,6 +62,11 @@ export interface HubOptions extends HubListenOptions {
 
 export const DEFAULT_HOSTNAME = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
+/** Port of the box listeners, one per box-network address (docs/DECISIONS.md, 0012). */
+export const DEFAULT_BOX_PORT = 8788;
+
+/** Addresses that bind every interface; never used for a box listener. */
+const UNSPECIFIED_HOSTS = new Set(["0.0.0.0", "[::]", "[0:0:0:0:0:0:0:0]", ""]);
 
 /** Environment variables `launchBox` passes to the box-agent for one boot. */
 export const BOX_ENV = {
@@ -80,31 +106,14 @@ export function startHub(options: HubOptions) {
     },
   );
 
-  let server: Bun.Server<BoxConnection | undefined>;
+  // The public listener: the UI/API only, on loopback by default (PRD §10).
+  // It never upgrades to the box socket; that path is a 404 here.
+  let server: Bun.Server<undefined>;
   try {
-    server = Bun.serve<BoxConnection | undefined>({
+    server = Bun.serve({
       hostname,
       port: options.port ?? DEFAULT_PORT,
-      fetch(req, srv) {
-        if (new URL(req.url).pathname === BOX_SOCKET_PATH) {
-          // The upgrade carries no credential: the box authenticates in its
-          // first frame, `hello`, and `authorize` runs before anything else.
-          if (srv.upgrade(req, { data: undefined })) return undefined;
-          return new Response("expected a WebSocket upgrade", { status: 426 });
-        }
-        return app.fetch(req);
-      },
-      websocket: {
-        open(ws) {
-          ws.data = boxes.open(ws);
-        },
-        message(ws, message) {
-          if (ws.data !== undefined) boxes.message(ws.data, message);
-        },
-        close(ws) {
-          if (ws.data !== undefined) boxes.closed(ws.data);
-        },
-      },
+      fetch: (req) => app.fetch(req),
     });
   } catch (cause) {
     db.close();
@@ -112,12 +121,105 @@ export function startHub(options: HubOptions) {
   }
 
   let stopped: Promise<void> | undefined;
+
+  // Box listeners: the box socket only, one per box-network address
+  // (docs/DECISIONS.md, 0012). Nothing else is served on them, so the API and
+  // its Host/Origin checks (0010) stay on the public listener.
+  const boxPort = options.boxPort ?? DEFAULT_BOX_PORT;
+  const boxListeners = new Map<string, Bun.Server<BoxConnection | undefined>>();
+  const websocket: Bun.WebSocketHandler<BoxConnection | undefined> = {
+    open(ws) {
+      ws.data = boxes.open(ws);
+    },
+    message(ws, message) {
+      if (ws.data !== undefined) boxes.message(ws.data, message);
+    },
+    close(ws) {
+      if (ws.data !== undefined) boxes.closed(ws.data);
+    },
+  };
+  function listenForBoxes(address: string): string {
+    if (stopped !== undefined) throw new Error("the hub is stopped");
+    const key = hostKey(address);
+    if (UNSPECIFIED_HOSTS.has(key)) {
+      throw new Error(`a box listener binds one box-network address, not "${address}"`);
+    }
+    let listener = boxListeners.get(key);
+    if (listener === undefined) {
+      listener = Bun.serve<BoxConnection | undefined>({
+        hostname: address,
+        port: boxPort,
+        fetch(req, srv) {
+          if (new URL(req.url).pathname !== BOX_SOCKET_PATH) {
+            return new Response("not found", { status: 404 });
+          }
+          // The upgrade carries no credential: the box authenticates in its
+          // first frame, `hello`, and `authorize` runs before anything else.
+          if (srv.upgrade(req, { data: undefined })) return undefined;
+          return new Response("expected a WebSocket upgrade", { status: 426 });
+        },
+        websocket,
+      });
+      boxListeners.set(key, listener);
+      options.log?.(`box listener on ${listener.url}`);
+    }
+    return boxSocketUrl(listener.url);
+  }
+
+  async function authorizeStart(principal: Principal, spec: BoxSpec): Promise<void> {
+    const decision = await authorizer.authorize(principal, "box.start", {
+      workspaceId: spec.workspaceId,
+      type: "box",
+      id: spec.boxId,
+    });
+    if (!decision.allowed) {
+      throw new HearthError(`box.start denied: ${decision.reason}`, {
+        owner: "user",
+        disposition: "give-up",
+        code: "authz.denied",
+      });
+    }
+  }
+
+  async function bootBox(provider: BoxProvider, spec: BoxSpec, hubUrl: string) {
+    const { token } = await credentials.issueJoinToken(
+      { workspaceId: spec.workspaceId },
+      spec.boxId,
+      spec.sessionId,
+    );
+    return await provider.start(spec, {
+      env: {
+        [BOX_ENV.hubUrl]: hubUrl,
+        [BOX_ENV.boxId]: spec.boxId,
+        [BOX_ENV.joinToken]: token,
+      },
+    });
+  }
+
+  function requireProvider(): BoxNetworkProvider {
+    if (options.provider === undefined) {
+      throw new HearthError("no box provider is configured", {
+        owner: "hub",
+        disposition: "give-up",
+        code: "box.no-provider",
+      });
+    }
+    return options.provider;
+  }
+
   const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
+    /** The public listener: UI/API only. */
     server,
     url: server.url,
-    /** The URL a box on this host dials. */
-    boxSocketUrl: boxSocketUrl(server.url),
+    /** The box listeners, by bound address. */
+    boxListeners: boxListeners as ReadonlyMap<string, Bun.Server<BoxConnection | undefined>>,
+    /**
+     * Open (or reuse) a box listener on `address` and return the box socket URL
+     * a box on that network dials. Refuses unspecified addresses (`0.0.0.0`,
+     * `::`): box listeners are reachable only from box networks (0012).
+     */
+    listenForBoxes,
     authorizer,
     events,
     credentials,
@@ -132,37 +234,43 @@ export function startHub(options: HubOptions) {
      * the box sees it (for a container, not the hub's own loopback address).
      */
     async launchBox(principal: Principal, provider: BoxProvider, spec: BoxSpec, hubUrl: string) {
-      const decision = await authorizer.authorize(principal, "box.start", {
-        workspaceId: spec.workspaceId,
-        type: "box",
-        id: spec.boxId,
-      });
-      if (!decision.allowed) {
-        throw new HearthError(`box.start denied: ${decision.reason}`, {
-          owner: "user",
-          disposition: "give-up",
-          code: "authz.denied",
-        });
+      await authorizeStart(principal, spec);
+      return await bootBox(provider, spec, hubUrl);
+    },
+    /**
+     * Start a box through the configured provider (decision 0012): `authorize`,
+     * create the box's network and volumes, open a box listener on the hub's
+     * address on that network, then boot the box with a fresh join token and
+     * that listener's URL.
+     */
+    async startBox(principal: Principal, spec: BoxSpec) {
+      const provider = requireProvider();
+      await authorizeStart(principal, spec);
+      await provider.create(spec);
+      const hubUrl = listenForBoxes(await provider.hubAddress(spec.boxId));
+      return await bootBox(provider, spec, hubUrl);
+    },
+    /**
+     * After a hub restart: open the box listeners of the boxes the provider
+     * still runs, so they can reconnect. Returns their ids.
+     */
+    async listenForRunningBoxes(): Promise<string[]> {
+      const provider = requireProvider();
+      const ids: string[] = [];
+      for (const box of await provider.adopt()) {
+        if (box.state !== "running") continue;
+        listenForBoxes(await provider.hubAddress(box.boxId));
+        ids.push(box.boxId);
       }
-      const { token } = await credentials.issueJoinToken(
-        { workspaceId: spec.workspaceId },
-        spec.boxId,
-        spec.sessionId,
-      );
-      return await provider.start(spec, {
-        env: {
-          [BOX_ENV.hubUrl]: hubUrl,
-          [BOX_ENV.boxId]: spec.boxId,
-          [BOX_ENV.joinToken]: token,
-        },
-      });
+      return ids;
     },
     /** Close every box connection, stop listening and close the database. Idempotent. */
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
       boxes.shutdown();
       stopped = (async () => {
-        await server.stop(true);
+        await Promise.all([server, ...boxListeners.values()].map((srv) => srv.stop(true)));
+        boxListeners.clear();
         db.close();
       })();
       return stopped;
