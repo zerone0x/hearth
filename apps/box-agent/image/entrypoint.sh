@@ -83,7 +83,7 @@ chromium_flags=(
   --remote-debugging-port="${cdp_port}"
   --user-data-dir="${chromium_profile}"
   --start-maximized
-  --window-position=0,0
+  "--window-position=0,0"
   --window-size="${window_size}"
   --no-first-run
   --no-default-browser-check
