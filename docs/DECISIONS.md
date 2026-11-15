@@ -102,3 +102,61 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
   test sample; the test file's mapped sample type fails to compile until the
   sample exists.
 - Moving to a schema library later would need a new decision entry.
+
+## 0003: Extension-point contracts in packages/core
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #3
+
+### Decision
+
+- **One module per extension point** in `packages/core/src` (`tenancy`, `identity`,
+  `authorize`, `box`, `events`, `secrets`, `gateway`, `channel`, `audit`), all
+  re-exported from `@hearth/core`. Ids are plain string aliases (no branding),
+  so they cross SQLite, the wire protocol and logs without conversion.
+- **Failure classification is a type in core.** `HearthError` carries an `owner`
+  (`box`, `model-provider`, `gateway`, `hub`, `user`), a `disposition`
+  (`retry`, `retry-cold`, `give-up`) and a stable `code` (PRD §8.1 principle 2).
+  Implementations of every extension point reject with it.
+- **Every store call takes a `WorkspaceScope`** as its first argument (E1). v1
+  has one fixed workspace, `ws_default`, and one local principal, `pr_local`.
+- **`authorize` fails closed on audit.** `AllowAllAuthorizer` allows anything
+  inside the principal's own workspace and writes every decision to the
+  `AuditSink` before returning it. If the audit write fails, the answer is a
+  denial (`audit unavailable`), never an allow (PRD §10). A resource in another
+  workspace is denied by every implementation.
+- **`withAudit(sink, record, action)` lives in core**, since it only needs the
+  `AuditSink` interface. The hub's SQLite sink (#4) plugs into it.
+- **`EventStore`**: `append(scope, sessionId, event)` returns `{ seq, duplicate }`
+  and is idempotent on `(bootId, deliveryId)` for box-originated events;
+  `read(scope, sessionId, afterSeq, limit)` returns a page with a `cursor` and
+  `hasMore`; `seq` starts at 1, and `0` means "from the start".
+- **`BoxProvider` verbs.** `create` provisions durable parts only (volume,
+  network). `start(spec, boot)` builds a fresh runtime from the spec, since the
+  container is disposable, and passes the per-boot environment (hub URL, one-time
+  join token). `stop` is hibernate: remove the runtime, keep the volume.
+  `destroy` removes everything. `attach(boxId)` re-attaches to one box by
+  inspecting it (the box dials the hub, so attach opens no channel); `adopt()`
+  lists every managed box at hub startup. `stop`, `destroy` and `snapshot` return
+  explicit outcomes (`not-found`, `already-stopped`, `not-supported`) instead of
+  throwing (PRD §8.1 principle 6). Failures are `box`- or `hub`-owned.
+- **Secrets.** References are `scheme:body`; v1 resolvers are `env:NAME` (from an
+  injected environment, default `process.env`) and `file:/abs/path` (absolute
+  only, one trailing newline dropped). Values are cached for 30 s
+  (`SECRET_CACHE_TTL_MS`); concurrent lookups of one reference share one read;
+  failures are not cached; `preflight` bypasses the cache. A resolved secret is a
+  `SecretValue` whose string, JSON and inspect forms show only its fingerprint,
+  `sha256:` plus 12 hex characters. A reference that does not parse, or names an
+  unknown scheme, may be a pasted raw secret, so errors show only its
+  fingerprint.
+- **`ModelGateway`** issues one credential per session (idempotent), replaces its
+  model allowlist (an empty list allows no model), revokes it, and reports usage
+  from the gateway's own log.
+
+### Consequences
+
+- Implementations (#4 SQLite store and audit sink, #6 Docker provider, #7
+  connection) code against these signatures. Changing one needs a new entry.
+- Business code can hold a `SecretValue` without risking a leak through logging;
+  only `reveal()` at the point of use exposes the value.
