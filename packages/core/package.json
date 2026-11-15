@@ -1,0 +1,10 @@
+{
+  "name": "@hearth/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Extension-point interfaces (PRD §7) and shared types.",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@hearth/hub",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Hearth hub: API, session manager, and the only owner of state (PRD §8).",
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@hearth/core": "workspace:*",
+    "@hearth/protocol": "workspace:*",
+    "hono": "4.13.18"
+  }
+}

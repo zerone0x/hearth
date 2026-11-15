@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "rangeStrategy": "pin",
+  "packageRules": [
+    {
+      "description": "pi packages move together, pinned to one exact version (PRD §8.4).",
+      "matchPackageNames": ["@earendil-works/pi-*"],
+      "groupName": "pi",
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "The frozen pi package names must never come back.",
+      "matchPackageNames": ["@mariozechner/**"],
+      "enabled": false
+    }
+  ]
+}
