@@ -1,4 +1,5 @@
-# The build context is the repo root; the image only needs manifests and sources.
+# The build context is the repo root; the image only needs manifests and sources
+# (it copies nothing from deploy/, which also holds the model key secret).
 **/node_modules
 .git
 **/*.test.ts
@@ -7,3 +8,4 @@
 **/*.sqlite
 **/*.sqlite-*
 docs
+deploy

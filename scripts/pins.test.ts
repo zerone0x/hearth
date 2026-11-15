@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { checkPins, type Manifest } from "./pins";
+import { checkFilePins, checkPins, type Manifest } from "./pins";
 
 const LOCK = "";
 const m = (path: string, json: Manifest["json"]): Manifest => ({ path, json });
@@ -110,5 +110,58 @@ describe("checkPins", () => {
       "package.json: resolutions.@mariozechner/pi-tui uses a frozen package name; use @earendil-works/pi-*",
       "pi packages are pinned to different versions: 1.4.0 in package.json (@earendil-works/pi-tui); 1.5.2 in package.json (@earendil-works/pi-ai)",
     ]);
+  });
+});
+
+describe("checkFilePins", () => {
+  const compose = (pin: string) => ({
+    path: "deploy/compose.yaml",
+    text: `services:\n  box-image:\n    build:\n      args:\n        PI_VERSION: "${pin}"\n`,
+  });
+  const dockerfile = {
+    path: "apps/box-agent/Dockerfile",
+    text: [
+      "#     --build-arg PI_VERSION=\"$(jq -r '.dependencies' package.json)\" \\",
+      "ARG PI_VERSION",
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: Dockerfile text, not a template
+      'RUN test -n "${PI_VERSION}" && echo "pi is ${PI_VERSION}"',
+    ].join("\n"),
+  };
+
+  test("accepts build files that match the pin or only reference the build arg", () => {
+    expect(checkFilePins([compose("1.5.2"), dockerfile], "1.5.2", ["deploy/compose.yaml"])).toEqual(
+      [],
+    );
+  });
+
+  test("rejects a compose PI_VERSION that drifted from the pin", () => {
+    expect(checkFilePins([compose("1.5.1")], "1.5.2", ["deploy/compose.yaml"])).toEqual([
+      "deploy/compose.yaml: PI_VERSION is 1.5.1, expected 1.5.2",
+    ]);
+  });
+
+  test("rejects other hard-coded pi versions in Dockerfiles", () => {
+    const files = [
+      { path: "a/Dockerfile", text: "ARG PI_VERSION=1.4.0\nENV PI_VERSION=1.5.2" },
+      { path: "b/Dockerfile", text: "RUN npm i -g @earendil-works/pi-coding-agent@1.4.0" },
+    ];
+    expect(checkFilePins(files, "1.5.2")).toEqual([
+      "a/Dockerfile: PI_VERSION is 1.4.0, expected 1.5.2",
+      "b/Dockerfile: @earendil-works/pi-coding-agent@1.4.0, expected 1.5.2",
+    ]);
+  });
+
+  test("requires the compose file to pin PI_VERSION", () => {
+    expect(checkFilePins([dockerfile], "1.5.2", ["deploy/compose.yaml"])).toEqual([
+      "deploy/compose.yaml: file is missing; it must pin PI_VERSION",
+    ]);
+    const unpinned = { path: "deploy/compose.yaml", text: "services: {}\n" };
+    expect(checkFilePins([unpinned], "1.5.2", ["deploy/compose.yaml"])).toEqual([
+      "deploy/compose.yaml: no literal PI_VERSION; it must pin the pi version",
+    ]);
+  });
+
+  test("compares nothing when no workspace depends on pi", () => {
+    expect(checkFilePins([compose("1.5.1")], undefined, ["deploy/compose.yaml"])).toEqual([]);
   });
 });

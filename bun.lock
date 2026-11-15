@@ -70,6 +70,13 @@
         "vite": "8.3.8",
       },
     },
+    "deploy/e2e": {
+      "name": "@hearth/compose-e2e",
+      "version": "0.0.0",
+      "devDependencies": {
+        "playwright": "1.65.1",
+      },
+    },
     "packages/core": {
       "name": "@hearth/core",
       "version": "0.0.0",
@@ -207,6 +214,8 @@
     "@happy-dom/global-registrator": ["@happy-dom/global-registrator@21.0.4", "", { "dependencies": { "@types/node": ">=20.0.0", "happy-dom": "^21.0.4" } }, "sha512-Bbr0hW9hhDhBf3Jp0EyDlkCbFgbr0z2jd3BMKYOYW+fOkPM4Nx195GMXyCtRCGEgoNn6i09FabXrSkNFm2ONzg=="],
 
     "@hearth/box-agent": ["@hearth/box-agent@workspace:apps/box-agent"],
+
+    "@hearth/compose-e2e": ["@hearth/compose-e2e@workspace:deploy/e2e"],
 
     "@hearth/core": ["@hearth/core@workspace:packages/core"],
 

@@ -57,6 +57,12 @@ export interface RunnerConfig {
   readonly denyList?: readonly DenyRule[];
   /** Allowlisted pinned extensions (#56). Empty by default. */
   readonly extensionAllowlist?: readonly ExtensionPin[];
+  /**
+   * A pi `models.json` (`HEARTH_MODELS_FILE`, decision 0020): providers and
+   * models beyond pi's built-in ones, such as an OpenAI-compatible endpoint.
+   * Unset: built-in models only.
+   */
+  readonly modelsFile?: string;
 }
 
 export interface RunnerSessions {
@@ -268,7 +274,7 @@ export class SessionRunners {
         (await ModelRuntime.create({
           // An empty file of the hub's own: no `~/.pi/agent/auth.json`.
           authPath: join(mkdtempSync(join(tmpdir(), "hearth-auth-")), "auth.json"),
-          modelsPath: null,
+          modelsPath: this.#o.config.modelsFile ?? null,
           refreshOnCreate: false,
         }));
       if (this.#o.config.apiKeyRef !== undefined) {

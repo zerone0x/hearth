@@ -6,7 +6,8 @@
   "workspaces": [
     "apps/*",
     "packages/*",
-    "spikes/*"
+    "spikes/*",
+    "deploy/e2e"
   ],
   "scripts": {
     "check": "bun run typecheck && bun run lint && bun run format:check && bun run pins && bun run test",
