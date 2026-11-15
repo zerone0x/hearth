@@ -364,3 +364,102 @@ bumping the minor.
   migration that drops the triggers, and a new decision entry.
 - Producers that need to attach more than 4 MiB (files, screenshots) need a
   separate store for the bytes and a reference in the event.
+
+## 0007: Docker BoxProvider and the box's sandbox
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #6
+
+### Decision
+
+- **Engine API over the unix socket, no CLI and no SDK.** `apps/hub/src/box/docker`
+  holds a small client (`fetch` with Bun's `unix` option) for the endpoints the
+  provider needs, speaking API version 1.44 (Docker Engine 25 and later). The
+  socket path, default limits and deadlines come from config
+  (`dockerBoxConfigFromEnv`: `HEARTH_DOCKER_SOCKET`, `HEARTH_BOX_CPUS`,
+  `HEARTH_BOX_MEMORY_BYTES`, `HEARTH_BOX_PIDS`, `HEARTH_BOX_DISK_BYTES`,
+  `HEARTH_BOX_PULL`, `HEARTH_BOX_INSTANCE`). Each call has a named deadline;
+  `stop` waits the box's grace plus one ordinary call.
+- **Objects per box**, all named `<instance>-box-<boxId>` (the instance defaults
+  to `hearth`) and labeled `dev.hearth.managed`, `dev.hearth.instance`,
+  `dev.hearth.box.id`, `dev.hearth.workspace.id`, `dev.hearth.session.id` and
+  `dev.hearth.image`; the container also carries the image's
+  `dev.hearth.pi.version`, and the volumes `dev.hearth.created-at` and
+  `dev.hearth.volume.role`. The `dev.hearth.` prefix is the provider's: user
+  labels (`BoxSpec.labels`) under it are dropped before any object is labeled, so
+  they can neither override these nor add their own. Dropped rather than rejected,
+  because `BoxInfo.labels` carries the provider's labels and a caller that passes
+  them back in a spec must not fail.
+  - A bridge network of its own: egress allowed (not `Internal`), inter-container
+    traffic off, no published or exposed ports. Boxes on different networks cannot
+    reach each other; the CI integration test checks this.
+  - **Two named volumes**: `<name>` for `/workspace` and `<name>-home` for
+    `/home/hearth`. Two volumes rather than one with sub-paths, because Docker
+    copies the image's directory (with its `hearth` ownership) into an empty named
+    volume only when the volume itself is the mount; a sub-path mount would start
+    out owned by root. `BoxInfo.volumeRef` is the workspace volume; `destroy`
+    removes both.
+  - The container, built fresh by every `start`, with `NanoCpus`, `Memory` (swap
+    equal to memory, so no swap), `PidsLimit` and a 256 MB `/dev/shm` for Chromium.
+    `diskBytes` maps to `StorageOpt.size`, which only some storage drivers support
+    (overlay2 on xfs with `pquota`), so it is unset by default. The local volume
+    driver does not limit volume size; a host that needs that uses filesystem
+    quotas.
+- **Idempotency.** Calls for one box id are serialized in the provider. `create`
+  of an existing box returns it unchanged; `start` of a running box leaves it
+  alone; an exited or half-created container is removed and replaced; `stop`
+  answers `already-stopped` or `not-found`; `destroy` of a missing box answers
+  `not-found`. An object with a box's name that lacks this instance's and this
+  box's labels is never adopted, started, stopped, mounted, attached to or removed
+  (`box.name-conflict`). That includes a network that appears between the
+  provider's inspect and its create: a `409` from `networks/create` is inspected
+  again and checked before the network is used.
+- **Failure owners.** A missing or refusing socket and daemon timeouts are
+  `hub`/`retry`; permission denied on the socket is `hub`/`give-up`; unexpected
+  daemon answers about its own objects are `hub`. A missing image (or a failed
+  pull) is `box`/`give-up`; the runtime refusing to create or start the container
+  is `box`/`retry-cold`, and the failed container is removed first. A missing
+  image is pulled once unless `HEARTH_BOX_PULL=never`. `containers/create`
+  answers `404` for a missing image and a missing network alike, so the provider
+  inspects both: the image is `box`/`give-up` (`box.image-missing`); the box's own
+  network, gone since `create` built it, is `box`/`retry-cold`
+  (`box.network-missing`), because the hub is fine and a cold `start` builds the
+  network again; neither is `box`/`retry-cold` (`box.create-failed`).
+- **`adopt`** lists containers and volumes with `dev.hearth.managed=true` and this
+  instance's label, so a hub restart finds hibernated boxes too, and two hubs (or
+  a test run) on one daemon never adopt each other's boxes.
+- **Chromium runs with `--no-sandbox`; the container is the sandbox.** The
+  provider sets `HEARTH_CHROMIUM_SANDBOX=off` in the box's environment, for
+  box-agent to read when it launches Chromium. Every box runs with all
+  capabilities dropped, `no-new-privileges`, Docker's default seccomp and
+  AppArmor profiles, as `1000:1000` (set on the container, so it does not depend
+  on the image's `USER`), with no published ports. Reasoning:
+  - Chromium's sandbox needs either a setuid helper (blocked by
+    `no-new-privileges`, and not shipped by Debian) or unprivileged user
+    namespaces, which Docker's default seccomp profile denies. Enabling it means a
+    custom seccomp profile that allows `clone`/`unshare` with namespace flags and,
+    on hosts that restrict unprivileged user namespaces through AppArmor (Ubuntu
+    23.10 and later), an unconfined or custom AppArmor profile too.
+  - That trade points the wrong way for Hearth. The boundaries that matter most
+    are box to host and box to box. User namespaces are a recurring source of
+    kernel privilege escalations, and allowing them would expose that kernel
+    surface to every process in every box, including the commands the agent runs,
+    which are as untrusted as a web page.
+  - Inside one box, Chromium's sandbox would only separate a compromised renderer
+    from the rest of that box. The agent already runs arbitrary commands there,
+    and the box holds no long-lived secrets (PRD §10): only the session's
+    short-lived, revocable credentials and the session's own files.
+  - When a stronger runtime arrives (gVisor or a VM provider, PRD §7 E4), user
+    namespaces inside the box become cheap, and a new decision can revisit this.
+- **Tests.** Unit tests run the provider against an in-memory fake Engine API on
+  a unix socket in a temporary directory (`fake-engine.ts`). The
+  `HEARTH_DOCKER_TESTS=1` suite runs in the `box-provider` CI job against the box
+  image built there, with `CMD ["sleep", "infinity"]` layered on so the box stays
+  up until box-agent connects to a hub (#7).
+
+### Consequences
+
+- The hub's session manager wires the provider in; this change does not start it.
+- Process snapshots stay `not-supported` until a provider implements them (P2).
+- Supervising the desktop processes inside the box is #15.
