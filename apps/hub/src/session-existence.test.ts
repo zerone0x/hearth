@@ -16,7 +16,6 @@ import {
   type Action,
   type Authorizer,
   DEFAULT_WORKSPACE_ID,
-  HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
   type SecretStore,

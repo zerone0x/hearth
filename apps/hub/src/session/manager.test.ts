@@ -597,11 +597,13 @@ describe("SessionManager", () => {
       ["allow-all", undefined],
       ["deny-all", denyAll],
     ] as const) {
-      test(`archive, fail and ensureBox answer alike for unknown, live and archived ids, ${name}`, async () => {
+      test(`archive, fail and ensureBox answer alike for unknown, live, archived and failed ids, ${name}`, async () => {
         const r = rig();
         const live = await r.manager.create(LOCAL_PRINCIPAL);
         const gone = await r.manager.create(LOCAL_PRINCIPAL);
         await r.manager.archive(LOCAL_PRINCIPAL, gone.id);
+        const dead = await r.manager.create(LOCAL_PRINCIPAL);
+        await r.manager.fail(dead.id, "x");
         const m = policy === undefined ? r.manager : r.make({ authorizer: policy });
         await m.ready;
         const outcome = async (run: (id: string) => Promise<unknown>, id: string) => {
@@ -627,8 +629,10 @@ describe("SessionManager", () => {
           expect(expected).toStartWith("authz.denied");
           expect(await outcome(op, live.id)).toBe(expected);
           expect(await outcome(op, gone.id)).toBe(expected);
+          expect(await outcome(op, dead.id)).toBe(expected);
         }
         expect(r.store.getSession(scope, live.id)?.state).toBe("idle");
+        expect(r.store.getSession(scope, dead.id)?.state).toBe("failed");
         expect(r.boxes.calls).toEqual([]);
         const refused = r.db
           .query<{ n: number }, [string]>(
