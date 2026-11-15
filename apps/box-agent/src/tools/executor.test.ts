@@ -25,7 +25,9 @@ import {
   type ToolMethod,
   type ToolResults,
 } from "@hearth/protocol";
+import { ToolCallError } from "./errors";
 import { DEFAULT_EXEC_ENV, ToolExecutor, type ToolExecutorOptions } from "./executor";
+import { Workspace } from "./paths";
 
 const STEP_MS = 10_000;
 const dirs: string[] = [];
@@ -159,6 +161,16 @@ describe("path confinement", () => {
     }
     expect(existsSync(join(h.outside, "new.txt"))).toBe(false);
     expect(existsSync(`${h.root}x`)).toBe(false);
+  });
+
+  test("the lexical check alone refuses paths outside the root, before any file system access", () => {
+    const ws = new Workspace("/workspace");
+    for (const path of ["/etc/passwd", "/workspacex/a", "/", "../a", "a/../b", "x\u0000"]) {
+      expect(() => ws.lexical(path)).toThrow(ToolCallError);
+    }
+    expect(ws.lexical("a/b/")).toBe("/workspace/a/b");
+    expect(ws.lexical("/workspace/a")).toBe("/workspace/a");
+    expect(ws.lexical("~/a")).toBe("/workspace/~/a");
   });
 
   test("an absolute path inside the workspace and a symlink inside it are fine", async () => {
