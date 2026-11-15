@@ -624,6 +624,84 @@ describe("hardening", () => {
     await expectAllGone(found);
   });
 
+  // A child that stays in the group but drops the run marker (`env -i`) is
+  // missed by the marker sweep, so only the process-group kill can stop it.
+  const unmarked = "env -i sleep 305 >/dev/null 2>&1 </dev/null & echo $! > unmarked.pid";
+
+  async function unmarkedPid(root: string): Promise<number> {
+    const file = join(root, "unmarked.pid");
+    const until = Date.now() + STEP_MS;
+    while (!(existsSync(file) && readFileSync(file, "utf8").trim() !== "") && Date.now() < until)
+      await Bun.sleep(10);
+    const pid = Number(readFileSync(file, "utf8"));
+    pids.push(pid);
+    return pid;
+  }
+
+  test("a timeout kills a group member without the marker (env -i)", async () => {
+    const h = harness();
+    const result = await h.ok("tool.exec", {
+      ...c,
+      command: `${unmarked}\nsleep 30`,
+      cwd: ".",
+      timeoutMs: 1_000,
+    });
+    expect(result.outcome).toBe("timed-out");
+    expect(await gone(await unmarkedPid(h.root))).toBe(true);
+  });
+
+  test("a cancel kills a group member without the marker (env -i)", async () => {
+    const h = harness();
+    const running = h.send(
+      "tool.exec",
+      { ...c, command: `${unmarked}\nsleep 30`, cwd: ".", timeoutMs: 60_000 },
+      "rpc_cancel_unmarked",
+    );
+    const pid = await unmarkedPid(h.root);
+    expect(await h.ok("tool.cancel", { ...c, target: "rpc_cancel_unmarked" })).toEqual({
+      found: true,
+    });
+    const frame = await running;
+    expect(frame.ok && frame.result).toMatchObject({ outcome: "cancelled" });
+    expect(await gone(pid)).toBe(true);
+  });
+
+  /** Pids whose command line is exactly `argv`, read from `/proc`. */
+  function pidsRunning(argv: readonly string[]): number[] {
+    const wanted = `${argv.join("\u0000")}\u0000`;
+    const found: number[] = [];
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        if (readFileSync(`/proc/${entry}/cmdline`, "utf8") === wanted) found.push(Number(entry));
+      } catch {}
+    }
+    return found;
+  }
+
+  test("the marker sweep runs in rounds, so a setsid fork loop leaves no survivors", async () => {
+    const h = harness();
+    // A duration unique to this run, so no other process matches.
+    const duration = `307.${process.pid}${Date.now() % 100_000}`;
+    let survivors = 0;
+    try {
+      for (let run = 0; run < 3; run += 1) {
+        const result = await h.ok("tool.exec", {
+          ...c,
+          command: `setsid bash -c 'while :; do (sleep ${duration} &); done' >/dev/null 2>&1 </dev/null &\nsleep 30`,
+          cwd: ".",
+          timeoutMs: 800,
+        });
+        expect(result.outcome).toBe("timed-out");
+        await Bun.sleep(300);
+        survivors += pidsRunning(["sleep", duration]).length;
+      }
+    } finally {
+      pids.push(...pidsRunning(["sleep", duration]));
+    }
+    expect(survivors).toBe(0);
+  });
+
   test("a FIFO is refused at once by read, image and write, and frees its slot", async () => {
     const h = harness({ maxConcurrent: 1 });
     execFileSync("mkfifo", [join(h.root, "fifo")]);

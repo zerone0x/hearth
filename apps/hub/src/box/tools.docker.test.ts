@@ -3,7 +3,8 @@
  * box with `DockerBoxProvider`, the box's own box-agent dials in, and the
  * hub's `ToolRpcClient` writes and reads a file, searches it with the image's
  * `rg`, runs a command in `/workspace`, and checks that a `setsid` child dies
- * with a timed-out or cancelled command and that a FIFO is refused at once.
+ * with a timed-out or cancelled command, that a group member without the run
+ * marker (`env -i`) dies with a timed-out one, and that a FIFO is refused at once.
  *
  * Runs only with HEARTH_DOCKER_TESTS=1 (AGENTS.md), with the box image's real
  * default command, like `echo.docker.test.ts`:
@@ -151,6 +152,15 @@ describe.skipIf(!enabled)("tool RPC through DockerBoxProvider and the box image"
     abort.abort();
     await expect(cancelled).rejects.toThrow("aborted");
     expect(await run(deadCheck("setsid-cancel.pid"))).toBe("dead\n");
+
+    // A child that stays in the group without the run marker (env -i) dies by the group kill.
+    const timedOutUnmarked = ops.bash.exec(
+      "env -i sleep 305 >/dev/null 2>&1 </dev/null & echo $! > unmarked.pid\nsleep 60",
+      "/workspace",
+      { onData: () => {}, timeout: 1 },
+    );
+    await expect(timedOutUnmarked).rejects.toThrow("timeout:1");
+    expect(await run(deadCheck("unmarked.pid"))).toBe("dead\n");
 
     // A FIFO is refused at once instead of hanging a slot.
     await run("mkfifo /workspace/fifo");
