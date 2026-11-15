@@ -28,4 +28,5 @@ export {
 export * from "./frames";
 export { checkHelloVersion, rejectHello } from "./handshake";
 export * from "./tools";
+export { formatTraceparent, parseTraceparent, TRACEPARENT_LENGTH, type TraceParent } from "./trace";
 export { formatVersion, isCompatible, PROTOCOL_VERSION, type ProtocolVersion } from "./version";

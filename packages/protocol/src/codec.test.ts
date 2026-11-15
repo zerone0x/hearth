@@ -654,7 +654,7 @@ describe("handshake version check", () => {
     expect(reject).toEqual({
       type: "reject",
       reason: "version-mismatch",
-      message: "box speaks protocol 2.1 but the hub speaks 1.1; major versions must match",
+      message: "box speaks protocol 2.1 but the hub speaks 1.2; major versions must match",
       hubVersion: PROTOCOL_VERSION,
       boxVersion: { major: 2, minor: 1 },
     });
@@ -679,7 +679,7 @@ describe("version first", () => {
       ok: false,
       error: {
         code: "version-mismatch",
-        message: "hello speaks protocol 2.4 but this side speaks 1.1; major versions must match",
+        message: "hello speaks protocol 2.4 but this side speaks 1.2; major versions must match",
         frameType: "hello",
         peerVersion: { major: 2, minor: 4 },
       },
@@ -689,7 +689,7 @@ describe("version first", () => {
     expect(reject).toEqual({
       type: "reject",
       reason: "version-mismatch",
-      message: "box speaks protocol 2.4 but the hub speaks 1.1; major versions must match",
+      message: "box speaks protocol 2.4 but the hub speaks 1.2; major versions must match",
       hubVersion: PROTOCOL_VERSION,
       boxVersion: { major: 2, minor: 4 },
     });
