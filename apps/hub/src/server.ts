@@ -41,6 +41,19 @@ import {
   SqliteSessionStore,
 } from "./store";
 
+/** `req.url` as a URL, or undefined when it is not absolute (an empty or malformed Host). */
+function parseUrl(req: Request): URL | undefined {
+  try {
+    return new URL(req.url);
+  } catch {
+    return undefined;
+  }
+}
+
+function refusal(status: 400 | 404 | 421 | 426, code: string, message: string): Response {
+  return Response.json({ ok: false, error: { code, owner: "user", message } }, { status });
+}
+
 export interface HubListenOptions {
   /** Interface to bind. Defaults to loopback: the hub is never public by default (PRD §10). */
   readonly hostname?: string;
@@ -197,7 +210,15 @@ export function startHub(options: HubOptions) {
     server = Bun.serve<DesktopSocketData>({
       hostname,
       port: options.port ?? DEFAULT_PORT,
-      fetch: (req, srv) => app.fetch(req, srv),
+      fetch: (req, srv) => {
+        // A Host the HTTP layer cannot turn into a URL (an empty one) makes
+        // `req.url` relative and every later `new URL` throw: answer it as the
+        // request guard would (decision 0010) instead of a 500 (issue #48).
+        if (parseUrl(req) === undefined) {
+          return refusal(421, "request.foreign-host", "the Host header is missing or malformed");
+        }
+        return app.fetch(req, srv);
+      },
       websocket: {
         open(ws) {
           if (desktop === undefined) return ws.close(DESKTOP_CLOSE.shutdown, "not ready");
@@ -264,13 +285,21 @@ export function startHub(options: HubOptions) {
         hostname: address,
         port: boxPort,
         fetch(req, srv) {
-          if (new URL(req.url).pathname !== BOX_SOCKET_PATH) {
-            return new Response("not found", { status: 404 });
+          const url = parseUrl(req);
+          if (url === undefined) {
+            return refusal(
+              400,
+              "request.invalid-url",
+              "the request URL or Host header is malformed",
+            );
+          }
+          if (url.pathname !== BOX_SOCKET_PATH) {
+            return refusal(404, "request.not-found", "not found");
           }
           // The upgrade carries no credential: the box authenticates in its
           // first frame, `hello`, and `authorize` runs before anything else.
           if (srv.upgrade(req, { data: undefined })) return undefined;
-          return new Response("expected a WebSocket upgrade", { status: 426 });
+          return refusal(426, "request.upgrade-required", "expected a WebSocket upgrade");
         },
         websocket,
       });
