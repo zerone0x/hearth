@@ -79,6 +79,24 @@ function docker(...args: string[]): string {
   return out.stdout.toString().trim();
 }
 
+/**
+ * Files in the session box that contain `key`: every process's environment
+ * and every file under /workspace, /home and /tmp. Runs as privileged root in
+ * the box (the box drops every capability, and reading another user's
+ * environment needs CAP_SYS_PTRACE), so no process is hidden. The key is an
+ * argument of the scanning shell, never in its environment.
+ */
+function keyInBox(box: string, key: string): string[] {
+  const scan = [
+    'key="$1"',
+    'grep -lsF -e "$key" /proc/[0-9]*/environ',
+    'grep -rlsF -e "$key" /workspace /home /tmp',
+    "true",
+  ].join("; ");
+  const out = docker("exec", "--privileged", "-u", "0", box, "sh", "-c", scan, "sh", key);
+  return out === "" ? [] : out.split("\n");
+}
+
 async function signIn(page: Page): Promise<void> {
   await page.goto(BASE.toString());
   await page.getByRole("heading", { name: "Sign in" }).waitFor();
@@ -199,10 +217,47 @@ async function install(browser: Browser): Promise<void> {
   check(box !== "" && !box.includes("\n"), `expected one running box for ${sessionId}: "${box}"`);
   const content = docker("exec", box, "cat", "/workspace/hello.txt");
   check(content === "hello from the compose box", `the box's /workspace/hello.txt is "${content}"`);
-  // The box runs no model credentials (PRD §8): the key is not in its environment.
+  // The box runs no model credentials (PRD §8): the key is not in its
+  // configured environment, in any running process's environment, or in a
+  // file under /workspace, /home or /tmp.
   if (key !== undefined) {
     const env = docker("inspect", "--format", "{{json .Config.Env}}", box);
     check(!env.includes(key), "the model key reached the box's environment");
+    const found = keyInBox(box, key);
+    check(found.length === 0, `the model key is in the box: ${found.join(", ")}`);
+    // Positive controls: the same scan finds the key once it is there, in the
+    // environment of a process of the box user (uid 1000, not the scanner's)
+    // and in a file, so the empty result above is real.
+    const canaryPid = "/workspace/.hearth-e2e-canary.pid";
+    docker(
+      "exec",
+      "-d",
+      "-u",
+      "1000",
+      "-e",
+      `HEARTH_E2E_CANARY=${key}`,
+      box,
+      "sh",
+      "-c",
+      `echo $$ > ${canaryPid}; exec sleep 120`,
+    );
+    let inEnv: string[] = [];
+    for (let i = 0; i < 40 && !inEnv.some((f) => /^\/proc\/\d+\/environ$/.test(f)); i++) {
+      await Bun.sleep(250);
+      inEnv = keyInBox(box, key);
+    }
+    docker("exec", "-u", "1000", box, "sh", "-c", `kill "$(cat ${canaryPid})"; rm -f ${canaryPid}`);
+    check(
+      inEnv.some((f) => /^\/proc\/\d+\/environ$/.test(f)),
+      `the scan missed the key in a box process's environment: ${inEnv.join(", ")}`,
+    );
+    const canaryFile = "/tmp/hearth-e2e-canary";
+    docker("exec", "-u", "0", box, "sh", "-c", `printf %s "$1" > ${canaryFile}`, "sh", key);
+    const inFile = keyInBox(box, key);
+    docker("exec", "-u", "0", box, "rm", "-f", canaryFile);
+    check(inFile.includes(canaryFile), `the scan missed the key in /tmp: ${inFile.join(", ")}`);
+    const after = keyInBox(box, key);
+    check(after.length === 0, `the canaries were not removed: ${after.join(", ")}`);
   }
 
   step("5. the box's desktop is visible");
