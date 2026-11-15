@@ -6,7 +6,7 @@
  *   of discovery off. Extensions: `hearth-tools` (tools.ts), the allowlisted
  *   pinned ones (extensions.ts), and pi's `codemode` when the session asks.
  * - Every pi event is appended to the session's event log as `pi.<type>`;
- *   `pi.entry_appended` carries the session entries a rebuild needs, and
+ *   `runner.entry` carries the session entries a rebuild needs, and
  *   `runner.header` the pi session header.
  * - A turn runs in the background. Anything it throws, and any failure to
  *   record an event, becomes a visible session failure (`runner.failed`, the
@@ -102,6 +102,8 @@ export class SessionRunner {
   #chain: Promise<void> = Promise.resolve();
   #turn: Promise<void> = Promise.resolve();
   #contextKey: string;
+  /** How many pi session entries are already in the event log. */
+  #persisted: number;
   #unsubscribe: () => void;
 
   private constructor(
@@ -116,6 +118,7 @@ export class SessionRunner {
     this.#pi = pi;
     this.#agentDir = agentDir;
     this.#contextKey = JSON.stringify(options.contextFiles?.() ?? []);
+    this.#persisted = pi.getEntries().length;
     this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
   }
 
@@ -264,6 +267,7 @@ export class SessionRunner {
     try {
       await this.#refreshContext();
       await this.#session.prompt(text);
+      this.#flushEntries();
       await this.#chain;
       if (this.#status === "running") this.#status = "idle";
     } catch (error) {
@@ -282,6 +286,7 @@ export class SessionRunner {
   #onEvent(event: AgentSessionEvent): void {
     try {
       this.#record(`pi.${event.type}`, event);
+      if (event.type === "message_end" || event.type === "agent_end") this.#flushEntries();
       if (event.type === "message_end" && event.message.role === "assistant") {
         const m = event.message;
         this.#record("runner.usage", {
@@ -294,6 +299,28 @@ export class SessionRunner {
     } catch (error) {
       void this.#fail(error);
     }
+  }
+
+  /**
+   * Record the pi session entries appended since the last flush as
+   * `runner.entry`: the rebuild reads them back (`SessionManager.inMemory`).
+   * Runs in the event chain, after pi appended the entry for the event.
+   */
+  #flushEntries(): void {
+    this.#chain = this.#chain
+      .then(async () => {
+        if (this.#status === "failed") return;
+        const entries = this.#pi.getEntries();
+        while (this.#persisted < entries.length) {
+          const entry = entries[this.#persisted];
+          await this.#o.events.append(this.#o.scope, this.sessionId, {
+            type: "runner.entry",
+            payload: { entry: jsonSafe(entry) },
+          });
+          this.#persisted++;
+        }
+      })
+      .catch((error: unknown) => this.#fail(error));
   }
 
   /** Append in order; a failed append fails the session, visibly. */

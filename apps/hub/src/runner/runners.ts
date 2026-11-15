@@ -307,9 +307,13 @@ export class SessionRunners {
     for (;;) {
       const page = await this.#o.events.read(this.#scope, sessionId, cursor, 1000);
       for (const event of page.events) {
-        const payload = event.payload as { entry?: unknown; codemode?: unknown; files?: unknown } | null;
+        const payload = event.payload as {
+          entry?: unknown;
+          codemode?: unknown;
+          files?: unknown;
+        } | null;
         if (event.type === "runner.header") header = payload as unknown as FileEntry;
-        else if (event.type === "pi.entry_appended" && payload !== null) {
+        else if (event.type === "runner.entry" && payload !== null) {
           entries.push(payload.entry as FileEntry);
         } else if (event.type === "runner.options" && payload !== null) {
           codemode = payload.codemode === true;

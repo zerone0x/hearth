@@ -1,0 +1,639 @@
+/**
+ * The hub-side pi runner (#43; decision 0015) against pi-ai's faux model (no
+ * model credits) and a real box-agent `ToolExecutor` behind a fake link, with
+ * the hub's real `ToolRpcClient` in between.
+ */
+
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  type AssistantMessage,
+  type FauxProviderHandle,
+  type FauxResponseStep,
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+  type AppendResult,
+  type Authorizer,
+  type EventPage,
+  type EventStore,
+  HearthError,
+  LOCAL_PRINCIPAL,
+  type NewEvent,
+  type SecretStore,
+  SecretValue,
+  type StoredEvent,
+} from "@hearth/core";
+import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
+import { ToolExecutor } from "../../../box-agent/src/tools/executor";
+import type { BoxConnectionListener } from "../box/connections";
+import { ToolRpcClient } from "../box/tool-rpc";
+import type { BoxLease, SessionView } from "../session/manager";
+import type { PinnedExtension } from "./extensions";
+import { HUB_TEMP_NOTE, rewriteHome, scrubHubTempPaths } from "./policy";
+import { type RunnerConfig, SessionRunners } from "./runners";
+
+const dirs: string[] = [];
+const closers: Array<() => unknown> = [];
+
+afterEach(async () => {
+  for (const close of closers.splice(0)) await close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function workspace(): string {
+  const dir = mkdtempSync(join(tmpdir(), "hearth-runner-test-"));
+  dirs.push(dir);
+  const root = join(dir, "workspace");
+  mkdirSync(root);
+  return root;
+}
+
+/** In-memory EventStore with the interface's guarantees that matter here. */
+class MemoryEvents implements EventStore {
+  readonly all = new Map<string, StoredEvent[]>();
+  failOn: ((sessionId: string, event: NewEvent) => boolean) | undefined;
+
+  async append(_scope: unknown, sessionId: string, event: NewEvent): Promise<AppendResult> {
+    if (this.failOn?.(sessionId, event)) throw new Error(`disk full writing ${event.type}`);
+    const list = this.all.get(sessionId) ?? [];
+    const seq = list.length + 1;
+    list.push({
+      workspaceId: "ws_local",
+      sessionId,
+      seq,
+      ts: Date.now(),
+      type: event.type,
+      payload: event.payload,
+    });
+    this.all.set(sessionId, list);
+    return { seq, duplicate: false };
+  }
+
+  async read(_scope: unknown, sessionId: string, afterSeq: number, limit: number) {
+    const list = this.all.get(sessionId) ?? [];
+    const events = list.filter((e) => e.seq > afterSeq).slice(0, limit);
+    const page: EventPage = {
+      events,
+      cursor: events.at(-1)?.seq ?? afterSeq,
+      hasMore: list.length > afterSeq + events.length,
+    };
+    return page;
+  }
+
+  async lastSeq(_scope: unknown, sessionId: string) {
+    return this.all.get(sessionId)?.length ?? 0;
+  }
+
+  types(sessionId: string): string[] {
+    return (this.all.get(sessionId) ?? []).map((e) => e.type);
+  }
+
+  of(sessionId: string, type: string): StoredEvent[] {
+    return (this.all.get(sessionId) ?? []).filter((e) => e.type === type);
+  }
+}
+
+/** One box with a real executor; the link can be cut and the box rebooted. */
+class FakeBoxes {
+  readonly listeners = new Set<BoxConnectionListener>();
+  readonly sent: RpcFrame[] = [];
+  bootId = "boot_1";
+  executor: ToolExecutor;
+
+  constructor(readonly root: string) {
+    this.executor = this.#newExecutor();
+  }
+
+  #newExecutor(): ToolExecutor {
+    return new ToolExecutor({
+      root: this.root,
+      send: (frame: RpcResultFrame) => {
+        for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
+      },
+    });
+  }
+
+  listen(listener: BoxConnectionListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  sendRpc(_boxId: string, frame: RpcFrame): string | undefined {
+    this.sent.push(frame);
+    queueMicrotask(() => this.executor.handle(frame));
+    return this.bootId;
+  }
+
+  /** The box crashed and came back with a new boot. */
+  crash(): void {
+    this.executor.abortAll();
+    this.executor = this.#newExecutor();
+    this.bootId = `boot_${Number(this.bootId.slice(5)) + 1}`;
+    for (const l of this.listeners) l.connected?.("box_1", this.bootId);
+  }
+
+  methods(): string[] {
+    return this.sent.map((f) => f.method);
+  }
+}
+
+/** The session manager as the runner sees it: leases with in-flight accounting. */
+class FakeSessions {
+  inFlight = 0;
+  leases = 0;
+  readonly known = new Set<string>(["se_a", "se_b"]);
+
+  async ensureBox(sessionId: string): Promise<BoxLease> {
+    this.inFlight++;
+    this.leases++;
+    let released = false;
+    return {
+      sessionId,
+      boxId: "box_1",
+      release: () => {
+        if (released) return;
+        released = true;
+        this.inFlight--;
+      },
+    };
+  }
+
+  async get(_principal: unknown, sessionId: string): Promise<SessionView> {
+    if (!this.known.has(sessionId)) {
+      throw new HearthError(`no session ${sessionId}`, {
+        owner: "user",
+        disposition: "give-up",
+        code: "session.not-found",
+      });
+    }
+    return { id: sessionId } as SessionView;
+  }
+}
+
+const allowAll: Authorizer = { authorize: async () => ({ allowed: true, policy: "test" }) };
+
+const noSecrets: SecretStore = {
+  resolve: async () => new SecretValue("faux-key-not-a-secret"),
+  fingerprint: async () => "fp",
+  preflight: async () => ({ ok: true, failures: [] }) as never,
+  invalidate: () => {},
+};
+
+interface Harness {
+  root: string;
+  boxes: FakeBoxes;
+  sessions: FakeSessions;
+  events: MemoryEvents;
+  faux: FauxProviderHandle;
+  runtime: ModelRuntime;
+  runners: SessionRunners;
+  rpc: ToolRpcClient;
+  make(overrides?: Partial<RunnerConfig>, extra?: Partial<HarnessExtra>): SessionRunners;
+}
+
+interface HarnessExtra {
+  availableExtensions: PinnedExtension[];
+  authorizer: Authorizer;
+}
+
+async function harness(
+  config: Partial<RunnerConfig> = {},
+  extra: Partial<HarnessExtra> = {},
+): Promise<Harness> {
+  const root = workspace();
+  const boxes = new FakeBoxes(root);
+  const rpc = new ToolRpcClient({ boxes, log: () => {} });
+  closers.push(() => rpc.close());
+  const sessions = new FakeSessions();
+  const events = new MemoryEvents();
+  const faux = fauxProvider({ provider: "faux" });
+  const authDir = workspace();
+  const runtime = await ModelRuntime.create({
+    authPath: join(authDir, "auth.json"),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  runtime.registerNativeProvider(faux.provider);
+  const make = (overrides: Partial<RunnerConfig> = {}, more: Partial<HarnessExtra> = {}) => {
+    const runners = new SessionRunners({
+      authorizer: more.authorizer ?? extra.authorizer ?? allowAll,
+      events,
+      sessions,
+      tools: rpc,
+      secrets: noSecrets,
+      config: {
+        provider: "faux",
+        model: faux.getModel().id,
+        apiKeyRef: "env:FAUX_KEY",
+        ...config,
+        ...overrides,
+      },
+      modelRuntime: runtime,
+      availableExtensions: more.availableExtensions ?? extra.availableExtensions ?? [],
+      boxCwd: root,
+      log: () => {},
+    });
+    closers.push(() => runners.close());
+    return runners;
+  };
+  const runners = make();
+  return { root, boxes, sessions, events, faux, runtime, runners, rpc, make };
+}
+
+type Msg = { role: string; toolCallId?: string; isError?: boolean; content?: unknown };
+
+function toolResults(messages: readonly unknown[]) {
+  return (messages as Msg[])
+    .filter((m) => m.role === "toolResult")
+    .map((m) => ({
+      id: m.toolCallId,
+      isError: m.isError,
+      text: (m.content as Array<{ text?: string }>).map((c) => c.text ?? "").join(""),
+    }));
+}
+
+function call(
+  name: string,
+  args: Parameters<typeof fauxToolCall>[1],
+  id: string,
+): AssistantMessage {
+  return fauxAssistantMessage([fauxToolCall(name, args, { id })], { stopReason: "toolUse" });
+}
+
+async function turn(h: Harness, sessionId: string, text: string, steps: FauxResponseStep[]) {
+  h.faux.setResponses(steps);
+  await h.runners.send(LOCAL_PRINCIPAL, sessionId, text);
+  const runner = await h.runners.runner(sessionId);
+  await runner.settled();
+  return runner;
+}
+
+describe("routing", () => {
+  test("all seven tools go to the box with their call id, under a lease, without the hub env", async () => {
+    const h = await harness();
+    writeFileSync(join(h.root, "notes.txt"), "alpha\nbeta\n");
+    process.env["HEARTH_RUNNER_TEST_SECRET"] = "hub-secret-value";
+    try {
+      const runner = await turn(h, "se_a", "go", [
+        call("write", { path: "src/a.ts", content: "export const a = 1;\n" }, "c_write"),
+        call("edit", { path: "src/a.ts", edits: [{ oldText: "1", newText: "2" }] }, "c_edit"),
+        call("read", { path: "~/notes.txt" }, "c_read"),
+        call("ls", { path: "src" }, "c_ls"),
+        call("find", { pattern: "*.ts", path: "src" }, "c_find"),
+        call("grep", { pattern: "alpha" }, "c_grep"),
+        call(
+          "bash",
+          { command: 'echo "env=[$HEARTH_RUNNER_TEST_SECRET]"; cat src/a.ts' },
+          "c_bash",
+        ),
+        fauxAssistantMessage("done"),
+      ]);
+      expect(runner.status).toBe("idle");
+      expect(runner.activeTools.sort()).toEqual(
+        ["bash", "edit", "find", "grep", "ls", "read", "write"].sort(),
+      );
+      const results = toolResults(runner.messages);
+      const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+      for (const id of ["c_write", "c_edit", "c_read", "c_ls", "c_find", "c_bash"]) {
+        expect(byId[id]?.isError).toBe(false);
+      }
+      expect(readFileSync(join(h.root, "src/a.ts"), "utf8")).toBe("export const a = 2;\n");
+      expect(byId.c_read?.text).toContain("alpha");
+      expect(byId.c_ls?.text).toContain("a.ts");
+      expect(byId.c_find?.text).toContain("a.ts");
+      expect(byId.c_bash?.text).toContain("env=[]");
+      expect(byId.c_bash?.text).toContain("export const a = 2;");
+      // Every routed method reached the box, each frame carrying its pi call id.
+      const methods = new Set(h.boxes.methods());
+      for (const m of [
+        "tool.writeFile",
+        "tool.readFile",
+        "tool.readdir",
+        "tool.glob",
+        "tool.grep",
+        "tool.exec",
+      ]) {
+        expect(methods.has(m)).toBe(true);
+      }
+      const ids = new Set(
+        h.boxes.sent.map((f) => (f.params as { callId: string }).callId.replace(/^context_.*/, "")),
+      );
+      ids.delete("");
+      expect([...ids].sort()).toEqual(
+        ["c_bash", "c_edit", "c_find", "c_grep", "c_ls", "c_read", "c_write"].sort(),
+      );
+      // `~/notes.txt` was rewritten to the box workspace, not the hub's home.
+      const readFrame = h.boxes.sent.find(
+        (f) => f.method === "tool.readFile" && (f.params as { callId: string }).callId === "c_read",
+      );
+      expect((readFrame?.params as { path?: string } | undefined)?.path).toBe(
+        `${h.root}/notes.txt`,
+      );
+      // The hub's environment never crossed.
+      expect(JSON.stringify(h.boxes.sent)).not.toContain("hub-secret-value");
+      // One lease per tool call, all released.
+      expect(h.sessions.leases).toBe(7);
+      expect(h.sessions.inFlight).toBe(0);
+      expect(h.rpc.pending).toBe(0);
+    } finally {
+      delete process.env["HEARTH_RUNNER_TEST_SECRET"];
+    }
+  });
+
+  test("rewriteHome maps ~ and ~/x only", () => {
+    expect(rewriteHome("~", "/workspace")).toBe("/workspace");
+    expect(rewriteHome("~/a/b", "/workspace")).toBe("/workspace/a/b");
+    expect(rewriteHome("~root/x", "/workspace")).toBe("~root/x");
+    expect(rewriteHome("a/~/b", "/workspace")).toBe("a/~/b");
+  });
+});
+
+describe("events", () => {
+  test("every pi event lands in the event log: deltas, tool calls and results, usage", async () => {
+    const h = await harness();
+    await turn(h, "se_a", "hello", [
+      call("bash", { command: "echo hi" }, "c1"),
+      fauxAssistantMessage("all good"),
+    ]);
+    const types = h.events.types("se_a");
+    expect(types[0]).toBe("runner.header");
+    expect(types).toContain("message.user");
+    for (const t of [
+      "pi.agent_start",
+      "pi.turn_start",
+      "pi.message_update",
+      "pi.message_end",
+      "pi.tool_execution_start",
+      "pi.tool_execution_end",
+      "runner.entry",
+      "runner.usage",
+      "pi.agent_end",
+    ]) {
+      expect(types).toContain(t);
+    }
+    const deltas = h.events
+      .of("se_a", "pi.message_update")
+      .map((e) => e.payload as { assistantMessageEvent: { type: string; delta?: string } })
+      .filter((p) => p.assistantMessageEvent.type === "text_delta")
+      .map((p) => p.assistantMessageEvent.delta)
+      .join("");
+    expect(deltas).toBe("all good");
+    const end = h.events.of("se_a", "pi.tool_execution_end")[0]?.payload as {
+      toolCallId: string;
+      isError: boolean;
+    };
+    expect(end.toolCallId).toBe("c1");
+    expect(end.isError).toBe(false);
+  });
+});
+
+describe("interrupt", () => {
+  test("interrupt aborts the box command; the session stays usable", async () => {
+    const h = await harness();
+    h.faux.setResponses([
+      call("bash", { command: "sleep 20" }, "c_sleep"),
+      fauxAssistantMessage("x"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "sleep");
+    const runner = await h.runners.runner("se_a");
+    const started = Date.now();
+    while (!h.boxes.methods().includes("tool.exec") && Date.now() - started < 5000) {
+      await Bun.sleep(10);
+    }
+    expect(await h.runners.interrupt(LOCAL_PRINCIPAL, "se_a")).toBe(true);
+    await runner.settled();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(runner.status).toBe("idle");
+    expect(toolResults(runner.messages)[0]?.text).toContain("aborted");
+    expect(h.boxes.methods()).toContain("tool.cancel");
+    expect(h.events.types("se_a")).toContain("runner.interrupted");
+    await turn(h, "se_a", "again", [fauxAssistantMessage("still here")]);
+    expect(runner.status).toBe("idle");
+    expect(h.sessions.inFlight).toBe(0);
+  });
+});
+
+describe("restart", () => {
+  test("a new hub rebuilds the runner from the event log and continues", async () => {
+    const h = await harness();
+    const first = await turn(h, "se_a", "remember 42", [
+      call("write", { path: "n.txt", content: "42" }, "c1"),
+      fauxAssistantMessage("noted"),
+    ]);
+    const before = JSON.stringify(first.messages);
+    await h.runners.close();
+    // A new SessionRunners over the same event log: the hub restarted.
+    const again = h.make();
+    const rebuilt = await again.runner("se_a");
+    expect(JSON.stringify(rebuilt.messages)).toBe(before);
+    let seen: string[] = [];
+    h.faux.setResponses([
+      (context) => {
+        seen = context.messages.map((m) => m.role);
+        return fauxAssistantMessage("I still know");
+      },
+    ]);
+    await again.send(LOCAL_PRINCIPAL, "se_a", "what was it?");
+    await rebuilt.settled();
+    expect(seen).toEqual(["system", "user", "assistant", "toolResult", "assistant", "user"]);
+    // The header is written once, not again on rebuild.
+    expect(h.events.of("se_a", "runner.header")).toHaveLength(1);
+  });
+});
+
+describe("box crash", () => {
+  test("a box crash mid-tool reports outcome unknown, never re-runs, and the turn continues", async () => {
+    const h = await harness();
+    h.faux.setResponses([
+      call("bash", { command: "sleep 20; echo late > late.txt" }, "c_crash"),
+      fauxAssistantMessage("I will check the state"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "run it");
+    const runner = await h.runners.runner("se_a");
+    const started = Date.now();
+    while (!h.boxes.methods().includes("tool.exec") && Date.now() - started < 5000) {
+      await Bun.sleep(10);
+    }
+    h.boxes.crash();
+    await runner.settled();
+    expect(runner.status).toBe("idle");
+    const [result] = toolResults(runner.messages);
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("outcome is unknown");
+    expect(result?.text).toContain("not re-run");
+    expect(h.boxes.methods().filter((m) => m === "tool.exec")).toHaveLength(1);
+    expect((runner.messages.at(-1) as Msg).role).toBe("assistant");
+    expect(h.sessions.inFlight).toBe(0);
+  });
+});
+
+describe("approvals", () => {
+  test("a deny-listed command never reaches the box and the model sees why", async () => {
+    const h = await harness({
+      denyList: [{ tool: "bash", pattern: "rm\\s+-rf", reason: "rm -rf is not allowed here" }],
+    });
+    const runner = await turn(h, "se_a", "clean", [
+      call("bash", { command: "rm -rf /workspace" }, "c_rm"),
+      call("bash", { command: "echo ok" }, "c_ok"),
+      fauxAssistantMessage("fine"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results[0]?.isError).toBe(true);
+    expect(results[0]?.text).toContain("rm -rf is not allowed here");
+    expect(results[1]?.isError).toBe(false);
+    const execs = h.boxes.sent.filter((f) => f.method === "tool.exec");
+    expect(execs).toHaveLength(1);
+    expect(JSON.stringify(execs)).not.toContain("rm -rf");
+    expect(h.sessions.leases).toBe(1);
+  });
+
+  test("a bad deny pattern fails at startup", async () => {
+    await expect(harness({ denyList: [{ tool: "bash", pattern: "(" }] })).rejects.toThrow(
+      "bad pattern",
+    );
+  });
+});
+
+describe("crash isolation", () => {
+  test("a runner that throws fails its own session visibly; another session finishes", async () => {
+    const h = await harness();
+    h.events.failOn = (sessionId, event) => sessionId === "se_a" && event.type === "pi.message_end";
+    const responses: FauxResponseStep[] = [];
+    for (let i = 0; i < 4; i++) responses.push(fauxAssistantMessage(`reply ${i}`));
+    h.faux.setResponses(responses);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "a");
+    await h.runners.send(LOCAL_PRINCIPAL, "se_b", "b");
+    const a = await h.runners.runner("se_a");
+    const b = await h.runners.runner("se_b");
+    await a.settled();
+    await b.settled();
+    expect(a.status).toBe("failed");
+    expect(a.failure).toContain("disk full");
+    expect(h.events.types("se_a")).toContain("runner.failed");
+    expect(b.status).toBe("idle");
+    expect(h.events.types("se_b")).not.toContain("runner.failed");
+    const view = await h.runners.view(LOCAL_PRINCIPAL, "se_a");
+    expect(view.status).toBe("failed");
+    await expect(h.runners.send(LOCAL_PRINCIPAL, "se_a", "more")).rejects.toThrow("runner failed");
+  });
+});
+
+describe("codemode and hub temp files", () => {
+  test("codemode is off by default and on when the session asks", async () => {
+    const h = await harness();
+    const off = await h.runners.runner("se_a");
+    expect(off.activeTools).not.toContain("codemode");
+    await h.runners.configure(LOCAL_PRINCIPAL, "se_b", { codemode: true });
+    const on = await h.runners.runner("se_b");
+    expect(on.activeTools).toContain("codemode");
+    // Options cannot change once the runner exists.
+    await expect(h.runners.configure(LOCAL_PRINCIPAL, "se_b", { codemode: false })).rejects.toThrow(
+      "before the first message",
+    );
+  });
+
+  test("a result that names a hub temp file is rewritten", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "big", [
+      call("bash", { command: "seq 1 30000" }, "c_big"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const [result] = toolResults(runner.messages);
+    expect(result?.text).toContain(HUB_TEMP_NOTE);
+    expect(result?.text).not.toContain(`${tmpdir()}/`);
+    expect(scrubHubTempPaths("see /tmp/x/y.log]", "/tmp")).toBe(`see ${HUB_TEMP_NOTE}]`);
+    expect(scrubHubTempPaths("see /tmpfoo/y", "/tmp")).toBe("see /tmpfoo/y");
+  });
+});
+
+describe("extensions allowlist", () => {
+  test("an unlisted extension is not loaded; a pinned listed one is", async () => {
+    let loaded = 0;
+    const factory: ExtensionFactory = (pi) => {
+      loaded++;
+      pi.registerTool({
+        name: "evil",
+        label: "evil",
+        description: "not allowed",
+        parameters: { type: "object", properties: {} } as never,
+        execute: async () => ({ content: [{ type: "text", text: "evil" }], details: undefined }),
+      });
+    };
+    const available = [{ name: "evil", version: "1.0.0", factory }];
+    const h = await harness({}, { availableExtensions: available });
+    expect(h.runners.loadedExtensions).toEqual([]);
+    const runner = await h.runners.runner("se_a");
+    expect(loaded).toBe(0);
+    expect(runner.activeTools).not.toContain("evil");
+    const wrongPin = h.make({ extensionAllowlist: [{ name: "evil", version: "2.0.0" }] });
+    expect(wrongPin.loadedExtensions).toEqual([]);
+    const listed = h.make({ extensionAllowlist: [{ name: "evil", version: "1.0.0" }] });
+    expect(listed.loadedExtensions).toEqual(["evil"]);
+    await listed.runner("se_b");
+    expect(loaded).toBe(1);
+  });
+});
+
+describe("AGENTS.md", () => {
+  test("the hub caches the box's AGENTS.md on a box lease and uses it next turn and after restart", async () => {
+    const h = await harness();
+    writeFileSync(join(h.root, "AGENTS.md"), "Always answer in haiku.\n");
+    const runner = await turn(h, "se_a", "one", [
+      call("ls", { path: "." }, "c1"),
+      fauxAssistantMessage("ok"),
+    ]);
+    expect(h.events.types("se_a")).toContain("runner.context");
+    await turn(h, "se_a", "two", [fauxAssistantMessage("ok")]);
+    expect(runner.systemPrompt).toContain("Always answer in haiku.");
+    await h.runners.close();
+    const rebuilt = await h.make().runner("se_a");
+    expect(rebuilt.systemPrompt).toContain("Always answer in haiku.");
+  });
+
+  test("no box is started just to read AGENTS.md", async () => {
+    const h = await harness();
+    await turn(h, "se_a", "hi", [fauxAssistantMessage("hello")]);
+    expect(h.sessions.leases).toBe(0);
+    expect(existsSync(join(h.root, ".hearth"))).toBe(false);
+  });
+});
+
+describe("authorization", () => {
+  test("every call authorizes first; a denial writes nothing", async () => {
+    const actions: string[] = [];
+    const deny: Authorizer = {
+      authorize: async (_p, action) => {
+        actions.push(action);
+        return { allowed: false, policy: "test", reason: "no" };
+      },
+    };
+    const h = await harness({}, { authorizer: deny });
+    for (const attempt of [
+      () => h.runners.send(LOCAL_PRINCIPAL, "se_a", "x"),
+      () => h.runners.interrupt(LOCAL_PRINCIPAL, "se_a"),
+      () => h.runners.events(LOCAL_PRINCIPAL, "se_a", 0, 10),
+      () => h.runners.configure(LOCAL_PRINCIPAL, "se_a", { codemode: true }),
+    ]) {
+      await expect(attempt()).rejects.toThrow("denied");
+    }
+    expect(actions).toEqual([
+      "session.message",
+      "session.interrupt",
+      "session.events",
+      "session.configure",
+    ]);
+    expect(h.events.types("se_a")).toEqual([]);
+  });
+
+  test("an unknown session is refused", async () => {
+    const h = await harness();
+    await expect(h.runners.send(LOCAL_PRINCIPAL, "se_nope", "x")).rejects.toThrow("no session");
+  });
+});
