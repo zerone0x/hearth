@@ -305,7 +305,11 @@ async function install(browser: Browser): Promise<void> {
   await context.close();
 }
 
-/** Everything the session API holds right now, through the signed-in context. */
+/**
+ * Everything the session API holds right now, through the signed-in context, minus the
+ * box lifecycle (state, last activity, `session.state` and `box.*` events). The hub's
+ * idle timer moves those on its own, so they say nothing about a refused request.
+ */
 async function snapshot(context: BrowserContext, sessionId: string) {
   const origin = { origin: BASE.origin };
   const sessions = await context.request.get(new URL("/v1/sessions", BASE).toString(), {
@@ -317,33 +321,20 @@ async function snapshot(context: BrowserContext, sessionId: string) {
     { headers: origin },
   );
   check(events.ok(), `reading events answered ${events.status()}`);
+  const sessionList = (await sessions.json()) as { sessions: Record<string, unknown>[] };
+  const eventPage = (await events.json()) as { events: { type: string }[] };
+  const lifecycle = (type: string) => type === "session.state" || type.startsWith("box.");
   return {
-    sessions: JSON.stringify(await sessions.json()),
-    events: JSON.stringify(await events.json()),
+    sessions: JSON.stringify(
+      sessionList.sessions.map(({ state: _s, lastActivityAt: _l, boxId: _b, ...rest }) => rest),
+    ),
+    events: JSON.stringify(eventPage.events.filter((e) => !lifecycle(e.type))),
     model: (await fauxRequests()).length,
   };
 }
 
-/** Snapshots once the session stops changing on its own (state transitions after a turn). */
-async function settledSnapshot(context: BrowserContext, sessionId: string) {
-  let last = await snapshot(context, sessionId);
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const next = await snapshot(context, sessionId);
-    if (
-      next.sessions === last.sessions &&
-      next.events === last.events &&
-      next.model === last.model
-    ) {
-      return next;
-    }
-    last = next;
-  }
-  throw new Error("the session did not settle within 30 s before the refusal checks");
-}
-
 async function refusals(context: BrowserContext, page: Page, sessionId: string): Promise<void> {
-  const before = await settledSnapshot(context, sessionId);
+  const before = await snapshot(context, sessionId);
   const sessionsUrl = new URL("/v1/sessions", BASE).toString();
   const messagesUrl = new URL(
     `/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
