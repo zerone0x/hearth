@@ -505,6 +505,30 @@ describe("startHub", () => {
     expect(JSON.parse(empty.body)).toMatchObject({ error: { code: "request.foreign-host" } });
   });
 
+  test("/healthz answers a Host that is not a valid URL authority, as before issue #48", async () => {
+    const hub = start();
+    const port = Number(hub.url.port);
+    // Base served these through the guard's /healthz exemption (decision 0010).
+    for (const host of [":80", ":", "127.0.0.1:99999", "127.0.0.1:abc", "[::1"]) {
+      const healthz = parseAnswer(
+        await raw(port, `GET /healthz HTTP/1.1\r\nHost: ${host}\r\nconnection: close\r\n\r\n`),
+      );
+      expect({ host, status: healthz.status }).toEqual({ host, status: 200 });
+      expect(JSON.parse(healthz.body)).toMatchObject({ status: "ok" });
+      // Any other path with the same Host is still refused, never served.
+      const other = parseAnswer(
+        await raw(port, `GET /v1/sessions HTTP/1.1\r\nHost: ${host}\r\nconnection: close\r\n\r\n`),
+      );
+      expect({ host, status: other.status }).toEqual({ host, status: 421 });
+      expect(JSON.parse(other.body)).toMatchObject({ error: { code: "request.foreign-host" } });
+    }
+    // The app decodes the path before the exemption, so an encoded /healthz is one too.
+    const encoded = parseAnswer(
+      await raw(port, "GET /%68ealthz?probe=1 HTTP/1.1\r\nHost: :80\r\nconnection: close\r\n\r\n"),
+    );
+    expect(encoded.status).toBe(200);
+  });
+
   test("a box listener serves the box socket and nothing else, whatever Host and Origin", async () => {
     const hub = start();
     const url = new URL(hub.listenForBoxes("127.0.0.1").replace("ws", "http"));
@@ -513,6 +537,15 @@ describe("startHub", () => {
     const foreign = { host: "attacker.example", origin: "https://evil.example" };
     const socket = await fetch(url, { headers: foreign, signal: AbortSignal.timeout(5_000) });
     expect(socket.status).toBe(426);
+    expect(socket.headers.get("content-type")).toContain("application/json");
+    expect(await socket.json()).toEqual({
+      ok: false,
+      error: {
+        code: "request.upgrade-required",
+        owner: "user",
+        message: "expected a WebSocket upgrade",
+      },
+    });
     for (const path of ["/healthz", "/v1/boxes/box_none/echo"]) {
       const res = await fetch(new URL(path, url), {
         method: path === "/healthz" ? "GET" : "POST",
