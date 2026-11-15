@@ -588,6 +588,62 @@ describe("SessionManager", () => {
     expect(await statesOf(r, s.id)).toEqual(["creating", "idle"]);
   });
 
+  describe("a refused principal cannot tell whether a session exists (#90)", () => {
+    const stranger = { ...LOCAL_PRINCIPAL, id: "usr_stranger", workspaceId: "ws_elsewhere" };
+    const denyAll: Authorizer = {
+      authorize: async () => ({ allowed: false, policy: "test", reason: "no" }),
+    };
+    for (const [name, policy] of [
+      ["allow-all", undefined],
+      ["deny-all", denyAll],
+    ] as const) {
+      test(`archive, fail and ensureBox answer alike for unknown, live, archived and failed ids, ${name}`, async () => {
+        const r = rig();
+        const live = await r.manager.create(LOCAL_PRINCIPAL);
+        const gone = await r.manager.create(LOCAL_PRINCIPAL);
+        await r.manager.archive(LOCAL_PRINCIPAL, gone.id);
+        const dead = await r.manager.create(LOCAL_PRINCIPAL);
+        await r.manager.fail(dead.id, "x");
+        const m = policy === undefined ? r.manager : r.make({ authorizer: policy });
+        await m.ready;
+        const outcome = async (run: (id: string) => Promise<unknown>, id: string) => {
+          const e = (await run(id).then(
+            () =>
+              new HearthError("resolved", {
+                owner: "hub",
+                disposition: "give-up",
+                code: "resolved",
+              }),
+            (error: unknown) => error,
+          )) as HearthError;
+          return `${e.code} ${e.message.replaceAll(id, "<id>")}`;
+        };
+        const ops: ((id: string) => Promise<unknown>)[] = [
+          (id) => m.archive(stranger, id),
+          (id) => m.fail(id, "x", stranger),
+          (id) => m.ensureBox(id, stranger),
+          (id) => m.get(stranger, id),
+        ];
+        for (const op of ops) {
+          const expected = await outcome(op, "se_unknown");
+          expect(expected).toStartWith("authz.denied");
+          expect(await outcome(op, live.id)).toBe(expected);
+          expect(await outcome(op, gone.id)).toBe(expected);
+          expect(await outcome(op, dead.id)).toBe(expected);
+        }
+        expect(r.store.getSession(scope, live.id)?.state).toBe("idle");
+        expect(r.store.getSession(scope, dead.id)?.state).toBe("failed");
+        expect(r.boxes.calls).toEqual([]);
+        const refused = r.db
+          .query<{ n: number }, [string]>(
+            "SELECT count(*) AS n FROM audit WHERE resource_id = ? AND allowed = 0",
+          )
+          .get(live.id);
+        if (policy === undefined) expect(refused?.n).toBe(4);
+      });
+    }
+  });
+
   test("fail moves the session to failed through the state machine and stops its box (#43)", async () => {
     const r = rig();
     const s = await r.manager.create(LOCAL_PRINCIPAL);

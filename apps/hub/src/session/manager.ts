@@ -282,7 +282,7 @@ export class SessionManager {
   async archive(principal: Principal, sessionId: SessionId): Promise<SessionView> {
     await this.ready;
     return await this.#serial(sessionId, async () => {
-      const s = this.#mustGet(sessionId);
+      const s = await this.#load(principal, "session.archive", sessionId);
       const row = await this.#transition(principal, s, "archived", "archived");
       this.#clearIdle(this.#rt(sessionId));
       this.#clearGrace(this.#rt(sessionId));
@@ -313,8 +313,11 @@ export class SessionManager {
   ): Promise<SessionView> {
     await this.ready;
     return await this.#serial(sessionId, async () => {
-      const s = this.#mustGet(sessionId);
-      if (s.state === "failed") return view(s);
+      const s = await this.#load(principal, "session.fail", sessionId);
+      if (s.state === "failed") {
+        await this.#authorize(principal, "session.fail", sessionId);
+        return view(s);
+      }
       const row = await this.#transition(principal, s, "failed", reason);
       this.#clearIdle(this.#rt(sessionId));
       this.#clearGrace(this.#rt(sessionId));
@@ -350,6 +353,12 @@ export class SessionManager {
     let boxId: BoxId;
     try {
       boxId = await this.#serial(sessionId, async () => {
+        // Authorize one fixed action before anything depends on the session's
+        // existence or state: the action a later transition asks for (run or
+        // wake) and the "unavailable" answer would tell an outsider which it is.
+        // The hub's own runner (system principal) is not an outsider (#90).
+        if (principal !== SYSTEM_PRINCIPAL)
+          await this.#authorize(principal, "session.run", sessionId);
         const s = this.#mustGet(sessionId);
         if (s.state === "archived" || s.state === "failed") {
           throw new HearthError(`session ${sessionId} is ${s.state}`, {
@@ -832,6 +841,8 @@ export class SessionManager {
     reason: string,
   ): Promise<SessionRow> {
     const from = s.state;
+    // Authorize first: a refusal must not reveal the session's state (#90).
+    await this.#authorize(principal, TRANSITION_ACTIONS[to], s.id);
     if (!isSessionState(from) || !canTransition(from, to)) {
       throw new HearthError(`session ${s.id} cannot go from ${from} to ${to}`, {
         owner: "hub",
@@ -839,7 +850,6 @@ export class SessionManager {
         code: "session.illegal-transition",
       });
     }
-    await this.#authorize(principal, TRANSITION_ACTIONS[to], s.id);
     await this.#append(s.id, "session.state", { from, to, reason });
     const now = this.#now();
     this.#store.setSessionState(this.#scope, s.id, to, now);
@@ -872,6 +882,23 @@ export class SessionManager {
 
   async #append(sessionId: SessionId, type: string, payload: JsonValue): Promise<void> {
     await this.#events.append(this.#scope, sessionId, { type, payload });
+  }
+
+  /**
+   * Look a session up for a caller. An unknown id is authorized before it is
+   * reported missing, so a principal the policy refuses gets the same
+   * `authz.denied` (and audit row) for an unknown id as for another
+   * workspace's id, and learns nothing about which ids exist (#90).
+   */
+  async #load(
+    principal: Principal,
+    action: `${string}.${string}`,
+    sessionId: SessionId,
+  ): Promise<SessionRow> {
+    if (this.#store.getSession(this.#scope, sessionId) === undefined) {
+      await this.#authorize(principal, action, sessionId);
+    }
+    return this.#mustGet(sessionId);
   }
 
   #mustGet(sessionId: SessionId): SessionRow {
