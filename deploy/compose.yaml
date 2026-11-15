@@ -63,6 +63,8 @@ services:
       context: ..
       dockerfile: deploy/hub.Dockerfile
     network_mode: host
+    # Root in the container: see SECURITY above (decision 0020).
+    user: "0:0"
     init: true
     restart: unless-stopped
     depends_on:
