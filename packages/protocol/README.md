@@ -22,8 +22,37 @@ One WebSocket per box, opened by the box. Two kinds of message share it:
 
 `decodeFrame` returns `{ ok: true, frame }` or `{ ok: false, error }`, where
 `error.code` is one of `invalid-json`, `not-a-frame`, `unknown-type`,
-`invalid-field` (with the field's `path`) or `invalid-binary`. Unknown fields
-are dropped, so a newer minor version can add optional fields.
+`invalid-field` (with the field's `path`), `invalid-binary` or
+`version-mismatch` (see [Versioning](#versioning)). An `unknown-type` error
+echoes at most `MAX_ECHOED_TYPE_LENGTH` (64) characters of the received type.
+
+Unknown fields are dropped, so a newer minor version can add optional fields.
+A field that belongs to another variant of the same frame is rejected, not
+dropped: `path` or `mode` on a `vnc` stream, `failure` on a non-failed outcome,
+`hubVersion` or `boxVersion` on a reject that is not `version-mismatch`, and
+`result` and `error` together in an `rpc.result`.
+
+`encodeFrame` never produces a message the decoder rejects. A frame that fails
+validation (say a `ping` with a negative nonce), or that JSON cannot carry
+faithfully (`NaN`, a `Uint8Array` inside a payload), throws `EncodeError`, a
+`RangeError`. That is a caller bug, not bad input. A property test checks that
+every frame that encodes decodes back to an equal frame.
+
+Opaque JSON payloads (`turn.event` `event`, `rpc` params and results) nest at
+most `MAX_JSON_DEPTH` (64) arrays and objects, counting the outermost one.
+
+## Failures
+
+A `failed` outcome carries a `Failure`: an `owner` (`FailureOwner`: `box`,
+`model-provider`, `gateway`, `hub`, `user`), a `disposition`
+(`FailureDisposition`) and a `message`. This package owns that vocabulary;
+other packages import the types from `@hearth/protocol`.
+
+| Disposition | Meaning |
+|---|---|
+| `retry` | Retrying the same work may succeed, on the same box |
+| `retry-cold` | Retry only on a fresh box started by a cold boot; this box or its state is suspect |
+| `give-up` | Retrying will not help; surface the failure |
 
 ## Frames
 
@@ -31,7 +60,7 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
 
 | Frame | Direction | Delivery | Purpose |
 |---|---|---|---|
-| `hello` | B→H | fire-and-forget | First frame: protocol version, box id, boot id, credential |
+| `hello` | B→H | fire-and-forget | First frame: protocol version, box id, boot id, credential, box state |
 | `welcome` | H→B | fire-and-forget | Handshake accepted; may carry the per-box credential |
 | `reject` | H→B | fire-and-forget | Handshake refused, with a reason; names both versions on `version-mismatch` |
 | `session.assign` | H→B | fire-and-forget | Run (or resume) a session in this box |
@@ -67,16 +96,69 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
   session state machine re-drives commands after a reconnect, an `rpc` caller
   hits its deadline, and a broken stream is reopened.
 
+## Commands are idempotent
+
+`session.assign`, `turn.start` and `session.hibernate` are the hub → box
+commands. They are fire-and-forget, and after a reconnect the hub re-sends any
+command whose effect it has not seen. So the box may receive a command twice and
+must apply it at most once. `isDuplicateCommand(history, command)` is the rule,
+and the box ignores a command it returns `true` for:
+
+- `turn.start` whose `turnId` the box already knows in this boot (running or
+  ended). A turn never runs twice. Its `turn.event` and `turn.end` frames are
+  at-least-once, so the hub gets the outcome anyway.
+- `session.hibernate` whose `requestId` the box already knows in this boot. Its
+  one `hibernate.done` is at-least-once.
+- `session.assign` for the session that is assigned now. Assigning the same
+  session again after it was hibernated is a new command (a resume).
+
+## Reconnect
+
+Every `hello` carries the box's `state`:
+
+| Field | Meaning |
+|---|---|
+| `sessionId` | The session assigned to the box, or `null` |
+| `turnId` | The turn running in that session, or `null` (requires `sessionId`) |
+| `lastDeliveryId` | The highest `deliveryId` sent in this boot, or 0 when none |
+
+The state is part of `hello`, so it is fire-and-forget like the rest of the
+handshake: it is a snapshot that is sent again on every connect, and the hub has
+it before it sends anything. On reconnect the hub:
+
+1. Compares `bootId` with the boot it knew. A new boot means the box lost its
+   memory: a turn the hub thought was running on the old boot is ended visibly
+   as failed (owner `box`) and is never re-sent, since part of its work may
+   already have happened (PRD §8.1, principles 1 and 7).
+2. On the same boot, applies the redelivered at-least-once frames until it has
+   applied `lastDeliveryId`. It then knows everything the box has reported.
+3. Re-sends what the box still lacks: `session.assign` when `state.sessionId`
+   is not the session it assigned, `turn.start` for a turn with no `turn.end`
+   that is not `state.turnId`, `session.hibernate` for a request with no
+   `hibernate.done`. Idempotent apply makes a needless re-send harmless.
+
 ## Versioning
 
 `hello` carries `{ major, minor }`. Peers with the same major can talk; a minor
-bump only adds optional fields or frame types. `checkHelloVersion(hello)`
-returns `null` when the versions are compatible, or the `reject` frame to send,
-whose message names both versions.
+bump only adds optional fields or frame types.
+
+**Frozen across all major versions:** the `type` and `version` fields of
+`hello` (`version` is `{ major, minor }`, two unsigned integers), and the whole
+`reject` frame. Every future major keeps them, so any two versions can always
+tell each other why they cannot talk.
+
+The decoder reads a `hello`'s `type` and `version` before any other field. When
+the major differs from its own, it stops and returns `version-mismatch` with
+`peerVersion`, whatever shape the rest of the hello has. The hub turns a failed
+first frame into the `reject` to send with `rejectHello(error)`:
+`version-mismatch` naming both versions, or `malformed-hello` otherwise.
+`checkHelloVersion(hello)` does the same check on a decoded hello.
 
 ## Streams
 
 Stream ids are unsigned 32-bit integers. The hub opens even ids and the box
 opens odd ids, so the two sides never collide. `seq` starts at 0 for each
 stream. A `file` stream names a path relative to the box workspace; the decoder
-rejects absolute paths, drive letters and `..` segments.
+rejects absolute paths, drive letters, `..` segments, and control or bidi
+characters (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069), which could
+make a path display as a different one.
