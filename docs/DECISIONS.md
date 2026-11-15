@@ -1541,6 +1541,121 @@ of box-agent's memory.
 - A separate uid for commands stays open; revisit it if a box ever holds a
   secret on disk or in a process other than box-agent.
 
+## 0020: Docker Compose install: host-network hub, a privileged firewall one-shot, a models file, the faux model server
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #47
+
+### Decision
+
+- **`deploy/compose.yaml`, three services.** `box-image` builds the box image
+  (`hearth-box:local`, `PI_VERSION` from the pi pin) and exits at once: it is
+  never a running service, and the hub starts boxes from that tag with
+  `HEARTH_BOX_PULL=never`. `box-firewall` is a one-shot that applies the box
+  egress firewall. `hub` depends on both completing successfully, so a fresh
+  `docker compose up` builds everything, firewalls the host and then starts the
+  hub. Settings come from `deploy/.env` (`hearth.env.example`), the model key
+  from the file `deploy/secrets/model_key` (a compose secret at
+  `/run/secrets/model_key`, `HEARTH_MODEL_KEY_REF=file:/run/secrets/model_key`),
+  read through the SecretStore. Data is the named volume `hearth-data` at
+  `/data`.
+- **The hub image** (`deploy/hub.Dockerfile`) builds the web UI in a first
+  stage and ships only `apps/web/dist`, the hub, `packages/*` sources and
+  production dependencies on `oven/bun:1.4.4-slim`, with a `/healthz` health
+  check (`docker compose up --wait`). Build contexts are the repo root; the
+  per-Dockerfile ignore files keep `deploy/secrets` (and the box image's own
+  ignore file now does too) out of every build context.
+- **The hub runs on the host's network** (`network_mode: host`), as 0012
+  requires: it binds each box network's gateway address. Its UI/API listener
+  still binds `127.0.0.1:8787`, which is now the host's loopback; the owner
+  publishes it with a TLS reverse proxy or an SSH tunnel. No port is published
+  and no compose network is created.
+- **The hub mounts the Docker socket and runs as root in its container.** The
+  socket is root on the host, so a non-root user in the socket's group is no
+  smaller boundary, and it would need the host's group id and a key file
+  readable by that user, both host-specific. The risk is stated in
+  `compose.yaml` and `docs/install.md`: whoever controls the hub controls the
+  daemon. The login (0014), the request guard (0010) and loopback binding are
+  what stand in front of it.
+- **Firewall: a privileged init step, not a host prerequisite.** 0012 needs
+  root on the host's network namespace once per boot. Of the two ways to get
+  that under compose, the install uses a one-shot container,
+  `box-firewall` (`deploy/firewall.Dockerfile`: Debian slim, `iptables`,
+  `scripts/box-firewall.sh` unchanged), with `network_mode: host`,
+  `cap_drop: ALL` plus `NET_ADMIN` and `NET_RAW`, and the host's `/run/hearth`
+  mounted for the marker. Reasons:
+  - The owner already gives this compose project the Docker socket, which is
+    more than `NET_ADMIN`; a documented `sudo scripts/box-firewall.sh apply`
+    adds a manual step and a host dependency (`iptables` binaries matching the
+    kernel's backend) without lowering the trust needed.
+  - Compose orders it: the hub starts only after the rules and the marker are
+    in place, so the first `up` never has a window with unfiltered boxes.
+  - The privilege stays out of the long-running hub (0012's reason for a
+    one-shot), and the one-shot holds no state.
+  The host's iptables backend matters: the rules must sit in the backend
+  Docker uses. `deploy/firewall-entrypoint.sh` picks the backend whose
+  ruleset has Docker's chains (nft when neither or both do), overridable with
+  `HEARTH_IPTABLES=nft|legacy`. After a reboot Docker restarts the hub but not
+  the one-shot; the marker is then missing and the hub refuses to start boxes
+  (`box.egress-unfiltered`), visibly, until `docker compose up` runs again.
+  `docs/install.md` gives a systemd unit that runs it at boot and re-applies
+  on a firewalld reload. A host prerequisite stays possible: the script is the
+  same file, and an owner can run it on the host and remove the one-shot.
+- **`HEARTH_MODELS_FILE`: a pi `models.json` for the runner.** `ModelRuntime`
+  is created with it as `modelsPath` (it was always `null`), so an owner can
+  use a provider pi does not ship, such as an OpenAI-compatible endpoint.
+  The value must be an absolute path to an existing file (startup error
+  otherwise); compose mounts `deploy/config/` read-only at `/etc/hearth`. The
+  key still comes only from `HEARTH_MODEL_KEY_REF` through the SecretStore and
+  is redacted as before (0015). A models file can carry its own `apiKey` and
+  `headers` (pi resolves `$VAR` and `!command` there); it is the owner's own
+  config, mounted read-only, and the docs do not use those fields.
+- **The e2e drives the hub with the faux model server, not pi-ai's faux
+  provider.** pi-ai's faux provider lives in the process that registers it;
+  the compose hub is another process in another container, and a test-only
+  provider switch in the production hub was not wanted. `deploy/e2e/faux-model.ts`
+  is a scripted OpenAI-compatible chat completions endpoint (streaming, text
+  and tool calls) with an HTTP control API (`/faux/script`,
+  `/faux/requests`). The install points the hub at it through
+  `HEARTH_MODELS_FILE`, so the e2e also proves that the key from the secret
+  file reaches the provider as the bearer token, and never the box.
+- **CI runs `docs/install.md` verbatim.** Each block the CI runs is fenced
+  as ` ```sh install:<step>`; `scripts/doc-block.sh` extracts one by name
+  (one match exactly) and `scripts/run-doc-block.sh` runs it in `deploy/`
+  under `bash -euo pipefail`, failing when the block is missing, duplicated
+  or empty (so a renamed tag cannot turn a step into an empty, passing script). Only the
+  `git clone`, the interactive `read` of the key and systemd are untagged. The
+  one step CI does in its own words is the `.env` edit the page asks for,
+  done with the models-file option the page documents.
+- **The exit e2e** (`deploy/e2e/prototype.ts`, Playwright) drives the UI by
+  role, label and accessible name only, so the component rewrite of #77 that
+  keeps those names keeps the test. It walks PRD §11.1: `/healthz` with
+  `boxEgress: filtered`; setup with the logged token, sign out, sign in;
+  create a session; a turn whose `write` and `bash` calls show as done with
+  their output, the file read back from the box container's `/workspace` with
+  `docker exec`, and the key absent from the box's environment; the desktop
+  opened to the real 1280x800 framebuffer; the page closed and reopened from
+  the session list, the chat rebuilt and a second turn answered; refusals
+  (no login: 401; another `Origin` with a valid cookie: 403; `text/plain`:
+  415; a real page on another origin of the same site, which does send the
+  `SameSite=Strict` cookie, posting both no-cors and CORS requests), after
+  which the session list, the session's events and the model's request count
+  are unchanged. Then the job runs the upgrade block (`up --build` again) and
+  checks the password, the session and its chat survived and a turn runs, and
+  the uninstall and purge blocks, checking that the rules, the marker, the
+  boxes, their networks, the volumes and the images are gone.
+
+### Consequences
+
+- The first `docker compose up` builds the box image locally (several
+  minutes). Published images are a later step (v1.0 one-command install).
+- `PI_VERSION` in `compose.yaml` must move with the pi pin; the box image
+  build fails if it does not match the installed pi, so the CI job catches a
+  drift.
+- The e2e needs Docker, so it runs only in CI (`compose-e2e`), like the other
+  Docker suites.
+
 ## 0021: Observability: trajectories, structured logs, trace context on tool RPCs, optional OTLP export
 
 - Date: 2026-11-15

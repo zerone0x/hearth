@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { createDefaultSecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
@@ -51,7 +51,10 @@ export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>)
 /**
  * The runner's model (decision 0015): `HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL`
  * and `HEARTH_MODEL_KEY_REF`, a SecretStore reference such as
- * `env:ANTHROPIC_API_KEY`. Without `HEARTH_MODEL` the runner is off.
+ * `env:ANTHROPIC_API_KEY` or `file:/run/secrets/model_key`. Without
+ * `HEARTH_MODEL` the runner is off. `HEARTH_MODELS_FILE` (decision 0020) is a
+ * pi `models.json` for providers pi does not ship, such as an
+ * OpenAI-compatible endpoint; it must be an absolute path to an existing regular file (not a directory).
  */
 export function runnerConfigFromEnv(
   env: Readonly<Record<string, string | undefined>>,
@@ -63,7 +66,18 @@ export function runnerConfigFromEnv(
     throw new Error("HEARTH_MODEL_PROVIDER must be set when HEARTH_MODEL is");
   }
   const keyRef = env["HEARTH_MODEL_KEY_REF"];
-  return { provider, model, ...(keyRef ? { apiKeyRef: keyRef } : {}) };
+  const modelsFile = env["HEARTH_MODELS_FILE"];
+  if (modelsFile !== undefined && modelsFile !== "") {
+    if (!isAbsolute(modelsFile) || !statSync(modelsFile, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error(`HEARTH_MODELS_FILE must be an absolute path to a file, got "${modelsFile}"`);
+    }
+  }
+  return {
+    provider,
+    model,
+    ...(keyRef ? { apiKeyRef: keyRef } : {}),
+    ...(modelsFile ? { modelsFile } : {}),
+  };
 }
 
 /** Where `bun run --filter @hearth/web build` puts the UI, relative to this file. */
