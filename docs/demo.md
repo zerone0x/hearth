@@ -30,12 +30,11 @@ HEARTH_DATA_DIR=/tmp/hearth-data bun run --filter @hearth/hub start
 curl -s -X POST http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
 ```
 
-Today this can only answer `409` with `box.not-connected`. A standalone hub
-has no way yet to get a box connected to it: it listens on loopback only, so a
-box on its own bridge network cannot reach it, and nothing in `main.ts` starts
-or watches boxes. Those are follow-ups: #27 (a listener boxes can reach) and
-#28 (box supervision). Until they land, the echo round trip runs in the two
-setups below, where the test starts the box itself.
+Today this can only answer `409` with `box.not-connected`. The hub has the
+Docker box provider wired in and listens for each box on its network's gateway
+(decision 0012), but nothing in the API starts a box until the session manager
+lands (#28). The echo round trip runs in the two setups below, where the test
+starts the box itself.
 
 ### With Docker and the real box image
 
@@ -46,10 +45,13 @@ HEARTH_DOCKER_TESTS=1 HEARTH_BOX_AGENT_IMAGE=hearth-box:ci \
   bun test apps/hub/src/box/echo.docker.test.ts
 ```
 
-The test starts a hub, creates the box with `DockerBoxProvider` (its own
-bridge network, no published ports), passes the hub URL and join token in the
-box's boot environment, waits for the box's own box-agent to dial in, and
-checks the echo round trip. CI runs it in the `box-provider` job.
+The test starts a hub on its production defaults (API on loopback, box
+listener on the box network's gateway, decision 0012), starts the box with
+`hub.startBox` (its own bridge network, no published ports, the box
+listener's URL and a join token in its boot environment), waits for the box's
+own box-agent to dial in, checks the echo round trip, and probes the box's
+egress. It needs `HEARTH_TEST_LAN_URL` (an HTTP server on a private address)
+and `HEARTH_TEST_EGRESS=open` unless `sudo scripts/box-firewall.sh apply` ran. CI runs it in the `box-provider` job.
 
 ### The reliability tests
 
