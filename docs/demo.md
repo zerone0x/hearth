@@ -15,30 +15,22 @@ bun apps/hub/src/demo.ts
 It starts a hub on a free loopback port with a database in a temporary
 directory, issues a one-time join token for `box_demo`, starts box-agent as a
 child process with `HEARTH_HUB_URL`, `HEARTH_BOX_ID` and `HEARTH_JOIN_TOKEN`,
-waits for it to connect, and calls the echo endpoint. Expected last lines:
+waits for it to connect, and calls the echo endpoint. Among the hub's and
+box-agent's log lines it prints:
 
 ```
 box_demo connected
 POST /v1/boxes/box_demo/echo -> 200 {"ok":true,"result":{"message":"hello from the hub"}}
 ```
 
-### With a running hub
+The `check` job in CI runs it and fails unless it exits 0 and prints both
+lines.
 
-```sh
-HEARTH_DATA_DIR=/tmp/hearth-data bun run --filter @hearth/hub start
-# in another shell:
-# sign in first (decision 0014; the first run logs a setup token, see README):
-curl -s -c jar -H 'content-type: application/json' http://127.0.0.1:8787/v1/auth/login \
-  -d '{"password":"<owner password>"}'
-curl -s -b jar -X POST -H 'content-type: application/json' \
-  http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
-```
+### The whole product
 
-Today this can only answer `409` with `box.not-connected`. The hub has the
-Docker box provider wired in and listens for each box on its network's gateway
-(decision 0012), but nothing in the API starts a box until the session manager
-lands (#28). The echo round trip runs in the two setups below, where the test
-starts the box itself.
+[install.md](install.md) installs the M1 prototype with Docker Compose. The
+`compose-e2e` CI job runs that page, then walks the prototype's exit criteria
+in a browser (`deploy/e2e/prototype.ts`).
 
 ### With Docker and the real box image
 

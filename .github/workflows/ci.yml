@@ -27,6 +27,15 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Check
         run: bun run check
+      # docs/demo.md (#36): the hub-box echo without Docker. The output is
+      # captured first and grepped after, so a demo that hangs, fails or
+      # prints neither line fails the step.
+      - name: M0 demo (docs/demo.md)
+        run: |
+          out="$(timeout 60 bun apps/hub/src/demo.ts 2>&1)"
+          printf '%s\n' "$out"
+          grep -qxF 'box_demo connected' <<<"$out"
+          grep -qxF 'POST /v1/boxes/box_demo/echo -> 200 {"ok":true,"result":{"message":"hello from the hub"}}' <<<"$out"
 
   # Web UI e2e (#46, decision 0017): the built UI in Chromium against a real
   # hub (faux model, box-agent as a local process, fake RFB server).
