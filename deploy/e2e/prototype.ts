@@ -324,8 +324,26 @@ async function snapshot(context: BrowserContext, sessionId: string) {
   };
 }
 
+/** Snapshots once the session stops changing on its own (state transitions after a turn). */
+async function settledSnapshot(context: BrowserContext, sessionId: string) {
+  let last = await snapshot(context, sessionId);
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const next = await snapshot(context, sessionId);
+    if (
+      next.sessions === last.sessions &&
+      next.events === last.events &&
+      next.model === last.model
+    ) {
+      return next;
+    }
+    last = next;
+  }
+  throw new Error("the session did not settle within 30 s before the refusal checks");
+}
+
 async function refusals(context: BrowserContext, page: Page, sessionId: string): Promise<void> {
-  const before = await snapshot(context, sessionId);
+  const before = await settledSnapshot(context, sessionId);
   const sessionsUrl = new URL("/v1/sessions", BASE).toString();
   const messagesUrl = new URL(
     `/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
@@ -404,7 +422,10 @@ async function refusals(context: BrowserContext, page: Page, sessionId: string):
   // Nothing changed: no session created, no message stored, no turn run.
   await page.waitForTimeout(2000);
   const after = await snapshot(context, sessionId);
-  check(after.sessions === before.sessions, "a refused request created or changed a session");
+  check(
+    after.sessions === before.sessions,
+    `a refused request created or changed a session:\nbefore ${before.sessions}\nafter  ${after.sessions}`,
+  );
   check(after.events === before.events, "a refused request added events to the session");
   check(after.model === before.model, "a refused request reached the model");
   await script([]);
