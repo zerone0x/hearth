@@ -83,6 +83,8 @@ export interface HubOptions extends HubListenOptions {
   readonly boxEgress?: BoxEgressCheck;
   /** Path of the hub's SQLite database. Created and migrated on start. */
   readonly dbPath: string;
+  /** Built web UI to serve on the public listener (`apps/web/dist`, decision 0017). */
+  readonly webRoot?: string;
   readonly log?: (line: string) => void;
   /**
    * The hub-side pi runner (#43, decision 0015): model, key reference,
@@ -181,6 +183,7 @@ export function startHub(options: HubOptions) {
       allowedHosts: [...LOOPBACK_HOSTS, hostname],
       ...(options.provider === undefined ? {} : { boxEgress }),
       ...(options.publicOrigin === undefined ? {} : { publicOrigin: options.publicOrigin }),
+      ...(options.webRoot === undefined ? {} : { webRoot: options.webRoot }),
     },
   );
 

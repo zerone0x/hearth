@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createDefaultSecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
@@ -65,6 +65,28 @@ export function runnerConfigFromEnv(
   return { provider, model, ...(keyRef ? { apiKeyRef: keyRef } : {}) };
 }
 
+/** Where `bun run --filter @hearth/web build` puts the UI, relative to this file. */
+const DEFAULT_WEB_DIR = join(import.meta.dir, "../../web/dist");
+
+/**
+ * The built web UI (decision 0017): `HEARTH_WEB_DIR`, else `apps/web/dist`
+ * when it was built. A configured directory that does not exist is an error;
+ * an unbuilt default just means no UI.
+ */
+export function webRootFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+  fallback: string = DEFAULT_WEB_DIR,
+): string | undefined {
+  const raw = env["HEARTH_WEB_DIR"];
+  if (raw !== undefined && raw !== "") {
+    if (!existsSync(join(raw, "index.html"))) {
+      throw new Error(`HEARTH_WEB_DIR has no index.html: "${raw}"`);
+    }
+    return raw;
+  }
+  return existsSync(join(fallback, "index.html")) ? fallback : undefined;
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -77,6 +99,7 @@ if (import.meta.main) {
   const boxEgress = boxEgressFromEnv(process.env);
   mkdirSync(dataDir, { recursive: true });
   const runnerConfig = runnerConfigFromEnv(process.env);
+  const webRoot = webRootFromEnv(process.env);
   const hub = startHub({
     ...(runnerConfig === undefined
       ? {}
@@ -89,12 +112,14 @@ if (import.meta.main) {
     ...(provider === undefined ? {} : { provider }),
     boxEgress,
     dbPath: join(dataDir, "hearth.db"),
+    ...(webRoot === undefined ? {} : { webRoot }),
     ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
     sessions: { idleMs: idleMsFromEnv(process.env) },
     log: (line) => console.log(line),
   });
 
   console.log(`hearth hub listening on ${hub.url} (box provider: ${provider?.name ?? "none"})`);
+  console.log(webRoot === undefined ? "web UI: not built" : `web UI: ${webRoot}`);
   if (provider !== undefined) {
     // Boxes still running from before a restart get their listeners back. A
     // daemon that is down is not fatal: the hub serves the API and keeps
