@@ -1196,6 +1196,107 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 - Only one principal exists. A multi-user edition (PRD §7 E2) adds principals
   to `owner_password` / `login_session` without changing the guard.
 
+## 0015: Hub-side pi runner: routed tools, event log, AGENTS.md cache, codemode, extension allowlist, legacy turn commands
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #43 (and its comments from the #38 verification, the #40 spike and #56)
+
+### Decision
+
+- **One runner per session, in the hub** (`apps/hub/src/runner/`, docs/runner.md).
+  `createAgentSession` with `SettingsManager.inMemory`, an empty `agentDir` the
+  runner owns, and a `DefaultResourceLoader` with all discovery off
+  (`noExtensions`, `noSkills`, `noPromptTemplates`, `noThemes`,
+  `noContextFiles`). The `hearth-tools` extension registers `read`, `write`,
+  `edit`, `bash`, `ls`, `find` and `grep` under their built-in names. Each call
+  takes a `SessionManager.ensureBox` lease (lazy start, in-flight accounting),
+  builds `ToolRpcClient.operations(boxId, toolCallId)`, and releases the lease
+  when the call ends. `grep` replaces `execute()`; `bash` drops pi's `env`.
+- **`tool_call`** rewrites `~` to `/workspace` (0011) and applies the config
+  deny-list (`{tool, pattern?, reason?}`; `tool` may be `*`; a rule without a
+  pattern blocks every call of its tool; the pattern is tested against the bash
+  command or the path, and a path also in its normalized form, resolved against
+  `/workspace` with `//` and `..` collapsed). A blocked call never reaches the
+  box. The deny-list is **best-effort, not a boundary**: shell spellings
+  (`rm -fr`, `$X -rf`, `base64 -d | sh`) and write content get past a regex.
+  The box is the boundary; stopping those is the job of the M3 approvals.
+  **`tool_result`**
+  rewrites every path under the hub's temp dir (pi's bash truncation hint,
+  codemode's spilled output and saved images) to a note that it is a hub file.
+  The box keeps its own full exec output (0011), so the model loses nothing.
+- **Model key: the `direct` gateway of PRD §6.4.** The key is resolved from the
+  `SecretStore` (`HEARTH_MODEL_KEY_REF`) and applied in memory with
+  `ModelRuntime.setRuntimeApiKey`; pi gets no auth file and no hub env. The
+  provider and model are config (`HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL`).
+  The key, and any other SecretStore value the runner uses, is redacted
+  (`[redacted]`) from provider error text and every other event payload,
+  failure message and log line before it is stored or logged.
+- **Events.** Every pi session event is appended as `pi.<type>` (without the
+  `partial`, `messages` and `toolResults` fields, which repeat other events),
+  plus `message.user`, `runner.usage`, `runner.interrupted`, `runner.failed`,
+  `runner.header` once and `runner.entry` per pi session entry. After a hub
+  restart the runner is rebuilt with
+  `SessionManager.inMemory(cwd, undefined, [header, ...entries])`.
+- **Box crash mid-tool.** The tool RPC fails the call with
+  `tool.outcome-unknown` ("its outcome is unknown and it was not re-run"); pi
+  turns it into a tool error the model sees, and the turn goes on. The next
+  call's `ensureBox` gets the relaunched box. Nothing re-runs the call.
+- **Hub restart mid-tool.** A rebuilt runner gives every tool call on the
+  branch that has no result an error result saying its outcome is unknown and
+  it was not re-run, persists it as `runner.entry`, and records
+  `runner.outcome-unknown`. The model does not get pi-ai's synthetic
+  "No result provided", which reads as if the call never ran.
+- **Crash isolation.** A turn runs in the background behind a catch. An
+  exception from `prompt`, from the event subscriber, or a failed event append
+  marks that runner `failed`, aborts its turn and appends `runner.failed`.
+  The hub then moves the session to `failed` with `SessionManager.fail`,
+  through the state machine (authorized as `session.fail`, audited, and
+  recorded as a `session.state` event), and stops its box; the volume stays.
+  Other sessions and the hub go on. A failed session refuses messages
+  (`runner.failed`, 409), also after a hub restart.
+- **AGENTS.md under lazy start: a hub-side cache.** The hub never starts a box
+  just to read context files. On the first box lease of each turn (the box is
+  up for a tool call anyway) the runner reads `/workspace/AGENTS.md` through
+  the tool RPC, inside that call's lease (its try/finally), so the lease is
+  released whatever happens. A failed read keeps the last copy; a failed
+  `runner.context` append fails the call and the runner, like any failed
+  append. A changed copy is stored as `runner.context` and used from the
+  next turn on (`session.reload()`) and after a restart. The first turn of a
+  new session runs without it. Starting the box on session create was not
+  chosen: it breaks lazy start (PRD §6.2) for every chat that never touches
+  files. Skills can follow the same path (`skillsOverride`).
+- **Codemode** is a per-session option, set before the first message
+  (`POST /v1/sessions/:id/runner {"codemode": true}`), off by default. QuickJS
+  runs in the hub and its `tools.*` calls go through `hearth-tools`, so to the
+  box. Its `models` global is off, so scripts cannot spend the key on other
+  models. Its hub temp paths are rewritten as above.
+- **Extensions (#56).** Only extensions bundled with the hub as pinned
+  factories and listed in `extensionAllowlist` with the same version load. The
+  allowlist is empty by default. `hearth-tools` and `codemode` are reserved.
+- **Legacy box `turn.start` / `turn.end`: deprecated, not removed.** Under 0009
+  the box runs no turns: box-agent answers `turn.start` as failed and the hub
+  never sends one, so the #38 risk (a re-sent `turn.start` after a refused
+  `turn.end` running a turn twice) cannot arise. Removing the frames from v1
+  would break a 1.x peer that still decodes them, which is a major bump; a
+  deprecation changes no wire shape, so no minor bump either. They go at the
+  next major.
+- **API**, all behind the login guard (0014), each authorizing the signed-in
+  principal first: `POST /v1/sessions/:id/messages {"text"}` (202; the turn
+  runs in the background; 409 `runner.busy` while one runs),
+  `POST /v1/sessions/:id/interrupt`, `GET /v1/sessions/:id/events?after=&limit=`
+  (cursor resume), `GET|POST /v1/sessions/:id/runner`. Actions:
+  `session.message`, `session.interrupt`, `session.events`,
+  `session.configure`, `session.read`.
+
+### Consequences
+
+- pi's file mutation queue is process-wide (#40): writes to the same path in
+  two sessions serialize. Accepted for M1.
+- One message at a time per session; steering and follow-up queues come later.
+- An exception thrown from a pi timer outside any runner callback is not
+  attributable to a session and still reaches the process.
+
 ## 0016: Desktop stream: box-agent VNC relay, browser WebSocket, view-only RFB filter
 
 - Date: 2026-11-15

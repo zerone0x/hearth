@@ -167,6 +167,11 @@ export interface SessionAssignFrame {
 /**
  * Hub → box: start a turn with this user input. Idempotent: ignored when the
  * box already knows `turnId` in this boot, so a turn never runs twice.
+ *
+ * @deprecated Since decision 0015 the pi runner lives in the hub (0009): the
+ * hub never sends `turn.start`, and the box answers one with a failed
+ * `turn.end`. Kept for wire compatibility; removed at the next major
+ * `PROTOCOL_VERSION`.
  */
 export interface TurnStartFrame {
   readonly type: "turn.start";
@@ -187,7 +192,13 @@ export interface TurnEventFrame extends Delivery {
 
 export type TurnOutcome = "completed" | "failed" | "cancelled";
 
-/** Box → hub: the turn ended. Every turn ends in exactly one of these (principle 1). */
+/**
+ * Box → hub: the turn ended. Every turn ends in exactly one of these (principle 1).
+ *
+ * @deprecated Since decision 0015 turns run in the hub's pi runner, which
+ * records its own `runner.*` and `pi.*` events. The box sends `turn.end` only
+ * to refuse a legacy `turn.start`. Removed at the next major `PROTOCOL_VERSION`.
+ */
 export interface TurnEndFrame extends Delivery {
   readonly type: "turn.end";
   readonly sessionId: string;

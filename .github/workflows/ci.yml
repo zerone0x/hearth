@@ -116,6 +116,14 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/session/session.docker.test.ts
+      # M1 core proof (#43, decision 0015): the hub's pi runner on the faux
+      # model edits a file in the box's /workspace and runs a command there;
+      # the results come back as events through the HTTP API.
+      - name: Pi runner turn in a Docker box under the firewall (M1 core, #43)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/runner/runner.docker.test.ts
       # Desktop stream (#45; decision 0016): the real Xvnc banner through the hub.
       - name: Desktop stream reads the real Xvnc banner through the hub, egress filtered
         env:

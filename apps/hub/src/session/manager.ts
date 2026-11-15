@@ -291,6 +291,38 @@ export class SessionManager {
   }
 
   /**
+   * Mark the session `failed` through the state machine (authorized, audited,
+   * and recorded as a `session.state` event). The runner calls this when its
+   * turn fails (#43, decision 0015). A session already `failed` stays as it is;
+   * an `archived` one is refused by the transition table. The box is stopped;
+   * its volume stays.
+   */
+  async fail(
+    sessionId: SessionId,
+    reason: string,
+    principal: Principal = SYSTEM_PRINCIPAL,
+  ): Promise<SessionView> {
+    await this.ready;
+    return await this.#serial(sessionId, async () => {
+      const s = this.#mustGet(sessionId);
+      if (s.state === "failed") return view(s);
+      const row = await this.#transition(principal, s, "failed", reason);
+      this.#clearIdle(this.#rt(sessionId));
+      this.#clearGrace(this.#rt(sessionId));
+      const box = s.boxId === null ? undefined : this.#store.getBox(this.#scope, s.boxId);
+      if (this.#boxes !== undefined && box !== undefined && box.state !== "stopped") {
+        try {
+          await this.#boxes.stop(box.id);
+          this.#store.setBoxState(this.#scope, box.id, "stopped");
+        } catch (error) {
+          this.#log(`session ${sessionId}: could not stop box ${box.id}: ${String(error)}`);
+        }
+      }
+      return view(row);
+    });
+  }
+
+  /**
    * Make sure the session has a connected box, starting or waking it if needed
    * (lazy start, PRD §6.2), and hold it for one tool call. The runner calls
    * this before every routed tool call and releases the lease when the call

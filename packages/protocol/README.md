@@ -64,9 +64,9 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
 | `welcome` | H→B | fire-and-forget | Handshake accepted; may carry the per-box credential |
 | `reject` | H→B | fire-and-forget | Handshake refused, with a reason; names both versions on `version-mismatch` |
 | `session.assign` | H→B | fire-and-forget | Run (or resume) a session in this box |
-| `turn.start` | H→B | fire-and-forget | Start a turn with the user's input |
+| `turn.start` | H→B | fire-and-forget | **Deprecated (0015).** Start a turn with the user's input |
 | `turn.event` | B→H | at-least-once | One event of a running turn, ordered by `seq` |
-| `turn.end` | B→H | at-least-once | The turn ended: `completed`, `failed` (with a classified failure) or `cancelled` |
+| `turn.end` | B→H | at-least-once | **Deprecated (0015).** The turn ended: `completed`, `failed` (with a classified failure) or `cancelled` |
 | `session.hibernate` | H→B | fire-and-forget | Hibernate a session |
 | `hibernate.done` | B→H | at-least-once | Answer to `session.hibernate`: `hibernated`, `busy` or `failed` |
 | `usage.report` | B→H | at-least-once | Token usage of one model call |
@@ -78,6 +78,12 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
 | `stream.open` | both | fire-and-forget | Open a byte stream of kind `vnc` or `file` |
 | `stream.data` | both | fire-and-forget | Stream bytes, ordered by `seq` within the stream |
 | `stream.close` | both | fire-and-forget | End a stream: `done`, `cancelled`, `error` or `revoked` |
+
+**Deprecated: `turn.start` and `turn.end`** (docs/DECISIONS.md, 0015). Turns
+run in the hub's pi runner (0009), not in the box. The hub never sends
+`turn.start`; box-agent answers one with a failed `turn.end`, so a turn still
+never runs twice. Both frames stay in the codec for wire compatibility and go
+at the next major `PROTOCOL_VERSION`. New code must not send them.
 
 `FRAME_SPECS` in `src/frames.ts` holds the same table in code.
 
