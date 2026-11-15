@@ -1402,7 +1402,10 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   gets `X-Content-Type-Options: nosniff`; hashed `/assets/*` get a year of
   immutable cache. The build emits no inline script or style element
   (`assetsInlineLimit: 0`, no module-preload polyfill), so the policy needs
-  no `'unsafe-inline'`; the e2e fails on any CSP console violation.
+  no `'unsafe-inline'`; the e2e fails on any CSP console violation. A unit
+  test parses the served header and checks each directive against this list
+  written out by hand (not against `WEB_CSP`), and refuses `'unsafe-*'`, `*`
+  and bare schemes in any directive.
   `connect-src 'self'` covers the same-origin desktop WebSocket.
 - **The client holds no secrets.** The cookie is `HttpOnly`; the setup token
   is typed by the owner and sent once. Every API call sends
@@ -1440,3 +1443,9 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   listener; it must only ever contain the built UI.
 - Polling costs one small request per 0.7–3 s per open session view.
 - No PWA, service worker or push yet (M3).
+- Known limitation: opening the UI from a link on another site gets 403.
+  The browser sends that navigation with `Sec-Fetch-Site: cross-site` (or
+  `same-site` from a sibling subdomain) and no `Origin`, and the request
+  guard (0010) refuses it before the asset handler runs, even for `GET /`. Typing the URL, a bookmark or a same-origin link
+  (`Sec-Fetch-Site: none` or `same-origin`) works. This is left as it is:
+  relaxing 0010 for navigations is a separate decision.
