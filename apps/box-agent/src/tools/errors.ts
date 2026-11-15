@@ -18,6 +18,8 @@ const ERRNO: Readonly<Record<string, ToolErrorCode>> = {
   EROFS: "tool.permission",
   ENOTDIR: "tool.not-a-directory",
   EISDIR: "tool.is-a-directory",
+  // Opening a FIFO without a reader, or a socket, for writing.
+  ENXIO: "tool.not-regular-file",
   EFBIG: "tool.too-large",
 };
 

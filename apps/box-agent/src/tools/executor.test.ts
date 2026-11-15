@@ -5,10 +5,12 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -290,7 +292,8 @@ describe("exec", () => {
       expect(result.output).toContain("HOME=/home/box");
       expect(
         vars.filter(
-          (v) => !["PATH", "HOME", "LANG", "TERM", "PWD", "SHLVL", "_"].includes(v ?? ""),
+          (v) =>
+            !["PATH", "HOME", "LANG", "TERM", "PWD", "SHLVL", "_", "HEARTH_EXEC"].includes(v ?? ""),
         ),
       ).toEqual([]);
     } finally {
@@ -340,7 +343,8 @@ describe("exec", () => {
     const h = harness();
     const result = await h.ok("tool.exec", {
       ...c,
-      command: "echo hi; echo err >&2",
+      // Two pipes: without a pause the two lines can arrive in either order.
+      command: "echo hi; sleep 0.1; echo err >&2",
       cwd: ".",
       timeoutMs: 5_000,
     });
@@ -526,4 +530,139 @@ describe("search", () => {
       ).toBe("tool.path-escape");
     },
   );
+});
+
+// Regressions from the verification of 9b39ec9 (PR #53); each failed there.
+describe("hardening", () => {
+  test("a glob refuses a symlinked literal segment and drops matches outside", async () => {
+    const h = harness();
+    symlinkSync(h.outside, join(h.root, "link"));
+    mkdirSync(join(h.root, "sub"));
+    symlinkSync(h.outside, join(h.root, "sub", "deep"));
+    writeFileSync(join(h.root, "mine.txt"), "x");
+    for (const pattern of ["link/*", "link/secret*", "sub/deep/*.txt", "./link/*"]) {
+      const error = await h.fail("tool.glob", { ...c, pattern, cwd: ".", ignore: [], limit: 10 });
+      expect({ pattern, code: error.code }).toEqual({ pattern, code: "tool.path-escape" });
+    }
+    // The symlinked directory is matched by a wildcard, not named: its files are dropped.
+    for (const pattern of ["*/secret.txt", "{link,sub}/*", "*/*/*.txt", "**/secret.txt"]) {
+      const found = await h.ok("tool.glob", { ...c, pattern, cwd: ".", ignore: [], limit: 10 });
+      expect({ pattern, paths: found.paths }).toEqual({ pattern, paths: [] });
+    }
+    const mine = await h.ok("tool.glob", {
+      ...c,
+      pattern: "*.txt",
+      cwd: ".",
+      ignore: [],
+      limit: 10,
+    });
+    expect(mine.paths).toEqual(["mine.txt"]);
+  });
+
+  const escapers = [
+    ["setsid", "setsid sleep 300 >/dev/null 2>&1 </dev/null & echo $! > setsid.pid"],
+    ["double fork", "( sleep 301 >/dev/null 2>&1 & echo $! > fork.pid ) &"],
+    ["nohup", "nohup sleep 302 >/dev/null 2>&1 & echo $! > nohup.pid"],
+  ] as const;
+  const escaperCommand = escapers.map(([, command]) => command).join("\n");
+
+  async function escaperPids(root: string): Promise<number[]> {
+    const files = ["setsid.pid", "fork.pid", "nohup.pid"].map((f) => join(root, f));
+    const ready = () => files.every((f) => existsSync(f) && readFileSync(f, "utf8").trim() !== "");
+    const until = Date.now() + STEP_MS;
+    while (!ready() && Date.now() < until) await Bun.sleep(10);
+    const found = files.map((f) => Number(readFileSync(f, "utf8")));
+    pids.push(...found);
+    return found;
+  }
+
+  async function expectAllGone(found: readonly number[]): Promise<void> {
+    for (const [i, pid] of found.entries()) {
+      const child = escapers[i]?.[0];
+      expect({ child, gone: await gone(pid) }).toEqual({ child, gone: true });
+    }
+  }
+
+  test("a timeout also kills setsid, double-forked and nohup children", async () => {
+    const h = harness();
+    const result = await h.ok("tool.exec", {
+      ...c,
+      command: `${escaperCommand}\nsleep 30`,
+      cwd: ".",
+      timeoutMs: 1_000,
+    });
+    expect(result.outcome).toBe("timed-out");
+    await expectAllGone(await escaperPids(h.root));
+  });
+
+  test("a cancel also kills setsid, double-forked and nohup children", async () => {
+    const h = harness();
+    const running = h.send(
+      "tool.exec",
+      { ...c, command: `${escaperCommand}\nsleep 30`, cwd: ".", timeoutMs: 60_000 },
+      "rpc_cancel_escapers",
+    );
+    const found = await escaperPids(h.root);
+    expect(await h.ok("tool.cancel", { ...c, target: "rpc_cancel_escapers" })).toEqual({
+      found: true,
+    });
+    const frame = await running;
+    expect(frame.ok && frame.result).toMatchObject({ outcome: "cancelled" });
+    await expectAllGone(found);
+  });
+
+  test("a FIFO is refused at once by read, image and write, and frees its slot", async () => {
+    const h = harness({ maxConcurrent: 1 });
+    execFileSync("mkfifo", [join(h.root, "fifo")]);
+    const started = Date.now();
+    const calls: [ToolMethod, Record<string, JsonValue>][] = [
+      ["tool.readFile", { path: "fifo" }],
+      ["tool.imageMimeType", { path: "fifo" }],
+      ["tool.writeFile", { path: "fifo", content: "x" }],
+    ];
+    for (const [method, params] of calls) {
+      const error = await h.fail(method, { ...c, ...params });
+      expect({ method, code: error.code }).toEqual({ method, code: "tool.not-regular-file" });
+    }
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(h.executor.running).toBe(0);
+    // The only slot is free again.
+    expect(await h.ok("tool.stat", { ...c, path: "fifo" })).toMatchObject({ isFile: false });
+  });
+
+  test("every file method has its own budget, and a cancel ends it", async () => {
+    const h = harness({ fileTimeoutMs: 200 });
+    // A file call that never ends, as I/O stuck in the kernel would.
+    const stuck = () => new Promise<never>(() => {});
+    Object.assign(h.executor, { readFile: stuck, writeFile: stuck, stat: stuck });
+    const started = Date.now();
+    expect((await h.fail("tool.readFile", { ...c, path: "a" })).code).toBe("tool.deadline");
+    expect((await h.fail("tool.writeFile", { ...c, path: "a", content: "x" })).code).toBe(
+      "tool.deadline",
+    );
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(h.executor.running).toBe(0);
+    const pending = h.send("tool.stat", { ...c, path: "a" }, "rpc_stuck_stat");
+    expect(await h.ok("tool.cancel", { ...c, target: "rpc_stuck_stat" })).toEqual({ found: true });
+    expect((await pending).ok).toBe(false);
+    expect(h.executor.running).toBe(0);
+  });
+
+  test("the spill file is never written through a symlinked .hearth or exec directory", async () => {
+    for (const link of [".hearth", ".hearth/exec"]) {
+      const h = harness();
+      if (link === ".hearth/exec") mkdirSync(join(h.root, ".hearth"));
+      symlinkSync(h.outside, join(h.root, link));
+      const result = await h.ok("tool.exec", {
+        ...c,
+        command: `head -c ${MAX_TOOL_OUTPUT_BYTES * 2} /dev/zero | tr '\\0' b`,
+        cwd: ".",
+        timeoutMs: 10_000,
+      });
+      expect(result.outcome).toBe("exited");
+      expect(result.truncatedBytes).toBe(MAX_TOOL_OUTPUT_BYTES);
+      expect(result.fullOutputPath).toBeNull();
+      expect(readdirSync(h.outside)).toEqual(["secret.txt"]);
+    }
+  });
 });

@@ -9,20 +9,12 @@
  * second run.
  */
 
-import {
-  access,
-  constants,
-  mkdir,
-  open,
-  readdir,
-  readFile,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { access, constants, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { posix } from "node:path";
 import {
   decodeToolParams,
   EXEC_SPILL_DIR,
+  FILE_TIMEOUT_MS,
   isToolMethod,
   type JsonValue,
   MAX_CONCURRENT_TOOL_CALLS,
@@ -39,7 +31,7 @@ import {
   truncationMarker,
 } from "@hearth/protocol";
 import { ToolCallError, toToolError } from "./errors";
-import { Workspace } from "./paths";
+import { openPlainFile, Workspace } from "./paths";
 import { runProcess } from "./process";
 
 /** Box-defined variables a command gets; nothing comes from the hub or the agent's own env. */
@@ -67,6 +59,8 @@ export interface ToolExecutorOptions {
   readonly maxConcurrent?: number;
   readonly resultCacheBytes?: number;
   readonly searchTimeoutMs?: number;
+  /** Box-side budget of each file method. Defaults to `FILE_TIMEOUT_MS`. */
+  readonly fileTimeoutMs?: number;
   /** Sends a frame to the hub if connected; a lost answer is re-sent on the hub's re-send. */
   readonly send: (frame: RpcResultFrame) => void;
   readonly log?: (line: string) => void;
@@ -226,6 +220,48 @@ export class ToolExecutor {
     signal: AbortSignal,
   ): Promise<JsonValue> {
     switch (method) {
+      case "tool.glob":
+        return await this.glob(params as ToolParams["tool.glob"], signal);
+      case "tool.grep":
+        return await this.grep(params as ToolParams["tool.grep"], signal);
+      case "tool.exec":
+        return await this.exec(params as ToolParams["tool.exec"], rpcId, signal);
+      default:
+        return await this.#withFileBudget(method, signal, () => this.#file(method, params));
+    }
+  }
+
+  /**
+   * Runs a file method under its own budget (`FILE_TIMEOUT_MS`) and the call's
+   * cancel. An I/O the kernel keeps blocked cannot be interrupted, but the call
+   * is answered and its slot freed.
+   */
+  async #withFileBudget<T>(method: string, signal: AbortSignal, run: () => Promise<T>): Promise<T> {
+    const budget = this.#options.fileTimeoutMs ?? FILE_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const stopped = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new ToolCallError("tool.deadline", `${method} ran longer than ${budget} ms`)),
+        budget,
+      );
+      onAbort = () => reject(new ToolCallError("tool.internal", "aborted"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([run(), stopped]);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #file(
+    method: Exclude<ToolMethod, "tool.cancel" | "tool.glob" | "tool.grep" | "tool.exec">,
+    params: ToolParams[ToolMethod],
+  ): Promise<JsonValue> {
+    switch (method) {
       case "tool.readFile":
         return await this.readFile(params as ToolParams["tool.readFile"]);
       case "tool.access":
@@ -242,12 +278,26 @@ export class ToolExecutor {
         return await this.stat(params as ToolParams["tool.stat"]);
       case "tool.readdir":
         return await this.readdir(params as ToolParams["tool.readdir"]);
-      case "tool.glob":
-        return await this.glob(params as ToolParams["tool.glob"], signal);
-      case "tool.grep":
-        return await this.grep(params as ToolParams["tool.grep"], signal);
-      case "tool.exec":
-        return await this.exec(params as ToolParams["tool.exec"], rpcId, signal);
+    }
+  }
+
+  /**
+   * Opens a file for reading without blocking (a FIFO with no writer would
+   * hang a plain open) and refuses anything but a regular file.
+   */
+  async #openRegular(path: string, real: string) {
+    const handle = await open(real, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const info = await handle.stat();
+      if (info.isDirectory())
+        throw new ToolCallError("tool.is-a-directory", `${path} is a directory`);
+      if (!info.isFile()) {
+        throw new ToolCallError("tool.not-regular-file", `${path} is not a regular file`);
+      }
+      return { handle, size: info.size };
+    } catch (error) {
+      await handle.close();
+      throw error;
     }
   }
 
@@ -255,20 +305,25 @@ export class ToolExecutor {
 
   async readFile(p: ToolParams["tool.readFile"]): Promise<ToolResults["tool.readFile"]> {
     const { real } = await this.workspace.resolve(p.path);
-    const info = await stat(real);
-    if (info.isDirectory())
-      throw new ToolCallError("tool.is-a-directory", `${p.path} is a directory`);
-    if (info.size > MAX_TOOL_FILE_BYTES) {
-      throw new ToolCallError(
-        "tool.too-large",
-        `${p.path} has ${info.size} bytes; tool reads are capped at ${MAX_TOOL_FILE_BYTES}`,
-      );
+    const { handle, size } = await this.#openRegular(p.path, real);
+    try {
+      if (size > MAX_TOOL_FILE_BYTES) {
+        throw new ToolCallError(
+          "tool.too-large",
+          `${p.path} has ${size} bytes; tool reads are capped at ${MAX_TOOL_FILE_BYTES}`,
+        );
+      }
+      const data = await handle.readFile();
+      if (data.length > MAX_TOOL_FILE_BYTES) {
+        throw new ToolCallError(
+          "tool.too-large",
+          `${p.path} grew past ${MAX_TOOL_FILE_BYTES} bytes`,
+        );
+      }
+      return { data: data.toString("base64"), size: data.length };
+    } finally {
+      await handle.close();
     }
-    const data = await readFile(real);
-    if (data.length > MAX_TOOL_FILE_BYTES) {
-      throw new ToolCallError("tool.too-large", `${p.path} grew past ${MAX_TOOL_FILE_BYTES} bytes`);
-    }
-    return { data: data.toString("base64"), size: data.length };
   }
 
   async access(p: ToolParams["tool.access"]): Promise<ToolResults["tool.access"]> {
@@ -281,7 +336,7 @@ export class ToolExecutor {
     p: ToolParams["tool.imageMimeType"],
   ): Promise<ToolResults["tool.imageMimeType"]> {
     const { real } = await this.workspace.resolve(p.path);
-    const handle = await open(real, "r");
+    const { handle } = await this.#openRegular(p.path, real);
     try {
       const head = Buffer.alloc(16);
       const { bytesRead } = await handle.read(head, 0, 16, 0);
@@ -301,7 +356,21 @@ export class ToolExecutor {
       );
     }
     const { real } = await this.workspace.resolve(p.path);
-    await writeFile(real, p.content, "utf8");
+    // Non-blocking, so a FIFO without a reader fails (ENXIO) instead of hanging.
+    const handle = await open(
+      real,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_NONBLOCK,
+      0o666,
+    );
+    try {
+      if (!(await handle.stat()).isFile()) {
+        throw new ToolCallError("tool.not-regular-file", `${p.path} is not a regular file`);
+      }
+      await handle.truncate(0);
+      await handle.writeFile(p.content, "utf8");
+    } finally {
+      await handle.close();
+    }
     return { bytes };
   }
 
@@ -344,7 +413,17 @@ export class ToolExecutor {
         `glob pattern ${JSON.stringify(p.pattern)} must be relative and without ..`,
       );
     }
-    const { real } = await this.workspace.resolve(p.cwd);
+    const { real, lexical } = await this.workspace.resolve(p.cwd);
+    // The literal leading segments are walked as named, symlinks included,
+    // so they must stay inside (`etclink/pass*` with etclink -> /etc).
+    const segments = p.pattern.split("/");
+    const literal: string[] = [];
+    for (const segment of segments.slice(0, -1)) {
+      if (/[*?[\]{}!\\]/.test(segment)) break;
+      literal.push(segment);
+    }
+    if (literal.length > 0) await this.workspace.resolve(posix.join(lexical, ...literal));
+    const realRoot = await this.workspace.realRoot();
     const ignore = p.ignore.map((pattern) => new Bun.Glob(pattern));
     const deadline = Date.now() + (this.#options.searchTimeoutMs ?? SEARCH_TIMEOUT_MS);
     const paths: string[] = [];
@@ -363,6 +442,8 @@ export class ToolExecutor {
         );
       }
       if (ignore.some((g) => g.match(path))) continue;
+      // Any match reached through a symlink out of the workspace is dropped.
+      if (!(await this.#insideRealRoot(posix.join(real, path), realRoot))) continue;
       if (paths.length >= p.limit) {
         limitReached = true;
         break;
@@ -370,6 +451,15 @@ export class ToolExecutor {
       paths.push(path);
     }
     return { paths, limitReached };
+  }
+
+  async #insideRealRoot(path: string, realRoot: string): Promise<boolean> {
+    try {
+      const resolved = await realpath(path);
+      return resolved === realRoot || resolved.startsWith(`${realRoot}/`);
+    } catch {
+      return false;
+    }
   }
 
   async grep(p: ToolParams["tool.grep"], signal: AbortSignal): Promise<ToolResults["tool.grep"]> {
@@ -438,7 +528,8 @@ export class ToolExecutor {
     if (!info.isDirectory())
       throw new ToolCallError("tool.not-a-directory", `${p.cwd} is not a directory`);
     const realRoot = await this.workspace.realRoot();
-    const spillRelative = posix.join(EXEC_SPILL_DIR, spillName(p.callId, rpcId));
+    const name = spillName(p.callId, rpcId);
+    const spillRelative = posix.join(EXEC_SPILL_DIR, name);
     const run = await runProcess({
       argv: [this.#options.shell ?? "/bin/bash", "-c", p.command],
       cwd: real,
@@ -446,7 +537,12 @@ export class ToolExecutor {
       timeoutMs: p.timeoutMs,
       signal,
       outputCap: MAX_TOOL_OUTPUT_BYTES,
-      spill: { path: posix.join(realRoot, spillRelative), cap: MAX_EXEC_SPILL_BYTES },
+      spill: {
+        path: posix.join(realRoot, spillRelative),
+        cap: MAX_EXEC_SPILL_BYTES,
+        // Never through a symlinked `.hearth` or `exec`: no spill rather than a write outside.
+        open: () => openPlainFile(realRoot, EXEC_SPILL_DIR.split("/"), name),
+      },
     });
     const fullOutputPath =
       run.spillPath === null ? null : posix.join(this.workspace.root, spillRelative);

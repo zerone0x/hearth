@@ -34,10 +34,12 @@ export const DEFAULT_EXEC_TIMEOUT_MS = 10 * 60_000;
 export const MAX_EXEC_TIMEOUT_MS = 60 * 60_000;
 /** Box-side budget of `tool.glob` and `tool.grep`; the search is stopped after it. */
 export const SEARCH_TIMEOUT_MS = 30_000;
-/** Hub-side deadline of the file methods (read, write, stat, …). */
-export const FS_DEADLINE_MS = 30_000;
 /** Added to the box-side budget to get the hub-side deadline (PRD §8.1, principle 3). */
 export const TOOL_DEADLINE_GRACE_MS = 5_000;
+/** Box-side budget of each file method (read, write, stat, …); the call fails with `tool.deadline` after it. */
+export const FILE_TIMEOUT_MS = 25_000;
+/** Hub-side deadline of the file methods: their box-side budget plus the grace. */
+export const FS_DEADLINE_MS = FILE_TIMEOUT_MS + TOOL_DEADLINE_GRACE_MS;
 /** Tool calls one box runs at once; more are refused with `tool.busy`. */
 export const MAX_CONCURRENT_TOOL_CALLS = 16;
 
@@ -204,6 +206,7 @@ export type ToolErrorCode =
   | "tool.permission"
   | "tool.not-a-directory"
   | "tool.is-a-directory"
+  | "tool.not-regular-file"
   | "tool.too-large"
   | "tool.busy"
   | "tool.io"
@@ -226,6 +229,7 @@ export const TOOL_ERRORS: Readonly<
   "tool.permission": { owner: "user", disposition: "give-up" },
   "tool.not-a-directory": { owner: "user", disposition: "give-up" },
   "tool.is-a-directory": { owner: "user", disposition: "give-up" },
+  "tool.not-regular-file": { owner: "user", disposition: "give-up" },
   "tool.too-large": { owner: "user", disposition: "give-up" },
   "tool.busy": { owner: "box", disposition: "retry" },
   "tool.io": { owner: "box", disposition: "give-up" },

@@ -177,8 +177,13 @@ Rules:
   one). The box runs commands with its own minimal environment.
 - **Paths are box paths inside `/workspace`.** Relative ones resolve against
   it. The box refuses absolute paths outside it, any `..` segment, and paths
-  that leave it through a symlink (`tool.path-escape`). The box does not
-  expand `~`; the runner rewrites it before the call.
+  that leave it through a symlink (`tool.path-escape`). A glob pattern whose
+  literal leading segments leave it is refused too, and matches that resolve
+  outside it are dropped. The box does not expand `~`; the runner rewrites
+  `~` to `/workspace` before the call.
+- **Regular files only.** `tool.readFile`, `tool.imageMimeType` and
+  `tool.writeFile` refuse a FIFO, socket or device with
+  `tool.not-regular-file`, without blocking on it.
 - **Limits:** files up to `MAX_TOOL_FILE_BYTES` (1 MiB) per read or write;
   output up to `MAX_TOOL_OUTPUT_BYTES` (256 KiB), keeping the tail behind a
   `truncationMarker`; a truncated command's whole output (up to 16 MiB) is
@@ -186,7 +191,10 @@ Rules:
   `fullOutputPath`; lists up to 10,000 entries; `MAX_CONCURRENT_TOOL_CALLS`
   (16) per box, past which a call gets `tool.busy`. A command runs for
   `timeoutMs` (at most 1 h) and is then killed with its whole process group,
-  as on `tool.cancel`; searches stop after `SEARCH_TIMEOUT_MS` (30 s).
+  as on `tool.cancel`, and with every process that still carries the run's
+  `HEARTH_EXEC` marker in its environment (a `setsid` child); searches stop
+  after `SEARCH_TIMEOUT_MS` (30 s) and every file method after
+  `FILE_TIMEOUT_MS` (25 s), with `tool.deadline`.
 - **Deadline.** The hub times every call with `toolDeadlineMs(method, params)`:
   the box's own budget for the call plus `TOOL_DEADLINE_GRACE_MS` (5 s). A
   call past it fails with `tool.deadline`; a command is cancelled.
@@ -202,7 +210,7 @@ Error codes and their classification (`TOOL_ERRORS`):
 | Code | Owner | Disposition |
 |---|---|---|
 | `tool.bad-params` | `hub` | `give-up` |
-| `tool.path-escape`, `tool.not-found`, `tool.permission`, `tool.not-a-directory`, `tool.is-a-directory`, `tool.too-large` | `user` | `give-up` |
+| `tool.path-escape`, `tool.not-found`, `tool.permission`, `tool.not-a-directory`, `tool.is-a-directory`, `tool.not-regular-file`, `tool.too-large` | `user` | `give-up` |
 | `tool.busy` | `box` | `retry` |
 | `tool.io`, `tool.result-expired` | `box` | `give-up` |
 | `tool.internal` | `box` | `retry-cold` |

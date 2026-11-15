@@ -2,7 +2,8 @@
  * Tool RPC through the real box image (#41, decision 0011): the hub creates a
  * box with `DockerBoxProvider`, the box's own box-agent dials in, and the
  * hub's `ToolRpcClient` writes and reads a file, searches it with the image's
- * `rg`, and runs a command in `/workspace`.
+ * `rg`, runs a command in `/workspace`, and checks that a `setsid` child dies
+ * with a timed-out or cancelled command and that a FIFO is refused at once.
  *
  * Runs only with HEARTH_DOCKER_TESTS=1 (AGENTS.md), with the box image's real
  * default command, like `echo.docker.test.ts`:
@@ -134,6 +135,45 @@ describe.skipIf(!enabled)("tool RPC through DockerBoxProvider and the box image"
 
     const timedOut = ops.bash.exec("sleep 60", "/workspace", { onData: () => {}, timeout: 1 });
     await expect(timedOut).rejects.toThrow("timeout:1");
+
+    // A child in its own session (setsid) dies with the call, on timeout and on cancel.
+    const run = async (command: string) => {
+      const out: Buffer[] = [];
+      await ops.bash.exec(command, "/workspace", { onData: (d) => out.push(d), timeout: 30 });
+      return Buffer.concat(out).toString();
+    };
+    // Dead, or a zombie waiting for tini to reap it.
+    const deadCheck = (pidFile: string) =>
+      `p=$(cat ${pidFile}); for i in $(seq 1 30); do ` +
+      `if [ ! -e /proc/$p ] || [ "$(cut -d' ' -f3 /proc/$p/stat)" = Z ]; then echo dead; exit 0; fi; ` +
+      "sleep 0.1; done; echo alive";
+    const escaper = (pidFile: string) =>
+      `setsid sleep 300 >/dev/null 2>&1 </dev/null & echo $! > ${pidFile}\nsleep 60`;
+    const timedOutSetsid = ops.bash.exec(escaper("setsid-timeout.pid"), "/workspace", {
+      onData: () => {},
+      timeout: 1,
+    });
+    await expect(timedOutSetsid).rejects.toThrow("timeout:1");
+    expect(await run(deadCheck("setsid-timeout.pid"))).toBe("dead\n");
+    const abort = new AbortController();
+    const cancelled = ops.bash.exec(escaper("setsid-cancel.pid"), "/workspace", {
+      onData: () => {},
+      signal: abort.signal,
+      timeout: 60,
+    });
+    const waitPid = "for i in $(seq 1 50); do [ -s setsid-cancel.pid ] && break; sleep 0.1; done";
+    expect(await run(`${waitPid}; echo ok`)).toBe("ok\n");
+    abort.abort();
+    await expect(cancelled).rejects.toThrow("aborted");
+    expect(await run(deadCheck("setsid-cancel.pid"))).toBe("dead\n");
+
+    // A FIFO is refused at once instead of hanging a slot.
+    await run("mkfifo /workspace/fifo");
+    const started = Date.now();
+    await expect(ops.read.readFile("/workspace/fifo")).rejects.toMatchObject({
+      code: "tool.not-regular-file",
+    });
+    expect(Date.now() - started).toBeLessThan(5_000);
     client.close();
   }, 300_000);
 });

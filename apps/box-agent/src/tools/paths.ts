@@ -4,7 +4,8 @@
  *
  * - A relative path is resolved against the workspace root. An absolute path
  *   must already be inside it (`/workspace/x`). `~` is not expanded: the
- *   runner rewrites it before the call, so `~/x` here is a relative name.
+ *   runner rewrites `~` to `/workspace` before the call, so `~/x` here is a
+ *   relative name.
  * - Any `..` segment is refused outright, even one that would stay inside.
  * - The deepest existing ancestor is resolved with `realpath` and must be
  *   inside the real workspace root, so a symlink to `/etc` is refused. A
@@ -17,6 +18,7 @@
  * mistakes and hostile paths, not against code already running in the box.
  */
 
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { posix } from "node:path";
 import { ToolCallError } from "./errors";
@@ -95,4 +97,43 @@ export class Workspace {
     if (!within(realRoot, real)) throw escapeError(input, `resolves outside ${this.root}`);
     return { real: rest.length === 0 ? real : posix.join(real, ...rest), lexical };
   }
+}
+
+/**
+ * Opens `<realRoot>/<dirs>/<name>` for writing (created, truncated) without
+ * following a symlink anywhere below `realRoot`: each directory is created if
+ * missing and must then be a plain directory by `lstat`, and the file is
+ * opened with `O_NOFOLLOW` and must be a regular file. Used for the exec spill
+ * file, which the box writes on its own, not on the model's request.
+ */
+export function openPlainFile(realRoot: string, dirs: readonly string[], name: string): number {
+  let dir = realRoot;
+  for (const segment of dirs) {
+    if (segment === "" || segment === "." || segment === ".." || segment.includes("/")) {
+      throw new Error(`bad directory segment ${JSON.stringify(segment)}`);
+    }
+    dir = posix.join(dir, segment);
+    try {
+      mkdirSync(dir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    if (!lstatSync(dir).isDirectory()) {
+      throw new ToolCallError("tool.path-escape", `${dir} is not a plain directory`);
+    }
+  }
+  const fd = openSync(
+    posix.join(dir, name),
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_TRUNC |
+      constants.O_NOFOLLOW |
+      constants.O_NONBLOCK,
+    0o600,
+  );
+  if (!fstatSync(fd).isFile()) {
+    closeSync(fd);
+    throw new ToolCallError("tool.not-regular-file", `${posix.join(dir, name)} is not a file`);
+  }
+  return fd;
 }

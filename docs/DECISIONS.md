@@ -755,24 +755,49 @@ its listener is #27.
   (decision 0009, a later minor bump).
 - **No hub environment crosses.** `tool.exec` has no `env` field and the decoder
   drops one. Commands get a box-defined environment (`PATH`, `HOME`, `LANG`,
-  `TERM`, `PWD`, and `DISPLAY` in the image), never box-agent's own, which holds
-  the join token.
+  `TERM`, `PWD`, and `DISPLAY` in the image, plus the per-run `HEARTH_EXEC`
+  marker below), never box-agent's own, which holds the join token.
 - **Paths are confined to `/workspace`.** This narrows PRD §8.2.1, which let an
   absolute path name anything in the box; the issue asked for confinement, and
   `bash` remains the way to reach the rest of the box. Relative paths resolve
   against `/workspace`; an absolute path must be inside it; any `..` segment is
   refused; the existing part of the path is resolved with `realpath` and must
   stay inside, and a dangling symlink is refused. glob does not follow
-  symlinks and refuses `..` patterns. `~` is not expanded by the box: pi
-  expands it to the hub's home, so the runner rewrites it in `tool_call`
-  (as the spike does), and a hub-home path that slips through is refused as
-  outside the workspace.
+  symlinks while it walks, refuses `..` patterns and patterns whose literal
+  leading segments (`etclink/` in `etclink/pass*`) resolve outside, and drops
+  every match whose `realpath` is outside. **`~` means `/workspace`.** The box
+  does not expand it: pi expands it to the hub's home, so the runner (#43)
+  rewrites `~` to `/workspace` in `tool_call`, and a hub-home path that slips
+  through is refused as outside the workspace. `/workspace` rather than the box
+  user's home (`/home/hearth`, the spike's choice), because every tool path
+  must be inside `/workspace`, so a rewrite to the home would always be refused.
+- **Regular files only, each file method on a budget.** `readFile`,
+  `imageMimeType` and `writeFile` open without blocking and refuse a FIFO,
+  socket or device with `tool.not-regular-file` (owner `user`, `give-up`), so a
+  FIFO cannot hang a call. Every file method also has its own box-side budget,
+  `FILE_TIMEOUT_MS` (25 s, the hub's 30 s deadline less the grace), and ends on
+  `tool.cancel`: the call is answered with `tool.deadline` and its slot is freed
+  even if the I/O itself stays stuck in the kernel.
+- **The spill file never follows a symlink.** `/workspace/.hearth` and its
+  `exec/` are created if missing and must be plain directories by `lstat`, and
+  the file is opened with `O_NOFOLLOW`. If a segment is a symlink the output is
+  not spilled (`fullOutputPath: null`); the tail still comes back.
 - **Limits:** file reads and writes 1 MiB (larger files get `tool.too-large`;
   the `file` byte stream is the later path for them), output 256 KiB, 10,000
   list entries, 16 concurrent calls per box (`tool.busy`, retryable).
-- **Process groups.** Each command leads its own process group; a timeout or a
-  cancel sends `SIGKILL` to the group. After the shell exits the call ends
-  within 200 ms even if a background child holds the pipe; such a child is left
+- **Process groups and the run marker.** Each command leads its own process
+  group, and its environment carries `HEARTH_EXEC=<random uuid>`, which every
+  child inherits. A timeout or a cancel sends `SIGKILL` to the group, then
+  kills every process whose `/proc/<pid>/environ` carries the marker, in a few
+  rounds to catch forks; that catches a child that left the group (`setsid`, a
+  daemonizing double fork, `nohup` in a new session). The threat is a runaway
+  process in the box, not an escape from it: a process that deliberately
+  re-executes with an environment without the marker can survive the call, and
+  lives until the box stops (the box is the sandbox). A subreaper or a per-call
+  cgroup was not chosen: the image runs box-agent unprivileged under tini, with
+  no writable cgroup, and a subreaper would also have to reap and attribute
+  orphans of concurrent calls. After the shell exits the call ends within
+  200 ms even if a background child holds the pipe; such a child is left
   running (a server the agent started), it is only killed on timeout or cancel.
 - **Errors are classified by code** (`TOOL_ERRORS`): the model's bad request
   (`path-escape`, `not-found`, `too-large`, …) is owner `user`, `give-up`;
@@ -784,11 +809,15 @@ its listener is #27.
 ### Consequences
 
 - The runner (#43) adapts `ToolRpcClient.operations(boxId, toolCallId)` per
-  call, rewrites `~`, and replaces pi's truncation hint with the box path, or
-  relies on the marker the box already puts in the output.
+  call, rewrites `~` to `/workspace`, and replaces pi's truncation hint with
+  the box path, or relies on the marker the box already puts in the output.
 - Files over 1 MiB cannot be read through `read` until the `file` stream path
   lands; the model gets a clear error and can use `bash` (`head`, `sed`).
 - `/workspace/.hearth/` holds spill files; cleaning them up is the session
   manager's call (they are small and per command).
+- Commands run as box-agent's uid, so they can read its initial environment
+  in `/proc/<box-agent pid>/environ` (the spent one-time join token, the hub
+  URL, the box id). That is a follow-up (a separate uid, or a re-exec without
+  those variables), not part of this decision.
 - The path check is check-then-use; code already running in the box could race
   it. It guards against hostile paths from the model, not against `bash`.
