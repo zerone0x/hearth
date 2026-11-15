@@ -66,6 +66,8 @@ export interface SessionRunnerOptions {
   readonly boxCwd?: string;
   readonly hubTempDir?: string;
   readonly log?: (line: string) => void;
+  /** Removes the secrets the runner uses (the model key) from text it stores or logs. */
+  readonly redact?: (text: string) => string;
   /**
    * Called once when the runner fails, after `runner.failed` is recorded: the
    * hub moves the session row to `failed` through the session manager.
@@ -81,11 +83,35 @@ export const MAX_RUNNER_EVENT_BYTES = 1024 * 1024;
 /** Fields of a pi event that repeat what other events already carry. */
 const BULKY_FIELDS = new Set(["partial", "messages", "toolResults"]);
 
-function jsonSafe(value: unknown): JsonValue {
-  const text = JSON.stringify(value, (key, v: unknown) =>
+export const REDACTED = "[redacted]";
+
+/**
+ * `text` with every secret replaced, raw and as it appears inside a JSON
+ * string. Provider errors can echo the key (`invalid x-api-key sk-...`).
+ */
+export function redactSecrets(text: string, secrets: Iterable<string>): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    out = out.split(secret).join(REDACTED);
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) out = out.split(escaped).join(REDACTED);
+  }
+  return out;
+}
+
+/** The text a rebuilt runner gives a tool call that a hub restart cut off. */
+export const RESTART_OUTCOME_UNKNOWN =
+  "The hub restarted while this tool call was running: its outcome is unknown and it was not re-run. Check the box's state before running it again.";
+
+const identity = (text: string): string => text;
+
+function jsonSafe(value: unknown, redact: (text: string) => string = identity): JsonValue {
+  const raw = JSON.stringify(value, (key, v: unknown) =>
     BULKY_FIELDS.has(key) ? undefined : typeof v === "bigint" ? String(v) : v,
   );
-  if (text === undefined) return null;
+  if (raw === undefined) return null;
+  const text = redact(raw);
   if (text.length > MAX_RUNNER_EVENT_BYTES) {
     return { truncated: true, bytes: text.length, head: text.slice(0, 4096) };
   }
@@ -94,6 +120,26 @@ function jsonSafe(value: unknown): JsonValue {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Tool calls on the session branch with no tool result. */
+function orphanedToolCalls(branch: readonly unknown[]): Array<{ id: string; name: string }> {
+  const calls: Array<{ id: string; name: string }> = [];
+  const answered = new Set<string>();
+  for (const entry of branch as Array<{ type?: string; message?: unknown }>) {
+    if (entry.type !== "message") continue;
+    const message = entry.message as { role?: string; content?: unknown; toolCallId?: unknown };
+    if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+      answered.add(message.toolCallId);
+    } else if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const part of message.content as Array<{ type?: string; id?: unknown; name?: unknown }>) {
+        if (part.type === "toolCall" && typeof part.id === "string") {
+          calls.push({ id: part.id, name: typeof part.name === "string" ? part.name : "unknown" });
+        }
+      }
+    }
+  }
+  return calls.filter((c) => !answered.has(c.id));
 }
 
 export class SessionRunner {
@@ -110,12 +156,14 @@ export class SessionRunner {
   /** How many pi session entries are already in the event log. */
   #persisted: number;
   #unsubscribe: () => void;
+  #failing: Promise<void> = Promise.resolve();
 
   private constructor(
     options: SessionRunnerOptions,
     session: AgentSession,
     pi: PiSessionManager,
     agentDir: string,
+    persisted: number,
   ) {
     this.sessionId = options.sessionId;
     this.#o = options;
@@ -123,7 +171,7 @@ export class SessionRunner {
     this.#pi = pi;
     this.#agentDir = agentDir;
     this.#contextKey = JSON.stringify(options.contextFiles?.() ?? []);
-    this.#persisted = pi.getEntries().length;
+    this.#persisted = persisted;
     this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
   }
 
@@ -131,13 +179,29 @@ export class SessionRunner {
     const boxCwd = options.boxCwd ?? BOX_CWD;
     // pi reads settings, auth and context from agentDir: give it an empty one it owns.
     const agentDir = mkdtempSync(join(tmpdir(), "hearth-runner-"));
+    let self: SessionRunner | undefined;
+    const inner = options.box;
+    // A failed prepare (the AGENTS.md refresh: its `runner.context` append)
+    // fails the call, which releases the lease, and fails the runner (0015).
+    const box: RunnerBox = {
+      ensureBox: () => inner.ensureBox(),
+      operations: (boxId, callId) => inner.operations(boxId, callId),
+      prepare: async (lease) => {
+        try {
+          await inner.prepare?.(lease);
+        } catch (error) {
+          if (self !== undefined) void self.#fail(error);
+          throw error;
+        }
+      },
+    };
     try {
       const settingsManager = SettingsManager.inMemory({});
       const extensionFactories = [
         {
           name: "hearth-tools",
           factory: hearthToolsExtension({
-            box: options.box,
+            box,
             boxCwd,
             denyList: options.denyList,
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),
@@ -168,6 +232,21 @@ export class SessionRunner {
         undefined,
         options.entries === undefined ? undefined : [...options.entries],
       );
+      const persisted = pi.getEntries().length;
+      // A hub restart cut these calls off: give each an explicit outcome-unknown
+      // result, so the model does not get pi-ai's "No result provided" and
+      // re-run a command that may already have run in the box.
+      const orphans = options.entries === undefined ? [] : orphanedToolCalls(pi.getBranch());
+      for (const orphan of orphans) {
+        pi.appendMessage({
+          role: "toolResult",
+          toolCallId: orphan.id,
+          toolName: orphan.name,
+          content: [{ type: "text", text: RESTART_OUTCOME_UNKNOWN }],
+          isError: true,
+          timestamp: Date.now(),
+        });
+      }
       const { session } = await createAgentSession({
         cwd: boxCwd,
         agentDir,
@@ -178,15 +257,24 @@ export class SessionRunner {
         settingsManager,
         tools: [...ROUTED_TOOLS, ...(options.codemode === true ? ["codemode"] : [])],
       });
-      const runner = new SessionRunner(options, session, pi, agentDir);
+      const runner = new SessionRunner(options, session, pi, agentDir, persisted);
+      self = runner;
       if (options.entries === undefined) {
         const header = pi.getHeader();
         if (header !== null && header !== undefined) {
           await options.events.append(options.scope, options.sessionId, {
             type: "runner.header",
-            payload: jsonSafe(header),
+            payload: jsonSafe(header, options.redact),
           });
         }
+      }
+      if (orphans.length > 0) {
+        runner.#record("runner.outcome-unknown", {
+          reason: "hub restart",
+          toolCallIds: orphans.map((o) => o.id),
+        });
+        runner.#flushEntries();
+        await runner.#chain;
       }
       return runner;
     } catch (error) {
@@ -220,6 +308,7 @@ export class SessionRunner {
   async settled(): Promise<void> {
     await this.#turn;
     await this.#chain;
+    await this.#failing;
   }
 
   /**
@@ -290,6 +379,11 @@ export class SessionRunner {
 
   #onEvent(event: AgentSessionEvent): void {
     try {
+      if (event.type === "message_end" && event.message.role === "assistant") {
+        // A provider error can echo the key; the session keeps only the redacted text.
+        const m = event.message as { errorMessage?: string };
+        if (typeof m.errorMessage === "string") m.errorMessage = this.#redact(m.errorMessage);
+      }
       this.#record(`pi.${event.type}`, event);
       if (event.type === "message_end" || event.type === "agent_end") this.#flushEntries();
       if (event.type === "message_end" && event.message.role === "assistant") {
@@ -320,7 +414,7 @@ export class SessionRunner {
           const entry = entries[this.#persisted];
           await this.#o.events.append(this.#o.scope, this.sessionId, {
             type: "runner.entry",
-            payload: { entry: jsonSafe(entry) },
+            payload: { entry: jsonSafe(entry, this.#o.redact) },
           });
           this.#persisted++;
         }
@@ -330,7 +424,7 @@ export class SessionRunner {
 
   /** Append in order; a failed append fails the session, visibly. */
   #record(type: string, payload: unknown): void {
-    const event = { type, payload: jsonSafe(payload) };
+    const event = { type, payload: jsonSafe(payload, this.#o.redact) };
     this.#chain = this.#chain
       .then(async () => {
         if (this.#status === "failed") return;
@@ -339,10 +433,21 @@ export class SessionRunner {
       .catch((error: unknown) => this.#fail(error));
   }
 
-  async #fail(error: unknown): Promise<void> {
-    if (this.#status === "failed") return;
+  #redact(text: string): string {
+    return this.#o.redact === undefined ? text : this.#o.redact(text);
+  }
+
+  /** Mark the runner failed (once) and record it; `settled()` waits for the record. */
+  #fail(error: unknown): Promise<void> {
+    if (this.#status === "failed") return this.#failing;
     this.#status = "failed";
-    this.#failure = errorText(error);
+    this.#failure = this.#redact(errorText(error));
+    this.#failing = this.#recordFailure();
+    return this.#failing;
+  }
+
+  async #recordFailure(): Promise<void> {
+    if (this.#failure === undefined) return;
     (this.#o.log ?? ((line: string) => console.error(line)))(
       `session ${this.sessionId}: runner failed: ${this.#failure}`,
     );
@@ -358,14 +463,14 @@ export class SessionRunner {
       });
     } catch (appendError) {
       (this.#o.log ?? console.error)(
-        `session ${this.sessionId}: could not record the failure: ${errorText(appendError)}`,
+        `session ${this.sessionId}: could not record the failure: ${this.#redact(errorText(appendError))}`,
       );
     }
     try {
       await this.#o.onFailure?.(this.#failure);
     } catch (stateError) {
       (this.#o.log ?? console.error)(
-        `session ${this.sessionId}: could not mark the session failed: ${errorText(stateError)}`,
+        `session ${this.sessionId}: could not mark the session failed: ${this.#redact(errorText(stateError))}`,
       );
     }
   }
