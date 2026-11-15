@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createApp } from "./app";
 import { parsePort, startHub } from "./server";
 
@@ -17,14 +20,18 @@ describe("GET /healthz", () => {
 
 describe("startHub", () => {
   let server: ReturnType<typeof startHub> | undefined;
-  afterEach(() => {
-    server?.stop(true);
+  let dir: string | undefined;
+  afterEach(async () => {
+    await server?.stop();
     server = undefined;
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
   });
 
   test("serves /healthz over a real socket on loopback", async () => {
-    server = startHub({ port: 0 });
-    expect(server.hostname).toBe("127.0.0.1");
+    dir = mkdtempSync(join(tmpdir(), "hearth-server-"));
+    server = startHub({ port: 0, dbPath: join(dir, "hub.db") });
+    expect(server.server.hostname).toBe("127.0.0.1");
     const res = await fetch(new URL("/healthz", server.url), {
       signal: AbortSignal.timeout(5_000),
     });
