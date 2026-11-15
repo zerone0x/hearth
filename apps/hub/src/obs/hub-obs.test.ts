@@ -208,6 +208,114 @@ describe("secrets known from startup (a key stored raw by an older build)", () =
   });
 });
 
+describe("main.ts registers the model key before it serves", () => {
+  function freePort(): number {
+    const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const port = s.port as number;
+    s.stop(true);
+    return port;
+  }
+
+  test("the hub process resolves HEARTH_MODEL_KEY_REF for redaction before it listens", async () => {
+    const dir = tempDir();
+    const ref = `file:${join(dir, "missing-key")}`;
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "main.ts")], {
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        HOME: process.env["HOME"] ?? dir,
+        HEARTH_DATA_DIR: join(dir, "data"),
+        HEARTH_PORT: String(freePort()),
+        HEARTH_BOX_PORT: String(freePort()),
+        HEARTH_MODEL: "m",
+        HEARTH_MODEL_PROVIDER: "anthropic",
+        HEARTH_MODEL_KEY_REF: ref,
+        // No Docker needed: the hub logs the failed box listing and keeps serving.
+        HEARTH_DOCKER_SOCKET: join(dir, "no-docker.sock"),
+      },
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    closers.push(() => proc.kill());
+    // A missing key file is a warning (redaction of the rest still applies), so
+    // the attempt to register it shows in the log, before the listening line.
+    const lines: string[] = [];
+    const decoder = new TextDecoder();
+    const reader = proc.stderr.getReader();
+    const deadline = Date.now() + 20_000;
+    let buffered = "";
+    while (!lines.some((l) => l.includes("listening on")) && Date.now() < deadline) {
+      const next = await Promise.race([reader.read(), Bun.sleep(1_000).then(() => undefined)]);
+      if (next === undefined) continue;
+      if (next.done) break;
+      buffered += decoder.decode(next.value, { stream: true });
+      const parts = buffered.split("\n");
+      buffered = parts.pop() ?? "";
+      lines.push(...parts);
+    }
+    proc.kill();
+    const listening = lines.findIndex((l) => l.includes("listening on"));
+    const registered = lines.findIndex((l) => l.includes(`could not resolve ${ref} for redaction`));
+    expect(listening).toBeGreaterThan(-1);
+    expect(registered).toBeGreaterThan(-1);
+    expect(registered).toBeLessThan(listening);
+  }, 30_000);
+});
+
+describe("AGENTS.md in the trajectory (runner.context, stored as read)", () => {
+  test("the API and the CLI redact a registered key before the 16 KiB cut", async () => {
+    const key = "AIzaSyD-CONTEXTKEY0123456789abcdefCTX";
+    await registerStartupSecrets(
+      store({ "file:/c": key }),
+      { apiKeyRef: "file:/c" },
+      {
+        warn: () => {},
+      },
+    );
+    // The key across the cut, still over the cap after redaction.
+    const content = `${"a".repeat(16 * 1024 - 10)}${key}${"b".repeat(100)}`;
+    const path = join(tempDir(), "hub.db");
+    const db = openDatabase(path);
+    await new SqliteEventStore(db).append({ workspaceId: "ws_default" }, "se_ctx", {
+      type: "runner.context",
+      payload: { files: [{ path: "/workspace/AGENTS.md", content }] },
+    });
+    db.close();
+    const head = `${"a".repeat(16 * 1024 - 10)}[redacted]`;
+    const noPrefix = (out: string) => {
+      for (let n = 4; n <= key.length; n++) expect(out).not.toContain(key.slice(0, n));
+    };
+    const cli = await dumpTrajectory(path, "se_ctx", { secrets: store({}), keyRefs: [] });
+    const fromCli = cli
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r["kind"] === "context");
+    expect(fromCli).toMatchObject({
+      files: [{ path: "/workspace/AGENTS.md", content: { text: head, truncated: true } }],
+    });
+    noPrefix(cli);
+    const reopened = openDatabase(path);
+    closers.push(() => reopened.close());
+    const app = new Hono<HubEnv>();
+    app.use(async (c, next) => {
+      c.set("principal", LOCAL_PRINCIPAL);
+      await next();
+    });
+    mountTrajectoryRoutes(
+      app,
+      new Trajectories({
+        authorizer: { authorize: async () => ({ allowed: true, policy: "test" }) },
+        events: new SqliteEventStore(reopened),
+        sessions: { get: async () => ({}) },
+        versions: { pi: "p", hub: "h" },
+      }),
+    );
+    const body = await (await app.request("/v1/sessions/se_ctx/trajectory")).text();
+    expect(body).toContain(`"text":"${head}"`);
+    noPrefix(body);
+  });
+});
+
 describe("telemetry shutdown", () => {
   test("a collector that is down: shutdown resolves, says so, and does not reject", async () => {
     const gone = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
