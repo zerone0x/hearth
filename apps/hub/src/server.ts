@@ -44,6 +44,46 @@ import {
   SqliteSessionStore,
 } from "./store";
 
+/** `req.url` as a URL, or undefined when it is not absolute (an empty or malformed Host). */
+function parseUrl(req: Request): URL | undefined {
+  try {
+    return new URL(req.url);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The one path the request guard exempts from the Host check (decision 0010). */
+const HEALTHZ_PATH = "/healthz";
+
+/**
+ * A request whose `req.url` did not parse (`http://<Host><target>` with a
+ * Host such as ":80" or "[::1"), rebuilt on a fixed placeholder host, when
+ * its path is `/healthz`; undefined otherwise. The Host header is kept as
+ * sent. `/healthz` takes no input and the request guard exempts it from the
+ * Host check (decision 0010), so it answers whatever the Host, as it did
+ * before issue #48; every other path keeps the refusal. A relative `req.url`
+ * (an empty Host) never reached `/healthz` before either: it stays refused.
+ */
+function healthzOnPlaceholder(req: Request): Request | undefined {
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(req.url);
+  if (authority === null) return undefined;
+  const target = req.url.slice(authority[0].length);
+  const rawPath = target.split(/[?#]/, 1)[0] ?? "";
+  let path: string;
+  try {
+    path = decodeURI(rawPath);
+  } catch {
+    return undefined;
+  }
+  if (path !== HEALTHZ_PATH) return undefined;
+  return new Request(new URL(target, "http://hub.invalid").href, req);
+}
+
+function refusal(status: 400 | 404 | 421 | 426, code: string, message: string): Response {
+  return Response.json({ ok: false, error: { code, owner: "user", message } }, { status });
+}
+
 export interface HubListenOptions {
   /** Interface to bind. Defaults to loopback: the hub is never public by default (PRD §10). */
   readonly hostname?: string;
@@ -200,7 +240,18 @@ export function startHub(options: HubOptions) {
     server = Bun.serve<DesktopSocketData>({
       hostname,
       port: options.port ?? DEFAULT_PORT,
-      fetch: (req, srv) => app.fetch(req, srv),
+      fetch: (req, srv) => {
+        // A Host the HTTP layer cannot turn into a URL (an empty one) makes
+        // `req.url` relative and every later `new URL` throw: answer it as the
+        // request guard would (decision 0010) instead of a 500 (issue #48).
+        // `/healthz` is exempt from the Host check, so it is still served.
+        if (parseUrl(req) === undefined) {
+          const healthz = healthzOnPlaceholder(req);
+          if (healthz !== undefined) return app.fetch(healthz, srv);
+          return refusal(421, "request.foreign-host", "the Host header is missing or malformed");
+        }
+        return app.fetch(req, srv);
+      },
       websocket: {
         open(ws) {
           if (desktop === undefined) return ws.close(DESKTOP_CLOSE.shutdown, "not ready");
@@ -267,13 +318,21 @@ export function startHub(options: HubOptions) {
         hostname: address,
         port: boxPort,
         fetch(req, srv) {
-          if (new URL(req.url).pathname !== BOX_SOCKET_PATH) {
-            return new Response("not found", { status: 404 });
+          const url = parseUrl(req);
+          if (url === undefined) {
+            return refusal(
+              400,
+              "request.invalid-url",
+              "the request URL or Host header is malformed",
+            );
+          }
+          if (url.pathname !== BOX_SOCKET_PATH) {
+            return refusal(404, "request.not-found", "not found");
           }
           // The upgrade carries no credential: the box authenticates in its
           // first frame, `hello`, and `authorize` runs before anything else.
           if (srv.upgrade(req, { data: undefined })) return undefined;
-          return new Response("expected a WebSocket upgrade", { status: 426 });
+          return refusal(426, "request.upgrade-required", "expected a WebSocket upgrade");
         },
         websocket,
       });

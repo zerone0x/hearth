@@ -9,6 +9,10 @@
  *
  * - `message.user`, recorded by the hub before the runner starts: shown as a
  *   pending user message until pi's own user `message_start` arrives;
+ * - a tool call the user interrupted: the hub records `runner.interrupted`
+ *   and then aborts pi, so pi ends the call in flight as an error; a call
+ *   that ends with an error after `runner.interrupted` and before the turn
+ *   ends shows as interrupted, not as a failure;
  * - `runner.failed` (an error that ends the turn) and `runner.interrupted`
  *   (a notice), shown as system messages where they happened;
  * - Hearth's tool states (`hearthToolStatus`): done, error, outcome unknown
@@ -50,10 +54,21 @@ export interface HearthChat {
   /** `message.user` texts not yet mirrored by pi's own user message. */
   readonly pending: readonly { readonly seq: number; readonly text: string }[];
   readonly notices: readonly Notice[];
+  /** A `runner.interrupted` arrived and the turn has not ended yet. */
+  readonly interrupting: boolean;
+  /** Tool calls the interrupt cut off: they ended with an error while `interrupting`. */
+  readonly interruptedCalls: readonly string[];
 }
 
 export function emptyChat(sessionId: string): HearthChat {
-  return { pi: createPiThreadState(sessionId), cursor: 0, pending: [], notices: [] };
+  return {
+    pi: createPiThreadState(sessionId),
+    cursor: 0,
+    pending: [],
+    notices: [],
+    interrupting: false,
+    interruptedCalls: [],
+  };
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -77,7 +92,7 @@ export function toPiClientEvent(threadId: string, event: HubEvent): PiClientEven
 export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
   if (event.seq <= chat.cursor) return chat;
   const p = record(event.payload);
-  let { pi, pending, notices } = chat;
+  let { pi, pending, notices, interrupting, interruptedCalls } = chat;
   const notice = (tone: Notice["tone"], text: string) => [
     ...notices,
     { seq: event.seq, tone, text, at: pi.messages.length },
@@ -91,6 +106,7 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       break;
     case "runner.interrupted":
       notices = notice("info", "Interrupted.");
+      interrupting = true;
       break;
     case "runner.failed":
       notices = notice(
@@ -111,11 +127,20 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       if (piEvent.type === "message_start" && record(piEvent.message)["role"] === "user") {
         pending = pending.slice(1);
       }
+      if (piEvent.type === "agent_start" || piEvent.type === "agent_end") interrupting = false;
       if (piEvent.type === "agent_end") pending = [];
+      if (
+        interrupting &&
+        piEvent.type === "tool_execution_end" &&
+        piEvent.isError === true &&
+        typeof piEvent.toolCallId === "string"
+      ) {
+        interruptedCalls = [...interruptedCalls, piEvent.toolCallId];
+      }
       pi = reducePiThreadState(pi, piEvent);
     }
   }
-  return { pi, cursor: event.seq, pending, notices };
+  return { pi, cursor: event.seq, pending, notices, interrupting, interruptedCalls };
 }
 
 export function applyHubEvents(chat: HearthChat, events: readonly HubEvent[]): HearthChat {
@@ -146,6 +171,13 @@ export function projectChat(chat: HearthChat): ThreadMessageLike[] {
     hostUiRequests: chat.pi.hostUiRequests,
   }).map((message): ThreadMessageLike => {
     if (typeof message.content === "string") return message;
+    const cut = message.content.flatMap((part) =>
+      part.type === "tool-call" &&
+      part.toolCallId !== undefined &&
+      chat.interruptedCalls.includes(part.toolCallId)
+        ? [part.toolCallId]
+        : [],
+    );
     return {
       ...message,
       content: message.content.map((part) =>
@@ -153,6 +185,14 @@ export function projectChat(chat: HearthChat): ThreadMessageLike[] {
           ? { ...part, result: clip(part.result) }
           : part,
       ),
+      ...(cut.length === 0
+        ? {}
+        : {
+            metadata: {
+              ...message.metadata,
+              custom: { ...message.metadata?.custom, [INTERRUPTED_CALLS]: cut },
+            },
+          }),
     };
   });
   const out: ThreadMessageLike[] = [];
@@ -195,21 +235,39 @@ export const TOOL_STATUS_LABEL: Readonly<Record<HearthToolStatus, string>> = {
 };
 
 /**
+ * The key in an assistant message's `metadata.custom` that lists its tool
+ * calls the user interrupted (see `HearthChat.interruptedCalls`).
+ */
+export const INTERRUPTED_CALLS = "hearthInterruptedCalls";
+
+/** Whether a message's `metadata.custom` lists `toolCallId` as interrupted by the user. */
+export function wasInterrupted(custom: unknown, toolCallId: string): boolean {
+  const ids = record(custom)[INTERRUPTED_CALLS];
+  return Array.isArray(ids) && ids.includes(toolCallId);
+}
+
+/**
  * Hearth's status of a tool-call part. assistant-ui gives a call without a
  * final result its message's status, so a call with no result in a message
- * that is no longer running was cut off by the end of the turn.
+ * that is no longer running was cut off by the end of the turn. A call the
+ * user interrupted (`interrupted`) ends as an error in pi; it shows as
+ * interrupted unless the box says its outcome is unknown.
  */
-export function hearthToolStatus(part: {
-  readonly result?: unknown;
-  readonly isError?: boolean | undefined;
-  readonly isPreliminary?: boolean | undefined;
-  readonly status: { readonly type: string };
-}): HearthToolStatus {
+export function hearthToolStatus(
+  part: {
+    readonly result?: unknown;
+    readonly isError?: boolean | undefined;
+    readonly isPreliminary?: boolean | undefined;
+    readonly status: { readonly type: string };
+  },
+  interrupted = false,
+): HearthToolStatus {
   if (part.result === undefined || part.isPreliminary === true) {
     return part.status.type === "running" ? "running" : "interrupted";
   }
   if (part.isError !== true) return "ok";
-  return OUTCOME_UNKNOWN.test(String(part.result)) ? "outcome-unknown" : "error";
+  if (OUTCOME_UNKNOWN.test(String(part.result))) return "outcome-unknown";
+  return interrupted ? "interrupted" : "error";
 }
 
 /** What a tool call acts on: the shell command, else the path, else the pattern. */

@@ -17,6 +17,7 @@ const { App } = await import("./App");
 const { createQueryClient } = await import("./queries");
 const { ChatRuntime, Thread } = await import("./Thread");
 const { applyHubEvents, emptyChat, isRunning, projectChat } = await import("./hearthPi");
+const { DesktopPanel, loadNoVnc } = await import("./Desktop");
 
 type Route = (method: string, path: string, body: unknown) => Response | undefined;
 
@@ -164,5 +165,85 @@ describe("tool card in a DOM", () => {
     expect(screen.queryByText(/The box restarted during this call/)).toBeNull();
     fireEvent.click(trigger);
     expect(await screen.findByText(/The box restarted during this call/)).toBeTruthy();
+  });
+});
+
+describe("desktop panel in a DOM", () => {
+  /** A stand-in for noVNC's RFB and the WebSocket, counting what gets opened. */
+  function fakes() {
+    const opened = { sockets: 0, clients: 0 };
+    class FakeSocket extends EventTarget {
+      constructor() {
+        super();
+        opened.sockets += 1;
+      }
+    }
+    class FakeRfb extends EventTarget {
+      viewOnly = false;
+      scaleViewport = false;
+      resizeSession = false;
+      constructor() {
+        super();
+        opened.clients += 1;
+      }
+      disconnect() {}
+    }
+    const realSocket = globalThis.WebSocket;
+    const realLoad = loadNoVnc.load;
+    globalThis.WebSocket = FakeSocket as never;
+    let release: (ok: boolean) => void = () => {};
+    let loads = 0;
+    loadNoVnc.load = () => {
+      loads += 1;
+      return new Promise((resolve, reject) => {
+        release = (ok) => (ok ? resolve(FakeRfb as never) : reject(new Error("chunk failed")));
+      });
+    };
+    const restore = () => {
+      globalThis.WebSocket = realSocket;
+      loadNoVnc.load = realLoad;
+    };
+    return { opened, release: (ok = true) => release(ok), loads: () => loads, restore };
+  }
+
+  test("noVNC loads on Open desktop, not before", async () => {
+    const f = fakes();
+    try {
+      render(<DesktopPanel sessionId="se_1" />);
+      expect(f.loads()).toBe(0);
+      fireEvent.click(screen.getByRole("button", { name: "Open desktop" }));
+      expect(f.loads()).toBe(1);
+      await act(async () => f.release());
+      expect(f.opened).toEqual({ sockets: 1, clients: 1 });
+    } finally {
+      f.restore();
+    }
+  });
+
+  test("a panel gone before noVNC loads opens no socket", async () => {
+    const f = fakes();
+    try {
+      const view = render(<DesktopPanel sessionId="se_1" />);
+      fireEvent.click(screen.getByRole("button", { name: "Open desktop" }));
+      view.unmount();
+      await act(async () => f.release());
+      expect(f.opened).toEqual({ sockets: 0, clients: 0 });
+    } finally {
+      f.restore();
+    }
+  });
+
+  test("a viewer that fails to load says so and offers Reconnect", async () => {
+    const f = fakes();
+    try {
+      render(<DesktopPanel sessionId="se_1" />);
+      fireEvent.click(screen.getByRole("button", { name: "Open desktop" }));
+      await act(async () => f.release(false));
+      expect(screen.getByText("The desktop viewer did not load.")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
+      expect(f.opened.sockets).toBe(0);
+    } finally {
+      f.restore();
+    }
   });
 });

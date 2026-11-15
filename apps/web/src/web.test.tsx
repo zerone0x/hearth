@@ -13,6 +13,7 @@ import {
   projectChat,
   toolTarget,
   toPiClientEvent,
+  wasInterrupted,
 } from "./hearthPi";
 import {
   createQueryClient,
@@ -93,10 +94,21 @@ function tools(chat: HearthChat) {
     typeof m.content === "string"
       ? []
       : m.content.flatMap((p) =>
-          p.type === "tool-call" ? [{ ...p, status: m.status ?? { type: "complete" } }] : [],
+          p.type === "tool-call"
+            ? [
+                {
+                  ...p,
+                  status: m.status ?? { type: "complete" },
+                  interrupted: wasInterrupted(m.metadata?.custom, p.toolCallId ?? ""),
+                },
+              ]
+            : [],
         ),
   );
 }
+
+/** Each tool call's Hearth status, as the tool card derives it. */
+const statuses = (chat: HearthChat) => tools(chat).map((p) => hearthToolStatus(p, p.interrupted));
 
 function render(chat: HearthChat): string {
   return renderToStaticMarkup(
@@ -145,7 +157,7 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
       result: "a.txt\n",
     });
     expect(parts[2]).toMatchObject({ text: "There is a.txt." });
-    expect(tools(chat).map(hearthToolStatus)).toEqual(["ok"]);
+    expect(statuses(chat)).toEqual(["ok"]);
   });
 
   test("the user's message shows at once, then pi's own copy replaces it (no duplicate)", () => {
@@ -216,7 +228,7 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
       ev("pi.agent_end", { messages: [] }),
     ]);
     expect(isRunning(chat)).toBe(false);
-    expect(tools(chat).map(hearthToolStatus)).toEqual(["error", "outcome-unknown", "interrupted"]);
+    expect(statuses(chat)).toEqual(["error", "outcome-unknown", "interrupted"]);
     const html = render(chat);
     expect(html).toContain('data-status="outcome-unknown"');
     expect(html).toContain('aria-label="Tool call bash: interrupted"');
@@ -237,6 +249,99 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
       role: "system",
       content: [{ text: "Interrupted." }],
     });
+  });
+
+  test("a call the user interrupts shows as interrupted, not as a failed tool", () => {
+    // The hub records runner.interrupted, then aborts pi, which ends the call in flight as an error.
+    const step = assistant(
+      [toolCall("f", "read", { path: "x" }), toolCall("s", "bash", { command: "sleep 30" })],
+      "toolUse",
+    );
+    const aborted = toolResult("s", "bash", "Command aborted", true);
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("message.user", { text: "go" }),
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: user("go") }),
+      ev("pi.message_start", { message: step }),
+      ev("pi.message_end", { message: step }),
+      ev("pi.tool_execution_start", { toolCallId: "f", toolName: "read", args: {} }),
+      ev("pi.tool_execution_end", { toolCallId: "f", result: {}, isError: true }),
+      ev("pi.message_start", { message: toolResult("f", "read", "ENOENT", true) }),
+      ev("pi.tool_execution_start", { toolCallId: "s", toolName: "bash", args: {} }),
+      ev("runner.interrupted", { reason: "interrupted by the user" }),
+      ev("pi.tool_execution_end", { toolCallId: "s", result: {}, isError: true }),
+      ev("pi.message_start", { message: aborted }),
+      ev("pi.message_end", { message: aborted }),
+      ev("pi.agent_end", { messages: [] }),
+    ]);
+    // The read failed on its own before the interrupt: still an error.
+    expect(statuses(chat)).toEqual(["error", "interrupted"]);
+    expect(chat.interrupting).toBe(false);
+    const html = render(chat);
+    expect(html).toContain('aria-label="Tool call read: error"');
+    expect(html).toContain('aria-label="Tool call bash: interrupted"');
+    expect(html).not.toContain('aria-label="Tool call bash: error"');
+    const card = html
+      .split('data-testid="tool-card"')
+      .find((c) => c.includes('data-status="interrupted"'));
+    expect(card).toContain("Cancelled tool");
+    expect(card).not.toContain("Failed tool");
+
+    // The next turn starts clean: a tool error there is an error again.
+    const next = assistant([toolCall("n", "bash", { command: "false" })], "toolUse");
+    const later = applyHubEvents(chat, [
+      ev("message.user", { text: "again" }),
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: next }),
+      ev("pi.tool_execution_start", { toolCallId: "n", toolName: "bash", args: {} }),
+      ev("pi.tool_execution_end", { toolCallId: "n", result: {}, isError: true }),
+      ev("pi.message_start", { message: toolResult("n", "bash", "exit 1", true) }),
+      ev("pi.agent_end", { messages: [] }),
+    ]);
+    expect(statuses(later)).toEqual(["error", "interrupted", "error"]);
+  });
+
+  test("an interrupt that never reached agent_end is cleared by the next agent_start", () => {
+    const step = assistant([toolCall("n", "bash", { command: "false" })], "toolUse");
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("runner.interrupted", { reason: "interrupted by the user" }),
+      ev("message.user", { text: "go" }),
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: step }),
+      ev("pi.tool_execution_end", { toolCallId: "n", result: {}, isError: true }),
+      ev("pi.message_start", { message: toolResult("n", "bash", "exit 1", true) }),
+    ]);
+    expect(statuses(chat)).toEqual(["error"]);
+  });
+
+  test("an interrupted call whose outcome is unknown still says so", () => {
+    const unknown = "tool.outcome-unknown: Box bx restarted; its outcome is unknown";
+    const step = assistant([toolCall("u", "write", { path: "y" })], "toolUse");
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: step }),
+      ev("pi.tool_execution_start", { toolCallId: "u", toolName: "write", args: {} }),
+      ev("runner.interrupted", { reason: "interrupted by the user" }),
+      ev("pi.tool_execution_end", { toolCallId: "u", result: {}, isError: true }),
+      ev("pi.message_start", { message: toolResult("u", "write", unknown, true) }),
+      ev("pi.agent_end", { messages: [] }),
+    ]);
+    expect(statuses(chat)).toEqual(["outcome-unknown"]);
+  });
+
+  test("a call that finishes cleanly despite an interrupt is done", () => {
+    const step = assistant([toolCall("d", "bash", { command: "true" })], "toolUse");
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: step }),
+      ev("pi.tool_execution_start", { toolCallId: "d", toolName: "bash", args: {} }),
+      ev("runner.interrupted", { reason: "interrupted by the user" }),
+      ev("pi.tool_execution_end", { toolCallId: "d", result: {}, isError: false }),
+      ev("pi.message_start", { message: toolResult("d", "bash", "") }),
+      ev("pi.agent_end", { messages: [] }),
+    ]);
+    expect(statuses(chat)).toEqual(["ok"]);
+    expect(chat.interruptedCalls).toEqual([]);
   });
 
   test("hearthToolStatus: a call with no result is running only while its message runs", () => {
@@ -385,6 +490,42 @@ describe("chat view", () => {
     expect(html).toContain('aria-label="Tool call bash: done"');
     expect(html).toContain('aria-expanded="false"');
     expect(html).toContain("echo &lt;hi&gt;");
+  });
+
+  test("links in an assistant reply open in a new tab without an opener or referrer", () => {
+    const reply = assistant([text("See [the docs](https://example.com/docs).")]);
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.message_start", { message: user("where?") }),
+      ev("pi.message_start", { message: reply }),
+      ev("pi.message_end", { message: reply }),
+    ]);
+    const link = /<a[^>]*href="https:\/\/example\.com\/docs"[^>]*>/.exec(render(chat))?.[0];
+    expect(link).toBeDefined();
+    expect(link).toContain('target="_blank"');
+    expect(link).toContain('rel="noopener noreferrer"');
+  });
+
+  test("the action bars offer copy and the export menu, but no regenerate or edit Hearth lacks", () => {
+    const reply = assistant([text("Done.")]);
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.message_start", { message: user("do it") }),
+      ev("pi.message_start", { message: reply }),
+      ev("pi.message_end", { message: reply }),
+    ]);
+    const html = render(chat);
+    // The assistant action bar renders (copy is supported) ...
+    expect(html).toContain("aui-assistant-action-bar-root");
+    expect(html).toContain(">Copy<");
+    // ... and the "…" menu (Export as Markdown runs in the browser) ...
+    expect(html).toContain(">More<");
+    // ... without the registry's refresh (regenerate) or the user edit button.
+    expect(html).not.toContain(">Refresh<");
+    // The last message's user action bar renders, without the edit button.
+    const asked = render(
+      applyHubEvents(emptyChat(S), [ev("pi.message_start", { message: user("do it") })]),
+    );
+    expect(asked).toContain("aui-user-action-bar-root");
+    expect(asked).not.toContain(">Edit<");
   });
 
   test("while a turn runs the composer offers Interrupt", () => {

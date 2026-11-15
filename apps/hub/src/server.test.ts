@@ -423,6 +423,149 @@ describe("startHub", () => {
     expect(opened).toBe("refused");
   });
 
+  /** Send raw bytes to `port` on loopback and return everything the server answers. */
+  async function raw(port: number, request: string): Promise<string> {
+    let received = "";
+    const done = Promise.withResolvers<void>();
+    const socket = await Bun.connect({
+      hostname: "127.0.0.1",
+      port,
+      socket: {
+        open(s) {
+          s.write(request);
+        },
+        data(_s, chunk) {
+          received += chunk.toString();
+        },
+        close() {
+          done.resolve();
+        },
+        error() {
+          done.resolve();
+        },
+      },
+    });
+    const timer = setTimeout(() => socket.end(), 3_000);
+    await done.promise;
+    clearTimeout(timer);
+    return received;
+  }
+
+  /** Status line and JSON body of a raw HTTP answer. */
+  function parseAnswer(answer: string): { status: number; contentType: string; body: string } {
+    const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(answer)?.[1]);
+    const contentType = /^content-type: *([^\r\n]*)/im.exec(answer)?.[1] ?? "";
+    const body = answer.slice(answer.indexOf("\r\n\r\n") + 4);
+    return { status, contentType, body };
+  }
+
+  test("a bad Host header on a real socket gets a JSON refusal, never a 500 (issue #48)", async () => {
+    const hub = start();
+    const port = Number(hub.url.port);
+    const boxPort = Number(new URL(hub.listenForBoxes("127.0.0.1").replace("ws", "http")).port);
+    const tail =
+      "content-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+    const requests = [
+      `POST /v1/boxes/b/echo HTTP/1.1\r\nHost: \r\n${tail}`,
+      `POST /v1/boxes/b/echo HTTP/1.1\r\nHost: bad host\r\n${tail}`,
+      `GET /healthz HTTP/1.1\r\nHost: \r\nconnection: close\r\n\r\n`,
+      `GET http://attacker.example/v1/sessions HTTP/1.1\r\nHost: \r\nconnection: close\r\n\r\n`,
+      `GET http://attacker.example/v1/sessions HTTP/1.1\r\nHost: attacker.example\r\nconnection: close\r\n\r\n`,
+      `GET /v1/sessions HTTP/1.0\r\n\r\n`,
+    ];
+    // Bun's HTTP parser refuses a malformed request line or header before the
+    // fetch handler runs, with a bare 4xx/505 and no body: not a 500, no page.
+    const unparsable = [
+      `GET //\r\nHost: \r\n\r\n`,
+      `GET\r\n\r\n`,
+      `GET /x HTTP/1.1\r\nHost: a\r\nbad header\r\n\r\n`,
+    ];
+    for (const port_ of [port, boxPort]) {
+      for (const request of requests) {
+        const answer = await raw(port_, request);
+        const { status, contentType, body } = parseAnswer(answer);
+        const label = JSON.stringify({ port: port_ === port ? "public" : "box", request });
+        expect(`${label} ${status}`).toMatch(/ (4\d\d)$/);
+        expect(`${label} ${contentType}`).toContain("application/json");
+        expect(`${label} ${body}`).not.toContain("<html");
+        expect(JSON.parse(body)).toMatchObject({ ok: false, error: { code: expect.any(String) } });
+      }
+    }
+    for (const port_ of [port, boxPort]) {
+      for (const request of unparsable) {
+        const { status, body } = parseAnswer(await raw(port_, request));
+        expect({ request, ok: [400, 505].includes(status), page: body.includes("<") }).toEqual({
+          request,
+          ok: true,
+          page: false,
+        });
+      }
+    }
+    const empty = parseAnswer(await raw(port, requests[0] as string));
+    expect(empty.status).toBe(421);
+    expect(JSON.parse(empty.body)).toMatchObject({ error: { code: "request.foreign-host" } });
+  });
+
+  test("/healthz answers a Host that is not a valid URL authority, as before issue #48", async () => {
+    const hub = start();
+    const port = Number(hub.url.port);
+    // Base served these through the guard's /healthz exemption (decision 0010).
+    for (const host of [":80", ":", "127.0.0.1:99999", "127.0.0.1:abc", "[::1"]) {
+      const healthz = parseAnswer(
+        await raw(port, `GET /healthz HTTP/1.1\r\nHost: ${host}\r\nconnection: close\r\n\r\n`),
+      );
+      expect({ host, status: healthz.status }).toEqual({ host, status: 200 });
+      expect(JSON.parse(healthz.body)).toMatchObject({ status: "ok" });
+      // Any other path with the same Host is still refused, never served.
+      const other = parseAnswer(
+        await raw(port, `GET /v1/sessions HTTP/1.1\r\nHost: ${host}\r\nconnection: close\r\n\r\n`),
+      );
+      expect({ host, status: other.status }).toEqual({ host, status: 421 });
+      expect(JSON.parse(other.body)).toMatchObject({ error: { code: "request.foreign-host" } });
+    }
+    // The app decodes the path before the exemption, so an encoded /healthz is one too.
+    const encoded = parseAnswer(
+      await raw(port, "GET /%68ealthz?probe=1 HTTP/1.1\r\nHost: :80\r\nconnection: close\r\n\r\n"),
+    );
+    expect(encoded.status).toBe(200);
+    // A fragment is not part of the path either.
+    const fragment = parseAnswer(
+      await raw(port, "GET /healthz#x HTTP/1.1\r\nHost: :80\r\nconnection: close\r\n\r\n"),
+    );
+    expect(fragment.status).toBe(200);
+    // Only GET/HEAD /healthz is served: other methods keep base's 404, so the
+    // forwarded request must keep its method (and headers and body).
+    for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
+      const res = parseAnswer(
+        await raw(
+          port,
+          `${method} /healthz HTTP/1.1\r\nHost: :80\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}`,
+        ),
+      );
+      expect({ method, status: res.status }).toEqual({ method, status: 404 });
+    }
+    // Near-misses are not /healthz: they get the listener's own refusal, not the app's.
+    for (const path of [
+      "/healthz/",
+      "/HEALTHZ",
+      "/healthzz",
+      "/healthz/../v1/sessions",
+      "/v1/../healthz",
+      "/x/healthz",
+    ]) {
+      const res = parseAnswer(
+        await raw(
+          port,
+          `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:99999\r\norigin: https://evil.example\r\nconnection: close\r\n\r\n`,
+        ),
+      );
+      expect({ path, status: res.status }).toEqual({ path, status: 421 });
+      expect(JSON.parse(res.body)).toMatchObject({
+        error: { code: "request.foreign-host", message: "the Host header is missing or malformed" },
+      });
+    }
+  });
+
   test("a box listener serves the box socket and nothing else, whatever Host and Origin", async () => {
     const hub = start();
     const url = new URL(hub.listenForBoxes("127.0.0.1").replace("ws", "http"));
@@ -431,6 +574,15 @@ describe("startHub", () => {
     const foreign = { host: "attacker.example", origin: "https://evil.example" };
     const socket = await fetch(url, { headers: foreign, signal: AbortSignal.timeout(5_000) });
     expect(socket.status).toBe(426);
+    expect(socket.headers.get("content-type")).toContain("application/json");
+    expect(await socket.json()).toEqual({
+      ok: false,
+      error: {
+        code: "request.upgrade-required",
+        owner: "user",
+        message: "expected a WebSocket upgrade",
+      },
+    });
     for (const path of ["/healthz", "/v1/boxes/box_none/echo"]) {
       const res = await fetch(new URL(path, url), {
         method: path === "/healthz" ? "GET" : "POST",

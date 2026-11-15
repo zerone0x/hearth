@@ -3,7 +3,11 @@
  * first-run setup → sign out → sign in → create a session → send a message →
  * see the tool card → open the desktop → reload, and the session continues
  * (the chat is rebuilt from the event log and a second turn runs) → the box
- * goes away and the desktop says it is asleep → wake.
+ * goes away and the desktop says it is asleep → wake. Along the way: the
+ * chat and noVNC load only when needed (#84), a link in a reply opens in a new
+ * tab, the action bar has no regenerate or edit but exports Markdown, an
+ * interrupted tool call shows as interrupted, and a session page chunk that
+ * fails to load (404) leaves the app shell with a Reload button.
  *
  *   bun run build:web && bun run e2e:web
  *
@@ -21,6 +25,10 @@ import { startE2eHub } from "./harness";
 const WEB_ROOT = join(import.meta.dir, "../dist");
 const PASSWORD = "correct horse battery staple";
 const STEP_MS = 15_000;
+
+/** The lazy chunks (#84): the session page (chat, markdown) and noVNC's RFB client. */
+const SESSION_CHUNK = /\/assets\/SessionPage-[^/]*\.js$/;
+const NOVNC_CHUNK = /\/assets\/rfb-[^/]*\.js$/;
 
 const shots = process.env["HEARTH_E2E_SCREENSHOTS"];
 if (shots) mkdirSync(shots, { recursive: true });
@@ -82,6 +90,11 @@ try {
   await watchCsp(context);
   const page = await context.newPage();
   const base = e2e.url.toString();
+  const scripts: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "script") scripts.push(new URL(request.url()).pathname);
+  });
+  const loaded = (chunk: RegExp) => scripts.some((path) => chunk.test(path));
 
   step("first-run setup with the setup token");
   await page.goto(base);
@@ -100,6 +113,11 @@ try {
   await page.getByRole("alert").filter({ hasText: "wrong password" }).waitFor();
   await page.getByLabel("Password").fill(PASSWORD);
   await page.getByRole("button", { name: "Sign in" }).click();
+
+  step("sign-in and the session list load neither the chat nor noVNC");
+  if (loaded(SESSION_CHUNK) || loaded(NOVNC_CHUNK)) {
+    throw new Error(`the session list loaded a lazy chunk: ${scripts.join(", ")}`);
+  }
 
   step("create a session");
   await page.getByLabel("New session title").fill("Say hello");
@@ -134,9 +152,30 @@ try {
     throw new Error("the tool call did not run in the box's workspace");
   }
 
+  if (!loaded(SESSION_CHUNK)) throw new Error("the session page chunk never loaded");
+  if (loaded(NOVNC_CHUNK)) throw new Error("noVNC loaded before the desktop was opened");
+  // Hearth cannot regenerate or edit yet: the registry's buttons for them stay out.
+  for (const name of ["Refresh", "Edit"]) {
+    if ((await page.getByRole("button", { name, exact: true }).count()) !== 0) {
+      throw new Error(`the action bar shows an unsupported "${name}" button`);
+    }
+  }
+  await page.getByRole("button", { name: "Copy", exact: true }).first().waitFor();
+
+  step('the "…" menu exports the reply as Markdown, in the browser');
+  await page.getByText("I wrote hello.txt in the workspace.").hover();
+  await page.getByRole("button", { name: "More", exact: true }).last().click();
+  const download = page.waitForEvent("download");
+  await page.getByRole("menuitem", { name: "Export as Markdown" }).click();
+  const exported = await (await download).path();
+  if (!readFileSync(exported, "utf8").includes("I wrote hello.txt in the workspace.")) {
+    throw new Error("Export as Markdown should download the reply's text");
+  }
+
   step("open the view-only desktop");
   await page.getByRole("button", { name: "Open desktop" }).click();
   await page.locator('[data-testid="desktop"][data-phase="open"] canvas').waitFor();
+  if (!loaded(NOVNC_CHUNK)) throw new Error("the desktop opened without loading the noVNC chunk");
   await page.waitForTimeout(500);
   await shot(page, "2-session-desktop");
 
@@ -152,12 +191,47 @@ try {
   await page.getByText("Still here: hello.txt says hello from the box.").waitFor();
   if (page.url() !== sessionUrl) throw new Error("the reload should stay on the session");
 
+  step("a link in a reply opens in a new tab");
+  e2e.faux.setResponses([fauxAssistantMessage("See [the pi docs](https://example.com/pi).")]);
+  await page.getByLabel("Message").fill("Where are the docs?");
+  await page.getByRole("button", { name: "Send" }).click();
+  const link = page.getByRole("link", { name: "the pi docs" });
+  await link.waitFor();
+  if (
+    (await link.getAttribute("target")) !== "_blank" ||
+    (await link.getAttribute("rel")) !== "noopener noreferrer"
+  ) {
+    throw new Error("a link in a reply should open in a new tab, without opener or referrer");
+  }
+
+  step("interrupt a running tool call: its card says interrupted, not error");
+  e2e.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("bash", { command: "sleep 30" }, { id: "call_sleep" })], {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("This turn was interrupted, so this never shows."),
+  ]);
+  await page.getByLabel("Message").fill("Sleep for a while");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByRole("button", { name: "Tool call bash: running" }).waitFor();
+  await page.getByRole("button", { name: "Interrupt" }).click();
+  const cut = page.getByTestId("tool-card").and(page.locator('[data-status="interrupted"]'));
+  await cut.getByRole("button", { name: "Tool call bash: interrupted" }).waitFor();
+  await page.getByRole("button", { name: "Send" }).waitFor();
+  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 0) {
+    throw new Error("an interrupted tool call should not show as an error");
+  }
+  // The composer floats over the bottom of the thread: centre the card for the shot
+  // (instantly: the viewport scrolls smoothly).
+  await cut.evaluate("(card) => card.scrollIntoView({ block: 'center', behavior: 'instant' })");
+  await shot(page, "3-interrupted-tool");
+
   step("the box goes away: the desktop says it is asleep (4410), Wake reconnects");
   await page.getByRole("button", { name: "Open desktop" }).click();
   await page.locator('[data-testid="desktop"][data-phase="open"]').waitFor();
   await e2e.boxes.stopAll();
   await page.getByTestId("desktop-asleep").waitFor();
-  await shot(page, "3-desktop-asleep");
+  await shot(page, "4-desktop-asleep");
   await page.getByRole("button", { name: "Wake" }).click();
   await page.locator('[data-testid="desktop"][data-phase="open"]').waitFor();
 
@@ -175,10 +249,58 @@ try {
   await mobile.getByLabel("Password").fill(PASSWORD);
   await mobile.getByRole("button", { name: "Sign in" }).click();
   await mobile.getByTestId("session-row").first().waitFor();
-  await shot(mobile, "4-mobile-sessions");
+  await shot(mobile, "5-mobile-sessions");
   await mobile.getByTestId("session-row").first().getByRole("link").click();
   await mobile.getByText("Still here: hello.txt says hello from the box.").waitFor();
-  await shot(mobile, "5-mobile-session");
+  await shot(mobile, "6-mobile-session");
+
+  step("the session page chunk 404s (a hub upgrade replaced it): the shell stays, Reload works");
+  const stale = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    deviceScaleFactor: 2,
+  });
+  stale.setDefaultTimeout(STEP_MS);
+  await watchCsp(stale);
+  await stale.route(SESSION_CHUNK, (route) => route.fulfill({ status: 404, body: "gone" }));
+  const failed = async (tab: Page, how: string) => {
+    await tab
+      .getByRole("alert")
+      .filter({ hasText: "The session page did not load." })
+      .waitFor()
+      .catch(() => {
+        throw new Error(`${how}: a session page chunk that 404s should show an alert`);
+      });
+    for (const [role, name] of [
+      ["button", "Reload"],
+      ["link", "Sessions"],
+      ["button", "Sign out"],
+    ] as const) {
+      if (!(await tab.getByRole(role, { name, exact: true }).isVisible())) {
+        throw new Error(`${how}: the "${name}" ${role} should stay visible`);
+      }
+    }
+  };
+  // Direct navigation: the tab opens on the session URL.
+  const direct = await stale.newPage();
+  await direct.goto(base);
+  await direct.getByLabel("Password").fill(PASSWORD);
+  await direct.getByRole("button", { name: "Sign in" }).click();
+  await direct.getByTestId("session-row").first().waitFor();
+  await direct.goto(sessionUrl);
+  await failed(direct, "direct navigation");
+  await shot(direct, "7-session-chunk-404");
+  await direct.getByRole("link", { name: "Sessions", exact: true }).click();
+  await direct.getByTestId("session-row").first().waitFor();
+  // In-app navigation: a fresh tab opens the list, then the session from it.
+  const inApp = await stale.newPage();
+  await inApp.goto(base);
+  await inApp.getByTestId("session-row").first().getByRole("link").click();
+  await failed(inApp, "in-app navigation");
+  // The chunk is back (the tab reloads onto the new build): Reload opens the session.
+  await stale.unroute(SESSION_CHUNK);
+  await inApp.getByRole("button", { name: "Reload", exact: true }).click();
+  await inApp.getByText("Still here: hello.txt says hello from the box.").waitFor();
+  await stale.close();
 
   if (cspViolations.length > 0) {
     throw new Error(`CSP violations: ${cspViolations.join("; ")}`);

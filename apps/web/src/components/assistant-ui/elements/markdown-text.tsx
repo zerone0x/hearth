@@ -158,6 +158,7 @@ const defaultComponents = memoizeMarkdownComponents({
       {...props}
     />
   ),
+  // Hearth: links open in a new tab, so the chat stays put (#84).
   a: ({ className, ...props }) => (
     <a
       className={cn(
@@ -165,6 +166,8 @@ const defaultComponents = memoizeMarkdownComponents({
         className,
       )}
       {...props}
+      target="_blank"
+      rel="noopener noreferrer"
     />
   ),
   blockquote: ({ className, ...props }) => (

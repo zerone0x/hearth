@@ -24,6 +24,16 @@ bun run e2e:web     # Chromium against a real hub (faux model, local box-agent)
 - Data fetching and polling: TanStack Query (`src/queries.ts`).
 - Desktop: `@novnc/novnc`.
 
+## Bundle
+
+The first load is sign-in and the session list only. `src/SessionPage.tsx`
+(chat, assistant-ui, markdown) is a `React.lazy` chunk, and the desktop panel
+imports noVNC on its first connect, so noVNC downloads only after `Open
+desktop` or `Wake` (#84). The web e2e checks both. If the session page chunk
+fails to load (a hub upgrade replaced the hashed files while a tab was open),
+a `react-error-boundary` boundary keeps the app shell and offers Reload
+(decision 0025).
+
 `src/components/ui`, `src/components/assistant-ui` and `src/hooks` are
 registry source: update them with the CLI (`bunx shadcn@4.23.0 add <name>`),
 not by hand. After the CLI runs:
@@ -34,8 +44,17 @@ not by hand. After the CLI runs:
   composer input `aria-label="Message"`, the send button `aria-label="Send"`,
   the stop button `"Interrupt"` (instead of `Message input`, `Send message`,
   `Stop generating`), `export` on `AssistantMessage`, and the attach button
-  wrapped in `AuiIf` on `s.thread.capabilities.attachments`.
-  `src/web.test.tsx` fails until they are back.
+  wrapped in `AuiIf` on `s.thread.capabilities.attachments`;
+- re-apply the local edits for #84: in `thread.aui.tsx`, the assistant
+  action bar's refresh (regenerate) button (not the "…" menu: Export as
+  Markdown runs in the browser) wrapped in `AuiIf` on
+  `s.thread.capabilities.reload`, the "…" menu's `ActionBarMorePrimitive.Root`
+  given `modal={false}` (a modal Radix menu injects a `<style>`, which the
+  CSP blocks), and the user message's edit button wrapped
+  in `AuiIf` on `s.thread.capabilities.edit`; in `markdown-text.tsx`, the `a`
+  component gets `target="_blank" rel="noopener noreferrer"` after its props.
+  Each edit is marked with a `Hearth:` comment.
+  `src/web.test.tsx` and the web e2e fail until they are back.
 
 Tests: `bun run test` runs `src/web.test.tsx` (server-rendered) and then
 `src/web.dom.tsx` (happy-dom, its own process).
