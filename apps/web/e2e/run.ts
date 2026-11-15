@@ -126,8 +126,10 @@ try {
   const card = page.getByTestId("tool-card").first();
   await card.and(page.locator('[data-status="ok"]')).waitFor();
   await page.getByText("I wrote hello.txt in the workspace.").waitFor();
-  await card.locator("summary").click();
-  await card.locator("pre", { hasText: "hello from the box" }).waitFor();
+  await card.getByRole("button", { name: "Tool call bash: done" }).click();
+  await card
+    .locator('[data-slot="tool-fallback-result"]', { hasText: "hello from the box" })
+    .waitFor();
   if (readFileSync(join(e2e.workspace, "hello.txt"), "utf8") !== "hello from the box\n") {
     throw new Error("the tool call did not run in the box's workspace");
   }

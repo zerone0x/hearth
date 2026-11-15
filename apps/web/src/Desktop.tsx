@@ -9,7 +9,7 @@
 import RFB from "@novnc/novnc";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { desktopUrl } from "./api";
-import { type DesktopPhase, DesktopStatus, desktopPhaseFor } from "./components";
+import { type DesktopPhase, DesktopStatus, desktopPhaseFor } from "./DesktopStatus";
 
 export function DesktopPanel({ sessionId }: { sessionId: string }) {
   const screen = useRef<HTMLDivElement>(null);

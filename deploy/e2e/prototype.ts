@@ -111,10 +111,17 @@ async function signIn(page: Page): Promise<void> {
  * names it as a button, "Tool call <tool>: done". Either one counts.
  */
 function toolDone(page: Page, tool: string, target: string) {
+  // The named trigger already carries the status in its accessible name; its badge
+  // may sit outside the button, so only the unnamed (older) card is filtered by text.
   return page
     .getByRole("button", { name: `Tool call ${tool}: done` })
-    .or(page.getByRole("group").filter({ hasText: tool }).filter({ hasText: target }))
-    .filter({ hasText: "done" })
+    .or(
+      page
+        .getByRole("group")
+        .filter({ hasText: tool })
+        .filter({ hasText: target })
+        .filter({ hasText: "done" }),
+    )
     .first();
 }
 
@@ -298,7 +305,11 @@ async function install(browser: Browser): Promise<void> {
   await context.close();
 }
 
-/** Everything the session API holds right now, through the signed-in context. */
+/**
+ * Everything the session API holds right now, through the signed-in context, minus the
+ * box lifecycle (state, last activity, `session.state` and `box.*` events). The hub's
+ * idle timer moves those on its own, so they say nothing about a refused request.
+ */
 async function snapshot(context: BrowserContext, sessionId: string) {
   const origin = { origin: BASE.origin };
   const sessions = await context.request.get(new URL("/v1/sessions", BASE).toString(), {
@@ -310,9 +321,14 @@ async function snapshot(context: BrowserContext, sessionId: string) {
     { headers: origin },
   );
   check(events.ok(), `reading events answered ${events.status()}`);
+  const sessionList = (await sessions.json()) as { sessions: Record<string, unknown>[] };
+  const eventPage = (await events.json()) as { events: { type: string }[] };
+  const lifecycle = (type: string) => type === "session.state" || type.startsWith("box.");
   return {
-    sessions: JSON.stringify(await sessions.json()),
-    events: JSON.stringify(await events.json()),
+    sessions: JSON.stringify(
+      sessionList.sessions.map(({ state: _s, lastActivityAt: _l, boxId: _b, ...rest }) => rest),
+    ),
+    events: JSON.stringify(eventPage.events.filter((e) => !lifecycle(e.type))),
     model: (await fauxRequests()).length,
   };
 }
@@ -397,7 +413,10 @@ async function refusals(context: BrowserContext, page: Page, sessionId: string):
   // Nothing changed: no session created, no message stored, no turn run.
   await page.waitForTimeout(2000);
   const after = await snapshot(context, sessionId);
-  check(after.sessions === before.sessions, "a refused request created or changed a session");
+  check(
+    after.sessions === before.sessions,
+    `a refused request created or changed a session:\nbefore ${before.sessions}\nafter  ${after.sessions}`,
+  );
   check(after.events === before.events, "a refused request added events to the session");
   check(after.model === before.model, "a refused request reached the model");
   await script([]);
