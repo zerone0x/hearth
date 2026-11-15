@@ -29,6 +29,19 @@ export const WAL_SWITCH_BASE_DELAY_MS = 5;
 /** Upper bound for a single pause between WAL switch attempts. */
 export const WAL_SWITCH_MAX_DELAY_MS = 250;
 
+/**
+ * `busy_timeout` while the WAL switch is retried. The retry loop already
+ * paces itself, so a long busy wait per attempt would only stack on top of the
+ * backoff (12 attempts x 5 s = about a minute before `store.open-failed`).
+ */
+export const WAL_SWITCH_BUSY_TIMEOUT_MS = 50;
+/**
+ * Deadline for the whole WAL switch (PRD §8.1 principle 8: every wait has a
+ * named bound). A locked file fails with `store.open-failed` within this time
+ * plus one attempt's busy wait.
+ */
+export const WAL_SWITCH_DEADLINE_MS = 3_000;
+
 export interface OpenDatabaseOptions {
   /** Run the migrations after opening. Default `true`. */
   readonly migrate?: boolean;
@@ -55,8 +68,9 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
   let db: Database | undefined;
   try {
     db = new Database(path, { create: true, readwrite: true, strict: true });
-    db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    db.run(`PRAGMA busy_timeout = ${WAL_SWITCH_BUSY_TIMEOUT_MS}`);
     switchToWal(db);
+    db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     db.run("PRAGMA synchronous = FULL");
     db.run("PRAGMA foreign_keys = ON");
     db.run("PRAGMA recursive_triggers = ON");
@@ -87,12 +101,15 @@ function isBusy(cause: unknown): boolean {
 /** Switch to WAL, retrying `SQLITE_BUSY` with bounded exponential backoff. */
 function switchToWal(db: Database): void {
   let delay = WAL_SWITCH_BASE_DELAY_MS;
+  const deadline = Date.now() + WAL_SWITCH_DEADLINE_MS;
   for (let attempt = 1; ; attempt++) {
     try {
       db.run("PRAGMA journal_mode = WAL");
       return;
     } catch (cause) {
-      if (!isBusy(cause) || attempt >= WAL_SWITCH_MAX_ATTEMPTS) throw cause;
+      if (!isBusy(cause) || attempt >= WAL_SWITCH_MAX_ATTEMPTS || Date.now() >= deadline) {
+        throw cause;
+      }
       Bun.sleepSync(delay + Math.floor(Math.random() * delay));
       delay = Math.min(delay * 2, WAL_SWITCH_MAX_DELAY_MS);
     }
