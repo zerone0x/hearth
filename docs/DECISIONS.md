@@ -872,3 +872,109 @@ its listener is #27.
   box's network.
 - Another provider (PRD §7 E4) implements `hubAddress` its own way; the hub
   only needs an address it can bind and the box can reach.
+
+## 0013: Session manager: state machine, lazy box start, hibernate as stop, box exit supervision
+
+- Date: 2026-11-15
+- Status: accepted
+- Issues: #42, #28
+
+### Decision
+
+- **The session manager lives in `apps/hub/src/session`** (`SessionManager`),
+  with its rows in `store/sessions.ts` (the store stays the only SQLite code,
+  0006). `startHub` builds it and exposes it as `hub.sessions`; it is the only
+  code that starts, stops or relaunches session boxes, through `hub.startBox`
+  (0012) and the provider.
+- **States** are those of PRD §5, persisted in `session.state`:
+  `creating → idle` (created, no box), `idle → running` (a tool call on a
+  connected box), `idle | hibernated → waking → running` (lazy start or wake),
+  `running → idle` (no tool call in flight), `idle → hibernated` (box stopped),
+  `running | idle → waking` (box relaunch), `waking → idle` (relaunched with no
+  call waiting), `waking → hibernated` (the box could not be started, or the
+  hub restarted mid-wake), `running | creating → idle` (hub restart), any
+  state but `archived` → `failed` / `archived`, and `failed → archived` only.
+  Anything else is `session.illegal-transition`. A failed session refuses tool
+  calls (`session.unavailable`) until it is archived; retrying a failed session
+  is a later decision.
+- **Every transition** is checked against that table, then authorized with
+  `session.<verb>` named by the target state (`session.create`, `.run`,
+  `.idle`, `.hibernate`, `.wake`, `.fail`, `.archive`; the authorizer audits
+  it), then written to the event log as `session.state {from, to, reason}`, and
+  only then written to the row. Hub-initiated transitions (idle timer,
+  supervision, restart recovery) use `SYSTEM_PRINCIPAL`.
+- **Lazy start: `ensureBox(sessionId, principal?)`** is the one entry point
+  that starts a box. The runner (#43) calls it before each routed tool call; it
+  returns a lease (`{ boxId, release() }`) once the box is connected, waiting
+  under the named deadline `connectDeadlineMs` (default 120 s). Creating a
+  session starts nothing. `withBox` wraps ensure/release.
+- **Hibernate means `BoxProvider.stop`** (the volume stays) after `idleMs`
+  (default 15 minutes, `HEARTH_IDLE_MINUTES`) with no lease held; a lease taken
+  meanwhile cancels it. `session.hibernate` / `hibernate.done` frames are not
+  used: the runner's state is in the hub, so there is nothing to quiesce in the
+  box (this settles the question 0009 left open).
+- **Running grace.** A session stays `running` for `runningGraceMs`
+  (`DEFAULT_RUNNING_GRACE_MS`, 3 s) after its last lease is released; each
+  release restarts it. The back-to-back tool calls of one turn so write one
+  `running` and one `idle`, not an `idle → running` pair (two audit rows, two
+  `session.state` events) per call. The grace counts toward `idleMs`: the
+  hibernate still comes `idleMs` after the last call ended.
+- **One lifecycle step at a time per session**: wakes, hibernates, relaunches,
+  state changes after a lease and archive run in a per-session queue, so a
+  wake waits for a hibernate in flight and runs on the next box (PRD §6.3).
+- **Every boot is cold and gets a fresh join token**: a wake stops whatever
+  runtime is left, then `startBox`, because `BoxProvider.start` leaves a running
+  box alone and would not apply the new token.
+- **In-flight orchestration is persisted** (migration 4, `session_operation`:
+  kind `wake` or `hibernate`, status `running`, `done`, `failed` or
+  `interrupted`), logged before it acts. At start the manager marks every
+  `running` operation `interrupted` and appends `session.operation {kind,
+  outcome: "interrupted"}`; a `waking` session goes to `hibernated` and a
+  `running` or `creating` one to `idle`, each with reason "the hub restarted".
+  Nothing is resumed silently: the next tool call wakes it again, visibly
+  (PRD §8.1 principle 7).
+- **No orphan box after a restart** (PRD §5: hibernated means the box is
+  stopped). Before that, recovery stops the box of every session that is not
+  `idle`/`running` and that was `waking`, had an operation in flight, or whose
+  box row still says `running` (a hibernate whose stop never reached the
+  provider). A stopped box's row becomes `stopped`, and the stop outcome
+  (`stop: "stopped" | "not-found"`) goes into the `interrupted` event and the
+  operation's detail; a box stopped with no operation in flight gets
+  `session.operation {kind: "recover"}`. A stop that fails is not swallowed:
+  `stop: "failed"` with its code and message in the event, a log line, and the
+  box row stays `running`, so the next wake stops it before it starts a new one.
+- **Box exit supervision (#28).** `BoxInfo` gains `exitCode` (present when the
+  state is `exited`; Docker's `State.ExitCode`). Exits are found by inspecting
+  the box (`BoxProvider.attach`): every `exitPollMs` (1 s) while a box boots,
+  shortly after any box connection closes, and on a sweep every
+  `superviseIntervalMs` (5 s) over sessions with a running box. Classification:
+  - `2` → `box.config`, give-up: `box.failed`, session `failed`.
+  - `3` → `box.credential-lost`, relaunch with a fresh join token, at most
+    `maxCredentialRelaunches` (3) times.
+  - anything else → `box.crashed`, retry-cold, at most `maxCrashRetries` (3).
+  - a box that never connects within `connectDeadlineMs` →
+    `box.connect-deadline`, counted with crashes.
+  Each relaunch appends `box.restarted {cause, code, exitCode, attempt,
+  maxAttempts}`; when the bound is used up or the cause gives up, `box.failed`
+  is appended and the session goes to `failed`. Both counters reset after a
+  hibernate, or when the box that exited had stayed connected for `stableMs`
+  (60 s), so stuck is counted, not timed (PRD §8.1 principle 4). A box that
+  exits while its session is idle is relaunched too. A start the provider
+  refuses (for example `box.egress-unfiltered`) appends `box.failed {cause:
+  "start"}` and returns the session to `hibernated`, since the owner can fix it.
+- **API** (`session/routes.ts`, mounted by `server.ts` on the app after its
+  request guard, so 0010 applies): `POST /v1/sessions` (`title`, `model`,
+  `repoUrl`, all optional strings), `GET /v1/sessions`, `GET /v1/sessions/:id`,
+  `POST /v1/sessions/:id/archive`. The caller is `LOCAL_PRINCIPAL` until login
+  (#44); list and get authorize `session.list` / `session.read`.
+
+### Consequences
+
+- The runner (#43) only calls `ensureBox` and releases the lease; it never
+  starts or stops a box. A tool RPC that fails because its box exited is the
+  runner's to report (PRD §6.3); the relaunch is the manager's.
+- A box that exits while idle costs a relaunch; making that lazy (stop and go
+  `hibernated` instead) is a small change if box churn matters.
+- The `box` table now tracks session boxes (`running`, `stopped`, `exited`).
+- Docker events would find exits faster than polling; polling needs no long
+  lived stream and works for any `BoxProvider`.

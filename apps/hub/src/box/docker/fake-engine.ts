@@ -20,7 +20,7 @@ export interface FakeContainer {
   Id: string;
   Name: string;
   Created: string;
-  State: { Status: string };
+  State: { Status: string; ExitCode?: number };
   Config: { Image: string; Labels: Record<string, string>; Env: string[] };
   HostConfig: Record<string, unknown>;
 }

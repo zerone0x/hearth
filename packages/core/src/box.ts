@@ -65,6 +65,12 @@ export interface BoxInfo {
   readonly volumeRef: string;
   readonly labels: Readonly<Record<string, string>>;
   readonly createdAt: EpochMs;
+  /**
+   * The runtime's exit code, present only when `state` is `exited`. The hub
+   * classifies the exit by it (docs/DECISIONS.md, 0013): box-agent exits 2 on
+   * bad box configuration and 3 when its credential is lost.
+   */
+  readonly exitCode?: number;
 }
 
 /** The explicit answer of `stop` (PRD §8.1 principle 6). */

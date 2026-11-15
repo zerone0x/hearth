@@ -231,8 +231,14 @@ describe("start", () => {
   test("an exited runtime is replaced by a fresh one", async () => {
     const first = await provider.start(spec, boot);
     const c = fake.containers.get(first.providerRef as string);
-    if (c) c.State.Status = "exited";
-    expect((await provider.attach("bx_1"))?.state).toBe("exited");
+    if (c) {
+      c.State.Status = "exited";
+      c.State.ExitCode = 3;
+    }
+    const exited = await provider.attach("bx_1");
+    expect(exited?.state).toBe("exited");
+    // The hub classifies the exit by its code (decision 0013).
+    expect(exited?.exitCode).toBe(3);
     const second = await provider.start(spec, { env: { HEARTH_JOIN_TOKEN: "tok-2" } });
     expect(second.state).toBe("running");
     expect(second.providerRef).not.toBe(first.providerRef);
