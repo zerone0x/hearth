@@ -37,17 +37,66 @@ export interface Delivery {
 /** Who a failure belongs to (PRD §8.1, principle 2). */
 export type FailureOwner = "box" | "model-provider" | "gateway" | "hub" | "user";
 
+/**
+ * What to do about a failure (PRD §8.1, principle 2):
+ * - `retry`: retrying the same work may succeed, on the same box.
+ * - `retry-cold`: retry only on a fresh box, started by a cold boot; the
+ *   current box or its state is suspect.
+ * - `give-up`: retrying will not help; surface the failure.
+ */
+export type FailureDisposition = "retry" | "retry-cold" | "give-up";
+
+/** Every failure owner. */
+export const FAILURE_OWNERS: readonly FailureOwner[] = [
+  "box",
+  "model-provider",
+  "gateway",
+  "hub",
+  "user",
+];
+
+/** Every failure disposition. */
+export const FAILURE_DISPOSITIONS: readonly FailureDisposition[] = [
+  "retry",
+  "retry-cold",
+  "give-up",
+];
+
 export interface Failure {
   readonly owner: FailureOwner;
-  /** Whether retrying the same work may succeed. */
-  readonly retryable: boolean;
+  readonly disposition: FailureDisposition;
   readonly message: string;
 }
 
 // ---------------------------------------------------------------------------
 // Handshake
 
-/** Box → hub, first frame on every connection. */
+/**
+ * What the box is doing right now, reported in every `hello` so that after a
+ * reconnect the hub can decide which commands to re-send.
+ */
+export interface BoxState {
+  /** The session assigned to the box, or `null` when none is. */
+  readonly sessionId: string | null;
+  /** The turn running in that session, or `null`. Requires a `sessionId`. */
+  readonly turnId: string | null;
+  /**
+   * The highest `deliveryId` the box has sent in this boot, or 0 when it has
+   * sent none. After the handshake the box redelivers every unacked frame up
+   * to this id; once the hub has applied them all, it knows everything the box
+   * reported and can decide what to re-send.
+   */
+  readonly lastDeliveryId: number;
+}
+
+/**
+ * Box → hub, first frame on every connection.
+ *
+ * `type` and `version` (`{ major, minor }`, two unsigned integers) are frozen
+ * across all major versions. The decoder reads them before any other field, so
+ * a hello from another major gets `version-mismatch`, whatever the rest of its
+ * shape.
+ */
 export interface HelloFrame {
   readonly type: "hello";
   readonly version: ProtocolVersion;
@@ -56,6 +105,8 @@ export interface HelloFrame {
   readonly bootId: string;
   /** The one-time token on first connect, then the per-box credential. */
   readonly credential: string;
+  /** The box's state when it connected. */
+  readonly state: BoxState;
 }
 
 /** Hub → box, the handshake succeeded. */
@@ -77,7 +128,11 @@ export type RejectReason =
   | "malformed-hello"
   | "internal";
 
-/** Hub → box, the handshake failed. The hub closes the socket after sending it. */
+/**
+ * Hub → box, the handshake failed. The hub closes the socket after sending it.
+ * The whole `reject` frame is frozen across all major versions, so a box of
+ * any version can read why it was refused.
+ */
 export interface RejectFrame {
   readonly type: "reject";
   readonly reason: RejectReason;
@@ -92,15 +147,27 @@ export interface RejectFrame {
 // ---------------------------------------------------------------------------
 // Sessions and turns
 
-/** Hub → box: run this session in the box (fresh or restored from hibernation). */
+/**
+ * Hub → box: run this session in the box (fresh or restored from hibernation).
+ * Idempotent: ignored when the box already knows `requestId` in this boot.
+ */
 export interface SessionAssignFrame {
   readonly type: "session.assign";
   readonly sessionId: string;
+  /**
+   * Names this assignment. The hub uses a new one for every assignment it
+   * decides on (a resume after hibernation is a new assignment) and the same
+   * one when it re-sends after a reconnect.
+   */
+  readonly requestId: string;
   /** `true` when the session is being restored rather than started. */
   readonly resume: boolean;
 }
 
-/** Hub → box: start a turn with this user input. */
+/**
+ * Hub → box: start a turn with this user input. Idempotent: ignored when the
+ * box already knows `turnId` in this boot, so a turn never runs twice.
+ */
 export interface TurnStartFrame {
   readonly type: "turn.start";
   readonly sessionId: string;
@@ -130,7 +197,10 @@ export interface TurnEndFrame extends Delivery {
   readonly failure?: Failure;
 }
 
-/** Hub → box: hibernate this session. Answered by exactly one `hibernate.done`. */
+/**
+ * Hub → box: hibernate this session. Answered by exactly one `hibernate.done`.
+ * Idempotent: ignored when the box already knows `requestId` in this boot.
+ */
 export interface SessionHibernateFrame {
   readonly type: "session.hibernate";
   readonly sessionId: string;
@@ -303,6 +373,12 @@ export type Frame =
 export type FrameType = Frame["type"];
 
 export type FrameOf<T extends FrameType> = Extract<Frame, { type: T }>;
+
+/**
+ * Hub → box commands. They are fire-and-forget and the hub re-sends them after
+ * a reconnect, so the box applies each at most once (see `isDuplicateCommand`).
+ */
+export type CommandFrame = SessionAssignFrame | TurnStartFrame | SessionHibernateFrame;
 
 /** Box → hub frames that carry a delivery and wait for `delivery.ack`. */
 export type ReliableFrame = TurnEventFrame | TurnEndFrame | HibernateDoneFrame | UsageReportFrame;

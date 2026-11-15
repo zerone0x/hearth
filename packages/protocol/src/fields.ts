@@ -14,7 +14,7 @@ export const MAX_ID_LENGTH = 256;
 export const MAX_CREDENTIAL_LENGTH = 4096;
 /** Longest free-text field (messages, turn input, file paths). */
 export const MAX_TEXT_LENGTH = 1_000_000;
-/** Deepest nesting accepted in an opaque JSON payload. */
+/** Most arrays and objects nested inside each other in an opaque JSON payload. */
 export const MAX_JSON_DEPTH = 64;
 export const MAX_U32 = 0xffff_ffff;
 
@@ -121,24 +121,26 @@ export class Fields {
   }
 }
 
+/**
+ * Checks and copies an opaque JSON value. `depth` counts the arrays and objects
+ * that enclose `value`, so a payload may nest at most `MAX_JSON_DEPTH`
+ * containers; scalars never count as a level.
+ */
 function checkJson(value: unknown, path: string, depth: number): JsonValue {
-  if (depth > MAX_JSON_DEPTH) throw new FieldError(path, `nested deeper than ${MAX_JSON_DEPTH}`);
   if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new FieldError(path, "expected a finite number");
     return value;
   }
+  if (!Array.isArray(value) && !isObj(value)) throw new FieldError(path, "expected a JSON value");
+  if (depth + 1 > MAX_JSON_DEPTH) {
+    throw new FieldError(path, `nested deeper than ${MAX_JSON_DEPTH} levels`);
+  }
   if (Array.isArray(value)) {
     return value.map((item, index) => checkJson(item, `${path}[${index}]`, depth + 1));
   }
-  if (isObj(value)) {
-    // `fromEntries` defines own properties, so a `__proto__` key stays plain data.
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        key,
-        checkJson(item, `${path}.${key}`, depth + 1),
-      ]),
-    );
-  }
-  throw new FieldError(path, "expected a JSON value");
+  // `fromEntries` defines own properties, so a `__proto__` key stays plain data.
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, checkJson(item, `${path}.${key}`, depth + 1)]),
+  );
 }
