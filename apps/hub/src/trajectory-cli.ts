@@ -4,19 +4,39 @@
  *
  *   bun apps/hub/src/trajectory-cli.ts [--db data/hearth.db] <session-id>
  *
- * Reads only; safe while the hub runs (WAL). Output is redacted like the API's.
+ * Reads only; safe while the hub runs (WAL). Output is redacted like the
+ * API's: the model key (`HEARTH_MODEL_KEY_REF`, the hub's own setting) is
+ * resolved first, so a key an older build stored raw is redacted too.
  */
 
 import { join } from "node:path";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_WORKSPACE_ID } from "@hearth/core";
-import { redactHub } from "./obs/redaction";
+import { createDefaultSecretStore, DEFAULT_WORKSPACE_ID, type SecretStore } from "@hearth/core";
+import { redactHub, registerKnownSecrets } from "./obs/redaction";
 import { readAllEvents } from "./obs/routes";
 import { buildTrajectory, toJsonl } from "./obs/trajectory";
 import { HUB_VERSION } from "./obs/version";
 import { openDatabase, SqliteEventStore } from "./store";
 
-export async function dumpTrajectory(dbPath: string, sessionId: string): Promise<string> {
+export interface DumpOptions {
+  /** Where `keyRefs` resolve; defaults to the hub's default SecretStore. */
+  readonly secrets?: SecretStore;
+  /** SecretStore references whose values are redacted (the model key). */
+  readonly keyRefs?: readonly string[];
+  readonly warn?: (message: string) => void;
+}
+
+export async function dumpTrajectory(
+  dbPath: string,
+  sessionId: string,
+  options: DumpOptions = {},
+): Promise<string> {
+  const keyRefs = options.keyRefs ?? [];
+  if (keyRefs.length > 0) {
+    const secrets = options.secrets ?? createDefaultSecretStore();
+    const warn = options.warn ?? ((m: string) => console.error(m));
+    await registerKnownSecrets(secrets, keyRefs, warn);
+  }
   const db = openDatabase(dbPath);
   try {
     const events = await readAllEvents(
@@ -47,5 +67,6 @@ if (import.meta.main) {
     console.error("usage: bun apps/hub/src/trajectory-cli.ts [--db PATH] <session-id>");
     process.exit(2);
   }
-  process.stdout.write(await dumpTrajectory(db, sessionId));
+  const keyRef = process.env["HEARTH_MODEL_KEY_REF"];
+  process.stdout.write(await dumpTrajectory(db, sessionId, { keyRefs: keyRef ? [keyRef] : [] }));
 }

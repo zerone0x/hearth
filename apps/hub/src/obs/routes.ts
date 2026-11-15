@@ -5,8 +5,9 @@
  * - `GET /v1/sessions/:id/trajectory`: the session's trajectory as JSON Lines
  *   (`application/x-ndjson`, `hearth.trajectory/2`). `session.trajectory`.
  * - `POST /v1/sessions/:id/labels {turn_id?, task_type?, outcome?, verdict?}`:
- *   an outcome label for the session or one turn, appended to the event log
- *   as `trajectory.label`. `session.label`.
+ *   an outcome label for the session (no `turn_id`) or for one of its turns
+ *   (`turn_id` must be a turn of this session, else 400), appended to the
+ *   event log as `trajectory.label`. `session.label`.
  */
 
 import {
@@ -95,6 +96,17 @@ export class Trajectories {
     }
     if (Object.keys(label).filter((k) => k !== "turn_id").length === 0) {
       throw invalid("set at least one of task_type, outcome, verdict");
+    }
+    const turnId = label["turn_id"];
+    if (turnId !== undefined) {
+      // A turn label must name a turn of this session; omit turn_id for the session.
+      const events = await readAllEvents(this.#o.events, this.#scope, sessionId);
+      const turns = new Set(
+        events.filter((e) => e.type === "runner.turn.start").map((e) => e.turnId),
+      );
+      if (!turns.has(turnId)) {
+        throw invalid(`turn_id ${JSON.stringify(turnId)} is not a turn of this session`);
+      }
     }
     await this.#o.events.append(this.#scope, sessionId, {
       type: "trajectory.label",

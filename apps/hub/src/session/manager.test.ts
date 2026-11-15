@@ -13,8 +13,8 @@ import {
   LOCAL_PRINCIPAL,
   type StopOutcome,
 } from "@hearth/core";
-import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteSessionStore } from "../store";
 import { buildTrajectory } from "../obs/trajectory";
+import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteSessionStore } from "../store";
 import { classifyExit } from "./exits";
 import { type SessionBoxes, SessionManager, type SessionManagerOptions } from "./manager";
 import { canTransition, SESSION_STATES, type SessionState, TRANSITIONS } from "./states";

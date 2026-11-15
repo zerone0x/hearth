@@ -84,12 +84,13 @@ class MemoryEvents implements EventStore {
     });
     return { seq, duplicate: false };
   }
-  async read(_scope: unknown, _sessionId: string, afterSeq: number, limit: number) {
-    const events = this.list.filter((e) => e.seq > afterSeq).slice(0, limit);
+  async read(_scope: unknown, sessionId: string, afterSeq: number, limit: number) {
+    const all = this.list.filter((e) => e.sessionId === sessionId && e.seq > afterSeq);
+    const events = all.slice(0, limit);
     const page: EventPage = {
       events,
       cursor: events.at(-1)?.seq ?? afterSeq,
-      hasMore: this.list.length > afterSeq + events.length,
+      hasMore: all.length > events.length,
     };
     return page;
   }
@@ -186,15 +187,22 @@ const USAGE: Usage = {
   cost: { input: 0.5, output: 0.25, cacheRead: 0.125, cacheWrite: 0.0625, total: 0.9375 },
 };
 
-/** The faux provider, with `USAGE` on every final message. */
+/** What a real provider would build; pi-ai's faux provider builds no payload. */
+const PAYLOAD = { model: "faux-1", max_tokens: 2048, temperature: 0.3 };
+
+/**
+ * The faux provider, with `USAGE` on every final message, and the
+ * `onPayload` hook called the way pi-ai's HTTP providers call it.
+ */
 function withFixedUsage(faux: FauxProviderHandle): Provider {
   type Stream = Provider["streamSimple"];
   const wrap =
     (inner: Stream): Stream =>
     (model, context, options) => {
-      const source = inner(model, context, options);
       const out: AssistantMessageEventStream = createAssistantMessageEventStream();
       void (async () => {
+        await options?.onPayload?.(structuredClone(PAYLOAD), model);
+        const source = inner(model, context, options);
         for await (const event of source) {
           if (event.type === "done") event.message.usage = structuredClone(USAGE);
           if (event.type === "error") event.error.usage = structuredClone(USAGE);
@@ -596,6 +604,9 @@ describe("model calls carry their request and output (schema /2)", () => {
         },
         // The prompt, then each assistant message and tool result before the call.
         message_count: 1 + 2 * i,
+        // From the provider payload (before_provider_request).
+        max_tokens: 2048,
+        temperature: 0.3,
       });
       expect((m["request"] as { tools_sha256: string }).tools_sha256).toMatch(/^[0-9a-f]{64}$/);
     }
@@ -705,6 +716,23 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
     const c = capText(text, (x) => redactSecrets(x, [SECRET]));
     expect(c.text).not.toContain(SECRET.slice(0, 10));
     expect(c.truncated).toBe(false);
+  });
+
+  test("through the runner: a secret across the cut of a tool result is redacted before the cut", async () => {
+    const s = await setup();
+    const big = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}`;
+    writeFileSync(join(s.root, "big.txt"), big);
+    await turn(s, "read it", [
+      call("read", { path: "big.txt" }, "c_r"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const records = trajectory(s);
+    const tool = records.find((r) => r.kind === "tool_call") as Record<string, unknown>;
+    const result = tool["result"] as { text: string; truncated: boolean; sha256: string };
+    expect(toJsonl(records)).not.toContain(SECRET.slice(0, 10));
+    expect(result.text.endsWith("[redacted]")).toBe(true);
+    // The hash is of the redacted text the trajectory has, so a reader can check it.
+    expect(result.sha256).toBe(createHash("sha256").update(result.text).digest("hex"));
   });
 
   test("through the runner: a CJK tool result and a long answer are capped by bytes", async () => {
@@ -940,6 +968,18 @@ describe("labels", () => {
     await expect(t.label(LOCAL_PRINCIPAL, "se_l", { turn_id: "turn_1" })).rejects.toThrow(
       /at least one/,
     );
+    // A turn label must name a turn of this session.
+    await expect(
+      t.label(LOCAL_PRINCIPAL, "se_l", { turn_id: "turn_bogus", verdict: "x" }),
+    ).rejects.toThrow(/not a turn of this session/);
+    await events.append({}, "se_other", {
+      type: "runner.turn.start",
+      turnId: "turn_9",
+      payload: { turn_id: "turn_9" },
+    });
+    await expect(
+      t.label(LOCAL_PRINCIPAL, "se_l", { turn_id: "turn_9", verdict: "x" }),
+    ).rejects.toThrow(/not a turn of this session/);
     const records = await t.trajectory(LOCAL_PRINCIPAL, "se_l");
     expect(records.at(-1)).toMatchObject({ labels: { task_type: "bugfix", outcome: "success" } });
     const labels = records.filter((r) => r.kind === "label");

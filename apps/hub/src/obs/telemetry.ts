@@ -48,6 +48,14 @@ import {
 
 export const HUB_SERVICE_NAME = "hearth-hub";
 
+/** How long `shutdown()` waits for the last export. */
+export const SHUTDOWN_TIMEOUT_MS = 5_000;
+
+export interface ShutdownResult {
+  readonly ok: boolean;
+  readonly error?: string;
+}
+
 export interface TelemetryOptions {
   readonly serviceVersion?: string;
   /** Span exporter (an OTLP one from `telemetryFromEnv`, or a test's). None: no export. */
@@ -157,9 +165,28 @@ export class Telemetry {
     await this.#meterProvider.forceFlush();
   }
 
-  async shutdown(): Promise<void> {
-    await this.#tracerProvider.shutdown();
-    await this.#meterProvider.shutdown();
+  /**
+   * Flush and stop export. Never rejects and never waits more than
+   * `timeoutMs`: a collector that is down or hangs must not keep the hub from
+   * exiting. Says whether everything was exported.
+   */
+  async shutdown(timeoutMs = SHUTDOWN_TIMEOUT_MS): Promise<ShutdownResult> {
+    const run = Promise.allSettled([
+      this.#tracerProvider.shutdown(),
+      this.#meterProvider.shutdown(),
+    ]).then((results): ShutdownResult => {
+      const failed = results.find((r) => r.status === "rejected");
+      return failed === undefined ? { ok: true } : { ok: false, error: String(failed.reason) };
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    });
+    const result = await Promise.race([run, timeout]);
+    clearTimeout(timer);
+    return result === "timeout"
+      ? { ok: false, error: `telemetry shutdown took longer than ${timeoutMs} ms` }
+      : result;
   }
 }
 
