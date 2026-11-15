@@ -1,0 +1,20 @@
+{
+  "name": "spike-chat-ui-assistant-ui",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "vite build" },
+  "dependencies": {
+    "@assistant-ui/react": "0.15.36",
+    "@assistant-ui/react-pi": "0.0.33",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.5",
+    "@vitejs/plugin-react": "6.3.0",
+    "playwright": "1.65.1",
+    "tailwindcss": "4.3.5",
+    "vite": "8.3.8"
+  }
+}
