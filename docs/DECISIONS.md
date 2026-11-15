@@ -1195,3 +1195,72 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   record shape for unauthenticated events and is a follow-up.
 - Only one principal exists. A multi-user edition (PRD §7 E2) adds principals
   to `owner_password` / `login_session` without changing the guard.
+
+## 0016: Desktop stream: box-agent VNC relay, browser WebSocket, view-only RFB filter
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #45
+
+### Decision
+
+- **Box side (`apps/box-agent/src/vnc.ts`).** On a hub `stream.open` of kind
+  `vnc` with an even id (0002), box-agent connects to Xvnc on
+  `127.0.0.1:HEARTH_VNC_PORT` (5901, no password, 0004) and relays RFB both
+  ways over `stream.data`, at most 64 KiB per frame, seqs from 0. It refuses
+  odd or duplicate ids, `file` streams and a ninth open stream with
+  `stream.close` `error`. Xvnc closing gives `done`, a connect failure `error`,
+  an out-of-order seq `error`. A hub `stream.close` or a lost hub connection
+  drops the desktop socket without a frame: desktop bytes are never redelivered.
+- **Backpressure, box side.** While the hub socket has more than 1 MiB queued
+  (`bufferedAmount`), the relay stops reading Xvnc (TCP pushes back on Xvnc)
+  and resumes below 256 KiB. Bytes for Xvnc it has not taken are capped at
+  256 KiB; past that the stream is closed with `error`.
+- **Hub endpoint: `GET /v1/sessions/:id/desktop`, a WebSocket upgrade on the
+  public listener.** It is an app route, so the request guard (0010: Host,
+  Origin) and the session guard (0014: login) run on the upgrade request; a
+  cross-origin or unauthenticated upgrade gets 403 or 401 before the handler.
+  The handler authorizes the signed-in principal with `desktop.view` on the
+  session, reads the session (`session.read`), calls `ensureBox` and releases
+  the lease at once, then upgrades. Watching does not keep a box awake: the
+  session still hibernates on schedule and its viewers are closed then.
+  A plain GET gets 426. At most 4 viewers per session.
+- **View-only (M1).** The desktop lock that decides who may type is M2
+  (PRD §8.3), so the hub parses the browser's RFB and forwards only:
+  - the handshake: protocol version `003.008` or `003.007` (3.3 is refused:
+    its server-chosen security would desynchronize the parser), security type
+    None only, and `ClientInit` rewritten to shared, so a viewer never
+    disconnects the desktop's other clients;
+  - `SetPixelFormat`, `FramebufferUpdateRequest`, and `SetEncodings` without
+    the pseudo-encodings ContinuousUpdates (-313), Fence (-312) and QEMU
+    extended key events (-258): the first two would make the server push
+    unrequested updates or expect answers, which breaks the pull-based flow
+    control below; the third is input.
+  Dropped, whole: `KeyEvent`, `PointerEvent`, `ClientCutText` (its text is
+  skipped as it arrives, up to 1 MiB), `SetDesktopSize`,
+  `EnableContinuousUpdates`, `ClientFence`, QEMU key events. Anything else
+  (an unknown type, `SetEncodings` with more than 256 entries, a text frame)
+  closes the viewer with 1008: without a length the next message boundary is
+  unknown, and passing bytes on could let input through.
+- **Backpressure, hub side.** RFB is pull-based: the server sends an update
+  only for a `FramebufferUpdateRequest`. While the browser socket has more
+  than 1 MiB queued, the hub holds the viewer's filtered messages back, so the
+  box stops sending updates; a viewer whose queue would pass 16 MiB anyway is
+  closed (4408) and its box stream cancelled. Held browser bytes are capped at
+  64 KiB (1008 past it). So per viewer the hub holds at most about 16 MiB.
+- **Closing.** The viewer is closed with 4410 when the box connection ends
+  (box exit, hibernate, archive, a superseding reconnect) or the box closes the
+  stream; with 4401 when its login is no longer valid, checked on every
+  browser message and every 5 s (the box stream gets `stream.close`
+  `revoked`); with 1001 on hub shutdown. `BoxConnections` gains `sendStream`
+  and two listener hooks, `stream` and `disconnected`; a `stream.data` nobody
+  holds is answered with `stream.close` `cancelled`.
+
+### Consequences
+
+- No new frame types or protocol version: flow control rides on RFB's own
+  request/response, and the box side on TCP.
+- M2 (takeover) replaces the drop list with a check of the desktop lock; the
+  filter already finds every input message boundary.
+- The web UI's noVNC must speak RFB 3.7/3.8 with security None, which is what
+  noVNC does against Xvnc `-SecurityTypes None`.
