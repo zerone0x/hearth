@@ -264,6 +264,12 @@ describe("main.ts registers the model key before it serves", () => {
     expect(listening).toBeGreaterThan(-1);
     expect(registered).toBeGreaterThan(-1);
     expect(registered).toBeLessThan(listening);
+    // startHub logs the setup token before it binds (Bun.serve), and the data
+    // directory is new, so this line always comes: the key must be registered
+    // before the hub can answer anything, not only before "listening on".
+    const serving = lines.findIndex((l) => l.includes("set the owner password with setup token"));
+    expect(serving).toBeGreaterThan(-1);
+    expect(registered).toBeLessThan(serving);
   }, 30_000);
 });
 
