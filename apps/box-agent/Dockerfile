@@ -34,7 +34,8 @@ RUN apt-get update \
     tini \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --create-home --uid 1000 --shell /bin/bash hearth \
-  && install -d -o hearth -g hearth /workspace
+  && install -d -o hearth -g hearth /workspace \
+  && install -d -o hearth -g hearth -m 0700 /run/hearth
 
 # 2. Desktop: TigerVNC (Xvnc), Openbox and Chromium.
 # hadolint ignore=DL3008
@@ -94,4 +95,6 @@ ENV HEARTH_DISPLAY=:1 \
 # Numeric so runtimes can tell it is not root without reading /etc/passwd (user hearth).
 USER 1000:1000
 WORKDIR /workspace
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hearth-box-entrypoint"]
+# The entrypoint starts as PID 1 and re-execs itself under tini once the join token
+# is out of the environment (decision 0018).
+ENTRYPOINT ["/usr/local/bin/hearth-box-entrypoint"]
