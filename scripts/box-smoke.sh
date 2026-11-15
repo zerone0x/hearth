@@ -114,16 +114,20 @@ dom="$(in_box chromium "${chromium_flags[@]}" --dump-dom 'data:text/html,<p>hear
 ok "chromium headless renders a page"
 
 # Start Chromium with CDP so the listener check covers it.
-timeout 30 docker exec -d "${container}" chromium "${chromium_flags[@]}" \
-  --remote-debugging-port="${cdp_port}" --user-data-dir=/tmp/cdp-profile about:blank
+timeout 30 docker exec -d "${container}" bash -c "exec chromium ${chromium_flags[*]} \
+  --remote-debugging-port=${cdp_port} --user-data-dir=/tmp/cdp-profile about:blank \
+  >/tmp/cdp.log 2>&1"
+cdp_probe="console.log(await (await fetch('http://127.0.0.1:${cdp_port}/json/version')).text())"
 cdp=""
 for _ in $(seq 1 60); do
-  cdp="$(in_box bash -c "exec 3<>/dev/tcp/127.0.0.1/${cdp_port} &&
-    printf 'GET /json/version HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' >&3 && cat <&3" 2>/dev/null)" &&
-    [[ "${cdp}" == *Browser* ]] && break
+  cdp="$(in_box bun -e "${cdp_probe}" 2>/dev/null)" && [[ "${cdp}" == *Browser* ]] && break
   sleep 0.5
 done
-[[ "${cdp}" == *Browser* ]] || fail "Chromium CDP did not answer on 127.0.0.1:${cdp_port}"
+if [[ "${cdp}" != *Browser* ]]; then
+  in_box cat /tmp/cdp.log >&2 || true
+  in_box cat /proc/net/tcp /proc/net/tcp6 >&2 || true
+  fail "Chromium CDP did not answer on 127.0.0.1:${cdp_port}"
+fi
 ok "Chromium CDP answers on 127.0.0.1:${cdp_port}"
 
 # Listening sockets in the box's network namespace, from /proc/net (no ss/netstat needed).

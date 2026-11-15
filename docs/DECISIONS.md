@@ -58,3 +58,46 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
 - TypeScript 7 is the native compiler. If a tool the project adopts later only
   supports the TypeScript 5 API, that tool runs separately; the typecheck gate
   stays on `tsc` 7.
+
+## 0004: Box image layout and runtime
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #5
+
+### Decision
+
+- **The box image lives in `apps/box-agent/Dockerfile`** and builds from the repo
+  root (`docker build -f apps/box-agent/Dockerfile .`), because it installs the
+  workspace from the root `bun.lock`. `apps/box-agent/Dockerfile.dockerignore`
+  keeps the context to manifests and sources.
+- **Base: `debian:trixie-slim`** with TigerVNC (`Xvnc`), Openbox, Debian's
+  `chromium`, git, python3 and `tini` as PID 1.
+- **pi runs on Bun, not Node.** `@earendil-works/pi-coding-agent` 1.5.2 needs
+  Node >= 22.19, newer than Debian trixie's `nodejs`. Bun 1.4.4 (copied from
+  `oven/bun:1.4.4-slim`, the version the repo pins) already runs box-agent and
+  runs the pi CLI too; `/usr/local/bin/pi` is a wrapper around it. No separate
+  Node is installed.
+- **The pi version comes from `apps/box-agent/package.json`.** The build takes it
+  as the `PI_VERSION` argument, fails if the installed pi reports a different
+  version, and records it in the `dev.hearth.pi.version` label (PRD §8.4).
+- **Layer order:** OS packages and user, then the desktop (Xvnc, Openbox,
+  Chromium), then Bun, then the dependencies (including pi) from the manifests
+  and lockfile only, then the box-agent sources. A box-agent change rebuilds only
+  the top layer; a pi bump rebuilds the dependency layer and above, never the
+  desktop layers (PRD §6.3).
+- **Desktop on loopback, no VNC password.** `Xvnc :1 -localhost -rfbport 5901
+  -nolisten tcp -SecurityTypes None`. Only processes in the box can reach it, and
+  box-agent relays it to the hub over its authenticated connection (PRD §8.2).
+  The image has no `EXPOSE`.
+- **The image runs as `hearth` (uid 1000)**, with `/workspace` as the working
+  directory. The entrypoint starts Xvnc and Openbox and then `exec`s box-agent,
+  or the command it was given.
+- **The image does not start Chromium.** box-agent will launch it when the
+  browser tools land; Chromium's CDP binds to loopback by default, which the smoke
+  test checks. Running Chromium with its sandbox in a container (seccomp profile
+  or user namespaces) is left to the `BoxProvider` work; the smoke test uses
+  `--no-sandbox`.
+- **`scripts/box-smoke.sh` is the image test**, run by the `box-image` CI job
+  together with hadolint and shellcheck. It is not part of `bun run check`, which
+  must pass without Docker.
