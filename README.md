@@ -30,6 +30,13 @@ bun test           # tests only
 The hub binds `127.0.0.1:8787` by default; set `HEARTH_HOST` and `HEARTH_PORT`
 to change it. Tests that need Docker run only with `HEARTH_DOCKER_TESTS=1`.
 
+The API (everything but `/healthz` and the box socket) only answers requests
+whose `Host` is `localhost`, `127.0.0.1`, `[::1]` or the bound address, whose
+`Origin` (if any) is the hub's own, and whose body is `application/json`
+(decision 0010). Behind a reverse proxy, set `HEARTH_PUBLIC_ORIGIN` to the
+public origin, e.g. `HEARTH_PUBLIC_ORIGIN=https://hearth.example`: its host and
+origin are then allowed too.
+
 ## Layout
 
 ```
