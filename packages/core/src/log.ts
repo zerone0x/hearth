@@ -78,10 +78,10 @@ export class Logger {
 
   /** A logger for the same sink with more fields (ids) on every line. */
   child(fields: LogFields, component?: string): Logger {
-    return new Logger(
-      component === undefined ? this.#o : { ...this.#o, component },
-      { ...this.#fields, ...fields },
-    );
+    return new Logger(component === undefined ? this.#o : { ...this.#o, component }, {
+      ...this.#fields,
+      ...fields,
+    });
   }
 
   debug(msg: string, fields?: LogFields): void {

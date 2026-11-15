@@ -25,6 +25,7 @@ import {
   DefaultResourceLoader,
   type FileEntry,
   type ModelRuntime,
+  VERSION as PI_VERSION,
   SessionManager as PiSessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -35,6 +36,9 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
+import { Telemetry } from "../obs/telemetry";
+import { type Clock, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
+import { HUB_VERSION } from "../obs/version";
 import type { PinnedExtension } from "./extensions";
 import type { CompiledDenyRule } from "./policy";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
@@ -73,7 +77,14 @@ export interface SessionRunnerOptions {
    * hub moves the session row to `failed` through the session manager.
    */
   readonly onFailure?: (message: string) => Promise<unknown>;
+  /** Spans and metrics (decision 0021). Defaults to a hub-wide one that exports nothing. */
+  readonly telemetry?: Telemetry;
+  /** Tests pin time and ids for golden trajectories. */
+  readonly clock?: Clock;
+  readonly newId?: (prefix: string) => string;
 }
+
+let defaultTelemetry: Telemetry | undefined;
 
 export type RunnerStatus = "idle" | "running" | "failed";
 
@@ -161,6 +172,8 @@ export class SessionRunner {
   #persisted: number;
   #unsubscribe: () => void;
   #failing: Promise<void> = Promise.resolve();
+  readonly tracer: TurnTracer;
+  #interrupted = false;
 
   private constructor(
     options: SessionRunnerOptions,
@@ -176,6 +189,7 @@ export class SessionRunner {
     this.#agentDir = agentDir;
     this.#contextKey = JSON.stringify(options.contextFiles?.() ?? []);
     this.#persisted = persisted;
+    this.tracer = tracerFor(options);
     this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
   }
 
@@ -187,9 +201,20 @@ export class SessionRunner {
     const inner = options.box;
     // A failed prepare (the AGENTS.md refresh: its `runner.context` append)
     // fails the call, which releases the lease, and fails the runner (0015).
+    // The lease wait (box start or wake) and each RPC's span go to the tracer.
     const box: RunnerBox = {
-      ensureBox: () => inner.ensureBox(),
-      operations: (boxId, callId) => inner.operations(boxId, callId),
+      ensureBox: async (callId) => {
+        const started = performance.now();
+        const lease = await inner.ensureBox(callId);
+        self?.observe(() => self?.tracer.onLease(callId, lease.boxId, performance.now() - started));
+        return lease;
+      },
+      operations: (boxId, callId, trace) =>
+        inner.operations(
+          boxId,
+          callId,
+          trace ?? self?.observe(() => self?.tracer.rpcTrace(callId)),
+        ),
       prepare: async (lease) => {
         try {
           await inner.prepare?.(lease);
@@ -208,6 +233,8 @@ export class SessionRunner {
             box,
             boxCwd,
             denyList: options.denyList,
+            onDenied: (_name, toolCallId, reason) =>
+              self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),
           }),
         },
@@ -335,21 +362,28 @@ export class SessionRunner {
       });
     }
     this.#status = "running";
+    this.#interrupted = false;
+    const start = this.tracer.startTurn();
+    const turnId = this.tracer.turnId;
     try {
       await this.#o.events.append(this.#o.scope, this.sessionId, {
         type: "message.user",
+        ...(turnId === undefined ? {} : { turnId }),
         payload: { text },
       });
     } catch (error) {
       this.#status = "idle";
+      this.tracer.endTurn("error", "could not record the message");
       throw error;
     }
+    this.#record(start.type, start.payload);
     this.#turn = this.#runTurn(text);
   }
 
   /** Abort the running turn; the session stays usable. */
   async interrupt(): Promise<boolean> {
     if (this.#status !== "running") return false;
+    this.#interrupted = true;
     this.#record("runner.interrupted", { reason: "interrupted by the user" });
     await this.#session.abort();
     return true;
@@ -366,9 +400,11 @@ export class SessionRunner {
       await this.#refreshContext();
       await this.#session.prompt(text);
       this.#flushEntries();
+      this.#endTurn(this.#interrupted ? "interrupted" : "done");
       await this.#chain;
       if (this.#status === "running") this.#status = "idle";
     } catch (error) {
+      this.#endTurn("failed", this.#redact(errorText(error)));
       await this.#fail(error);
     }
   }
@@ -389,6 +425,8 @@ export class SessionRunner {
         if (typeof m.errorMessage === "string") m.errorMessage = this.#redact(m.errorMessage);
       }
       this.#record(`pi.${event.type}`, event);
+      const step = this.#safe(() => this.tracer.onEvent(event));
+      if (step !== undefined) this.#record(step.type, step.payload);
       if (event.type === "message_end" || event.type === "agent_end") this.#flushEntries();
       if (event.type === "message_end" && event.message.role === "assistant") {
         const m = event.message;
@@ -426,9 +464,52 @@ export class SessionRunner {
       .catch((error: unknown) => this.#fail(error));
   }
 
+  #endTurn(outcome: "done" | "interrupted" | "failed", error?: string): void {
+    const end: TracedEvent | undefined = this.#safe(() => this.tracer.endTurn(outcome, error));
+    if (end === undefined) return;
+    // Recorded even after a failure: the turn's end belongs in its trajectory.
+    const event = {
+      type: end.type,
+      turnId: String(end.payload["turn_id"]),
+      payload: jsonSafe(end.payload, this.#o.redact),
+    };
+    this.#chain = this.#chain
+      .then(() => this.#o.events.append(this.#o.scope, this.sessionId, event))
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          (this.#o.log ?? console.error)(
+            `session ${this.sessionId}: could not record the turn end: ${this.#redact(errorText(error))}`,
+          );
+        },
+      );
+  }
+
+  /** Observability never breaks a turn: a throwing hook is logged and ignored. */
+  #safe<T>(fn: () => T): T | undefined {
+    try {
+      return fn();
+    } catch (error) {
+      (this.#o.log ?? console.error)(
+        `session ${this.sessionId}: tracer: ${this.#redact(errorText(error))}`,
+      );
+      return undefined;
+    }
+  }
+
+  /** Run an observability hook; never throws (see `#safe`). */
+  observe<T>(fn: () => T): T | undefined {
+    return this.#safe(fn);
+  }
+
   /** Append in order; a failed append fails the session, visibly. */
   #record(type: string, payload: unknown): void {
-    const event = { type, payload: jsonSafe(payload, this.#o.redact) };
+    const turnId = this.tracer?.turnId;
+    const event = {
+      type,
+      ...(turnId === undefined ? {} : { turnId }),
+      payload: jsonSafe(payload, this.#o.redact),
+    };
     this.#chain = this.#chain
       .then(async () => {
         if (this.#status === "failed") return;
@@ -484,4 +565,15 @@ export class SessionRunner {
     const header = this.#pi.getHeader();
     return JSON.parse(JSON.stringify([header, ...this.#pi.getEntries()])) as FileEntry[];
   }
+}
+
+function tracerFor(options: SessionRunnerOptions): TurnTracer {
+  defaultTelemetry ??= new Telemetry({ serviceVersion: HUB_VERSION });
+  return new TurnTracer({
+    sessionId: options.sessionId,
+    telemetry: options.telemetry ?? defaultTelemetry,
+    versions: { pi: PI_VERSION, hub: HUB_VERSION },
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.newId === undefined ? {} : { newId: options.newId }),
+  });
 }

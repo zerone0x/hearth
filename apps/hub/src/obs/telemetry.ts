@@ -16,7 +16,15 @@
  *   message passes through the hub's redactor before it is set.
  */
 
-import { type Attributes, type Context, context, type Span, SpanStatusCode, trace } from "@opentelemetry/api";
+import { formatTraceparent } from "@hearth/protocol";
+import {
+  type Attributes,
+  type Context,
+  context,
+  type Span,
+  SpanStatusCode,
+  trace,
+} from "@opentelemetry/api";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -37,7 +45,6 @@ import {
   METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
   METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
 } from "@opentelemetry/semantic-conventions/incubating";
-import { formatTraceparent } from "@hearth/protocol";
 
 export const HUB_SERVICE_NAME = "hearth-hub";
 
@@ -123,7 +130,11 @@ export class Telemetry {
   }
 
   /** End `span`, marking it failed with a redacted message when `error` is set. */
-  endSpan(span: Span, attributes: Attributes = {}, error?: { type: string; message: string }): void {
+  endSpan(
+    span: Span,
+    attributes: Attributes = {},
+    error?: { type: string; message: string },
+  ): void {
     span.setAttributes(this.#clean(attributes));
     if (error !== undefined) {
       span.setAttribute("error.type", error.type);

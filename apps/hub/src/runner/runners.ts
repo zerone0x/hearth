@@ -34,6 +34,8 @@ import {
   type WorkspaceScope,
 } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
+import { registerSecret } from "../obs/redaction";
+import type { Telemetry } from "../obs/telemetry";
 import type { BoxLease, SessionView } from "../session/manager";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
@@ -82,6 +84,8 @@ export interface SessionRunnersOptions {
   readonly boxCwd?: string;
   readonly hubTempDir?: string;
   readonly log?: (line: string) => void;
+  /** Spans and metrics (decision 0021); exports nothing unless configured. */
+  readonly telemetry?: Telemetry;
 }
 
 export interface RunnerOptionsInput {
@@ -259,6 +263,7 @@ export class SessionRunners {
       ...(this.#o.hubTempDir === undefined ? {} : { hubTempDir: this.#o.hubTempDir }),
       log: (line) => this.#log(line),
       redact: (text) => this.redact(text),
+      ...(this.#o.telemetry === undefined ? {} : { telemetry: this.#o.telemetry }),
       onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });
   }
@@ -276,6 +281,7 @@ export class SessionRunners {
       if (this.#o.config.apiKeyRef !== undefined) {
         const key = (await this.#o.secrets.resolve(this.#o.config.apiKeyRef)).reveal();
         this.#secretValues.add(key);
+        registerSecret(key);
         await runtime.setRuntimeApiKey(this.#o.config.provider, key);
       }
       return runtime;

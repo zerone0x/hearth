@@ -68,7 +68,13 @@ interface Usage {
   cacheRead?: number;
   cacheWrite?: number;
   totalTokens?: number;
-  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+  cost?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
 }
 
 interface RpcRecord {
@@ -105,7 +111,15 @@ interface Turn {
   toolFailures: number;
   tokens: { input: number; output: number; cache_read: number; cache_write: number };
   cost: number;
-  model: { span: Span; stepId: string; startedWall: number; startedMono: number; firstMono: number | undefined } | undefined;
+  model:
+    | {
+        span: Span;
+        stepId: string;
+        startedWall: number;
+        startedMono: number;
+        firstMono: number | undefined;
+      }
+    | undefined;
 }
 
 function round(ms: number): number {
@@ -138,11 +152,18 @@ export function capResult(result: unknown): Record<string, unknown> {
 }
 
 /** Why a tool call ended the way it did, from its RPCs and its result. */
-export function toolOutcome(isError: boolean, text: string, rpcs: readonly RpcRecord[], denied: string | undefined): string {
+export function toolOutcome(
+  isError: boolean,
+  text: string,
+  rpcs: readonly RpcRecord[],
+  denied: string | undefined,
+): string {
   if (denied !== undefined) return "denied";
   if (rpcs.some((r) => r.error_code === "tool.outcome-unknown")) return "outcome-unknown";
-  if (rpcs.some((r) => r.error_code === "tool.deadline" || r.error_code === "timed-out")) return "timeout";
-  if (rpcs.some((r) => r.error_code === "aborted" || r.error_code === "cancelled")) return "aborted";
+  if (rpcs.some((r) => r.error_code === "tool.deadline" || r.error_code === "timed-out"))
+    return "timeout";
+  if (rpcs.some((r) => r.error_code === "aborted" || r.error_code === "cancelled"))
+    return "aborted";
   if (!isError) return "ok";
   if (/^Command aborted/m.test(text)) return "aborted";
   if (/^Command timed out/m.test(text)) return "timeout";
@@ -178,12 +199,17 @@ export class TurnTracer {
     const startedWall = this.#clock.wall();
     const startedMono = this.#clock.mono();
     const id = this.#newId("turn");
-    const span = this.#o.telemetry.startSpan("invoke_agent hearth", {
-      [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
-      [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
-      "hearth.session.id": this.#o.sessionId,
-      "hearth.turn.id": id,
-    }, undefined, startedWall);
+    const span = this.#o.telemetry.startSpan(
+      "invoke_agent hearth",
+      {
+        [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
+        [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
+        "hearth.session.id": this.#o.sessionId,
+        "hearth.turn.id": id,
+      },
+      undefined,
+      startedWall,
+    );
     this.#turn = {
       id,
       span,
@@ -274,10 +300,15 @@ export class TurnTracer {
     turn.model?.span.end();
     const startedWall = this.#clock.wall();
     turn.model = {
-      span: this.#o.telemetry.startSpan("chat", {
-        [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_CHAT,
-        [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
-      }, turn.span, startedWall),
+      span: this.#o.telemetry.startSpan(
+        "chat",
+        {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_CHAT,
+          [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
+        },
+        turn.span,
+        startedWall,
+      ),
       stepId: this.#newId("step"),
       startedWall,
       startedMono: this.#clock.mono(),
@@ -319,7 +350,8 @@ export class TurnTracer {
     turn.tokens.cache_write += tokens.cache_write;
     turn.cost += cost.total;
     const latencyMs = round(now - model.startedMono);
-    const ttftMs = model.firstMono === undefined ? null : round(model.firstMono - model.startedMono);
+    const ttftMs =
+      model.firstMono === undefined ? null : round(model.firstMono - model.startedMono);
     const t = this.#o.telemetry;
     const attrs = {
       [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_CHAT,
@@ -345,7 +377,9 @@ export class TurnTracer {
         [ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS]: tokens.cache_read,
         [ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS]: tokens.cache_write,
       },
-      errorClass === undefined ? undefined : { type: errorClass, message: errorMessage ?? stopReason },
+      errorClass === undefined
+        ? undefined
+        : { type: errorClass, message: errorMessage ?? stopReason },
     );
     const ids = spanIds(model.span);
     return {
@@ -378,12 +412,17 @@ export class TurnTracer {
     if (this.#tools.has(toolCallId)) return;
     const startedWall = this.#clock.wall();
     this.#tools.set(toolCallId, {
-      span: this.#o.telemetry.startSpan(`execute_tool ${name}`, {
-        [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL,
-        [ATTR_GEN_AI_TOOL_NAME]: name,
-        [ATTR_GEN_AI_TOOL_CALL_ID]: toolCallId,
-        [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
-      }, turn.span, startedWall),
+      span: this.#o.telemetry.startSpan(
+        `execute_tool ${name}`,
+        {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL,
+          [ATTR_GEN_AI_TOOL_NAME]: name,
+          [ATTR_GEN_AI_TOOL_CALL_ID]: toolCallId,
+          [ATTR_GEN_AI_CONVERSATION_ID]: this.#o.sessionId,
+        },
+        turn.span,
+        startedWall,
+      ),
       stepId: this.#newId("step"),
       name,
       args,
@@ -418,13 +457,17 @@ export class TurnTracer {
     return {
       rpc: (method, rpcId) => {
         const startedMono = this.#clock.mono();
-        const span = this.#o.telemetry.startSpan(`rpc ${method}`, {
-          "rpc.system": "hearth",
-          "rpc.method": method,
-          "hearth.rpc.id": rpcId,
-          [ATTR_GEN_AI_TOOL_CALL_ID]: toolCallId,
-          ...(tool.boxId === undefined ? {} : { "hearth.box.id": tool.boxId }),
-        }, tool.span);
+        const span = this.#o.telemetry.startSpan(
+          `rpc ${method}`,
+          {
+            "rpc.system": "hearth",
+            "rpc.method": method,
+            "hearth.rpc.id": rpcId,
+            [ATTR_GEN_AI_TOOL_CALL_ID]: toolCallId,
+            ...(tool.boxId === undefined ? {} : { "hearth.box.id": tool.boxId }),
+          },
+          tool.span,
+        );
         const ids = spanIds(span);
         return {
           traceparent: ids.traceparent,
@@ -443,7 +486,9 @@ export class TurnTracer {
               outcome.exitCode === undefined || outcome.exitCode === null
                 ? {}
                 : { "process.exit.code": outcome.exitCode },
-              outcome.ok ? undefined : { type: outcome.code ?? "error", message: outcome.code ?? "error" },
+              outcome.ok
+                ? undefined
+                : { type: outcome.code ?? "error", message: outcome.code ?? "error" },
             );
           },
         };
@@ -451,7 +496,12 @@ export class TurnTracer {
     };
   }
 
-  #endTool(turn: Turn, toolCallId: string, result: unknown, isError: boolean): TracedEvent | undefined {
+  #endTool(
+    turn: Turn,
+    toolCallId: string,
+    result: unknown,
+    isError: boolean,
+  ): TracedEvent | undefined {
     const tool = this.#tools.get(toolCallId);
     if (tool === undefined) return undefined;
     this.#tools.delete(toolCallId);
@@ -465,11 +515,17 @@ export class TurnTracer {
     const t = this.#o.telemetry;
     t.metrics.toolCalls.add(1, { [ATTR_GEN_AI_TOOL_NAME]: tool.name });
     if (outcome !== "ok") {
-      t.metrics.toolFailures.add(1, { [ATTR_GEN_AI_TOOL_NAME]: tool.name, [ATTR_ERROR_TYPE]: outcome });
+      t.metrics.toolFailures.add(1, {
+        [ATTR_GEN_AI_TOOL_NAME]: tool.name,
+        [ATTR_ERROR_TYPE]: outcome,
+      });
     }
     t.endSpan(
       tool.span,
-      { "hearth.tool.outcome": outcome, ...(tool.boxId === undefined ? {} : { "hearth.box.id": tool.boxId }) },
+      {
+        "hearth.tool.outcome": outcome,
+        ...(tool.boxId === undefined ? {} : { "hearth.box.id": tool.boxId }),
+      },
       outcome === "ok" ? undefined : { type: outcome, message: `${tool.name}: ${outcome}` },
     );
     const ids = spanIds(tool.span);

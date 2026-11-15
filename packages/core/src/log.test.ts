@@ -49,7 +49,9 @@ describe("Logger", () => {
   test("a known secret is redacted at the sink, in the message, fields and errors", () => {
     const secret = 'sec"ret-value-123';
     const { logger, lines } = capture([secret]);
-    logger.child({ key: secret }).error(`echo ${secret}`, { nested: { v: secret } }, new Error(secret));
+    logger
+      .child({ key: secret })
+      .error(`echo ${secret}`, { nested: { v: secret } }, new Error(secret));
     expect(lines.join("\n")).not.toContain("ret-value-123");
     expect(lines.join("\n")).toContain(LOG_REDACTED);
   });
