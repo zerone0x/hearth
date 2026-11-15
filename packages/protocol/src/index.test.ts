@@ -14,6 +14,6 @@ describe("protocol version", () => {
 
   test("defaults to this build's version", () => {
     expect(isCompatible(PROTOCOL_VERSION)).toBe(true);
-    expect(formatVersion(PROTOCOL_VERSION)).toBe("1.1");
+    expect(formatVersion(PROTOCOL_VERSION)).toBe("1.2");
   });
 });

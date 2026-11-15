@@ -63,6 +63,9 @@ Every command below runs in `deploy/`.
 
 ```sh install:configure
 cp hearth.env.example .env
+# The build stamped on trajectories and /healthz (decision 0021).
+version="$(git describe --always --dirty)"
+sed -i "s/^HEARTH_VERSION=.*/HEARTH_VERSION=${version}/" .env
 ```
 
 Edit `.env`: set `HEARTH_MODEL_PROVIDER` and `HEARTH_MODEL` to the pi provider
@@ -201,6 +204,10 @@ git pull --ff-only
 ```
 
 ```sh install:upgrade
+# The new build's version (an .env from before HEARTH_VERSION gets the line).
+grep -q '^HEARTH_VERSION=' .env || echo 'HEARTH_VERSION=' >> .env
+version="$(git describe --always --dirty)"
+sed -i "s/^HEARTH_VERSION=.*/HEARTH_VERSION=${version}/" .env
 docker compose up -d --build --wait hub
 ```
 

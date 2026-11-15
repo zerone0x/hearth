@@ -42,6 +42,11 @@ LABEL org.opencontainers.image.title="hearth-hub" \
 # Defaults for the container; compose and .env override them. The public
 # listener stays on loopback (PRD §10); compose runs the hub in the host's
 # network namespace, so that is the host's loopback (decision 0020).
+# The hub's version on trajectories and spans (decision 0021): pass a git
+# commit or release tag as a build argument to tell builds apart; empty means
+# apps/hub/package.json's version.
+ARG HEARTH_VERSION=""
+ENV HEARTH_VERSION=${HEARTH_VERSION}
 ENV HEARTH_DATA_DIR=/data \
     HEARTH_WEB_DIR=/opt/hearth/apps/web/dist \
     HEARTH_HOST=127.0.0.1 \

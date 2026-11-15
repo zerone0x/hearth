@@ -29,6 +29,7 @@ export * from "./failure";
 export * from "./gateway";
 export * from "./identity";
 export * from "./ids";
+export * from "./log";
 export * from "./secrets";
 export * from "./tenancy";
 

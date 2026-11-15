@@ -1,8 +1,12 @@
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { createDefaultSecretStore } from "@hearth/core";
+import { createDefaultSecretStore, type SecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
+import { hubLines } from "./obs/hub-log";
+import { registerKnownSecrets } from "./obs/redaction";
+import { observabilityFromEnv } from "./obs/setup";
+import { HUB_VERSION } from "./obs/version";
 import type { RunnerConfig } from "./runner";
 import {
   type BoxNetworkProvider,
@@ -101,6 +105,22 @@ export function webRootFromEnv(
   return existsSync(join(fallback, "index.html")) ? fallback : undefined;
 }
 
+/**
+ * Register the secrets the hub resolves for its own use (the model key) with
+ * the sink-side redactor, before the first turn: the API, the logs and spans
+ * redact the key from the start, also in events an older build stored raw
+ * (decision 0021). A reference that does not resolve is a warning.
+ */
+export async function registerStartupSecrets(
+  secrets: SecretStore,
+  runnerConfig: Pick<RunnerConfig, "apiKeyRef"> | undefined,
+  log: { warn(message: string): void },
+): Promise<void> {
+  if (runnerConfig?.apiKeyRef !== undefined) {
+    await registerKnownSecrets(secrets, [runnerConfig.apiKeyRef], (m) => log.warn(m));
+  }
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -114,10 +134,21 @@ if (import.meta.main) {
   mkdirSync(dataDir, { recursive: true });
   const runnerConfig = runnerConfigFromEnv(process.env);
   const webRoot = webRootFromEnv(process.env);
+  // JSON logs and optional OTLP export (decision 0021, obs/setup.ts).
+  const obs = observabilityFromEnv(process.env);
+  const log = obs.logger.child({}, "hub");
+  const secrets = createDefaultSecretStore();
+  await registerStartupSecrets(secrets, runnerConfig, log);
   const hub = startHub({
     ...(runnerConfig === undefined
       ? {}
-      : { runner: { config: runnerConfig, secrets: createDefaultSecretStore() } }),
+      : {
+          runner: {
+            config: runnerConfig,
+            secrets,
+            telemetry: obs.telemetry,
+          },
+        }),
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
     port: parsePort(process.env["HEARTH_PORT"]),
     // Box listeners bind each box network's gateway on this port (0012).
@@ -129,11 +160,14 @@ if (import.meta.main) {
     ...(webRoot === undefined ? {} : { webRoot }),
     ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
     sessions: { idleMs: idleMsFromEnv(process.env) },
-    log: (line) => console.log(line),
+    // Level, component and ids from each line (obs/hub-log.ts).
+    log: hubLines(obs.logger),
   });
 
-  console.log(`hearth hub listening on ${hub.url} (box provider: ${provider?.name ?? "none"})`);
-  console.log(webRoot === undefined ? "web UI: not built" : `web UI: ${webRoot}`);
+  log.info(`hearth hub listening on ${hub.url} (box provider: ${provider?.name ?? "none"})`, {
+    hub_version: HUB_VERSION,
+  });
+  log.info(webRoot === undefined ? "web UI: not built" : `web UI: ${webRoot}`);
   if (provider !== undefined) {
     // Boxes still running from before a restart get their listeners back. A
     // daemon that is down is not fatal: the hub serves the API and keeps
@@ -141,16 +175,26 @@ if (import.meta.main) {
     hub.listenForRunningBoxes().then(
       ({ listening }) => {
         if (listening.length > 0) {
-          console.log(`listening again for running boxes: ${listening.join(", ")}`);
+          log.info(`listening again for running boxes: ${listening.join(", ")}`, {
+            component: "box",
+          });
         }
       },
-      (error: unknown) => console.error(`could not list running boxes: ${String(error)}`),
+      (error: unknown) => log.error("could not list running boxes", { component: "box" }, error),
     );
   }
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
-      void hub.stop().then(() => process.exit(0));
+      // A collector that is down or hangs does not keep the hub from exiting.
+      void hub
+        .stop()
+        .catch((error: unknown) => log.error("hub stop failed", {}, error))
+        .then(() => obs.telemetry.shutdown())
+        .then((r) => {
+          if (!r.ok) log.warn("telemetry export did not finish", { error: r.error ?? "" });
+        })
+        .finally(() => process.exit(0));
     });
   }
 }

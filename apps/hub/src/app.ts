@@ -5,6 +5,7 @@ import { getCookie } from "hono/cookie";
 import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
+import { HUB_VERSION } from "./obs/version";
 import { isWebAssetRequest, mountWebAssets } from "./web/static";
 
 export interface AppDeps {
@@ -167,6 +168,8 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
       {
         status: "ok",
         protocol: formatVersion(PROTOCOL_VERSION),
+        // The build, as stamped on trajectories (decision 0021).
+        version: HUB_VERSION,
         ...(boxEgress === undefined ? {} : { boxEgress: boxEgress().state }),
       },
       200,

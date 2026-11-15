@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.1** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.2** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -221,6 +221,15 @@ Error codes and their classification (`TOOL_ERRORS`):
 | `tool.io`, `tool.result-expired` | `box` | `give-up` |
 | `tool.internal` | `box` | `retry-cold` |
 | `tool.deadline`, `tool.outcome-unknown` | `box` | `give-up` when mutating, `retry` when read-only |
+
+## Trace context (1.2)
+
+An `rpc` frame may carry `traceparent`, a W3C Trace Context version-00 header
+(`00-<32 hex trace id>-<16 hex span id>-<2 hex flags>`, `src/trace.ts`). The hub
+sets it on every tool call to the span of that call, so the box's log lines for
+it carry the same trace id (decision 0021). It is optional: a 1.1 peer drops
+it, and the decoder drops a malformed one instead of refusing the call, since
+tracing never fails a tool call.
 
 ## Versioning
 

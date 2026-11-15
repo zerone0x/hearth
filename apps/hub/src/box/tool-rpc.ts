@@ -48,6 +48,28 @@ export interface ToolRpcClientOptions {
 export interface CallOptions {
   /** pi's abort signal: the call rejects with `aborted`, and a command is cancelled. */
   readonly signal?: AbortSignal;
+  /** Observability for this call (decision 0021): its `traceparent` and outcome. */
+  readonly trace?: RpcTrace;
+}
+
+/** How one RPC ended, for the trajectory. */
+export interface RpcOutcome {
+  readonly ok: boolean;
+  /** The `HearthError` code, `aborted`, or the exec outcome (`timed-out`, `cancelled`). */
+  readonly code?: string;
+  /** `tool.exec` only: the command's exit code. */
+  readonly exitCode?: number | null;
+}
+
+/** One RPC as the tracer sees it: the span's `traceparent` and its end. */
+export interface RpcSpan {
+  readonly traceparent?: string;
+  end(outcome: RpcOutcome): void;
+}
+
+/** Per pi tool call: opens a span for each RPC it makes. */
+export interface RpcTrace {
+  rpc(method: ToolMethod, rpcId: string): RpcSpan;
 }
 
 interface Pending {
@@ -150,7 +172,48 @@ export class ToolRpcClient {
     const full = { ...params, callId } as ToolParams[M];
     if (options.signal?.aborted) return Promise.reject(new Error("aborted"));
     const id = `tool_${randomUUID()}`;
-    const frame: RpcFrame = { type: "rpc", id, method, params: full as never };
+    const span = options.trace?.rpc(method, id);
+    const frame: RpcFrame = {
+      type: "rpc",
+      id,
+      method,
+      params: full as never,
+      ...(span?.traceparent === undefined ? {} : { traceparent: span.traceparent }),
+    };
+    const result = this.#send(boxId, callId, method, full, id, frame, options);
+    if (span !== undefined) {
+      result.then(
+        (value) => {
+          const exec = method === "tool.exec" ? (value as ToolResults["tool.exec"]) : undefined;
+          span.end(
+            exec === undefined
+              ? { ok: true }
+              : {
+                  ok: exec.outcome === "exited",
+                  ...(exec.outcome === "exited" ? {} : { code: exec.outcome }),
+                  exitCode: exec.exitCode,
+                },
+          );
+        },
+        (error: unknown) =>
+          span.end({
+            ok: false,
+            code: error instanceof HearthError ? error.code : String((error as Error)?.message),
+          }),
+      );
+    }
+    return result;
+  }
+
+  #send<M extends ToolMethod>(
+    boxId: BoxId,
+    callId: string,
+    method: M,
+    full: ToolParams[M],
+    id: string,
+    frame: RpcFrame,
+    options: CallOptions,
+  ): Promise<ToolResults[M]> {
     const bootId = this.#boxes.sendRpc(boxId, frame);
     if (bootId === undefined) {
       // Nothing was sent, so retrying is safe for any method.
@@ -214,9 +277,12 @@ export class ToolRpcClient {
   }
 
   /** pi-shaped operations for one tool call of one box. */
-  operations(boxId: BoxId, callId: string): BoxToolOperations {
+  operations(boxId: BoxId, callId: string, trace?: RpcTrace): BoxToolOperations {
     const call = <M extends ToolMethod>(method: M, params: CallParams<M>, signal?: AbortSignal) =>
-      this.call(boxId, callId, method, params, signal === undefined ? {} : { signal });
+      this.call(boxId, callId, method, params, {
+        ...(signal === undefined ? {} : { signal }),
+        ...(trace === undefined ? {} : { trace }),
+      });
     const readFile = async (path: string) =>
       Buffer.from((await call("tool.readFile", { path })).data, "base64");
     const writeFile = async (path: string, content: string) => {

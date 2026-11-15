@@ -11,6 +11,7 @@
 
 import { access, constants, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { posix } from "node:path";
+import type { Logger } from "@hearth/core";
 import {
   decodeToolParams,
   EXEC_SPILL_DIR,
@@ -22,6 +23,7 @@ import {
   MAX_TOOL_FILE_BYTES,
   MAX_TOOL_LIST_ENTRIES,
   MAX_TOOL_OUTPUT_BYTES,
+  parseTraceparent,
   type RpcFrame,
   type RpcResultFrame,
   SEARCH_TIMEOUT_MS,
@@ -64,6 +66,12 @@ export interface ToolExecutorOptions {
   /** Sends a frame to the hub if connected; a lost answer is re-sent on the hub's re-send. */
   readonly send: (frame: RpcResultFrame) => void;
   readonly log?: (line: string) => void;
+  /**
+   * Structured log of every tool call (decision 0021): one JSON line per call
+   * with the hub's trace id and parent span from the frame's `traceparent`.
+   * Without one, calls are not logged.
+   */
+  readonly logger?: Logger;
 }
 
 type CallState =
@@ -168,9 +176,17 @@ export class ToolExecutor {
     const controller = new AbortController();
     this.#calls.set(frame.id, { kind: "running", controller });
     this.#running += 1;
+    const done = this.#trace(frame, (decoded.value as { callId?: string }).callId);
     void this.#run(method, decoded.value, frame.id, controller.signal).then(
-      (result) => this.#finish(frame.id, { type: "rpc.result", id: frame.id, ok: true, result }),
-      (error) => this.#finish(frame.id, this.#errorFrame(frame.id, toToolError(error))),
+      (result) => {
+        done(result);
+        this.#finish(frame.id, { type: "rpc.result", id: frame.id, ok: true, result });
+      },
+      (error) => {
+        const e = toToolError(error);
+        done(undefined, e.code);
+        this.#finish(frame.id, this.#errorFrame(frame.id, e));
+      },
     );
   }
 
@@ -185,6 +201,37 @@ export class ToolExecutor {
       id,
       ok: false,
       error: { code: error.code, message: error.message },
+    };
+  }
+
+  /** Log the call's start and returns its end logger, with the hub's trace ids. */
+  #trace(frame: RpcFrame, callId: string | undefined): (result: unknown, code?: string) => void {
+    const logger = this.#options.logger;
+    if (logger === undefined) return () => {};
+    const parent =
+      frame.traceparent === undefined ? undefined : parseTraceparent(frame.traceparent);
+    const log = logger.child({
+      rpc_id: frame.id,
+      tool_call_id: callId ?? null,
+      method: frame.method,
+      trace_id: parent?.traceId ?? null,
+      parent_span_id: parent?.spanId ?? null,
+    });
+    const started = performance.now();
+    log.debug("tool call started");
+    return (result, code) => {
+      const duration_ms = Math.round((performance.now() - started) * 1000) / 1000;
+      const exit = (result as { exitCode?: unknown; outcome?: unknown } | undefined) ?? {};
+      if (code === undefined) {
+        log.info("tool call done", {
+          ok: true,
+          duration_ms,
+          ...(typeof exit.outcome === "string" ? { exec_outcome: exit.outcome } : {}),
+          ...(exit.exitCode === undefined ? {} : { exit_code: exit.exitCode }),
+        });
+      } else {
+        log.warn("tool call failed", { ok: false, duration_ms, error_code: code });
+      }
     };
   }
 

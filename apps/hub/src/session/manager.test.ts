@@ -13,6 +13,7 @@ import {
   LOCAL_PRINCIPAL,
   type StopOutcome,
 } from "@hearth/core";
+import { buildTrajectory } from "../obs/trajectory";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteSessionStore } from "../store";
 import { classifyExit } from "./exits";
 import { type SessionBoxes, SessionManager, type SessionManagerOptions } from "./manager";
@@ -374,10 +375,13 @@ describe("SessionManager", () => {
     expect(err).toBeInstanceOf(HearthError);
     expect((err as HearthError).code).toBe("box.config");
     expect((err as HearthError).disposition).toBe("give-up");
-    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("failed");
+    const after = await r.manager.get(LOCAL_PRINCIPAL, s.id);
+    expect(after.state).toBe("failed");
+    // The trajectory's box record names the box that failed (decision 0021).
+    expect(after.boxId).toEqual(expect.any(String));
     const failed = await eventsOf(r, s.id, "box.failed");
     expect(failed.map((e) => e.payload)).toMatchObject([
-      { cause: "config", code: "box.config", exitCode: 2 },
+      { cause: "config", code: "box.config", exitCode: 2, boxId: after.boxId },
     ]);
     expect(await eventsOf(r, s.id, "box.restarted")).toEqual([]);
     expect(r.boxes.calls.filter((c) => c.startsWith("start"))).toHaveLength(1);
@@ -402,6 +406,36 @@ describe("SessionManager", () => {
         maxAttempts: 3,
       },
     ]);
+  });
+
+  test("the box's life is in the session trajectory: state changes, a relaunch, the wake (decision 0021)", async () => {
+    const r = rig();
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    r.boxes.plan.push({ exit: 3 }, "connect");
+    const lease = await r.manager.ensureBox(s.id);
+    lease.release();
+    const records = buildTrajectory(await eventsOf(r, s.id), {
+      sessionId: s.id,
+      versions: { pi: "p", hub: "h" },
+    });
+    const box = records.filter((x) => x.kind === "box");
+    const ops = box.map((x) => x["op"]);
+    expect(ops).toContain("session.state");
+    expect(ops).toContain("session.operation");
+    expect(ops).toContain("box.restarted");
+    const restarted = box.find((x) => x["op"] === "box.restarted");
+    expect(restarted).toMatchObject({
+      box_id: lease.boxId,
+      detail: { cause: "credential-lost", exitCode: 3, attempt: 1 },
+    });
+    expect(box.find((x) => x["op"] === "session.operation" && x["detail"] !== null)).toMatchObject({
+      detail: { kind: "wake", outcome: "done", boxId: lease.boxId },
+      box_id: lease.boxId,
+    });
+    // Every state change is there, in order, ending with the box up.
+    const states = box.filter((x) => x["op"] === "session.state").map((x) => x["detail"]);
+    expect(states.at(0)).toMatchObject({ to: "creating" });
+    expect(states.map((d) => (d as { to: string }).to)).toContain("waking");
   });
 
   test("relaunches are bounded: the attempt after the last one gives up", async () => {
