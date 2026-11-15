@@ -4,8 +4,33 @@
  *
  * Business code depends on the interfaces exported here, never on Docker,
  * SQLite or environment secrets directly (AGENTS.md, boundary rules).
- * The interfaces themselves land in a later M0 issue.
+ *
+ * | PRD §7 | Module | v1 implementation here |
+ * |---|---|---|
+ * | E1 Tenancy | `tenancy.ts` | `SingleWorkspaceResolver` |
+ * | E2 Identity | `identity.ts` | `LOCAL_PRINCIPAL` |
+ * | E3 Authorization | `authorize.ts` | `AllowAllAuthorizer` |
+ * | E4 BoxProvider | `box.ts` | none (Docker, in the hub) |
+ * | E6 EventStore | `events.ts` | none (SQLite, in the hub) |
+ * | E7 SecretStore | `secrets.ts` | `ResolvingSecretStore` with `env:` / `file:` |
+ * | E8 ModelGateway | `gateway.ts` | none (Bifrost, in the hub) |
+ * | E9 Channel | `channel.ts` | none (Web, Telegram) |
+ * | E10 Audit | `audit.ts` | `MemoryAuditSink`, `withAudit` |
+ *
+ * E5, the hub-box protocol, lives in `@hearth/protocol`.
  */
+
+export * from "./audit";
+export * from "./authorize";
+export * from "./box";
+export * from "./channel";
+export * from "./events";
+export * from "./failure";
+export * from "./gateway";
+export * from "./identity";
+export * from "./ids";
+export * from "./secrets";
+export * from "./tenancy";
 
 /**
  * Exhaustiveness guard for discriminated unions. Put it in the `default` branch
