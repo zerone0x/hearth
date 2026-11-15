@@ -2,6 +2,7 @@
 
 export * from "./extensions";
 export * from "./policy";
+export { MAX_MESSAGE_CHARS, mountRunnerRoutes } from "./routes";
 export * from "./runner";
 export * from "./runners";
 export * from "./tools";
