@@ -29,12 +29,36 @@ export type SecretErrorCode =
 
 /**
  * How a reference appears in messages. A reference that does not parse, names
- * an unknown scheme, or has a body its scheme rejects (`env:` not followed by a
- * variable name, `file:` not followed by an absolute path) may be a raw secret
- * pasted where a reference belongs, so it is shown only as a fingerprint.
+ * an unknown scheme, has a body its scheme rejects (`env:` not followed by a
+ * variable name, `file:` not followed by an absolute path), or is an `env:`
+ * reference whose name is not conventional (see `displayRef`) may be a raw
+ * secret pasted where a reference belongs, so it is shown only as a fingerprint.
  */
 export function redactRef(ref: SecretRef): string {
   return `<unrecognized reference ${fingerprint(ref)}>`;
+}
+
+/** `scheme:body`; the scheme is lowercase letters, digits and `-`. */
+const SECRET_REF = /^([a-z][a-z0-9-]*):(.+)$/s;
+
+/**
+ * The `env:` names shown as written: uppercase letters, digits and `_`, at most
+ * 64 characters. A lowercase or mixed-case name is still looked up, but a
+ * token made of `[A-Za-z0-9_]` (e.g. `ghp_…`) pasted after `env:` also matches
+ * the lookup pattern, so anything unconventional is shown only by fingerprint.
+ */
+const CONVENTIONAL_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,63}$/;
+
+/**
+ * How a reference appears in messages and in `SecretError.ref`: as written when
+ * it parses and its body is safe to show, otherwise `redactRef(ref)`. An `env:`
+ * body is safe only when it looks like a conventional variable name.
+ */
+export function displayRef(ref: SecretRef): string {
+  const match = SECRET_REF.exec(ref);
+  if (!match?.[1] || !match[2]) return redactRef(ref);
+  if (match[1] === "env" && !CONVENTIONAL_ENV_NAME.test(match[2])) return redactRef(ref);
+  return ref;
 }
 
 /**
@@ -42,7 +66,7 @@ export function redactRef(ref: SecretRef): string {
  * one, its fingerprint), never the value.
  */
 export class SecretError extends HearthError {
-  /** The reference as it may be displayed: a parsed reference, or `redactRef` of an unrecognized one. */
+  /** The reference as it may be displayed: `displayRef` of the reference. */
   readonly ref: string;
   declare readonly code: SecretErrorCode;
 
@@ -56,7 +80,7 @@ export class SecretError extends HearthError {
 
 /** Split `scheme:body`. The scheme is lowercase letters, digits and `-`. */
 export function parseSecretRef(ref: SecretRef): ParsedSecretRef {
-  const match = /^([a-z][a-z0-9-]*):(.+)$/s.exec(ref);
+  const match = SECRET_REF.exec(ref);
   if (!match?.[1] || !match[2]) {
     const shown = redactRef(ref);
     throw new SecretError(
@@ -120,7 +144,8 @@ export class SecretValue {
  * Called only by a `SecretStore`. Guarantees: returns the raw value, possibly
  * empty (the store rejects values that are empty after trimming); throws a
  * `SecretError` on failure, with a message that contains no secret value. A
- * body that fails the scheme's validation is reported with `redactRef`.
+ * body that fails the scheme's validation is reported with `redactRef`; any
+ * other failure shows the reference as `displayRef(ref)`.
  */
 export interface SecretResolver {
   /** The scheme handled, without the colon, e.g. `env`. */
@@ -163,7 +188,10 @@ export class EnvSecretResolver implements SecretResolver {
     }
     const value = this.#env[body];
     if (value === undefined) {
-      throw new SecretError(ref, "secret.not-found", `Secret ${ref}: variable ${body} is not set`);
+      const shown = displayRef(ref);
+      // Name the variable only when the reference itself is shown as written.
+      const variable = shown === ref ? `variable ${body}` : "variable";
+      throw new SecretError(shown, "secret.not-found", `Secret ${shown}: ${variable} is not set`);
     }
     return value;
   }
@@ -203,7 +231,7 @@ export class FileSecretResolver implements SecretResolver {
 }
 
 export interface PreflightFailure {
-  /** The reference as it may be displayed: a parsed reference, or `redactRef` of an unrecognized one. */
+  /** The reference as it may be displayed: `displayRef` of the reference. */
   readonly ref: string;
   readonly code: SecretErrorCode;
   /** Names the reference and the problem; never contains a value. */
@@ -256,15 +284,6 @@ export interface ResolvingSecretStoreOptions {
 interface CacheEntry {
   readonly value: SecretValue;
   readonly expiresAt: EpochMs;
-}
-
-function safeRef(ref: SecretRef): string {
-  try {
-    parseSecretRef(ref);
-    return ref;
-  } catch {
-    return redactRef(ref);
-  }
 }
 
 /** v1 implementation of E7, over any set of scheme resolvers. */
@@ -331,7 +350,7 @@ export class ResolvingSecretStore implements SecretStore {
           if (error instanceof SecretError) {
             return { ref: error.ref, code: error.code, message: error.message };
           }
-          const shown = safeRef(ref);
+          const shown = displayRef(ref);
           return {
             ref: shown,
             code: "secret.unreadable",
@@ -364,13 +383,14 @@ export class ResolvingSecretStore implements SecretStore {
     const resolver = this.#resolvers.get(scheme);
     if (!resolver) {
       const known = [...this.#resolvers.keys()].join(", ") || "none";
-      const shown = redactRef(ref);
+      const unknown = redactRef(ref);
       throw new SecretError(
-        shown,
+        unknown,
         "secret.unknown-scheme",
-        `Secret ${shown}: unknown scheme (known: ${known})`,
+        `Secret ${unknown}: unknown scheme (known: ${known})`,
       );
     }
+    const shown = displayRef(ref);
     let raw: string;
     try {
       raw = await resolver.resolve(body, ref);
@@ -378,11 +398,11 @@ export class ResolvingSecretStore implements SecretStore {
       if (error instanceof SecretError) throw error;
       // A resolver broke its contract by throwing something else. Its message
       // could contain anything, so it is not passed on.
-      throw new SecretError(ref, "secret.unreadable", `Secret ${ref}: resolver failed`);
+      throw new SecretError(shown, "secret.unreadable", `Secret ${shown}: resolver failed`);
     }
     if (raw.trim().length === 0) {
       // Whitespace only is as useless as nothing, and usually a broken file.
-      throw new SecretError(ref, "secret.empty", `Secret ${ref}: value is empty`);
+      throw new SecretError(shown, "secret.empty", `Secret ${shown}: value is empty`);
     }
     return new SecretValue(raw);
   }

@@ -286,6 +286,26 @@ describe("rejects malformed messages", () => {
     expect(kept.ok ? null : kept.error.frameType).toBe(exact);
   });
 
+  test("the cap counts code points, so a surrogate pair is never split", () => {
+    // One ASCII char shifts every pair onto an odd UTF-16 offset, so a cap at
+    // MAX_ECHOED_TYPE_LENGTH UTF-16 units would cut a pair in half.
+    const astral = "\u{1F525}";
+    const type = `x${astral.repeat(MAX_ECHOED_TYPE_LENGTH)}`;
+    const result = decodeFrame(JSON.stringify({ type }));
+    if (result.ok) throw new Error("expected an error");
+    expect(result.error.code).toBe("unknown-type");
+    const shown = result.error.frameType ?? "";
+    expect(shown).toBe(`x${astral.repeat(MAX_ECHOED_TYPE_LENGTH - 1)}…`);
+    expect([...shown].length).toBe(MAX_ECHOED_TYPE_LENGTH + 1);
+    expect(shown).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    // Exactly the cap in code points (but more UTF-16 units) is kept whole.
+    const exact = astral.repeat(MAX_ECHOED_TYPE_LENGTH);
+    const kept = decodeFrame(JSON.stringify({ type: exact }));
+    expect(kept.ok ? null : kept.error.frameType).toBe(exact);
+  });
+
   test("control and bidi characters in an unknown type are not echoed", () => {
     for (const bad of ["\u202e", "\u2066", "\u200f", "\u0085", "\u0007", "\u061c"]) {
       const result = decodeFrame(JSON.stringify({ type: `turn${bad}.start` }));
