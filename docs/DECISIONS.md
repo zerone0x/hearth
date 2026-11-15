@@ -1402,7 +1402,11 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   gets `X-Content-Type-Options: nosniff`; hashed `/assets/*` get a year of
   immutable cache. The build emits no inline script or style element
   (`assetsInlineLimit: 0`, no module-preload polyfill), so the policy needs
-  no `'unsafe-inline'`; the e2e fails on any CSP console violation. A unit
+  no `'unsafe-inline'`. The e2e fails on any CSP violation: a
+  `securitypolicyviolation` listener installed before page scripts (Playwright
+  `addInitScript`) reports each one, including those the page code catches
+  (`try { new Function("") } catch {}` logs nothing to the console), and a
+  console listener stays as a second net. A unit
   test parses the served header and checks each directive against this list
   written out by hand (not against `WEB_CSP`), and refuses `'unsafe-*'`, `*`
   and bare schemes in any directive.

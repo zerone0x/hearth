@@ -15,7 +15,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { type Browser, chromium, type Page } from "playwright";
+import { type Browser, type BrowserContext, chromium, type Page } from "playwright";
 import { startE2eHub } from "./harness";
 
 const WEB_ROOT = join(import.meta.dir, "../dist");
@@ -31,6 +31,36 @@ async function shot(page: Page, name: string): Promise<void> {
 
 function step(name: string): void {
   console.log(`e2e: ${name}`);
+}
+
+/** Every CSP violation any page of the run reports; the run fails on any. */
+const cspViolations: string[] = [];
+
+/**
+ * Collects CSP violations from every page of `context`, two ways. A
+ * `securitypolicyviolation` listener installed before any page script runs
+ * sees each blocked load or eval, even one the page code catches
+ * (`try { new Function("") } catch {}` logs nothing to the console). The
+ * console listener stays as a second net for reports the event misses.
+ */
+async function watchCsp(context: BrowserContext): Promise<void> {
+  await context.exposeBinding("__hearthCspViolation", (_source, report: string) => {
+    cspViolations.push(report);
+  });
+  // A string, not a function: this project has no DOM types. It runs in the
+  // page before any of the page's scripts, and Playwright's injection is not
+  // itself subject to the page's CSP.
+  await context.addInitScript({
+    content: `document.addEventListener("securitypolicyviolation", (event) => {
+      void globalThis.__hearthCspViolation(
+        event.effectiveDirective + " blocked " + (event.blockedURI || "(inline)") +
+          " at " + event.sourceFile + ":" + event.lineNumber + " on " + event.documentURI,
+      );
+    });`,
+  });
+  context.on("console", (msg) => {
+    if (/Content Security Policy/i.test(msg.text())) cspViolations.push(msg.text());
+  });
 }
 
 if (!existsSync(join(WEB_ROOT, "index.html"))) {
@@ -49,11 +79,8 @@ try {
     deviceScaleFactor: 2,
   });
   context.setDefaultTimeout(STEP_MS);
+  await watchCsp(context);
   const page = await context.newPage();
-  const cspViolations: string[] = [];
-  page.on("console", (msg) => {
-    if (/Content Security Policy/i.test(msg.text())) cspViolations.push(msg.text());
-  });
   const base = e2e.url.toString();
 
   step("first-run setup with the setup token");
@@ -140,6 +167,7 @@ try {
     hasTouch: true,
   });
   phone.setDefaultTimeout(STEP_MS);
+  await watchCsp(phone);
   const mobile = await phone.newPage();
   await mobile.goto(base);
   await mobile.getByLabel("Password").fill(PASSWORD);
