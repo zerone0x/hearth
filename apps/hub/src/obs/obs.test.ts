@@ -74,6 +74,15 @@ function expectNoSecretPrefix(text: string): void {
  */
 const STRADDLE = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}${"b".repeat(100)}`;
 const STRADDLE_HEAD = `${"a".repeat(MAX_TEXT_BYTES - 10)}[redacted]`;
+
+/**
+ * The same, for tool-call arguments: `prefix` is the bytes of JSON before the
+ * string (`{"command":"`), so the secret still starts 10 bytes before the cut.
+ */
+function argStraddle(prefix: number): { arg: string; head: string } {
+  const a = "a".repeat(MAX_TEXT_BYTES - 10 - prefix);
+  return { arg: `${a}${SECRET}${"b".repeat(100)}`, head: `${a}[redacted]` };
+}
 const dirs: string[] = [];
 const closers: Array<() => unknown> = [];
 
@@ -850,13 +859,15 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
 
   test("tool-call arguments: redacted (keys too) before the cut, by bytes, 16 KiB kept whole", () => {
     // A secret across the cut of over-cap arguments.
-    const big = capJson({ command: STRADDLE }, redactTest) as {
+    const { arg, head } = argStraddle(Buffer.byteLength('{"command":"'));
+    const big = capJson({ command: arg }, redactTest) as {
       truncated: boolean;
       text: string;
       bytes: number;
     };
     expect(big.truncated).toBe(true);
-    expect(big.text).toBe(`{"command":"${STRADDLE_HEAD}`.slice(0, MAX_TEXT_BYTES));
+    expect(big.text).toBe(`{"command":"${head}`);
+    expect(Buffer.byteLength(big.text)).toBe(MAX_TEXT_BYTES);
     expectNoSecretPrefix(big.text);
     // The boundary: JSON of exactly 16 KiB is kept as the value; one byte more is cut.
     const overhead = Buffer.byteLength(JSON.stringify({ c: "" }));
@@ -891,13 +902,26 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
         { type: "thinking", thinking: "", redacted: true },
         { type: "thinking", thinking: "", redacted: true },
         { type: "text", text: STRADDLE },
-        { type: "toolCall", id: "c_1", name: "bash", arguments: { command: STRADDLE } },
+        {
+          type: "toolCall",
+          id: "c_1",
+          name: "bash",
+          arguments: { command: argStraddle(Buffer.byteLength('{"command":"')).arg },
+        },
       ],
       redactTest,
     );
     expect(out["thinking"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
     expect(out["text"]).toMatchObject({ text: STRADDLE_HEAD, truncated: true });
-    expect(out["tool_calls"]).toMatchObject([{ id: "c_1", args: { truncated: true } }]);
+    expect(out["tool_calls"]).toMatchObject([
+      {
+        id: "c_1",
+        args: {
+          text: `{"command":"${argStraddle(Buffer.byteLength('{"command":"')).head}`,
+          truncated: true,
+        },
+      },
+    ]);
     // Provider-redacted thinking has no text; the trajectory counts the blocks.
     expect(out["redacted_thinking_blocks"]).toBe(2);
     expectNoSecretPrefix(JSON.stringify(out));
@@ -925,13 +949,14 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
   });
 
   test("through the runner: over-cap thinking, text and tool-call arguments with a secret across the cut", async () => {
+    const ARG = argStraddle(Buffer.byteLength('{"command":": '));
     const s = await setup();
     await turn(s, "go", [
       fauxAssistantMessage(
         [
           fauxThinking(STRADDLE),
           fauxText(STRADDLE),
-          fauxToolCall("bash", { command: `: ${STRADDLE}` }, { id: "c_s" }),
+          fauxToolCall("bash", { command: `: ${ARG.arg}` }, { id: "c_s" }),
         ],
         { stopReason: "toolUse" },
       ),
@@ -946,7 +971,7 @@ describe("caps count UTF-8 bytes (review of #82)", () => {
       args: { truncated: boolean; text: string };
     }>;
     expect(toolCall?.args.truncated).toBe(true);
-    expect(toolCall?.args.text).toBe(`{"command":": ${STRADDLE_HEAD}`.slice(0, MAX_TEXT_BYTES));
+    expect(toolCall?.args.text).toBe(`{"command":": ${ARG.head}`);
     expectNoSecretPrefix(toJsonl(records));
   });
 
