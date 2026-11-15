@@ -23,6 +23,7 @@ import {
 } from "@hearth/protocol";
 import { type OutboundFrame, Outbox } from "./outbox";
 import { ToolExecutor, type ToolExecutorOptions } from "./tools/executor";
+import { VncRelay, type VncRelayOptions } from "./vnc";
 
 /** First reconnect delay; it doubles per failed attempt up to `RECONNECT_MAX_MS`. */
 export const RECONNECT_BASE_MS = 250;
@@ -74,6 +75,8 @@ export interface BoxAgentOptions {
   readonly log?: (line: string) => void;
   /** The tool executor's settings; without them, tool methods are refused. */
   readonly tools?: Omit<ToolExecutorOptions, "send" | "log">;
+  /** Where the desktop relay finds Xvnc, and its bounds (decision 0016). Tests change them. */
+  readonly vnc?: Omit<VncRelayOptions, "send" | "backlog" | "log">;
 }
 
 /** How the agent ended: stopped on request, or refused by the hub for good. */
@@ -103,6 +106,7 @@ export class BoxAgent {
   #sessionId: string | null = null;
   #connects = 0;
   readonly #tools: ToolExecutor | undefined;
+  readonly #vnc: VncRelay;
 
   constructor(options: BoxAgentOptions) {
     this.#options = options;
@@ -125,6 +129,20 @@ export class BoxAgent {
               if (this.#phase === "open") this.#write(frame);
             },
           });
+    this.#vnc = new VncRelay({
+      ...options.vnc,
+      log: this.#log,
+      // Desktop bytes are not redelivered: a stream ends with its connection.
+      send: (frame) => {
+        if (this.#phase === "open") this.#write(frame);
+      },
+      backlog: () => this.#socket?.bufferedAmount ?? 0,
+    });
+  }
+
+  /** Open desktop streams (decision 0016). */
+  get desktopStreams(): number {
+    return this.#vnc.size;
   }
 
   /** True between `welcome` and the next disconnect. */
@@ -198,6 +216,7 @@ export class BoxAgent {
       if (this.#socket !== socket) return;
       this.#socket = undefined;
       clearTimeout(this.#timer);
+      this.#vnc.closeAll();
       if (this.#phase === "ended") return;
       const lost = this.#phase === "open";
       const how = lost
@@ -268,6 +287,7 @@ export class BoxAgent {
     this.#phase = "ended";
     clearTimeout(this.#timer);
     this.#tools?.abortAll();
+    this.#vnc.closeAll();
     const socket = this.#socket;
     this.#socket = undefined;
     socket?.close();
@@ -326,6 +346,17 @@ export class BoxAgent {
         return;
       case "ping":
         this.#write({ type: "pong", nonce: frame.nonce });
+        return;
+      case "stream.open":
+        this.#vnc.open(frame);
+        return;
+      case "stream.data":
+        if (!this.#vnc.data(frame)) {
+          this.#log(`box-agent: dropped stream.data for unknown stream ${frame.streamId}`);
+        }
+        return;
+      case "stream.close":
+        this.#vnc.close(frame.streamId);
         return;
       case "session.assign":
         if (isDuplicateCommand(this.#history, frame)) return;

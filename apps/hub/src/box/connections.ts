@@ -34,6 +34,9 @@ import {
   type RpcFrame,
   type RpcResultFrame,
   rejectHello,
+  type StreamCloseFrame,
+  type StreamDataFrame,
+  type StreamOpenFrame,
   type WireMessage,
 } from "@hearth/protocol";
 import {
@@ -101,6 +104,10 @@ export interface BoxConnectionListener {
   connected?(boxId: BoxId, bootId: string): void;
   /** An `rpc.result` no `rpc()` call is waiting for. Return true when it was yours. */
   rpcResult?(boxId: BoxId, frame: RpcResultFrame): boolean;
+  /** A box sent `stream.data` or `stream.close` (decision 0016). Return true when it was yours. */
+  stream?(boxId: BoxId, frame: StreamDataFrame | StreamCloseFrame): boolean;
+  /** A box's open connection ended (closed, superseded, or the hub shut down). */
+  disconnected?(boxId: BoxId, bootId: string | undefined): void;
 }
 
 interface PendingRpc {
@@ -234,6 +241,17 @@ export class BoxConnections {
     if (conn === undefined || conn.state !== "open") return undefined;
     conn.send(frame);
     return conn.bootId;
+  }
+
+  /**
+   * Sends a byte-stream frame to a connected box (decision 0016). Returns
+   * false when the box is not connected; nothing was sent.
+   */
+  sendStream(boxId: BoxId, frame: StreamOpenFrame | StreamDataFrame | StreamCloseFrame): boolean {
+    const conn = this.#byBox.get(boxId);
+    if (conn === undefined || conn.state !== "open") return false;
+    conn.send(frame);
+    return true;
   }
 
   // -- socket events (called by the server) --------------------------------
@@ -387,6 +405,20 @@ export class BoxConnections {
         return;
       case "pong":
         return;
+      case "stream.data":
+      case "stream.close": {
+        const boxId = conn.binding?.boxId;
+        if (boxId !== undefined) {
+          for (const listener of this.#listeners) {
+            if (listener.stream?.(boxId, frame) === true) return;
+          }
+        }
+        // A stream nobody holds: tell the box to stop sending on it.
+        if (frame.type === "stream.data") {
+          conn.send({ type: "stream.close", streamId: frame.streamId, reason: "cancelled" });
+        }
+        return;
+      }
       default:
         this.#log(`box ${conn.binding?.boxId}: ignored unexpected ${frame.type} frame`);
     }
@@ -549,6 +581,7 @@ export class BoxConnections {
     if (boxId !== undefined && this.#byBox.get(boxId) === conn) {
       this.#byBox.delete(boxId);
       this.#log(`box ${boxId} disconnected: ${reason}`);
+      for (const listener of this.#listeners) listener.disconnected?.(boxId, conn.bootId);
     }
     for (const [id, pending] of conn.pending) {
       clearTimeout(pending.timer);

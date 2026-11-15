@@ -2,6 +2,7 @@ import { createDefaultSecretStore, HearthError } from "@hearth/core";
 import { describeBoxAgent } from "./agent";
 import { BoxAgent } from "./connection";
 import { DEFAULT_EXEC_ENV } from "./tools/executor";
+import { DEFAULT_VNC_PORT } from "./vnc";
 
 /** Exit code when the boot environment is incomplete. */
 const EXIT_CONFIG = 2;
@@ -18,6 +19,8 @@ const WORKSPACE_VAR = "HEARTH_WORKSPACE";
 const DEFAULT_WORKSPACE = "/workspace";
 /** The desktop display commands may draw on; not a secret. */
 const DISPLAY_VAR = "HEARTH_DISPLAY";
+/** The port Xvnc listens on in the box (loopback only), as the image's entrypoint uses it. */
+const VNC_PORT_VAR = "HEARTH_VNC_PORT";
 
 const info = describeBoxAgent();
 const banner = `hearth box-agent (protocol ${info.protocol}, pi ${info.pi})`;
@@ -39,6 +42,11 @@ async function main(): Promise<number> {
   }
 
   const display = process.env[DISPLAY_VAR];
+  const vncPort = Number(process.env[VNC_PORT_VAR] || DEFAULT_VNC_PORT);
+  if (!Number.isInteger(vncPort) || vncPort < 1 || vncPort > 65535) {
+    console.error(`${banner}: ${VNC_PORT_VAR} must be a port number`);
+    return EXIT_CONFIG;
+  }
   const agent = new BoxAgent({
     hubUrl,
     boxId,
@@ -49,6 +57,7 @@ async function main(): Promise<number> {
       // which holds the join token (PRD §8.2.1).
       env: { ...DEFAULT_EXEC_ENV, ...(display ? { DISPLAY: display } : {}) },
     },
+    vnc: { port: vncPort },
   });
   console.log(`${banner}: box ${boxId}, boot ${agent.bootId}, dialing ${hubUrl}`);
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
