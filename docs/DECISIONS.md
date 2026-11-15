@@ -1825,3 +1825,67 @@ caller's workspace, not the session's.
   `box.echo`: same status, same body, and the audit rows of both.
 - Routes added behind the guard later follow the same rule; the test is the
   place to add their family.
+
+## 0023: Box egress hardening: strict allow list, marker trust, firewalld reloads
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #58
+
+Follow-ups to 0012 and 0020 from the verification of #52.
+
+### Decision
+
+- **The allow list is parsed the way iptables reads it, or refused.** An
+  octet with a leading zero (`010.0.0.1`) is refused: the script read it as
+  decimal 10, iptables (`inet_aton`) reads it as octal 8 and installed
+  `8.0.0.1/32` while the marker recorded `010.0.0.1`. Refusing is chosen over
+  normalising because the owner's intent is ambiguous. A newline in
+  `HEARTH_BOX_EGRESS_ALLOW` is refused too: `read` took only the first line and
+  dropped the rest without a word. Both are refused before any rule or the
+  marker changes.
+- **The hub trusts the marker only if only root could have written it.**
+  `markerEgressCheck` (`apps/hub/src/box/egress.ts`) counts the firewall as
+  applied when the marker is a regular file (not a symlink) owned by uid 0
+  and not writable by group or others, and every directory on its real path
+  (after `realpath`, so `/var/run -> /run` works) is owned by root and is
+  not writable by group or others unless it is sticky (`/tmp`). So nobody but
+  root can create, replace or rename the marker or a directory above it.
+  Otherwise the status is `unfiltered`, with the reason in its detail line.
+  - *Bare metal*, hub as an unprivileged user: a `HEARTH_BOX_EGRESS_MARKER`
+    that points at a hub-writable path cannot be forged by the hub; the
+    script's default `/run/hearth` (root, 0755) and its marker (root, 0644)
+    pass.
+  - *Compose*, hub as root in its container (0020): the one-shot writes the
+    marker as root into the host's `/run/hearth`, which the hub mounts
+    read-only, so the same check passes. No file mode holds off a root hub;
+    there the check only proves the marker is root's, and the hub is trusted
+    by construction (it holds the Docker socket).
+  - The check reads owner and mode bits, not ACLs, and assumes uid 0 is
+    root in the hub's view (no user-namespace remapping of the bind mount).
+- **firewalld reloads re-apply the rules.** `ReloadPropagatedFrom=` in the
+  documented units fired only on `systemctl reload firewalld`, never on
+  `firewall-cmd --reload` (D-Bus, not systemd) nor on a restart. The units
+  in `docs/demo.md` (bare metal) and `docs/install.md` (compose) now use
+  `PartOf=firewalld.service`, which re-runs them on a firewalld restart, and
+  a second unit runs `scripts/firewalld-reload-watch.sh`, which waits for
+  firewalld's `org.fedoraproject.FirewallD1.Reloaded` signal (`dbus-monitor`)
+  and runs `systemctl reload` of the firewall unit each time. When the
+  monitor ends, the watcher exits 1 and systemd restarts it.
+- **No timer re-probe from a throwaway box (for now).** The marker still
+  cannot see rules flushed by hand. A re-probe would mean the hub starting a
+  box container and network on a timer (image pull, Docker work and a
+  network per probe, and a probe that must tell "rule missing" from "host
+  port closed"), outside the egress module. The reload watcher and
+  `PartOf=` cover the flushes that happen without the owner's intent; a
+  manual flush stays documented as the owner's responsibility.
+
+### Consequences
+
+- An allow list that worked by accident with leading zeros or several lines
+  now fails `apply`, with the reason, and the previous rules stay.
+- A marker the hub user can write, or one in a hub-writable directory, now
+  reports `unfiltered` and boxes do not start. Tests pass their own uid as
+  the owner (`markerEgressCheck(marker, { owner })`).
+- Hosts with firewalld need `dbus-monitor` for the watcher (Debian's
+  `dbus-bin`).

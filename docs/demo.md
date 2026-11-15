@@ -81,8 +81,9 @@ resolve, apply with the line the warning prints, for example:
 sudo HEARTH_BOX_EGRESS_ALLOW="192.168.1.1/32" scripts/box-firewall.sh apply
 ```
 
-The rules and the marker are gone after a reboot, and a firewalld reload drops
-the rules. Re-apply at boot with a systemd unit (adjust the path):
+The rules and the marker are gone after a reboot, and a firewalld reload or
+restart can drop the rules while the marker stays. Re-apply at boot, and after
+every firewalld restart, with a systemd unit (adjust the path):
 
 ```ini
 # /etc/systemd/system/hearth-box-firewall.service
@@ -90,7 +91,7 @@ the rules. Re-apply at boot with a systemd unit (adjust the path):
 Description=Hearth box egress firewall
 After=docker.service firewalld.service
 Wants=docker.service
-ReloadPropagatedFrom=firewalld.service
+PartOf=firewalld.service
 
 [Service]
 Type=oneshot
@@ -103,6 +104,33 @@ ExecStop=/opt/hearth/scripts/box-firewall.sh remove
 [Install]
 WantedBy=multi-user.target docker.service
 ```
+
+`PartOf=firewalld.service` restarts the unit when firewalld restarts (and
+stops it, rules and marker, when firewalld stops). `firewall-cmd --reload`
+goes to firewalld over D-Bus and never reaches systemd, so on a host with
+firewalld also run the watcher (it needs `dbus-monitor`, Debian's `dbus-bin`):
+
+```ini
+# /etc/systemd/system/hearth-firewalld-watch.service
+[Unit]
+Description=Re-apply the Hearth box firewall after a firewalld reload
+After=dbus.service hearth-box-firewall.service
+
+[Service]
+ExecStart=/opt/hearth/scripts/firewalld-reload-watch.sh /usr/bin/systemctl reload hearth-box-firewall.service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`sudo systemctl enable --now hearth-box-firewall hearth-firewalld-watch`.
+
+The hub trusts the marker only if root owns it and the directories above it,
+and nobody else can write any of them (decision 0023), so
+`HEARTH_BOX_EGRESS_MARKER` must point into a root-owned directory such as the
+default `/run/hearth`.
 
 To run boxes without the firewall on purpose (a disposable VM, for example),
 start the hub with `HEARTH_BOX_EGRESS=unrestricted`: boxes then reach the host,
