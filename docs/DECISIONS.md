@@ -1572,16 +1572,45 @@ event log, view-only noVNC desktop, the e2e) stays.
   browser, no `usePiRuntime` (its thread-list runtime adds ~220 kB and a
   transport Hearth does not use). react-pi's optional peer
   `@earendil-works/pi-coding-agent` is satisfied by the 1.5.2 pin.
+- **Thread, messages and composer: assistant-ui's registry `thread`**
+  (`https://r.assistant-ui.com/thread.json`, added with the shadcn CLI
+  together with its registry dependencies: markdown text, tool fallback,
+  tool group, tooltip button, attachments and others). `src/Thread.tsx`
+  only plugs Hearth's pieces into the component's slots: `ToolFallback` (the
+  tool card), `AssistantMessage` (Hearth's notices for system messages, the
+  registry's assistant message otherwise), `Welcome` (the empty state) and
+  `ToolGroup` (flat, so every tool card keeps its accessible name on screen
+  instead of inside a collapsed "N tool calls" group). Copy, export and
+  markdown come with it; the edit and refresh buttons render disabled
+  because the runtime has no `onEdit`/`onReload` (Hearth's log is
+  append-only).
+- **Five local edits in `thread.aui.tsx`** (listed in
+  `apps/web/README.md`): the composer input, send
+  and stop buttons carry Hearth's stable names (`Message`, `Send`,
+  `Interrupt`) instead of the registry's `Message input`, `Send message`,
+  `Stop generating`; `AssistantMessage` is exported so the slot can fall
+  back to it; the attach button shows only when the runtime takes
+  attachments (Hearth's does not). Unit tests pin the names and the hidden
+  attach button, so re-running the CLI without the edits fails `bun run
+  check`.
 - **Tool cards: assistant-ui's tool-call UI.** `ToolFallback` (and its
-  collapsible) from assistant-ui's shadcn registry
-  (`https://r.assistant-ui.com/tool-fallback.json`), rendered for every tool
-  through `MessagePrimitive.Parts` and composed with Hearth's status badge and
-  the call's target (bash command, else path or pattern).
+  collapsible) from the same registry, composed with Hearth's status badge
+  and the call's target (bash command, else path or pattern). A user
+  interrupt during a tool call shows that card as an error, because pi ends
+  the call with an error result; the `Interrupted.` notice follows it. This
+  matches main before this change.
+- **A failed send keeps the text.** assistant-ui clears the composer before
+  `onNew` runs; when the hub refuses the send, `sendFromComposer` puts the
+  text back with the composer runtime's `setText` (unless something new was
+  typed meanwhile) and the page shows the error as an alert.
 - **Primitives: shadcn/ui** (Radix + Tailwind 4, new-york style, stone base
-  colour): button, input, textarea, label, badge, alert, card, added with
+  colour): button, input, textarea, label, badge, alert, card, item
+  (the session list), plus what the registry thread pulls in, added with
   the shadcn CLI (`components.json`). shadcn ships source by design, so
   `src/components/ui/` and `src/components/assistant-ui/` are registry
-  source kept as the CLI wrote it (biome skips both). Theme tokens are CSS
+  source kept as the CLI wrote it, apart from the edits above (biome skips
+  both, and `src/hooks/`). The CLI rewrites `cn` imports to a package called
+  `cn`; they point back at `@/lib/utils`. Theme tokens are CSS
   variables in `src/index.css`. No toast package: sonner injects a
   `<style>` element, which `style-src 'self'` forbids; errors show as
   `Alert`s.
@@ -1599,17 +1628,23 @@ event log, view-only noVNC desktop, the e2e) stays.
   `new Function` probe never runs. The e2e stays fail-closed on any
   `securitypolicyviolation` and passed with none.
 - **Every new dependency pinned exactly**, as 0017 requires.
+- **DOM tests: happy-dom + Testing Library** (dev only) drive the app
+  against a fake hub (`src/web.dom.tsx`): failed send, 401 from a query and
+  from a mutation, the session list, the outcome-unknown warning. They run
+  in their own process (`bun run test:dom`, part of `bun run test` and
+  `check`), because modules loaded under the DOM would leak into the
+  server-rendered tests through bun's shared module cache.
 - **Stable accessible names** (the compose exit e2e, #47, drives these with
   `getByRole`/`getByLabel`; changing one is a breaking change). The list is
   in `apps/web/README.md`.
 
 ### Consequences
 
-- The JS bundle grows from 422.9 kB (130.0 kB gzip) to about 903 kB
-  (272 kB gzip), mostly assistant-ui and Radix. Splitting noVNC or the chat
-  into lazy chunks can come later.
+- The JS bundle grows from 422.9 kB (130.0 kB gzip) to about 1,258 kB
+  (378 kB gzip), mostly assistant-ui, its markdown renderer and Radix.
+  Splitting noVNC or the chat into lazy chunks can come later.
 - assistant-ui is pre-1.0 and changes often; exact pins plus the e2e catch
   breakage on upgrade. Registry source is updated by re-running the CLI.
-- Markdown in assistant messages (`@assistant-ui/react-markdown`) and M3
-  approvals (react-pi maps pi extension UI requests to tool approvals) are
-  available but not part of this change.
+- Assistant messages render as markdown (the registry thread's
+  `MarkdownText`). M3 approvals (react-pi maps pi extension UI requests to
+  tool approvals) are available but not part of this change.

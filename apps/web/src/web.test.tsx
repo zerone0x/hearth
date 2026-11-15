@@ -230,6 +230,7 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     const notice = /<div[^>]*data-testid="notice"[^>]*>/.exec(html)?.[0];
     expect(notice).toBeDefined();
     expect(notice).not.toContain("role=");
+    expect(notice).toContain("text-muted-foreground");
     expect(projectChat(chat).at(-1)).toMatchObject({
       role: "system",
       content: [{ text: "Interrupted." }],
@@ -274,6 +275,9 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     const html = render(chat);
     expect(html).toContain('role="alert"');
     expect(html).toContain("The runner failed: disk full");
+    const notice = /<div[^>]*data-testid="notice"[^>]*>/.exec(html)?.[0];
+    expect(notice).toContain('role="alert"');
+    expect(notice).toContain("text-destructive");
   });
 
   test("runner.failed during a running turn stops it", () => {
