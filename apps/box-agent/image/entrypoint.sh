@@ -5,6 +5,23 @@
 # test uses this to keep a box running while it inspects it.
 set -euo pipefail
 
+# Stage 1, as PID 1 (decision 0018): move the join token out of the environment
+# into a file only box-agent reads (and deletes), then re-exec under tini without
+# it. Every process in the box runs as the same uid, so a token left in the
+# environment of tini, Xvnc or Openbox would be readable by any tool command
+# through /proc/<pid>/environ. tini runs with -s when something else is PID 1
+# (`docker run --init`), so it still reaps orphans.
+token_file="/run/hearth/join-token"
+if [[ $$ -eq 1 || -n "${HEARTH_JOIN_TOKEN+set}" ]]; then
+  if [[ -n "${HEARTH_JOIN_TOKEN:-}" ]]; then
+    (umask 077 && printf '%s' "${HEARTH_JOIN_TOKEN}" >"${token_file}")
+    export HEARTH_JOIN_TOKEN_FILE="${token_file}"
+  fi
+  tini_flags=()
+  [[ $$ -eq 1 ]] || tini_flags=(-s)
+  exec env -u HEARTH_JOIN_TOKEN /usr/bin/tini "${tini_flags[@]}" -- "$0" "$@"
+fi
+
 display="${HEARTH_DISPLAY:-:1}"
 vnc_port="${HEARTH_VNC_PORT:-5901}"
 screen="${HEARTH_SCREEN:-1280x800}"

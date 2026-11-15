@@ -9,10 +9,10 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { type Subprocess, spawn } from "bun";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type Subprocess, spawn } from "bun";
 import { JOIN_TOKEN_FILE_VAR, JOIN_TOKEN_VAR, takeJoinToken } from "./boot";
 
 const TOKEN = "hjt_test-join-token-0123456789";
@@ -32,7 +32,10 @@ function tempDir(): string {
 }
 
 /** What a same-uid process gets when it reads `/proc/<pid>/<name>`. */
-function readProc(pid: number, name: string): { ok: true; text: string } | { ok: false; code: string } {
+function readProc(
+  pid: number,
+  name: string,
+): { ok: true; text: string } | { ok: false; code: string } {
   try {
     return { ok: true, text: readFileSync(`/proc/${pid}/${name}`).toString("latin1") };
   } catch (error) {
@@ -114,7 +117,9 @@ describe.skipIf(!linux)("a same-uid process reading box-agent through /proc", ()
     // The file goes once box-agent has read the token, after the dumpable flag is cleared.
     await until(() => !existsSync(file) || child.exitCode !== null);
     if (child.exitCode !== null) {
-      throw new Error(`box-agent exited ${child.exitCode}: ${await new Response(child.stderr).text()}`);
+      throw new Error(
+        `box-agent exited ${child.exitCode}: ${await new Response(child.stderr).text()}`,
+      );
     }
     return { child, file };
   }

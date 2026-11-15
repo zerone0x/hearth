@@ -140,3 +140,10 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/box/tools.docker.test.ts
+      # #57 (decision 0018): a command in a real box scans /proc and finds
+      # neither the join token nor a readable box-agent environ, maps or mem.
+      - name: A command cannot read box-agent's secrets through /proc, egress filtered
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/box/proc-secrets.docker.test.ts
