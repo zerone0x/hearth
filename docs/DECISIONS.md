@@ -2139,6 +2139,15 @@ already hold its `pi.tool_execution_end`.
   one extra check by the model.
 - The rule is therefore simple: a call has a result only when its result entry
   is persisted.
+- Two records then differ on purpose. The trajectory (0021) keeps the call's
+  real outcome, from the `runner.step` (`kind: "tool_call"`) that the turn
+  tracer stored at `tool_execution_end`; the rebuilt model context gets the
+  outcome-unknown result. The trajectory shows what happened in the box; the
+  model context shows only what the runner can vouch for.
+- The rebuild also records `runner.outcome-unknown` for this call, as 0015
+  says, with the call's id in `toolCallIds` (one event per rebuild that found
+  orphans), so the trajectory shows an `outcome_unknown` entry next to the
+  real step.
 
 Test follow-ups from #75 (JSON-escaped secret redaction and the failed
 `runner.context` call result) are in `runner.test.ts`.
