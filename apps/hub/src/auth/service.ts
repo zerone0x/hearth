@@ -8,7 +8,13 @@
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { type EpochMs, LOCAL_PRINCIPAL, type Principal } from "@hearth/core";
-import { argon2idKdf, PASSWORD_MAX_LENGTH, type PasswordKdf, passwordProblem } from "./password";
+import {
+  argon2idKdf,
+  normalizePassword,
+  PASSWORD_MAX_LENGTH,
+  type PasswordKdf,
+  passwordProblem,
+} from "./password";
 import { AttemptLimiter, LOGIN_RATE_LIMIT, type RateLimit } from "./rate-limit";
 import type { LoginStore } from "./store";
 
@@ -125,8 +131,10 @@ export class AuthService {
     if (!secretsEqual(setupToken, expected)) return { kind: "bad-token" };
     const problem = passwordProblem(password);
     if (problem !== undefined) return { kind: "bad-password", problem };
-    const hash = await this.#kdf.hash(password);
+    const hash = await this.#kdf.hash(normalizePassword(password));
     const owner = AuthService.OWNER;
+    // Atomic insert-if-absent: of two setups racing past the checks above,
+    // exactly one stores its password; the other gets `already-set-up`.
     if (!this.#store.setInitialPassword(owner.workspaceId, owner.id, hash, this.#now())) {
       return { kind: "already-set-up" };
     }
@@ -147,7 +155,7 @@ export class AuthService {
     const admission = this.#limiter.admit();
     if (!admission.admitted) return { kind: "rate-limited", retryAfterMs: admission.retryAfterMs };
     if (password.length > PASSWORD_MAX_LENGTH) return { kind: "rejected" };
-    if (!(await this.#kdf.verify(password, hash))) return { kind: "rejected" };
+    if (!(await this.#kdf.verify(normalizePassword(password), hash))) return { kind: "rejected" };
     this.#limiter.succeeded();
     return { kind: "ok", ...this.#signIn(owner, previous) };
   }

@@ -51,6 +51,16 @@ export function argon2idKdf(params: Argon2idParams = ARGON2ID_PARAMS): PasswordK
   };
 }
 
+/**
+ * The form a password is hashed and verified in: Unicode NFC. The same
+ * password typed on another keyboard or OS can arrive composed ("é", U+00E9)
+ * or decomposed ("e" + U+0301); both must log in. Call it only after the
+ * length cap, so the cap also bounds this work.
+ */
+export function normalizePassword(password: string): string {
+  return password.normalize("NFC");
+}
+
 /** Why a new password is refused, or undefined when it is acceptable. */
 export function passwordProblem(password: string): string | undefined {
   if (password.length < PASSWORD_MIN_LENGTH) {

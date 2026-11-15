@@ -4,6 +4,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import { type JsonValue, LOCAL_PRINCIPAL, type Principal } from "@hearth/core";
 import { type AppOptions, createApp } from "../app";
@@ -16,10 +17,10 @@ import {
   argon2idKdf,
   LOGIN_RATE_LIMIT,
   OPEN_ROUTES,
+  PASSWORD_MAX_LENGTH,
   type PasswordKdf,
   SESSION_COOKIE,
   SESSION_TTL_MS,
-  secretHash,
   secretsEqual,
 } from ".";
 
@@ -31,12 +32,16 @@ afterEach(() => {
   for (const db of dbs.splice(0)) db.close();
 });
 
-/** argon2id with tiny parameters, counting `verify` calls. */
+/** argon2id with tiny parameters, recording the input of every `hash` and `verify` call. */
 function cheapKdf() {
   const inner = argon2idKdf({ memoryCost: 256, timeCost: 1 });
   const kdf = {
+    hashes: [] as string[],
     verifies: [] as string[],
-    hash: (password: string) => inner.hash(password),
+    hash: (password: string) => {
+      kdf.hashes.push(password);
+      return inner.hash(password);
+    },
     verify: (password: string, hash: string) => {
       kdf.verifies.push(password);
       return inner.verify(password, hash);
@@ -263,6 +268,29 @@ describe("first-run setup", () => {
     expect((await login(h, PASSWORD)).status).toBe(200);
   });
 
+  test("two setups at once: exactly one wins, and its password is the one stored", async () => {
+    for (let round = 0; round < 5; round++) {
+      const h = harness();
+      const token = h.auth.setupToken() ?? "";
+      const passwords = ["first long password", "second long password"] as const;
+      const responses = await Promise.all(passwords.map((pw) => setup(h, token, pw)));
+      const statuses = responses.map((res) => res.status);
+      expect([...statuses].sort()).toEqual([201, 409]);
+      // Both got past the checks before either stored: the insert decided.
+      expect(h.kdf.hashes).toHaveLength(2);
+      const winner = statuses[0] === 201 ? passwords[0] : passwords[1];
+      const loser = winner === passwords[0] ? passwords[1] : passwords[0];
+      const loserRes = responses[statuses[0] === 201 ? 1 : 0];
+      expect(await loserRes?.json()).toMatchObject({ error: { code: "auth.already-set-up" } });
+      expect(loserRes?.headers.get("set-cookie")).toBeNull();
+      expect(h.sessions()).toBe(1);
+      const rows = h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM owner_password").get();
+      expect(rows?.n).toBe(1);
+      expect((await login(h, winner)).status).toBe(200);
+      expect((await login(h, loser)).status).toBe(401);
+    }
+  });
+
   test("the password is stored as argon2id with the named parameters, never in clear", async () => {
     const db = openDatabase(":memory:");
     dbs.push(db);
@@ -348,8 +376,95 @@ describe("login", () => {
     const h = await withPassword();
     const token = h.cookie.split("=")[1] ?? "";
     expect(token).toMatch(/^hls_[A-Za-z0-9_-]{43}$/);
+    // Computed here, not with the production helper, so a broken hash cannot agree with itself.
+    const expected = createHash("sha256").update(token).digest("hex");
     const rows = h.db.query<{ id_hash: string }, []>("SELECT id_hash FROM login_session").all();
-    expect(rows).toEqual([{ id_hash: secretHash(token) }]);
+    expect(rows).toEqual([{ id_hash: expected }]);
+    expect(rows[0]?.id_hash).toMatch(/^[0-9a-f]{64}$/);
+    // No column of any table holds the raw id, or its random part.
+    const tables = h.db
+      .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all();
+    expect(tables.map((t) => t.name)).toContain("login_session");
+    for (const { name } of tables) {
+      const dump = JSON.stringify(h.db.query(`SELECT * FROM "${name}"`).all());
+      expect({ name, leaks: dump.includes(token.slice(4)) }).toEqual({ name, leaks: false });
+    }
+  });
+
+  test("a session whose row names another principal or workspace is refused", async () => {
+    const h = await withPassword();
+    h.db.run("INSERT INTO workspace (id, name, created_at) VALUES (?, ?, ?)", [
+      "ws_someone_else",
+      "other",
+      START,
+    ]);
+    const forged = [
+      { principal: "pr_someone_else", workspace: LOCAL_PRINCIPAL.workspaceId },
+      { principal: LOCAL_PRINCIPAL.id, workspace: "ws_someone_else" },
+    ];
+    for (const [i, row] of forged.entries()) {
+      const token = `hls_forged-${i}-${"a".repeat(32)}`;
+      h.db.run(
+        `INSERT INTO login_session (id_hash, workspace_id, principal_id, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          createHash("sha256").update(token).digest("hex"),
+          row.workspace,
+          row.principal,
+          START,
+          START + SESSION_TTL_MS,
+        ],
+      );
+      const res = await echo(h, { cookie: `${SESSION_COOKIE}=${token}` });
+      expect({ row, status: res.status }).toEqual({ row, status: 401 });
+    }
+    expect(h.commands).toHaveLength(0);
+  });
+
+  test("a password over the length cap is refused without running the KDF", async () => {
+    const h = await withPassword();
+    const verifies = h.kdf.verifies.length;
+    for (const extra of [1, 1000, 1_000_000]) {
+      const res = await login(h, "a".repeat(PASSWORD_MAX_LENGTH + extra));
+      expect({ extra, status: res.status }).toEqual({ extra, status: 401 });
+      expect(res.headers.get("set-cookie")).toBeNull();
+    }
+    expect(h.kdf.verifies).toHaveLength(verifies);
+    // At the cap the KDF still runs: the bound is "over", not "at".
+    expect((await login(h, "a".repeat(PASSWORD_MAX_LENGTH))).status).toBe(401);
+    expect(h.kdf.verifies).toHaveLength(verifies + 1);
+
+    const fresh = harness();
+    const token = fresh.auth.setupToken() ?? "";
+    const long = await setup(fresh, token, "a".repeat(PASSWORD_MAX_LENGTH + 1));
+    expect(long.status).toBe(400);
+    expect(fresh.kdf.hashes).toHaveLength(0);
+    expect(fresh.auth.setupRequired()).toBe(true);
+  });
+
+  test("a password is compared in NFC, so composed and decomposed input both log in", async () => {
+    const composed = "caf\u00e9 cr\u00e8me br\u00fbl\u00e9e";
+    const decomposed = composed.normalize("NFD");
+    expect(decomposed).not.toBe(composed);
+    expect(decomposed.normalize("NFC")).toBe(composed);
+
+    // Set in NFC, typed in NFD.
+    const a = harness();
+    expect((await setup(a, a.auth.setupToken() ?? "", composed)).status).toBe(201);
+    expect((await login(a, decomposed)).status).toBe(200);
+    expect((await login(a, composed)).status).toBe(200);
+    expect(a.kdf.hashes).toEqual([composed]);
+    expect(a.kdf.verifies).toEqual([composed, composed]);
+
+    // Set in NFD, typed in NFC.
+    const b = harness();
+    expect((await setup(b, b.auth.setupToken() ?? "", decomposed)).status).toBe(201);
+    expect(b.kdf.hashes).toEqual([composed]);
+    expect((await login(b, composed)).status).toBe(200);
+    expect((await login(b, decomposed)).status).toBe(200);
+    // A different password is still wrong after normalization.
+    expect((await login(b, composed.replace("\u00e9", "e"))).status).toBe(401);
   });
 });
 
