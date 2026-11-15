@@ -176,6 +176,13 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/box/proc-secrets.docker.test.ts
+      # #31 (decision 0028): `docker pause` freezes the box with its TCP
+      # connection open; the hub's heartbeat declares it dead within its bound.
+      - name: Heartbeat detects a paused box within the bound, egress filtered
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/box/heartbeat.docker.test.ts
 
   # Prototype exit e2e (PRD §11.1, #47, decision 0020): docs/install.md run
   # verbatim on the runner (every block tagged install:<step>, extracted by
