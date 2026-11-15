@@ -26,10 +26,18 @@ export const ARGON2ID_PARAMS: Argon2idParams = Object.freeze({
 /** Shortest owner password accepted at setup, in characters. */
 export const PASSWORD_MIN_LENGTH = 12;
 /**
- * Longest password accepted at setup or login, in characters. Bounds the KDF
- * input, so a huge body cannot buy more hashing work than a normal attempt.
+ * Longest password accepted at setup or login, in UTF-16 units of its NFC
+ * form. Bounds the KDF input, so a huge body cannot buy more hashing work than
+ * a normal attempt.
  */
 export const PASSWORD_MAX_LENGTH = 1024;
+/**
+ * Loose cap on the password as it arrives, checked before NFC so the
+ * normalization work is bounded too. Looser than `PASSWORD_MAX_LENGTH`
+ * because the same password can arrive decomposed (NFD "é" is two units,
+ * NFC one); the real cap is applied to the NFC form.
+ */
+export const PASSWORD_RAW_MAX_LENGTH = 4 * PASSWORD_MAX_LENGTH;
 
 /** Hashes and verifies passwords. Tests swap in cheaper parameters. */
 export interface PasswordKdf {
@@ -54,20 +62,26 @@ export function argon2idKdf(params: Argon2idParams = ARGON2ID_PARAMS): PasswordK
 /**
  * The form a password is hashed and verified in: Unicode NFC. The same
  * password typed on another keyboard or OS can arrive composed ("é", U+00E9)
- * or decomposed ("e" + U+0301); both must log in. Call it only after the
- * length cap, so the cap also bounds this work.
+ * or decomposed ("e" + U+0301); both must log in. NFC, not NFKC: "ﬁ" (U+FB01)
+ * and fullwidth letters stay as typed. Call it only after the raw cap
+ * (`PASSWORD_RAW_MAX_LENGTH`), so that cap bounds this work; NFC can make a
+ * string longer (U+FB2C becomes three units), so check `PASSWORD_MAX_LENGTH`
+ * on the result.
  */
 export function normalizePassword(password: string): string {
   return password.normalize("NFC");
 }
 
-/** Why a new password is refused, or undefined when it is acceptable. */
+/** The problem `passwordProblem` names for a password over the cap. */
+export const PASSWORD_TOO_LONG = `the password can have at most ${PASSWORD_MAX_LENGTH} characters`;
+
+/** Why a new password (in NFC, see `normalizePassword`) is refused, or undefined when it is acceptable. */
 export function passwordProblem(password: string): string | undefined {
   if (password.length < PASSWORD_MIN_LENGTH) {
     return `the password needs at least ${PASSWORD_MIN_LENGTH} characters`;
   }
   if (password.length > PASSWORD_MAX_LENGTH) {
-    return `the password can have at most ${PASSWORD_MAX_LENGTH} characters`;
+    return PASSWORD_TOO_LONG;
   }
   return undefined;
 }

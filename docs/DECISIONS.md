@@ -903,13 +903,21 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   (19 MiB, 2 passes, parallelism 1: the OWASP Password Storage Cheat Sheet's
   first argon2id configuration), stored as the PHC string, so raising the
   parameters later still verifies old hashes. Passwords are 12 to 1024
-  characters; the upper bound caps the KDF input. A longer password is
-  refused before the KDF runs, at setup (`400`) and at login (`401`).
-- **Unicode NFC.** Setup and login normalize the password to NFC
-  (`normalizePassword`) before the KDF, after the length check. The same
-  password can arrive composed ("é", U+00E9) or decomposed ("e" + U+0301)
-  depending on the keyboard and OS; both must sign in. NFC, not NFKC: it
-  changes no character the owner typed into a different one.
+  UTF-16 units of their NFC form; the upper bound caps the KDF input. A
+  longer password is refused before the KDF runs, at setup (`400`) and at
+  login (`401`).
+- **Unicode NFC, and the order of the length checks.** Setup and login
+  (1) refuse input over `PASSWORD_RAW_MAX_LENGTH` (4 × 1024 units) as it
+  arrives, so the normalization work is bounded; (2) normalize to NFC
+  (`normalizePassword`); (3) apply the 1024 cap to the NFC form, which is what
+  the KDF gets. The same password can arrive composed ("é", U+00E9) or
+  decomposed ("e" + U+0301) depending on the keyboard and OS; both must sign
+  in, so the cap counts the NFC form (700 "é" typed in NFD are 1400 units and
+  still log in). NFC can also grow a string (U+FB2C is three units in NFC);
+  checking the cap after NFC keeps the KDF input at 1024 units or less. NFC,
+  not NFKC: it changes no character the owner typed into a different one, so
+  a password with "ﬁ" (U+FB01) or fullwidth letters is hashed as typed and
+  the ASCII "fi" form does not log in.
 - **Server-side sessions.** Migration 4 adds `owner_password` and
   `login_session` (`session` is the agent session of PRD §5). A session id is
   `hls_` + 256 random bits; only its SHA-256 is stored, so the database never
@@ -936,7 +944,7 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   the login can keep the owner out by guessing, and the owner then waits out
   the window. The limit is in memory, so a hub restart resets it.
 - **Timing.** The password comparison is argon2's own (`Bun.password.verify`);
-  every admitted attempt within the length cap runs it, whatever the input. The setup token is
+  every admitted attempt within the length caps runs it, whatever the input. The setup token is
   compared with `secretsEqual`: SHA-256 of both sides, then `timingSafeEqual`
   on the 32-byte digests, so neither content nor length shows in the time.
 - **Session guard.** A middleware in `createApp` runs after the request guard

@@ -12,6 +12,8 @@ import {
   argon2idKdf,
   normalizePassword,
   PASSWORD_MAX_LENGTH,
+  PASSWORD_RAW_MAX_LENGTH,
+  PASSWORD_TOO_LONG,
   type PasswordKdf,
   passwordProblem,
 } from "./password";
@@ -129,9 +131,14 @@ export class AuthService {
     const admission = this.#limiter.admit();
     if (!admission.admitted) return { kind: "rate-limited", retryAfterMs: admission.retryAfterMs };
     if (!secretsEqual(setupToken, expected)) return { kind: "bad-token" };
-    const problem = passwordProblem(password);
+    // Raw cap, then NFC, then the real cap on the NFC form (passwordProblem).
+    if (password.length > PASSWORD_RAW_MAX_LENGTH) {
+      return { kind: "bad-password", problem: PASSWORD_TOO_LONG };
+    }
+    const normalized = normalizePassword(password);
+    const problem = passwordProblem(normalized);
     if (problem !== undefined) return { kind: "bad-password", problem };
-    const hash = await this.#kdf.hash(normalizePassword(password));
+    const hash = await this.#kdf.hash(normalized);
     const owner = AuthService.OWNER;
     // Atomic insert-if-absent: of two setups racing past the checks above,
     // exactly one stores its password; the other gets `already-set-up`.
@@ -154,8 +161,11 @@ export class AuthService {
     if (hash === undefined) return { kind: "setup-required" };
     const admission = this.#limiter.admit();
     if (!admission.admitted) return { kind: "rate-limited", retryAfterMs: admission.retryAfterMs };
-    if (password.length > PASSWORD_MAX_LENGTH) return { kind: "rejected" };
-    if (!(await this.#kdf.verify(normalizePassword(password), hash))) return { kind: "rejected" };
+    // Raw cap, then NFC, then the real cap on the NFC form.
+    if (password.length > PASSWORD_RAW_MAX_LENGTH) return { kind: "rejected" };
+    const normalized = normalizePassword(password);
+    if (normalized.length > PASSWORD_MAX_LENGTH) return { kind: "rejected" };
+    if (!(await this.#kdf.verify(normalized, hash))) return { kind: "rejected" };
     this.#limiter.succeeded();
     return { kind: "ok", ...this.#signIn(owner, previous) };
   }

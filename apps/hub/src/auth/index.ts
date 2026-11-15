@@ -7,6 +7,7 @@ export {
   argon2idKdf,
   PASSWORD_MAX_LENGTH,
   PASSWORD_MIN_LENGTH,
+  PASSWORD_RAW_MAX_LENGTH,
   type PasswordKdf,
   passwordProblem,
 } from "./password";

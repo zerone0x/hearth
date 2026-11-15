@@ -18,6 +18,7 @@ import {
   LOGIN_RATE_LIMIT,
   OPEN_ROUTES,
   PASSWORD_MAX_LENGTH,
+  PASSWORD_RAW_MAX_LENGTH,
   type PasswordKdf,
   SESSION_COOKIE,
   SESSION_TTL_MS,
@@ -465,6 +466,110 @@ describe("login", () => {
     expect((await login(b, decomposed)).status).toBe(200);
     // A different password is still wrong after normalization.
     expect((await login(b, composed.replace("\u00e9", "e"))).status).toBe(401);
+  });
+
+  test("NFC, not NFKC: a ligature and fullwidth letters reach the KDF as typed", async () => {
+    // U+FB01 "ﬁ" and fullwidth "ｐａｓｓ": NFKC would fold them to ASCII "fi" and "pass".
+    const typed = "\ufb01ne \uff50\uff41\uff53\uff53 phrase";
+    const folded = "fine pass phrase";
+    expect(typed.normalize("NFC")).toBe(typed);
+    expect(typed.normalize("NFKC")).toBe(folded);
+
+    const h = harness();
+    expect((await setup(h, h.auth.setupToken() ?? "", typed)).status).toBe(201);
+    expect(h.kdf.hashes).toEqual([typed]);
+    expect((await login(h, folded)).status).toBe(401);
+    expect((await login(h, "\ufb01ne pass phrase")).status).toBe(401);
+    expect((await login(h, typed)).status).toBe(200);
+    expect(h.kdf.verifies).toEqual([folded, "\ufb01ne pass phrase", typed]);
+  });
+
+  test("the length cap applies to the NFC form: a long password typed in NFD still logs in", async () => {
+    const composed = "\u00e9".repeat(700);
+    const decomposed = composed.normalize("NFD");
+    expect(decomposed.length).toBe(1400);
+    expect(decomposed.length).toBeGreaterThan(PASSWORD_MAX_LENGTH);
+
+    const h = harness();
+    expect((await setup(h, h.auth.setupToken() ?? "", composed)).status).toBe(201);
+    expect((await login(h, decomposed)).status).toBe(200);
+    expect(h.kdf.verifies).toEqual([composed]);
+
+    // Set in NFD too: the 1400 units count as 700.
+    const b = harness();
+    expect((await setup(b, b.auth.setupToken() ?? "", decomposed)).status).toBe(201);
+    expect(b.kdf.hashes).toEqual([composed]);
+  });
+
+  test("input over the raw cap is refused before NFC and the KDF; at the cap it is normalized", async () => {
+    // Record the length of every string normalized while a request runs.
+    const original = String.prototype.normalize;
+    const normalized: number[] = [];
+    String.prototype.normalize = function (this: string, form?: string) {
+      normalized.push(this.length);
+      return original.call(this, form);
+    };
+    try {
+      const h = await withPassword();
+      const verifies = h.kdf.verifies.length;
+      normalized.length = 0;
+      for (const extra of [1, 100_000]) {
+        const res = await login(h, "a".repeat(PASSWORD_RAW_MAX_LENGTH + extra));
+        expect({ extra, status: res.status }).toEqual({ extra, status: 401 });
+      }
+      expect(h.kdf.verifies).toHaveLength(verifies);
+      expect(normalized.filter((n) => n > PASSWORD_RAW_MAX_LENGTH)).toEqual([]);
+
+      // Exactly at the raw cap: 1024 × U+1F8F typed decomposed (4 units each)
+      // is 1024 units in NFC, so it reaches the KDF.
+      const atCap = "\u1f8f".repeat(PASSWORD_MAX_LENGTH).normalize("NFD");
+      expect(atCap.length).toBe(PASSWORD_RAW_MAX_LENGTH);
+      expect((await login(h, atCap)).status).toBe(401);
+      expect(h.kdf.verifies.slice(verifies)).toEqual(["\u1f8f".repeat(PASSWORD_MAX_LENGTH)]);
+
+      const fresh = harness();
+      normalized.length = 0;
+      const res = await setup(
+        fresh,
+        fresh.auth.setupToken() ?? "",
+        "a".repeat(PASSWORD_RAW_MAX_LENGTH + 1),
+      );
+      expect(res.status).toBe(400);
+      expect(fresh.kdf.hashes).toHaveLength(0);
+      expect(normalized.filter((n) => n > PASSWORD_RAW_MAX_LENGTH)).toEqual([]);
+      expect(fresh.auth.setupRequired()).toBe(true);
+    } finally {
+      String.prototype.normalize = original;
+    }
+  });
+
+  test("NFC can grow input (U+FB2C is three units in NFC); the KDF still gets at most the cap", async () => {
+    const typed = "\ufb2c".repeat(PASSWORD_MAX_LENGTH);
+    expect(typed.length).toBe(PASSWORD_MAX_LENGTH);
+    expect(typed.normalize("NFC").length).toBe(3 * PASSWORD_MAX_LENGTH);
+
+    const h = await withPassword();
+    const verifies = h.kdf.verifies.length;
+    expect((await login(h, typed)).status).toBe(401);
+    expect(h.kdf.verifies).toHaveLength(verifies);
+
+    const fresh = harness();
+    const res = await setup(fresh, fresh.auth.setupToken() ?? "", typed);
+    expect(res.status).toBe(400);
+    expect(fresh.kdf.hashes).toHaveLength(0);
+
+    // 341 units that grow to exactly the cap are accepted; one more unit is refused.
+    const fits = `${"\ufb2c".repeat(341)}a`;
+    expect(fits.normalize("NFC").length).toBe(PASSWORD_MAX_LENGTH);
+    const g = harness();
+    expect((await setup(g, g.auth.setupToken() ?? "", fits)).status).toBe(201);
+    expect(g.kdf.hashes.map((p) => p.length)).toEqual([PASSWORD_MAX_LENGTH]);
+    expect((await login(g, `${fits}b`)).status).toBe(401);
+    expect((await login(g, fits)).status).toBe(200);
+    expect(g.kdf.verifies.map((p) => p.length)).toEqual([PASSWORD_MAX_LENGTH]);
+    for (const p of [...g.kdf.hashes, ...g.kdf.verifies, ...h.kdf.verifies, ...fresh.kdf.hashes]) {
+      expect(p.length).toBeLessThanOrEqual(PASSWORD_MAX_LENGTH);
+    }
   });
 });
 
