@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOCAL_PRINCIPAL } from "@hearth/core";
 import { BoxAgent } from "../../../box-agent/src/connection";
+import { SESSION_COOKIE } from "../auth";
 import { startHub } from "../server";
 import type { AppliedDelivery } from "./connections";
 
@@ -146,7 +147,10 @@ describe("join and echo", () => {
 
     const res = await fetch(new URL("/v1/boxes/box_echo/echo", h.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`,
+      },
       body: JSON.stringify({ message: "hello box", n: [1, 2, 3] }),
       signal: AbortSignal.timeout(STEP_MS),
     });
@@ -184,7 +188,10 @@ describe("join and echo", () => {
     const h = hub(tempDb());
     const res = await fetch(new URL("/v1/boxes/box_nobody/echo", h.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`,
+      },
       body: JSON.stringify("hi"),
       signal: AbortSignal.timeout(STEP_MS),
     });
@@ -608,7 +615,10 @@ describe("echo deadline", () => {
     const started = performance.now();
     const res = await fetch(new URL("/v1/boxes/box_mute/echo", h.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`,
+      },
       body: JSON.stringify("anyone there?"),
       signal: AbortSignal.timeout(DEADLINE_MS + 2_000),
     });

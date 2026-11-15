@@ -43,6 +43,27 @@ describe("migrate", () => {
     again.close();
   });
 
+  test("a database migrated by the session-manager hub (1-4) upgrades to the login (5)", () => {
+    const path = join(dir, "hub.db");
+    const old = openDatabase(path, { migrate: false });
+    expect(migrate(old, MIGRATIONS.slice(0, 4))).toEqual([1, 2, 3, 4]);
+    expect(MIGRATIONS[3]?.name).toBe("session operations");
+    old.close();
+
+    const db = openDatabase(path, { migrate: false });
+    expect(migrate(db)).toEqual([5]);
+    expect(MIGRATIONS[4]?.name).toBe("owner password and login sessions");
+    expect(versions(db)).toEqual([1, 2, 3, 4, 5]);
+    const tables = db
+      .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all()
+      .map((t) => t.name);
+    expect(tables).toEqual(
+      expect.arrayContaining(["session_operation", "owner_password", "login_session"]),
+    );
+    db.close();
+  });
+
   test("applies only the missing migrations", () => {
     const db = openDatabase(":memory:", { migrate: false });
     const first = [{ version: 1, name: "one", sql: "CREATE TABLE one (workspace_id TEXT)" }];

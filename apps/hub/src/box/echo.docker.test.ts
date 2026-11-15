@@ -29,6 +29,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BoxSpec, LOCAL_PRINCIPAL } from "@hearth/core";
+import { SESSION_COOKIE } from "../auth";
 import { DEFAULT_BOX_PORT, type Hub, parsePort, startHub } from "../server";
 import { DEFAULT_DOCKER_API_VERSION, DEFAULT_DOCKER_SOCKET } from "./docker/config";
 import { DockerEngine } from "./docker/engine";
@@ -165,10 +166,12 @@ describe.skipIf(!enabled)("echo and egress through a hub on production defaults"
     const params = { message: "hello from the hub", n: 7 };
     expect(await hub.boxes.echo(LOCAL_PRINCIPAL, spec.boxId, params)).toEqual(params);
 
-    // Over HTTP on the loopback API too, the way the M0 demo calls it.
+    // Over HTTP on the loopback API too, the way the M0 demo calls it,
+    // signed in (decision 0014).
+    const { token } = hub.auth.issueSession(LOCAL_PRINCIPAL);
     const res = await fetch(new URL(`/v1/boxes/${spec.boxId}/echo`, hub.url), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", cookie: `${SESSION_COOKIE}=${token}` },
       body: JSON.stringify("ping"),
       signal: AbortSignal.timeout(10_000),
     });

@@ -1,11 +1,15 @@
-import { HearthError, type JsonValue, LOCAL_PRINCIPAL } from "@hearth/core";
+import { HearthError, type JsonValue } from "@hearth/core";
 import { formatVersion, PROTOCOL_VERSION } from "@hearth/protocol";
 import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
+import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
 
 export interface AppDeps {
   readonly boxes: BoxConnections;
+  /** The local login (decision 0014). Every route outside `OPEN_ROUTES` needs one of its sessions. */
+  readonly auth: AuthService;
 }
 
 /** Host names that always reach a loopback hub (docs/DECISIONS.md, 0010). */
@@ -54,7 +58,7 @@ function hostnameOf(host: string): string | undefined {
   return lower.startsWith("[") ? lower.slice(0, lower.indexOf("]") + 1) : lower.split(":")[0];
 }
 
-function refuse(status: 403 | 415 | 421, code: string, message: string): Response {
+function refuse(status: 401 | 403 | 415 | 421, code: string, message: string): Response {
   return Response.json({ ok: false, error: { code, owner: "user", message } }, { status });
 }
 
@@ -80,7 +84,7 @@ function statusFor(error: HearthError): 403 | 409 | 500 | 502 | 504 {
  * tests can drive it with `app.request()`.
  */
 export function createApp(deps?: AppDeps, options: AppOptions = {}) {
-  const app = new Hono();
+  const app = new Hono<HubEnv>();
   const publicOrigin = options.publicOrigin;
   const allowedHosts = new Set((options.allowedHosts ?? LOOPBACK_HOSTS).map(hostKey));
   if (publicOrigin !== undefined) allowedHosts.add(hostKey(new URL(publicOrigin).hostname));
@@ -127,6 +131,23 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
     return next();
   });
 
+  // Session guard (docs/DECISIONS.md, 0014). After the request guard, so a
+  // cross-origin page cannot reach the login either. Every route except
+  // `OPEN_ROUTES` needs a live login session, including paths no handler
+  // serves: an unauthenticated caller learns nothing about the API. The
+  // principal of the session is what handlers pass to `authorize`. The box
+  // socket is on the box listeners and never reaches this app (0012). Without
+  // `deps` there is no login, so nothing but /healthz is served.
+  const openRoutes = new Set(OPEN_ROUTES);
+  app.use("*", async (c, next) => {
+    if (c.req.path === "/healthz") return next();
+    if (deps !== undefined && openRoutes.has(`${c.req.method} ${c.req.path}`)) return next();
+    const principal = deps?.auth.authenticate(getCookie(c, SESSION_COOKIE));
+    if (principal === undefined) return refuse(401, "auth.required", "sign in first");
+    c.set("principal", principal);
+    return next();
+  });
+
   // Liveness probe. The one route that does not call `authorize`: it takes no
   // input and returns no workspace data (docs/DECISIONS.md, 0001).
   // `boxEgress` is the hub's own state, not workspace data.
@@ -143,9 +164,11 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   );
 
   if (deps !== undefined) {
+    authRoutes(app, deps.auth, { publicOrigin });
+
     // Internal endpoint for the M0 echo round trip (docs/DECISIONS.md, 0008).
-    // There is no login before M1, so the caller is the local principal; the
-    // hub listens on loopback only. `echo` calls `authorize` before anything else.
+    // The caller is the signed-in principal (0014); `echo` calls `authorize`
+    // with it before anything else.
     app.post("/v1/boxes/:boxId/echo", async (c) => {
       let params: JsonValue;
       try {
@@ -154,7 +177,7 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
         return c.json({ ok: false, error: { code: "request.invalid-json" } }, 400);
       }
       try {
-        const result = await deps.boxes.echo(LOCAL_PRINCIPAL, c.req.param("boxId"), params);
+        const result = await deps.boxes.echo(c.get("principal"), c.req.param("boxId"), params);
         return c.json({ ok: true, result }, 200);
       } catch (error) {
         if (!(error instanceof HearthError)) throw error;
