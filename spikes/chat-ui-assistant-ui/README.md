@@ -18,6 +18,15 @@ npx tsc -p tsconfig.json
 ```
 
 `shot.cjs` serves `dist/` with Hearth's `WEB_CSP` (decision 0017) and exits non-zero
-on any console error or CSP report. Result on 2026-11-15: 3 tool cards, no problems,
-at 900×900 and 390×844; `tsc` 7.0.2 clean; bundle 604.6 kB (182.6 kB gzip) against a
+on any console error, page error or CSP report. CSP reports come from a
+`securitypolicyviolation` listener added with `page.addInitScript`, so a blocked
+`eval`/`new Function` that the page catches (no console error) still fails the run.
+Positive control (review rework 1): adding a caught `new Function("")` to `main.tsx`
+made it exit 1 with `csp-report: script-src eval ...`; the previous console-only
+version exited 0 on the same build. The control was then removed.
+Result on 2026-11-15: 3 tool cards, 0 CSP reports, no problems, at 900×900 and
+390×844. The same holds with `src/zod-jitless.ts` not imported: the bundle never
+calls zod's eval probe, because nothing here compiles a zod object schema, so
+jitless had no measured effect in this spike. The screenshots show markdown raw,
+because the spike does not render or test markdown; `tsc` 7.0.2 clean; bundle 604.6 kB (182.6 kB gzip) against a
 React-only baseline of 218.8 kB (68.3 kB gzip).
