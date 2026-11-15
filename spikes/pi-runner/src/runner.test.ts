@@ -65,7 +65,11 @@ describe("routed tools", () => {
     runtime.faux.setResponses([
       fauxAssistantMessage(
         [
-          fauxToolCall("write", { path: "src/a.ts", content: "export const a = 1;\n" }, { id: "w" }),
+          fauxToolCall(
+            "write",
+            { path: "src/a.ts", content: "export const a = 1;\n" },
+            { id: "w" },
+          ),
           fauxToolCall("read", { path: "notes.txt" }, { id: "r" }),
         ],
         { stopReason: "toolUse" },
@@ -266,9 +270,7 @@ describe("routed tools", () => {
       fauxAssistantMessage("read it"),
     ]);
     await session.prompt("read my todo");
-    expect(box.calls.find((c) => c.method === "fs.read")?.params["path"]).toBe(
-      "/home/box/todo.md",
-    );
+    expect(box.calls.find((c) => c.method === "fs.read")?.params["path"]).toBe("/home/box/todo.md");
     expect(toolResults(session.messages)[0]?.text).toContain("- ship");
     session.dispose();
   });
