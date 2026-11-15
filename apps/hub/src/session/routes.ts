@@ -1,13 +1,15 @@
 /**
  * Session API (#42): create, list, get and archive. Mounted by `server.ts` on
  * the app from `createApp`, after its request guard (decision 0010), so these
- * routes get the same Host/Origin/JSON checks. Every route calls `authorize`
- * through the manager first. There is no login before #44, so the caller is
- * the local principal.
+ * routes get the same Host/Origin/JSON checks, and after its session guard
+ * (decision 0014), so every route has a signed-in principal. Every route calls
+ * `authorize` through the manager first, with that principal (#61): it is also
+ * the principal of the manager's audit rows.
  */
 
-import { HearthError, LOCAL_PRINCIPAL } from "@hearth/core";
-import type { Context, Env, Hono } from "hono";
+import { HearthError } from "@hearth/core";
+import type { Context, Hono } from "hono";
+import type { HubEnv } from "../auth";
 import type { CreateSessionInput, SessionManager } from "./manager";
 
 function statusFor(error: HearthError): 400 | 403 | 404 | 409 | 500 {
@@ -68,7 +70,7 @@ export function parseCreateSession(body: unknown): CreateSessionInput {
   return input;
 }
 
-export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: SessionManager): void {
+export function mountSessionRoutes(app: Hono<HubEnv>, sessions: SessionManager): void {
   app.post("/v1/sessions", async (c) => {
     try {
       let body: unknown;
@@ -77,7 +79,7 @@ export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: Sessio
       } catch {
         throw invalid("the body is not JSON");
       }
-      const session = await sessions.create(LOCAL_PRINCIPAL, parseCreateSession(body));
+      const session = await sessions.create(c.get("principal"), parseCreateSession(body));
       return c.json({ ok: true, session }, 201);
     } catch (error) {
       return failure(c, error);
@@ -85,7 +87,7 @@ export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: Sessio
   });
   app.get("/v1/sessions", async (c) => {
     try {
-      return c.json({ ok: true, sessions: await sessions.list(LOCAL_PRINCIPAL) }, 200);
+      return c.json({ ok: true, sessions: await sessions.list(c.get("principal")) }, 200);
     } catch (error) {
       return failure(c, error);
     }
@@ -93,7 +95,7 @@ export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: Sessio
   app.get("/v1/sessions/:id", async (c) => {
     try {
       return c.json(
-        { ok: true, session: await sessions.get(LOCAL_PRINCIPAL, c.req.param("id")) },
+        { ok: true, session: await sessions.get(c.get("principal"), c.req.param("id")) },
         200,
       );
     } catch (error) {
@@ -102,7 +104,7 @@ export function mountSessionRoutes<E extends Env>(app: Hono<E>, sessions: Sessio
   });
   app.post("/v1/sessions/:id/archive", async (c) => {
     try {
-      const session = await sessions.archive(LOCAL_PRINCIPAL, c.req.param("id"));
+      const session = await sessions.archive(c.get("principal"), c.req.param("id"));
       return c.json({ ok: true, session }, 200);
     } catch (error) {
       return failure(c, error);

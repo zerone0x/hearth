@@ -9,7 +9,7 @@
  */
 
 import { lstatSync, realpathSync, type Stats } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { HearthError } from "@hearth/core";
 
 /** Where `scripts/box-firewall.sh apply` writes its marker (tmpfs; cleared on reboot). */
@@ -53,7 +53,9 @@ const STICKY = 0o1000;
  * symlink) owned by `owner` and writable by nobody else, and every directory
  * on its real path is owned by root or `owner` and is either writable by
  * nobody else or sticky (`/tmp`), so no other user can create, replace or
- * rename the marker or a directory above it. A hub that does not run as the
+ * rename the marker or a directory above it, and it has exactly one hard
+ * link (a hard link to a root file, made in a sticky directory where
+ * `fs.protected_hardlinks=0`, is otherwise root-owned and mode 0644). A hub that does not run as the
  * owner therefore cannot forge the marker, whatever `HEARTH_BOX_EGRESS_MARKER`
  * points at. A hub that runs as root (the compose install) is not held off by
  * any file mode; there the guarantee is that the marker is root's, and compose
@@ -67,12 +69,15 @@ export function untrustedMarker(
   let file: Stats;
   let dir: string;
   try {
-    file = lstat(marker);
+    // Resolve the directory once; the file and the directory walk both use
+    // this resolved path, so a swap between two lookups cannot split them.
     dir = realpathSync(dirname(resolve(marker)));
+    file = lstat(join(dir, basename(marker)));
   } catch {
     return "missing";
   }
   if (!file.isFile()) return "it is not a regular file";
+  if (file.nlink !== 1) return `it has ${file.nlink} hard links, not 1`;
   if (file.uid !== owner) return `it is owned by uid ${file.uid}, not ${owner}`;
   if ((file.mode & GROUP_OR_OTHER_WRITE) !== 0) return "it is writable by group or others";
   for (let at = dir; ; at = dirname(at)) {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -552,6 +552,7 @@ describe("box egress gate (decision 0012)", () => {
         code: "box.egress-unfiltered",
       });
       writeFileSync(marker, "applied\n");
+      chmodSync(marker, 0o644); // not the umask's choice: 0664 under umask 002 is untrusted
       await hub.startBox(LOCAL_PRINCIPAL, spec);
       expect(calls).toEqual(["create", "hubAddress bx", "start"]);
       expect(hub.boxEgress().state).toBe("filtered");

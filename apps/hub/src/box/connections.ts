@@ -294,23 +294,38 @@ export class BoxConnections {
   /**
    * `echo` round trip (the M0 exit criterion). Calls `authorize` first, then
    * sends `rpc` `echo` and resolves with what the box sent back.
+   *
+   * The resource workspace is the box's own (its join binding), so `authorize`
+   * sees, denies and audits an echo to a box of another workspace (#50,
+   * decision 0022). A box that has not said hello, or is not there, has no
+   * binding; it is checked against the caller's workspace.
+   *
+   * A box the caller cannot see (not connected, or connected for another
+   * workspace) answers `box.not-connected` whatever the policy decided, so the
+   * answer never tells an unknown id from another workspace's box. Only a
+   * connected box of the caller's own workspace can answer `authz.denied`.
+   * Visibility is checked after `authorize`, so the box may have connected or
+   * gone meanwhile, and a policy that allowed a cross-workspace echo still
+   * sends nothing to the box.
    */
   async echo(principal: Principal, boxId: BoxId, params: JsonValue): Promise<JsonValue> {
+    const boxWorkspace = this.#byBox.get(boxId)?.binding?.workspaceId ?? principal.workspaceId;
     const decision = await this.#authorizer.authorize(principal, "box.echo", {
-      workspaceId: principal.workspaceId,
+      workspaceId: boxWorkspace,
       type: "box",
       id: boxId,
     });
+    // `#byBox` holds open connections only (`#hello` adds a box as it opens,
+    // `#forget` removes it as it closes), each with its binding.
+    if (this.#byBox.get(boxId)?.binding?.workspaceId !== principal.workspaceId) {
+      throw notConnected(boxId);
+    }
     if (!decision.allowed) {
       throw new HearthError(`box.echo denied: ${decision.reason}`, {
         owner: "user",
         disposition: "give-up",
         code: "authz.denied",
       });
-    }
-    const conn = this.#byBox.get(boxId);
-    if (conn?.binding !== undefined && conn.binding.workspaceId !== principal.workspaceId) {
-      throw notConnected(boxId);
     }
     return await this.rpc(boxId, "echo", params, this.#echoDeadlineMs);
   }

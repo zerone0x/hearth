@@ -1951,6 +1951,68 @@ event log, view-only noVNC desktop, the e2e) stays.
   `session.operation` events now carry `boxId`, so the trajectory's box
   records name the box.
 
+## 0022: The guard's principal reaches every authorize; a box echo and the desktop are authorized against the resource's workspace
+
+- Date: 2026-11-15
+- Status: accepted
+- Issues: #61, #50
+
+### Context
+
+Decision 0014 put a login guard in front of every API route and said that the
+principal of the login session is what handlers pass to `authorize`. The
+session routes (#42) predate it and still passed `LOCAL_PRINCIPAL`. In v1 every
+login yields the owner, so the two are the same principal today, and the
+mistake was invisible; with more principals the audit log would record the
+owner for every session action.
+
+Separately, `box.echo` built its resource from the caller's workspace, not the
+box's. `authorize` never saw a cross-workspace echo, allowed it and audited it
+as allowed; the hub then refused it with its own check (409
+`box.not-connected`). The outcome was right, but the policy and the audit log
+were not (PRD §7 E3, E10).
+
+The desktop bridge had the same flaw: it authorized `desktop.view` against the
+caller's workspace, not the session's.
+
+### Decision
+
+- **Every handler behind the login guard takes the principal from the guard**
+  (`c.get("principal")`): session routes, runner routes, the desktop upgrade
+  (which keeps it in the viewer ticket, so later re-checks compare against the
+  principal that was authorized), and the box echo. Nothing behind the guard
+  names `LOCAL_PRINCIPAL`; the manager's audit rows carry the same principal.
+- **`box.echo` is authorized against the box's workspace**: the workspace of
+  the box's join binding once it said hello, else the caller's (such a box
+  is not visible; see below). A cross-workspace echo is
+  denied and audited as denied by `authorize` itself.
+- **`desktop.view` is authorized against the session's workspace** (the
+  session manager's scope, as the runner does), not the caller's.
+- **A box the caller cannot see answers 409 `box.not-connected`, whatever the
+  policy decided.** A box is visible when it is connected and its binding is
+  the caller's workspace. An unknown id, a box that has not said hello and a
+  box of another workspace all get the same status and body, under any
+  policy, so the answer never reveals that a box with that id exists in
+  another workspace. `authorize` still runs first and its audit row still
+  says what it saw (allowed=0 with its reason for another workspace's box).
+  Only a denial for a visible box answers 403 `authz.denied`.
+- **Visibility is checked after `authorize`**, so a box that connected or left
+  meanwhile is judged as it is now, and a policy that wrongly allows a
+  cross-workspace echo still sends nothing to the box.
+
+### Consequences
+
+- A test (`apps/hub/src/principal.test.ts`) drives each route family through
+  the real hub with a guard that returns a principal other than the owner, and
+  checks that this principal reaches `authorize` and every audit row.
+  Another of its tests signs in a principal of another workspace and checks
+  that `desktop.view` is denied against the session's workspace.
+- `apps/hub/src/authz.test.ts` compares an echo to an unknown id with one to
+  another workspace's box, under an allow-all policy and one that denies
+  `box.echo`: same status, same body, and the audit rows of both.
+- Routes added behind the guard later follow the same rule; the test is the
+  place to add their family.
+
 ## 0023: Box egress hardening: strict allow list, marker trust, firewalld reloads
 
 - Date: 2026-11-15
@@ -2014,3 +2076,18 @@ Follow-ups to 0012 and 0020 from the verification of #52.
   the owner (`markerEgressCheck(marker, { owner })`).
 - Hosts with firewalld need `dbus-monitor` for the watcher (Debian's
   `dbus-bin`).
+
+## 0024: Egress marker: one hard link, one resolved path
+
+Status: accepted. Qualifies 0023.
+
+0023 says nobody but root can create or replace the marker. That holds for
+the default `/run/hearth` and for any directory only root can write. It does
+not hold in a sticky directory such as `/tmp` on a host with
+`fs.protected_hardlinks=0` (the kernel default; systemd sets 1): a user can
+`ln /etc/hostname /tmp/box-egress.applied`, and the result is root-owned,
+mode 0644. So the marker must also have exactly one hard link
+(`box-firewall.sh` writes it with mktemp and mv, so a real marker always
+has one). The check resolves the marker's directory once and uses that
+resolved path for both the file `lstat` and the directory walk. The
+supported place for the marker stays a root-only directory.

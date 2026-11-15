@@ -206,6 +206,15 @@ export class SessionManager {
   /** Resolves once `recover` ran; every public call waits for it. */
   readonly ready: Promise<void>;
 
+  /**
+   * The workspace the sessions live in: the resource workspace of every
+   * session action, also for callers outside the manager (the desktop bridge),
+   * so `authorize` sees the session's workspace, not the caller's (#61).
+   */
+  get scope(): WorkspaceScope {
+    return this.#scope;
+  }
+
   constructor(options: SessionManagerOptions) {
     this.#authorizer = options.authorizer;
     this.#events = options.events;
