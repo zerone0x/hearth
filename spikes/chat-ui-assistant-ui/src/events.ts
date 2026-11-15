@@ -3,7 +3,8 @@
  * (`{seq, ts, type, payload}`, apps/web/src/api.ts on PR #66) with `pi.<type>`
  * events whose payload is the pi AgentSessionEvent the runner records as-is
  * (apps/hub/src/runner/runner.ts:391 on PR #63). Hand-written for the spike,
- * following the event order asserted in runner.test.ts:378-412.
+ * with the event types runner.test.ts:378-412 asserts are present (membership,
+ * not order), in pi's emit order; runner.entry is left out (the chat ignores it).
  */
 export interface HubEvent {
   readonly seq: number;
