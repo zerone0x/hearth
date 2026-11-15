@@ -1,6 +1,6 @@
 # Hearth PRD
 
-> Status: draft v0.1 · 2026-11-15 · Owner: @zerone0x
+> Status: draft v0.2 · 2026-11-15 · Owner: @zerone0x
 
 ## 1. One line
 
@@ -52,7 +52,7 @@ Differentiators:
 
 - Multiple users, orgs, teams, RBAC, SSO.
 - Multi-node / cluster scheduling, rolling upgrades.
-- A home-grown model gateway, budgets, or billing (left to pi providers or magpie).
+- A home-grown model gateway or billing (Bifrost is used instead).
 - Native iOS / Android apps (PWA first).
 - 20+ chat channels; Telegram only.
 - Controlling the user's own computer (local computer use).
@@ -101,15 +101,25 @@ Acceptance: start a 30-minute task from the web, close the browser, open it on a
 - **P0** Messaging a hibernated session → start the container, restore the pi session, continue. The user only sees "waking up".
 - **P1** Sessions running a scheduled task or waiting on an approval don't hibernate.
 - **P2** Process-level snapshots (CRIU) so Chrome page state survives too.
+- Rules (see §8.1):
+  - **Durable files and process snapshots are separate layers.** The volume is the source of truth and must survive a cold boot on its own; a process snapshot is an optional speed-up layered on top.
+  - A snapshot that fails to restore is kept aside for inspection, never deleted, and the session falls back to a cold boot from the volume.
+  - A wake waits for any hibernate still in flight; a message arriving while a box is going down is queued and replayed after wake.
+  - A woken box must prove it reconnected to the hub within a deadline, or the wake counts as failed and is retried as a cold boot.
+  - box-agent and pi live in the image's top layer, outside the snapshot, so upgrading pi does not invalidate snapshots.
+  - A turn interrupted by a box dying is re-asked from the start of the turn (no mid-turn resume in v1), and the user sees that it was re-asked.
 
 Acceptance: with 50 hibernated sessions, host idle memory differs from zero sessions by < 200 MB; wake to first token < 15 s.
 
 ### 6.4 Model access
 
-- **P0** Use pi's own provider configuration (API key / subscription sign-in), managed centrally in hub settings and delivered to boxes.
-- **P0** Support an OpenAI- / Anthropic-compatible base URL (e.g. a local magpie gateway).
-- **P1** Switch model per session.
-- Secrets live only in the hub; boxes get short-lived credentials issued by the hub, or go through a hub proxy (see §12, open questions).
+- **P0** Default gateway: **Bifrost** (self-hosted, on the internal network only). Provider keys live in Bifrost; the hub creates **one virtual key per session** with a budget, rate limit and an explicit model allowlist (empty means none, never "all"), injects it into the box, and revokes it when the session is archived or deleted.
+- **P0** pi in the box uses a custom provider pointing at Bifrost with the session's virtual key. **A box never holds a provider key.**
+- **P0** Alternative `direct` gateway: pi's own provider configuration, or an OpenAI- / Anthropic-compatible base URL such as a local magpie gateway (for multiplexing personal subscriptions).
+- **P1** Switch model per session (updates the virtual key's allowlist).
+- **P1** Per-session spend and tokens come from the gateway's request log, keyed by the session's virtual key, and feed the Retro (§6.8).
+- Subscriptions: Bifrost can pass a subscription token through while still applying the virtual key's governance, but the token then lives in the box. Allowed, off by default, and labelled as such in settings.
+- A model the provider has retired is refused with a message naming a replacement — never silently rerouted to another model.
 
 ### 6.5 Approvals
 
@@ -127,6 +137,9 @@ Acceptance: with 50 hibernated sessions, host idle memory differs from zero sess
 - **P1** Cron: expression + time zone + prompt + target (fixed session / new session each time).
 - **P1** Webhook: a URL with a secret; the request body is attached to the prompt as context.
 - **P1** Trigger history: fire time, session, result.
+- **P1** Default run mode for a recurring trigger: **persistent workspace, fresh context**. Each run continues in the same session's files but starts a new conversation, opened by a hub-written preamble (run number, previous outcome, what changed). Alternatives (fully fresh session, fully shared context) are per-trigger options; the extremes respectively lose state and grow context without bound.
+- **P1** A run whose previous run is still going is skipped and recorded as skipped. A trigger claim is a single conditional update, so one tick fires at most once.
+- **P2** Pre-warm the session's box shortly before a scheduled run.
 
 ### 6.8 Retro
 
@@ -156,8 +169,8 @@ Principle: **implement only the personal-edition variant now, but design each in
 | E4 | **BoxProvider**: `create / start / stop / destroy / snapshot / attach` | Local Docker | Remote Docker, Kubernetes, gVisor, cloud VMs |
 | E5 | **Hub↔Box protocol**: box dials out, one multiplexed connection | Same host, over unix socket or localhost | Cross-host / cross-network (enterprise data plane) |
 | E6 | **EventStore**: append-only log + cursor reads | SQLite | Postgres, object-storage archive |
-| E7 | **SecretStore**: read / write secrets | Encrypted local file (master key from env) | KMS / Vault |
-| E8 | **ModelGateway**: how a box gets model access | Direct to providers or via magpie | Unified gateway + budgets + virtual keys |
+| E7 | **SecretStore**: secrets are stored as *references* (`env:`, `file:`) resolved at use, with a short cache; UI shows fingerprints, never values | `env:` / `file:` resolvers | `vault:` / KMS resolvers |
+| E8 | **ModelGateway**: issues and revokes per-session credentials, reports usage | Bifrost (one virtual key per session); `direct` / magpie as an alternative | Bifrost Enterprise or another gateway; team / org budget layers |
 | E9 | **Channel**: message entry adapters | Web, Telegram | Slack, Teams, Lark, etc. |
 | E10 | **Audit**: every `authorize` decision and admin action is written to the event stream | Written, no UI | Audit log UI, compliance export |
 
@@ -191,8 +204,10 @@ Hard rules:
      │ Xvnc + WM       │    │                │
      │ /workspace (vol)│    │                │
      └────────┬────────┘    └────────────────┘
+              ▼ per-session virtual key
+   bifrost (internal only; holds provider keys, budgets, request log)
               ▼
-   Models: provider APIs / subscriptions / magpie gateway
+   Model providers (or `direct` / magpie, see §6.4)
 ```
 
 - **hub**: one process, TypeScript (Bun), SQLite. Owns all state; boxes are disposable.
@@ -200,7 +215,37 @@ Hard rules:
 - **One connection for everything**: the box starts with a one-time token and connects to the hub; control, events, VNC and file transfer are multiplexed on it. The box exposes no ports.
 - **Single source of state**: the session state machine lives only in the hub. A box dropping off means the hub decides to fail or restart it; the box never decides on its own.
 
-### 8.1 pi version policy
+### 8.1 Reliability principles
+
+These are the foundation; every feature is built on them.
+
+1. **No silent failure.** Every message ends in exactly one of: a turn, a visible retry, or a visible give-up. The hub runs a sweep that finds messages with no turn (re-ask, bounded) and turns with no progress for too long (end visibly, or wake if hibernated).
+2. **Classify before recovering.** Every failure is tagged with an owner (`box`, `model-provider`, `gateway`, `hub`, `user`) and a retry disposition. A model-provider failure never destroys a box; a box failure never burns model retries.
+3. **Separate clocks.** Tool silence and model silence are timed independently. Tool grace derives from the tool's own budget; model liveness counts any bytes from the provider. A stalled model stream gets a bounded number of resumes per episode (refunded on progress), with a per-turn cap; the last attempt may switch to a fallback model.
+4. **Stuck is counted, not timed.** "Stuck" means N identical consecutive failures, not "took longer than T". Every network call has a per-attempt deadline; long operations scale their deadline with the amount of work.
+5. **At-least-once with idempotent apply.** The box buffers outbound frames and redelivers after reconnect; each frame carries a delivery id and the box's boot id; the hub acks only after a frame is applied (written to the EventStore), not when received. Applying the same delivery twice is a no-op.
+6. **Every state has an explicit answer.** No "unknown" results: e.g. a hibernate request returns one of a fixed set of outcomes, and an intent is logged before it is acted on.
+7. **Long-running orchestration is persisted.** After a hub restart, in-flight orchestration (a wake, a hibernate, a trigger run) is marked interrupted and surfaced, not silently resumed.
+8. **Name the slow thing.** No global timeout bumps; a slow call gets its own named deadline.
+
+### 8.2 Hub↔box protocol
+
+- One outbound WebSocket from box-agent to the hub, authenticated by a one-time token exchanged for a per-box credential.
+- Two kinds of traffic share it:
+  - **Typed frames**: `session.assign`, `turn.start`, `turn.event`, `turn.end`, `session.hibernate`, `hibernate.done`, `usage.report`, `rpc` / `rpc.result`, `delivery.ack`, `desktop.lock`, …
+  - **Byte streams**: `stream.open` / `stream.data` / `stream.close`, ordered per stream, used for VNC (RFB) and file transfer.
+- Frames are versioned; the hub rejects a box speaking an incompatible major version with a clear message instead of misbehaving.
+- The protocol never carries hub-local paths or addresses, so a box can later run on another host (E5).
+
+### 8.3 Desktop control
+
+- One lock per box. Holders: `person`, `agent`, `automation`; first come, first served.
+- The lock is a lease the holder renews; a dead holder's lease lapses on its own. The box stops trusting its grant slightly before the hub would expire it.
+- A person renews by interacting. A person who finds the lock held may interrupt the holding turn, but cannot silently skip the queue.
+- While the agent waits for the lock, its turn clocks are paused.
+- Every desktop stream is authorized when opened and closed if access is revoked.
+
+### 8.4 pi version policy
 
 - Always build on the **latest pi release**: `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`. Baseline at time of writing: **1.5.2** (2026-11-10).
 - The old `@mariozechner/*` package names are frozen at 0.73.x and must not be used.
@@ -213,10 +258,11 @@ Stack (can change before implementation):
 | Part | Choice | Why |
 |---|---|---|
 | hub | Bun + Hono + bun:sqlite | Same TS ecosystem as pi; single-binary deploy |
-| box-agent | Bun + `@earendil-works/pi-coding-agent` SDK (`createAgentSession`) | pi-native, in-process; see §8.1 |
+| box-agent | Bun + `@earendil-works/pi-coding-agent` SDK (`createAgentSession`) | pi-native, in-process; see §8.4 |
 | Web | React + Vite + Tailwind, PWA; noVNC | Conventional, works on mobile |
 | Box image | Debian slim + TigerVNC + Openbox + Chromium | Light and stable |
-| Deploy | docker compose (hub + reverse proxy); hub manages boxes via the Docker socket | One command |
+| Gateway | Bifrost (Go, self-hosted) | Virtual keys, budgets, request log; small footprint; has an enterprise path |
+| Deploy | docker compose (hub + bifrost + reverse proxy); hub manages boxes via the Docker socket | One command |
 
 ## 9. Data model (sketch)
 
@@ -245,7 +291,10 @@ secret(id, workspace_id, name, ciphertext, created_at)
 - Login: password + optional passkey; session cookie `HttpOnly`, `SameSite=Strict`.
 - Boxes are network-isolated from each other (one Docker network per box, egress only to the internet and the hub).
 - Boxes hold no long-lived secrets (see §6.4).
-- Desktop takeovers, approvals and settings changes are written to the event stream (E10).
+- Desktop takeovers, approvals and settings changes are written to the event stream (E10). **The audit record is written before the action**; if it cannot be written, the action does not happen. The audit table is append-only, enforced in the database (SQLite triggers), not just by convention.
+- Secrets are references resolved at use; a preflight at startup checks every reference resolves. Logs and UI show only fingerprints.
+- Telegram: only paired chats are served. A stranger gets one pairing prompt and then silence. Display names in chats are labels, not identity.
+- Every external poller (Telegram, trigger scheduler) runs under a single lease, so a restart or a second hub instance never sends duplicate replies.
 - Retro runs locally or against a model the user configured; no data is sent to third parties by default.
 
 ## 11. Milestones
@@ -261,7 +310,8 @@ secret(id, workspace_id, name, ciphertext, created_at)
 
 ## 12. Open questions
 
-1. **Giving boxes subscription access safely**: sign in inside the box (simple, but credentials live in the box) vs. proxy all model calls through the hub (safer, but must handle each vendor's protocol). Leaning: hub proxy in v1, or reuse magpie. pi's own containerization guide (Docker Sandboxes / OpenShell credential substitution) is prior art to evaluate.
+1. **Subscriptions in boxes** (API keys are settled by §6.4): subscription passthrough puts the token in the box. Is that acceptable as an opt-in, or should subscriptions be served only through a host-side proxy (magpie, or pi's Docker Sandboxes / OpenShell credential substitution)?
+7. **Box per session vs. box per person**: v1 is one box per session for isolation. Chromium + desktop per box costs ~0.5 GB RAM while running. If density matters later, `BoxProvider` can offer a shared box with a per-session workspace, Chrome profile and port range — trading isolation for density. Hibernation makes per-session affordable for one user.
 2. **Persisting and restoring pi session state**: can pi's session files (via `SessionManager`) on the volume fully restore a session hibernated mid-turn? Needs a spike against the current pi release.
 3. **Telegram session mapping**: one forum topic per session, or reply threads?
 4. **Retro model**: cheap hosted model by default, or allow local models? What cost cap?
