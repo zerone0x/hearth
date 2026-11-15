@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
+import { DEFAULT_IDLE_MS } from "./session";
 import {
   type BoxNetworkProvider,
   DEFAULT_BOX_PORT,
@@ -29,6 +30,21 @@ export function boxProviderFromEnv(
   return new DockerBoxProvider({ config: dockerBoxConfigFromEnv(env) });
 }
 
+/**
+ * Minutes a session may sit idle before its box is stopped
+ * (`HEARTH_IDLE_MINUTES`, PRD §6.3: default 15). Rejects anything that is not
+ * a positive number instead of silently falling back.
+ */
+export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env["HEARTH_IDLE_MINUTES"];
+  if (raw === undefined || raw === "") return DEFAULT_IDLE_MS;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    throw new Error(`HEARTH_IDLE_MINUTES must be a positive number, got "${raw}"`);
+  }
+  return Math.round(minutes * 60_000);
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -49,6 +65,8 @@ if (import.meta.main) {
     ...(provider === undefined ? {} : { provider }),
     boxEgress,
     dbPath: join(dataDir, "hearth.db"),
+    ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
+    sessions: { idleMs: idleMsFromEnv(process.env) },
     log: (line) => console.log(line),
   });
 

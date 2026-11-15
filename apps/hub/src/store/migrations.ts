@@ -168,6 +168,26 @@ export const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    // The session manager's long-running orchestration (a wake, a hibernate),
+    // logged before it acts so a hub restart can mark it interrupted
+    // (PRD §8.1 principle 7; docs/DECISIONS.md, 0013).
+    version: 4,
+    name: "session operations",
+    sql: `
+      CREATE TABLE session_operation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        session_id TEXT NOT NULL REFERENCES session (id),
+        kind TEXT NOT NULL CHECK (kind IN ('wake', 'hibernate')),
+        status TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed', 'interrupted')),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        detail_json TEXT CHECK (detail_json IS NULL OR json_valid(detail_json))
+      ) STRICT;
+      CREATE INDEX session_operation_by_status ON session_operation (workspace_id, status);
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */
