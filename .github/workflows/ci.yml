@@ -169,3 +169,113 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/box/tools.docker.test.ts
+
+  # Prototype exit e2e (PRD §11.1, #47, decision 0020): docs/install.md run
+  # verbatim on the runner (every block tagged install:<step>, extracted by
+  # scripts/doc-block.sh), then Playwright walks every exit criterion against
+  # the compose install, with the faux model server standing in for the model.
+  compose-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DOC: ${{ github.workspace }}/docs/install.md
+      BLOCK: ${{ github.workspace }}/scripts/doc-block.sh
+      HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/compose-e2e
+      HEARTH_E2E_STATE: ${{ runner.temp }}/compose-e2e-state.json
+      HEARTH_FAUX_KEY: sk-faux-compose-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Install Chromium for Playwright
+        working-directory: deploy/e2e
+        run: timeout 300 bun x playwright install --with-deps --only-shell chromium
+      - name: Lint the deploy Dockerfiles and scripts
+        run: |
+          docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/hub.Dockerfile
+          docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/firewall.Dockerfile
+          shellcheck scripts/doc-block.sh deploy/firewall-entrypoint.sh
+      - name: Start the faux model server (127.0.0.1:18080)
+        run: |
+          nohup bun deploy/e2e/faux-model.ts 18080 > "$RUNNER_TEMP/faux-model.log" 2>&1 &
+          curl --retry 20 --retry-connrefused --retry-delay 1 -fsS http://127.0.0.1:18080/faux/requests
+      - name: "install.md: prerequisites"
+        working-directory: deploy
+        run: bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:prereq)"
+      - name: "install.md: configure (then the owner's .env edit: the faux model)"
+        working-directory: deploy
+        run: |
+          bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:configure)"
+          # The edit install.md asks for, done with the models-file option it documents.
+          cat > config/models.json <<'JSON'
+          {"providers":{"faux-http":{"baseUrl":"http://127.0.0.1:18080/v1","api":"openai-completions","models":[{"id":"faux-1","name":"Faux"}]}}}
+          JSON
+          sed -i -e 's/^HEARTH_MODEL_PROVIDER=.*/HEARTH_MODEL_PROVIDER=faux-http/' \
+            -e 's/^HEARTH_MODEL=.*/HEARTH_MODEL=faux-1/' \
+            -e 's|^HEARTH_MODELS_FILE=.*|HEARTH_MODELS_FILE=/etc/hearth/models.json|' .env
+          cat .env
+      - name: "install.md: add the model key"
+        working-directory: deploy
+        env:
+          HEARTH_MODEL_KEY: ${{ env.HEARTH_FAUX_KEY }}
+        run: |
+          bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:key)"
+          test "$(stat -c %a secrets/model_key)" = 600
+      - name: "install.md: start"
+        working-directory: deploy
+        run: timeout 1800 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:up)"
+      - name: The firewall is in place
+        run: |
+          sudo iptables -S HEARTH-BOX-IN
+          sudo iptables -S HEARTH-BOX-FWD
+          cat /run/hearth/box-egress.applied
+          curl -fsS http://127.0.0.1:8787/healthz
+      - name: "install.md: setup token"
+        working-directory: deploy
+        run: |
+          out="$(bash -euo pipefail -c "$("$BLOCK" "$DOC" install:setup-token)")"
+          token="$(grep -oE 'hst_[A-Za-z0-9_-]+' <<<"$out" | head -1)"
+          test -n "$token"
+          echo "::add-mask::$token"
+          echo "HEARTH_SETUP_TOKEN=$token" >> "$GITHUB_ENV"
+      - name: "Exit criteria: hub, login, session, tool calls in /workspace, desktop, reopen, refusals"
+        run: timeout 600 bun deploy/e2e/prototype.ts install
+      - name: "install.md: upgrade"
+        working-directory: deploy
+        run: |
+          timeout 900 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:upgrade)"
+      - name: After the upgrade the session continues
+        run: timeout 300 bun deploy/e2e/prototype.ts upgrade
+      - name: "install.md: uninstall"
+        working-directory: deploy
+        run: |
+          timeout 300 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:uninstall)"
+          ! sudo iptables -S HEARTH-BOX-IN 2>/dev/null
+          test ! -e /run/hearth/box-egress.applied
+          test -z "$(docker ps -aq --filter label=dev.hearth.managed=true)"
+          test -z "$(docker network ls -q --filter label=dev.hearth.managed=true)"
+          docker volume ls --filter label=dev.hearth.managed=true
+      - name: "install.md: purge"
+        working-directory: deploy
+        run: |
+          timeout 300 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:purge)"
+          test -z "$(docker volume ls -q --filter label=dev.hearth.managed=true)"
+          ! docker volume inspect hearth_hearth-data >/dev/null 2>&1
+          ! docker image inspect hearth-hub:local >/dev/null 2>&1
+      - name: Logs
+        if: failure()
+        working-directory: deploy
+        run: |
+          docker compose logs --no-color || true
+          cat "$RUNNER_TEMP/faux-model.log" || true
+          docker ps -a
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-e2e-screenshots
+          path: ${{ runner.temp }}/compose-e2e
+          if-no-files-found: ignore
