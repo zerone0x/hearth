@@ -211,3 +211,62 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
 - **`scripts/box-smoke.sh` is the image test**, run by the `box-image` CI job
   together with hadolint and shellcheck. It is not part of `bun run check`, which
   must pass without Docker.
+
+## 0006: Hub SQLite store, event log and audit log
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #4
+
+### Decision
+
+- **Hub persistence lives in `apps/hub/src/store`**, not in a new workspace: the
+  hub owns all state (AGENTS.md, layout) and is the only user of SQLite. The
+  store is the only code that imports `bun:sqlite`; the rest of the hub uses the
+  `EventStore` and `AuditSink` interfaces from `@hearth/core`.
+- **Connection settings** (`openDatabase`): `journal_mode = WAL`,
+  `synchronous = FULL`, `foreign_keys = ON` and
+  `busy_timeout = BUSY_TIMEOUT_MS` (5 s). `FULL` rather than WAL's usual
+  `NORMAL`, because "ack on apply" and "audit before act" both need a commit to
+  be on disk when it returns.
+- **Migrations** are a numbered, forward-only list in `migrations.ts`, recorded
+  in `schema_migration`. Each runs in its own `BEGIN IMMEDIATE` transaction
+  together with its record, so it applies fully or not at all, and two hubs
+  starting at once never apply one twice. The runner runs at every open and is
+  re-runnable. A database at a newer version than the code knows is refused
+  (`store.schema-too-new`). Shipped migrations are never edited.
+- **M0 schema** (migration 1): `workspace` (seeded with `ws_default`),
+  `session`, `box`, `event`, `audit`, with the columns of PRD §9. Every table
+  except `workspace` (whose `id` is the workspace) has `workspace_id`. `event`
+  has no foreign key to `session`, so the event log does not depend on the
+  session manager's write order.
+- **The `event` primary key is `(workspace_id, session_id, seq)`**, a widening
+  of PRD §9's `(session_id, seq)`, so a session id can never collide across
+  workspaces (E1). Box deliveries are unique on
+  `(workspace_id, boot_id, delivery_id)` through a partial unique index.
+- **`seq` assignment**: `max(seq) + 1` for the session inside a
+  `BEGIN IMMEDIATE` transaction, which takes the write lock before the read, so
+  concurrent appends from any connection or process stay gap-free.
+- **Idempotent apply**: a delivery already stored for the same session returns
+  its original `seq` with `duplicate: true`. The same delivery key on a
+  different session is a box bug, not a redelivery: the append rejects with a
+  `box`-owned `event.delivery-conflict`, so the hub never acks an event it did
+  not store.
+- **Append-only in the database**: `BEFORE UPDATE` and `BEFORE DELETE`
+  triggers on both `audit` and `event` abort with `<table> is append-only`
+  (PRD §10).
+- **`audit` stores the record flat**: principal, action, the resource's
+  workspace, type and id, the decision (`allowed`, `policy`, `reason`, all null
+  for an admin action audited directly) and `detail_json`. `SqliteAuditSink`
+  plugs into `withAudit` and `AllowAllAuthorizer` from core unchanged.
+- **Reads** return at most `MAX_READ_LIMIT` (1000) events per page, whatever the
+  caller asks for; `hasMore` comes from fetching one extra row in the same
+  statement. A negative or fractional cursor, or a limit below 1, rejects with
+  `event.invalid`.
+
+### Consequences
+
+- Schema changes are new migrations; editing migration 1 after it ships would
+  leave existing databases behind.
+- Removing event or audit rows (for example a retention policy) needs a
+  migration that drops the trigger, and a new decision entry.
