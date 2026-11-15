@@ -1827,3 +1827,18 @@ Follow-ups to 0012 and 0020 from the verification of #52.
   the owner (`markerEgressCheck(marker, { owner })`).
 - Hosts with firewalld need `dbus-monitor` for the watcher (Debian's
   `dbus-bin`).
+
+## 0024: Egress marker: one hard link, one resolved path
+
+Status: accepted. Qualifies 0023.
+
+0023 says nobody but root can create or replace the marker. That holds for
+the default `/run/hearth` and for any directory only root can write. It does
+not hold in a sticky directory such as `/tmp` on a host with
+`fs.protected_hardlinks=0` (the kernel default; systemd sets 1): a user can
+`ln /etc/hostname /tmp/box-egress.applied`, and the result is root-owned,
+mode 0644. So the marker must also have exactly one hard link
+(`box-firewall.sh` writes it with mktemp and mv, so a real marker always
+has one). The check resolves the marker's directory once and uses that
+resolved path for both the file `lstat` and the directory walk. The
+supported place for the marker stays a root-only directory.
