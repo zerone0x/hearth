@@ -68,10 +68,11 @@ tool-group pattern from eve.** Details, costs and risks below.
 - **Event model.** The runner records every pi AgentSession event as-is, as
   `pi.${event.type}` (`hearth@444e9cd:apps/hub/src/runner/runner.ts:391`), plus
   `runner.*` notices (`runner.ts:276` outcome-unknown, `:353` interrupted, and
-  `runner.failed`) and `runner.usage`. The order is asserted in
-  `apps/hub/src/runner/runner.test.ts:378-412` (agent_start, turn_start,
-  message_update with `text_delta`, message_end, tool_execution_start/end,
-  agent_end).
+  `runner.failed`) and `runner.usage`. `apps/hub/src/runner/runner.test.ts:378-412`
+  asserts that the log *contains* these types (`toContain`, not their order):
+  agent_start, turn_start, message_update with `text_delta`, message_end,
+  tool_execution_start/end and agent_end, plus `runner.entry` and `runner.usage`;
+  only `runner.header` is pinned, as the first event.
 - **Client reducer.** `hearth@9315289:apps/web/src/chat.ts:100-198` folds the log
   into four item kinds (user, assistant, tool, notice). It reads `message.user` for
   user text (`:106-112`), takes the assistant text from the full message carried by
@@ -190,8 +191,9 @@ tool-group pattern from eve.** Details, costs and risks below.
 
 - **License and maintenance.** MIT (`assistant-ui:LICENSE:1-3`), 13.2k stars,
   pushed 2026-11-15, near-daily npm releases. `@assistant-ui/react@0.15.36` depends
-  on `@assistant-ui/core`, `store`, `tap`, `assistant-stream`, `radix-ui`, `zod` and
-  `zustand` (`packages/react/package.json:68-78`); it is pre-1.0, so expect API churn
+  on `@assistant-ui/core`, `store`, `tap`, `assistant-cloud`, `assistant-stream`,
+  `radix-ui`, `react-textarea-autosize`, `safe-content-frame`, `zod` and `zustand`
+  (`packages/react/package.json:68-78`; the same ten in the published 0.15.36); it is pre-1.0, so expect API churn
   (example: `makeAssistantToolUI` is now `@deprecated` in favour of toolkit entries or
   `MessagePrimitive.Parts` overrides,
   `packages/core/src/react/model-context/makeAssistantToolUI.ts:7-16`).
@@ -199,7 +201,10 @@ tool-group pattern from eve.** Details, costs and risks below.
   supply `messages`, `convertMessage`, `isRunning`, `onNew`, `onCancel`
   (`apps/docs/content/docs/runtimes/custom/external-store.mdx:73-140`). No AI SDK is
   needed.
-- **pi support already exists.** `@assistant-ui/react-pi` (MIT, 0.0.33):
+- **pi support already exists.** `@assistant-ui/react-pi` (MIT, 0.0.33; it has an
+  *optional* peer dependency on `@earendil-works/pi-coding-agent >=0.80.8`, which
+  1.5.2 satisfies, and a peer on `@assistant-ui/react ^0.15.22`; the spike installs
+  with `npm install --legacy-peer-deps`):
   "`@assistant-ui/react-pi` — **browser-safe**. The runtime hook, the pure event
   reducer, the message projection, and the HTTP `PiClient`. This entry **never**
   imports `@earendil-works/pi-*`" (`packages/react-pi/README.md:15-19`). Its
@@ -239,8 +244,15 @@ tool-group pattern from eve.** Details, costs and risks below.
   above). One known issue: "zod probes `new Function` when it builds its first
   object schema, which a strict CSP reports as a script-src violation even though
   zod catches it", fixed with `config({ jitless: true })` imported first
-  (`apps/docs/content/docs/guides/vscode.mdx:128-132`, `:233`). The spike does that
-  and gets zero violations under Hearth's `WEB_CSP`. Only the primitives used in the
+  (`apps/docs/content/docs/guides/vscode.mdx:128-132`, `:234`). The spike imports
+  that shim and gets zero violations under Hearth's `WEB_CSP`, but **jitless had no
+  measured effect in the spike**: with the shim removed the build also gives zero
+  CSP reports, because zod's eval probe is not in the bundle (nothing in the spike
+  compiles a zod object schema). It matters once something does, for example tool
+  parameter schemas. Hearth's own e2e (0017, `apps/web/e2e/run.ts:54-55` on #66)
+  only collects CSP *console* messages, and a caught `new Function` raises a
+  `securitypolicyviolation` report with no console error, so it has the same blind
+  spot the spike's `shot.cjs` had before review; the #66 rework handles that. Only the primitives used in the
   spike were tested; the styled registry components (`npx assistant-ui add thread`)
   were not.
 - **Styling.** Primitives are unstyled; the styled set is shadcn-style source copied
@@ -280,7 +292,7 @@ backend contract Hearth does not want, so it was not evaluated further
 | Feeds from Hearth log | yes | only via a new pi → eve converter | via a pi → `UIMessage` converter | yes, but runs the agent in the browser | **yes: strip `pi.` prefix (tested)** |
 | Needs its backend | no | eve session API (`/eve/v1/*`) | AI SDK route handlers (by design) | in-browser `Agent` + keys | no (`useExternalStoreRuntime`) |
 | Vite SPA without Next.js | yes | components yes, shell no | yes with work (documented for Next.js) | yes | **yes (tested)** |
-| Strict CSP (0017) | yes | shell has 3 inline scripts | untested; Shiki/inline-HTML risks | untested; artifacts use iframes | **yes, 0 violations with zod jitless (tested)** |
+| Strict CSP (0017) | yes | shell has 3 inline scripts | untested; Shiki/inline-HTML risks | untested; artifacts use iframes | **yes, 0 CSP reports (tested; jitless not needed by the spike)** |
 | TypeScript 7.0.2 | yes | untested | untested | untested | **yes with `skipLibCheck` (tested)** |
 | Tool grouping | no | yes (best summary text) | no (per-tool cards) | no | yes (`GroupedParts`) |
 | Collapsible output, status | yes, 5 states | yes, 4 states | yes, 7 AI SDK states | yes | yes; Hearth maps its 5 states |
@@ -309,7 +321,7 @@ What we gain: grouping, markdown, reasoning blocks, approval
 primitives for M3, a composer with accessible controls, and a reducer maintained
 against pi's event set by someone else. What we lose or pay: ~114 kB gzip of JS, a
 pre-1.0 dependency with frequent API churn (pin exactly, as 0017 already requires),
-a zod-jitless shim to keep the CSP clean, and Hearth-specific states that need small
+a zod-jitless shim once zod compiles object schemas (tool parameter schemas), and Hearth-specific states that need small
 extensions (below).
 
 Keep Hearth's own pieces where the library has no notion of them:
@@ -355,19 +367,30 @@ Branch `spike/chat-ui-assistant-ui` (never merged), directory
 `spikes/chat-ui-assistant-ui/`:
 
 - `src/events.ts`: a hand-written event log in Hearth's envelope
-  (`{seq, ts, type, payload}`) with pi event payloads in the order
-  `runner.test.ts:378-412` asserts: one user prompt, two tool calls in one step, a
+  (`{seq, ts, type, payload}`) with the pi event types `runner.test.ts:378-412`
+  asserts are present (it checks membership, not order; it also expects
+  `runner.header` first, which the spike log has, and a `runner.entry`, which it
+  leaves out because the chat view ignores it), in pi's emit order: one user prompt, two tool calls in one step, a
   failing `npm test`, and a final answer. It is **not** captured from a live hub (no
   Docker here), so payload details beyond what the tests assert are my reading of
   pi's event types.
 - `src/main.tsx`: Vite + React 19 + Tailwind 4, `useExternalStoreRuntime`, grouped
   tool rows, Hearth's tool-card markup.
 - `shot.cjs`: serves `dist/` with Hearth's exact `WEB_CSP`, loads it in headless
-  Chromium, fails on any console error or CSP report, and saves a screenshot.
+  Chromium, saves a screenshot, and exits non-zero on any console error, page error
+  or CSP report. Reports come from a `securitypolicyviolation` listener installed
+  with `page.addInitScript` before any page script runs (spike commit `714d3bb`;
+  the first version, `da5677d`, only watched the console and so passed a caught
+  `eval`). Positive control: a caught `new Function("")` added to `main.tsx` made
+  it exit 1 with `csp-report: script-src eval …`, while the console-only version
+  exited 0 on the same build; the control was then removed.
 
-Results: 3 tool cards rendered, `problems: []` (no CSP violations, no errors) at
-900×900 and 390×844; `tsc` 7.0.2 clean. Screenshots (spike commit `da5677d`):
-[desktop](https://github.com/zerone0x/hearth/blob/da5677d/spikes/chat-ui-assistant-ui/shot-desktop.png), [mobile](https://github.com/zerone0x/hearth/blob/da5677d/spikes/chat-ui-assistant-ui/shot-mobile.png). A first attempt with `usePiRuntime` (react-pi's
+Results: 3 tool cards rendered, 0 CSP reports and `problems: []` at 900×900 and
+390×844 (also with the zod-jitless shim removed); `tsc` 7.0.2 clean. Screenshots
+(spike commit `714d3bb`):
+[desktop](https://github.com/zerone0x/hearth/blob/714d3bb/spikes/chat-ui-assistant-ui/shot-desktop.png), [mobile](https://github.com/zerone0x/hearth/blob/714d3bb/spikes/chat-ui-assistant-ui/shot-mobile.png).
+Markdown in the final answer is shown raw (`**2 of 3 tests pass**`), because the
+spike neither renders nor tests markdown. A first attempt with `usePiRuntime` (react-pi's
 full runtime with a thread list) rendered nothing within 10 s with a single
 `threadId`; I did not debug it, because the external-store path is the better fit
 for Hearth's one-session-per-page UI anyway.
@@ -383,7 +406,10 @@ for Hearth's one-session-per-page UI anyway.
    look.
 2. Map `runner.failed`, `runner.interrupted` and `runner.outcome-unknown` onto
    message errors and tool-part status, add eve-style grouped tool rows and
-   markdown, and enable zod jitless mode so the CSP e2e stays clean.
+   markdown. Enable zod jitless mode before anything imports zod once the UI
+   compiles zod object schemas (tool parameter schemas, for example); the spike did
+   not need it. The e2e must catch `securitypolicyviolation` reports, not only CSP
+   console messages, or a caught eval passes unseen (handled in the #66 rework).
 3. Record the dependency and bundle cost in a DECISIONS entry; keep the existing
    chat tests passing against the new renderer (same event logs in, same visible
    states out).
