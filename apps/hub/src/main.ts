@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { createDefaultSecretStore } from "@hearth/core";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
 import { boxEgressFromEnv } from "./box/egress";
+import { observabilityFromEnv } from "./obs/setup";
 import type { RunnerConfig } from "./runner";
 import {
   type BoxNetworkProvider,
@@ -100,10 +101,18 @@ if (import.meta.main) {
   mkdirSync(dataDir, { recursive: true });
   const runnerConfig = runnerConfigFromEnv(process.env);
   const webRoot = webRootFromEnv(process.env);
+  // JSON logs and optional OTLP export (decision 0021, obs/setup.ts).
+  const obs = observabilityFromEnv(process.env);
   const hub = startHub({
     ...(runnerConfig === undefined
       ? {}
-      : { runner: { config: runnerConfig, secrets: createDefaultSecretStore() } }),
+      : {
+          runner: {
+            config: runnerConfig,
+            secrets: createDefaultSecretStore(),
+            telemetry: obs.telemetry,
+          },
+        }),
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
     port: parsePort(process.env["HEARTH_PORT"]),
     // Box listeners bind each box network's gateway on this port (0012).
@@ -115,7 +124,7 @@ if (import.meta.main) {
     ...(webRoot === undefined ? {} : { webRoot }),
     ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
     sessions: { idleMs: idleMsFromEnv(process.env) },
-    log: (line) => console.log(line),
+    log: obs.logger.lines(),
   });
 
   console.log(`hearth hub listening on ${hub.url} (box provider: ${provider?.name ?? "none"})`);
@@ -136,7 +145,10 @@ if (import.meta.main) {
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
-      void hub.stop().then(() => process.exit(0));
+      void hub
+        .stop()
+        .then(() => obs.telemetry.shutdown())
+        .then(() => process.exit(0));
     });
   }
 }

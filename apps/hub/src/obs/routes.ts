@@ -21,6 +21,7 @@ import {
 } from "@hearth/core";
 import type { Context, Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { redactHub } from "./redaction";
 import { buildTrajectory, LABEL_OUTCOMES, type TrajectoryRecord, toJsonl } from "./trajectory";
 
 export interface TrajectoriesOptions {
@@ -147,7 +148,7 @@ export function mountTrajectoryRoutes(app: Hono<HubEnv>, trajectories: Trajector
   app.get("/v1/sessions/:id/trajectory", async (c) => {
     try {
       const records = await trajectories.trajectory(c.get("principal"), c.req.param("id"));
-      return c.body(toJsonl(records), 200, {
+      return c.body(redactHub(toJsonl(records)), 200, {
         "content-type": "application/x-ndjson; charset=utf-8",
         "content-disposition": `attachment; filename="trajectory-${c.req.param("id").replace(/[^A-Za-z0-9_-]/g, "_")}.jsonl"`,
       });
