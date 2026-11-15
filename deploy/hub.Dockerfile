@@ -49,10 +49,8 @@ ENV HEARTH_DATA_DIR=/data \
     HEARTH_BOX_PORT=8788
 RUN mkdir -p /data
 
-# Root in the container: the hub holds the Docker socket, which is root on the
-# host anyway (decision 0020).
-# hadolint ignore=DL3002
-USER root
+# No USER: the hub runs as the image's default, root. It holds the Docker
+# socket, which is root on the host anyway (decision 0020).
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
   CMD ["bun", "-e", "const r = await fetch(`http://127.0.0.1:${process.env.HEARTH_PORT}/healthz`); process.exit(r.ok ? 0 : 1)"]
 CMD ["bun", "apps/hub/src/main.ts"]
