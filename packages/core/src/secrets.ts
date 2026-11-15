@@ -31,8 +31,8 @@ export type SecretErrorCode =
  * How a reference appears in messages. A reference that does not parse, names
  * an unknown scheme, has a body its scheme rejects (`env:` not followed by a
  * variable name, `file:` not followed by an absolute path), or is an `env:`
- * reference whose name is not conventional or is token-shaped (see `displayRef`) may be a raw
- * secret pasted where a reference belongs, so it is shown only as a fingerprint.
+ * reference whose name is not conventional or is token-shaped (see `displayRef`) may be
+ * a raw secret pasted where a reference belongs, so it is shown only as a fingerprint.
  */
 export function redactRef(ref: SecretRef): string {
   return `<unrecognized reference ${fingerprint(ref)}>`;
@@ -42,10 +42,12 @@ export function redactRef(ref: SecretRef): string {
 const SECRET_REF = /^([a-z][a-z0-9-]*):(.+)$/s;
 
 /**
- * The longest `env:` name shown as written. Real variable names are short; a
- * longer all-caps name is more likely a pasted high-entropy token.
+ * The longest `env:` name shown as written, inclusive: a name of exactly this
+ * many characters can be shown, one character more is always redacted. Real
+ * variable names rarely exceed it; a longer all-caps name is more likely a
+ * pasted high-entropy token.
  */
-export const MAX_DISPLAYED_ENV_NAME_LENGTH = 40;
+export const MAX_DISPLAYED_ENV_NAME_LENGTH = 32;
 
 /**
  * The `env:` names shown as written: uppercase letters, digits and `_`, at most
@@ -66,6 +68,13 @@ const CONVENTIONAL_ENV_NAME = new RegExp(
 const AWS_KEY_ID = /(?:^|_)(?:AKIA|ASIA)[A-Z0-9]{16}/;
 
 /**
+ * A random-looking all-caps run: 16 or more uppercase letters and digits with
+ * no `_` separator and at least four digits mixed in. Conventional names such
+ * as `DATABASE_URL` separate words with `_`, so they do not match.
+ */
+const UNSEPARATED_CAPS_TOKEN = /^(?=(?:[A-Z]*[0-9]){4})[A-Z0-9]{16,}$/;
+
+/**
  * How a reference appears in messages and in `SecretError.ref`: as written when
  * it parses and its body is safe to show, otherwise `redactRef(ref)`. An `env:`
  * body is safe only when it looks like a conventional variable name.
@@ -75,7 +84,13 @@ export function displayRef(ref: SecretRef): string {
   if (!match?.[1] || !match[2]) return redactRef(ref);
   if (match[1] === "env") {
     const name = match[2];
-    if (!CONVENTIONAL_ENV_NAME.test(name) || AWS_KEY_ID.test(name)) return redactRef(ref);
+    if (
+      !CONVENTIONAL_ENV_NAME.test(name) ||
+      AWS_KEY_ID.test(name) ||
+      UNSEPARATED_CAPS_TOKEN.test(name)
+    ) {
+      return redactRef(ref);
+    }
   }
   return ref;
 }

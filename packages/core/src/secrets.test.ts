@@ -24,6 +24,12 @@ const AKIA = "AKIAIOSFODNN7EXAMPLE";
 const ASIA = "ASIAIOSFODNN7EXAMPLE";
 /** All caps, over the displayed-name length cap, no known prefix. */
 const LONG_CAPS = "QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTY";
+/** 40 random uppercase letters and digits: inside the old inclusive cap of 40. */
+const CAPS_40 = "Q7XK2M9ZP4LW8RT3VN6YB1CJ5HD0GFA2SEUI4OXQ";
+/** 33 random uppercase letters: one over the cap, no digits. */
+const CAPS_33 = "QWHZKPLMRTXBVNCJDFGSYAEUIOQZXKWPM";
+/** 20 random uppercase letters and digits, no `_`: under the cap, caught by shape. */
+const CAPS_20 = "K3P9ZQ7WX2M4LR8TB6VN";
 
 let dir: string;
 beforeAll(async () => {
@@ -188,6 +194,9 @@ describe("all-caps token shapes", () => {
     ["an AWS ASIA key id", ASIA],
     ["an AWS key id after a prefix", `PROD_${AKIA}`],
     ["a long all-caps string", LONG_CAPS],
+    ["a 40-character random all-caps string", CAPS_40],
+    ["a 33-character random all-caps string", CAPS_33],
+    ["a 20-character unseparated all-caps string with digits", CAPS_20],
   ] as const;
 
   for (const [name, value] of planted) {
@@ -209,6 +218,31 @@ describe("all-caps token shapes", () => {
 
   test("a short conventional name containing AKIA is still shown", () => {
     expect(displayRef("env:AKIA_KEY")).toBe("env:AKIA_KEY");
+  });
+
+  test("the length cap is 32 and inclusive", () => {
+    expect(MAX_DISPLAYED_ENV_NAME_LENGTH).toBe(32);
+    expect(CAPS_40).toHaveLength(40);
+    expect(CAPS_33).toHaveLength(33);
+    const at32 = "HEARTH_PROVIDER_ANTHROPIC_APIKEY";
+    expect(at32).toHaveLength(32);
+    expect(displayRef(`env:${at32}`)).toBe(`env:${at32}`);
+  });
+
+  test("conventional names are still shown", () => {
+    for (const name of [
+      "DATABASE_URL",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_ACCESS_KEY_ID",
+      "OPENAI_API_KEY",
+      "HEARTH_TOKEN",
+      "PG_HOST_2",
+      "S3_BUCKET",
+      "HTTPS_PROXY",
+      "NODEJSVERSION",
+    ]) {
+      expect(displayRef(`env:${name}`)).toBe(`env:${name}`);
+    }
   });
 });
 
