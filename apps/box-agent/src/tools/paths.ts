@@ -33,7 +33,7 @@ function within(root: string, path: string): boolean {
   return path === root || path.startsWith(root.endsWith("/") ? root : `${root}/`);
 }
 
-function escape(input: string, why: string): ToolCallError {
+function escapeError(input: string, why: string): ToolCallError {
   return new ToolCallError("tool.path-escape", `${JSON.stringify(input)} ${why}`);
 }
 
@@ -54,14 +54,12 @@ export class Workspace {
 
   /** Lexical check only: absolute, normalized, inside the root, no `..`. */
   lexical(input: string): string {
-    if (input.length === 0) throw escape(input, "is empty");
-    if (input.includes("\u0000")) throw escape(input, "contains NUL");
-    if (input.split("/").includes("..")) throw escape(input, "contains a .. segment");
-    const lexical = posix.isAbsolute(input)
-      ? posix.normalize(input)
-      : posix.join(this.root, input);
+    if (input.length === 0) throw escapeError(input, "is empty");
+    if (input.includes("\u0000")) throw escapeError(input, "contains NUL");
+    if (input.split("/").includes("..")) throw escapeError(input, "contains a .. segment");
+    const lexical = posix.isAbsolute(input) ? posix.normalize(input) : posix.join(this.root, input);
     const trimmed = lexical.length > 1 ? lexical.replace(/\/+$/, "") : lexical;
-    if (!within(this.root, trimmed)) throw escape(input, `is outside ${this.root}`);
+    if (!within(this.root, trimmed)) throw escapeError(input, `is outside ${this.root}`);
     return trimmed;
   }
 
@@ -90,11 +88,11 @@ export class Workspace {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === "ENOENT" || code === "ELOOP") {
-        throw escape(input, "goes through a dangling or looping symlink");
+        throw escapeError(input, "goes through a dangling or looping symlink");
       }
       throw error;
     }
-    if (!within(realRoot, real)) throw escape(input, `resolves outside ${this.root}`);
+    if (!within(realRoot, real)) throw escapeError(input, `resolves outside ${this.root}`);
     return { real: rest.length === 0 ? real : posix.join(real, ...rest), lexical };
   }
 }

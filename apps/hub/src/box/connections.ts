@@ -31,6 +31,8 @@ import {
   PROTOCOL_VERSION,
   type RejectFrame,
   type ReliableFrame,
+  type RpcFrame,
+  type RpcResultFrame,
   rejectHello,
   type WireMessage,
 } from "@hearth/protocol";
@@ -88,6 +90,17 @@ export interface BoxConnectionsOptions {
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC. Defaults to `ECHO_DEADLINE_MS`; tests shorten it. */
   readonly echoDeadlineMs?: number;
+}
+
+/**
+ * Observes box connections without owning them. The tool RPC client uses it
+ * to keep calls alive across a reconnect and to tell a new boot from the old.
+ */
+export interface BoxConnectionListener {
+  /** A box finished its handshake (first connect or reconnect). */
+  connected?(boxId: BoxId, bootId: string): void;
+  /** An `rpc.result` no `rpc()` call is waiting for. Return true when it was yours. */
+  rpcResult?(boxId: BoxId, frame: RpcResultFrame): boolean;
 }
 
 interface PendingRpc {
@@ -157,6 +170,7 @@ export class BoxConnections {
   readonly #byBox = new Map<BoxId, BoxConnection>();
   readonly #all = new Set<BoxConnection>();
   readonly #waiters = new Map<BoxId, Set<() => void>>();
+  readonly #listeners = new Set<BoxConnectionListener>();
   #rpcCounter = 0;
   #shutDown = false;
 
@@ -197,6 +211,29 @@ export class BoxConnections {
       }, deadlineMs);
       waiters.add(done);
     });
+  }
+
+  /** Adds a listener; returns its removal. */
+  listen(listener: BoxConnectionListener): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  /** The boot id of `boxId`'s open connection, if any. */
+  bootIdOf(boxId: BoxId): string | undefined {
+    const conn = this.#byBox.get(boxId);
+    return conn?.state === "open" ? conn.bootId : undefined;
+  }
+
+  /**
+   * Sends an `rpc` frame whose answer a listener collects. Returns the boot id
+   * it went to, or undefined when the box is not connected (nothing was sent).
+   */
+  sendRpc(boxId: BoxId, frame: RpcFrame): string | undefined {
+    const conn = this.#byBox.get(boxId);
+    if (conn === undefined || conn.state !== "open") return undefined;
+    conn.send(frame);
+    return conn.bootId;
   }
 
   // -- socket events (called by the server) --------------------------------
@@ -314,6 +351,12 @@ export class BoxConnections {
       case "rpc.result": {
         const pending = conn.pending.get(frame.id);
         if (pending === undefined) {
+          const boxId = conn.binding?.boxId;
+          if (boxId !== undefined) {
+            for (const listener of this.#listeners) {
+              if (listener.rpcResult?.(boxId, frame) === true) return;
+            }
+          }
           this.#log(`box ${conn.binding?.boxId}: rpc.result for unknown id ${frame.id}`);
           return;
         }
@@ -396,6 +439,7 @@ export class BoxConnections {
     this.#log(
       `box ${hello.boxId} connected (boot ${hello.bootId}, last delivery ${hello.state.lastDeliveryId})`,
     );
+    for (const listener of this.#listeners) listener.connected?.(hello.boxId, hello.bootId);
     const waiters = this.#waiters.get(hello.boxId);
     if (waiters !== undefined) for (const wake of [...waiters]) wake();
   }

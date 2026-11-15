@@ -131,7 +131,8 @@ export function runProcess(options: RunOptions): Promise<RunResult> {
         await new Promise<void>((done) => stream.end(done));
       }
       const all = Buffer.concat(chunks);
-      const output = all.length > options.outputCap ? all.subarray(all.length - options.outputCap) : all;
+      const output =
+        all.length > options.outputCap ? all.subarray(all.length - options.outputCap) : all;
       const outcome = stopped ?? "exited";
       let exitCode: number | null = null;
       if (outcome === "exited") {

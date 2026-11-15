@@ -9,19 +9,27 @@
  * second run.
  */
 
-import { access, constants, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { mkdir } from "node:fs/promises";
+import {
+  access,
+  constants,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { posix } from "node:path";
 import {
   decodeToolParams,
   EXEC_SPILL_DIR,
   isToolMethod,
+  type JsonValue,
   MAX_CONCURRENT_TOOL_CALLS,
   MAX_EXEC_SPILL_BYTES,
   MAX_TOOL_FILE_BYTES,
   MAX_TOOL_LIST_ENTRIES,
   MAX_TOOL_OUTPUT_BYTES,
-  type JsonValue,
   type RpcFrame,
   type RpcResultFrame,
   SEARCH_TIMEOUT_MS,
@@ -68,18 +76,23 @@ type CallState =
   | { readonly kind: "running"; readonly controller: AbortController }
   | { readonly kind: "done"; readonly frame: RpcResultFrame; readonly bytes: number };
 
-const IMAGE_SIGNATURES: readonly { readonly mime: string; readonly test: (b: Buffer) => boolean }[] =
-  [
-    { mime: "image/png", test: (b) => b.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")) },
-    { mime: "image/jpeg", test: (b) => b.subarray(0, 3).equals(Buffer.from("ffd8ff", "hex")) },
-    { mime: "image/gif", test: (b) => b.subarray(0, 4).toString("latin1") === "GIF8" },
-    {
-      mime: "image/webp",
-      test: (b) =>
-        b.subarray(0, 4).toString("latin1") === "RIFF" &&
-        b.subarray(8, 12).toString("latin1") === "WEBP",
-    },
-  ];
+const IMAGE_SIGNATURES: readonly {
+  readonly mime: string;
+  readonly test: (b: Buffer) => boolean;
+}[] = [
+  {
+    mime: "image/png",
+    test: (b) => b.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")),
+  },
+  { mime: "image/jpeg", test: (b) => b.subarray(0, 3).equals(Buffer.from("ffd8ff", "hex")) },
+  { mime: "image/gif", test: (b) => b.subarray(0, 4).toString("latin1") === "GIF8" },
+  {
+    mime: "image/webp",
+    test: (b) =>
+      b.subarray(0, 4).toString("latin1") === "RIFF" &&
+      b.subarray(8, 12).toString("latin1") === "WEBP",
+  },
+];
 
 function spillName(callId: string, rpcId: string): string {
   return `${`${callId}-${rpcId}`.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 200)}.log`;
@@ -152,7 +165,10 @@ export class ToolExecutor {
     const max = this.#options.maxConcurrent ?? MAX_CONCURRENT_TOOL_CALLS;
     if (this.#running >= max) {
       // Not recorded: the call did not run, so a later re-send may.
-      this.#reply(frame.id, new ToolCallError("tool.busy", `${max} tool calls are already running`));
+      this.#reply(
+        frame.id,
+        new ToolCallError("tool.busy", `${max} tool calls are already running`),
+      );
       return;
     }
     const controller = new AbortController();
@@ -170,7 +186,12 @@ export class ToolExecutor {
   }
 
   #errorFrame(id: string, error: ToolCallError): RpcResultFrame {
-    return { type: "rpc.result", id, ok: false, error: { code: error.code, message: error.message } };
+    return {
+      type: "rpc.result",
+      id,
+      ok: false,
+      error: { code: error.code, message: error.message },
+    };
   }
 
   #reply(id: string, error: ToolCallError): void {
@@ -235,7 +256,8 @@ export class ToolExecutor {
   async readFile(p: ToolParams["tool.readFile"]): Promise<ToolResults["tool.readFile"]> {
     const { real } = await this.workspace.resolve(p.path);
     const info = await stat(real);
-    if (info.isDirectory()) throw new ToolCallError("tool.is-a-directory", `${p.path} is a directory`);
+    if (info.isDirectory())
+      throw new ToolCallError("tool.is-a-directory", `${p.path} is a directory`);
     if (info.size > MAX_TOOL_FILE_BYTES) {
       throw new ToolCallError(
         "tool.too-large",
@@ -413,7 +435,8 @@ export class ToolExecutor {
   ): Promise<ToolResults["tool.exec"]> {
     const { real, lexical } = await this.workspace.resolve(p.cwd);
     const info = await stat(real);
-    if (!info.isDirectory()) throw new ToolCallError("tool.not-a-directory", `${p.cwd} is not a directory`);
+    if (!info.isDirectory())
+      throw new ToolCallError("tool.not-a-directory", `${p.cwd} is not a directory`);
     const realRoot = await this.workspace.realRoot();
     const spillRelative = posix.join(EXEC_SPILL_DIR, spillName(p.callId, rpcId));
     const run = await runProcess({

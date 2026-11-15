@@ -96,7 +96,11 @@ export interface ToolParams {
    * `BashOperations.exec`. There is deliberately no `env`: the command runs
    * with the box's own minimal environment, never the hub's (PRD §8.2.1).
    */
-  "tool.exec": Base & { readonly command: string; readonly cwd: string; readonly timeoutMs: number };
+  "tool.exec": Base & {
+    readonly command: string;
+    readonly cwd: string;
+    readonly timeoutMs: number;
+  };
   /** Cancel the running call whose `rpc` id is `target` (pi's abort signal). */
   "tool.cancel": Base & { readonly target: string };
 }
