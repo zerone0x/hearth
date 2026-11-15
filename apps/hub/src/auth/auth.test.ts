@@ -538,6 +538,10 @@ describe("login", () => {
       expect(fresh.kdf.hashes).toHaveLength(0);
       expect(normalized.filter((n) => n > PASSWORD_RAW_MAX_LENGTH)).toEqual([]);
       expect(fresh.auth.setupRequired()).toBe(true);
+
+      // Setup exactly at the raw cap passes it, and NFC brings it to 1024.
+      expect((await setup(fresh, fresh.auth.setupToken() ?? "", atCap)).status).toBe(201);
+      expect(fresh.kdf.hashes).toEqual(["ᾏ".repeat(PASSWORD_MAX_LENGTH)]);
     } finally {
       String.prototype.normalize = original;
     }
