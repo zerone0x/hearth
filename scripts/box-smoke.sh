@@ -10,6 +10,7 @@
 #   - `pi --version` prints the version pinned in apps/box-agent/package.json;
 #   - Xvnc accepts a local connection (RFB greeting on loopback);
 #   - Chromium headless prints its version and renders a page;
+#   - the desktop's Chromium answers CDP on loopback;
 #   - with Xvnc and Chromium CDP running, nothing listens on a non-loopback address.
 set -euo pipefail
 
@@ -88,7 +89,9 @@ agent_out="$(timeout 120 docker run --rm "${image}" 2>&1)" || agent_code=$?
 ok "box-agent: ${agent_out}"
 
 # A running box to inspect.
-timeout 60 docker run -d --name "${container}" "${image}" sleep infinity >/dev/null ||
+# HEARTH_CHROMIUM_SANDBOX=off as the provider sets it (decisions 0007, 0026).
+timeout 60 docker run -d --name "${container}" -e HEARTH_CHROMIUM_SANDBOX=off \
+  "${image}" sleep infinity >/dev/null ||
   fail "could not start the box"
 in_box() { timeout 60 docker exec "${container}" "$@"; }
 
@@ -118,10 +121,8 @@ dom="$(in_box chromium "${chromium_flags[@]}" --dump-dom 'data:text/html,<p>hear
 [[ "${dom}" == *"hearth-smoke"* ]] || fail "chromium rendered: ${dom}"
 ok "chromium headless renders a page"
 
-# Start Chromium with CDP so the listener check covers it.
-timeout 30 docker exec -d "${container}" bash -c "exec chromium ${chromium_flags[*]} \
-  --remote-debugging-port=${cdp_port} --user-data-dir=/tmp/cdp-profile about:blank \
-  >/tmp/cdp.log 2>&1"
+# The desktop's Chromium, started and supervised by the entrypoint, serves CDP
+# on loopback; the listener check below covers it.
 cdp_probe="console.log(await (await fetch('http://127.0.0.1:${cdp_port}/json/version')).text())"
 cdp=""
 for _ in $(seq 1 60); do
@@ -129,7 +130,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 if [[ "${cdp}" != *Browser* ]]; then
-  in_box cat /tmp/cdp.log >&2 || true
+  in_box cat /tmp/chromium.log >&2 || true
   in_box cat /proc/net/tcp /proc/net/tcp6 >&2 || true
   fail "Chromium CDP did not answer on 127.0.0.1:${cdp_port}"
 fi

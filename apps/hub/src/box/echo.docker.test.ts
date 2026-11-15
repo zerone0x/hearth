@@ -118,7 +118,7 @@ async function browserProbe(containerId: string, url: string, title: RegExp): Pr
   const script = `
 const base = "http://127.0.0.1:9222";
 const want = new RegExp(${JSON.stringify(title.source)});
-for (let i = 0; i < 120; i++) {
+for (let i = 0; i < 40; i++) {
   try { if ((await fetch(base + "/json/version")).ok) break } catch {}
   await Bun.sleep(500);
 }

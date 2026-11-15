@@ -2093,3 +2093,83 @@ mode 0644. So the marker must also have exactly one hard link
 has one). The check resolves the marker's directory once and uses that
 resolved path for both the file `lstat` and the directory walk. The
 supported place for the marker stays a root-only directory.
+
+## 0026: The box desktop runs a supervised Chromium; the box is its sandbox
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #92
+- Supersedes the "image does not start Chromium" part of 0004.
+
+### Context
+
+The box image installed Chromium (PRD §6.2), but the entrypoint started only
+Xvnc and Openbox, so the desktop pane showed a black Openbox root with a
+cursor. The compose e2e checked only that a 1280x800 canvas existed, so it
+passed on that black screen.
+
+### Decision
+
+- **The entrypoint starts Chromium on the desktop** once Openbox manages
+  windows (it waits up to 5 s for `_NET_SUPPORTING_WM_CHECK`), maximised,
+  with CDP on `127.0.0.1:${HEARTH_CDP_PORT}` (9222, `--remote-debugging-address=127.0.0.1`,
+  never published: the image has no `EXPOSE` and the provider publishes
+  nothing, 0007). Its profile is `/home/hearth/.config/hearth-chromium`, on
+  the home volume, so it survives hibernate. It opens
+  `/usr/share/hearth/start.html`, a static page naming the session (from the
+  URL fragment) and `/workspace`. `xsetroot` paints the root window slate
+  (`#3b4a5c`), so a desktop without a browser is visibly not a dead one.
+- **A shell supervisor restarts it.** When Chromium exits for any reason (the
+  user or the agent closed it, a crash) the supervisor logs the exit code to
+  `/tmp/chromium.log` and starts it again after 1 s, doubling to 30 s while
+  it keeps exiting within 30 s of its start. It removes the profile's
+  `Singleton*` lock files before each start: the profile outlives the
+  container, and a lock naming the previous container's hostname would make
+  Chromium refuse to start. Only the supervisor starts Chromium on that
+  profile, so removing them does not break a live browser.
+- **Clean environment (0018).** The supervisor runs after the re-exec under
+  tini, so the join token is already out of the environment, and it starts
+  Chromium with `env -i` and a fixed list: `HOME`, `USER`, `LOGNAME`,
+  `SHELL`, `PATH`, `LANG`, `DISPLAY`. Nothing from the provider's boot env
+  (`HEARTH_HUB_URL`, `HEARTH_BOX_ID`, `HEARTH_JOIN_TOKEN_FILE`, ...) reaches
+  the browser, its renderers, or a page.
+- **Sandbox: `--no-sandbox`, because the box is the sandbox.** This applies
+  the reasoning of 0007, now checked against the real box: with all
+  capabilities dropped, `no-new-privileges` and Docker's default seccomp
+  profile, Chromium has neither a setuid helper (blocked by
+  `no-new-privileges`, and not shipped by Debian) nor unprivileged user
+  namespaces (denied by the seccomp profile, and by AppArmor on Ubuntu 23.10
+  and later hosts), so with its sandbox on it refuses to start. The
+  `box-provider` CI job asserts exactly that: `chromium --headless` without
+  `--no-sandbox` fails in a provider-started box. The entrypoint passes
+  `--no-sandbox` only when the box's environment has
+  `HEARTH_CHROMIUM_SANDBOX=off`, which `DockerBoxProvider` always sets; a
+  future runtime (gVisor, a VM provider) that leaves the variable unset gets
+  Chromium's sandbox. Inside one box a renderer escape reaches only what the
+  agent's own commands already reach: the session's files and short-lived
+  credentials, never box-agent's environment or memory (0018).
+- **Egress.** Chromium runs in the box's network namespace, so the host
+  firewall of 0012 applies to it unchanged. The echo e2e loads the CI LAN
+  host in Chromium over CDP: reached with the firewall off, blocked with it
+  on, the same as `fetch` from a tool command.
+- **Image layers (0004).** `x11-xserver-utils` (for `xsetroot`) joins the
+  desktop layer; the start page is copied next to the entrypoint in the top
+  layer, so editing it rebuilds neither the desktop nor pi.
+- **Proof.** `provider.docker.test.ts`: CDP `/json/version` answers inside
+  the box, every CDP listener is on loopback, the browser process runs as
+  uid 1000 with exactly the variables above, no Chromium process holds the
+  join token, and after a `kill` a new browser process answers CDP.
+  `proc-secrets.docker.test.ts` sees Chromium among the box's processes with
+  the same clean environment. The compose e2e samples the desktop canvas and
+  fails when one colour covers more than 95% of it or the start page's
+  accent colour is missing (`deploy/e2e/desktop-pixels.ts`), so the black
+  desktop of #92 fails it.
+
+### Consequences
+
+- The `--no-sandbox` infobar shows in the desktop browser; it is accurate.
+- Chromium costs memory in every running box (about 200-300 MB idle with one
+  tab), inside the box's memory limit.
+- Browser tools for the agent (navigate, click, screenshot over CDP) are a
+  separate issue; they can use this browser through its CDP port.
+- Desktop supervision beyond Chromium (Xvnc or Openbox dying) is still #15.
