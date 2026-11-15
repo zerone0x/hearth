@@ -4,7 +4,7 @@
  * the hub's real `ToolRpcClient` in between.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +17,7 @@ import {
   fauxToolCall,
 } from "@earendil-works/pi-ai";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type AppendResult,
   type Authorizer,
@@ -32,11 +32,15 @@ import {
 } from "@hearth/core";
 import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
-import type { BoxConnectionListener } from "../box/connections";
+import { createApp } from "../app";
+import { AuthService, SESSION_COOKIE } from "../auth";
+import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
 import type { BoxLease, SessionView } from "../session/manager";
+import { openDatabase, SqliteLoginStore } from "../store";
 import type { PinnedExtension } from "./extensions";
 import { HUB_TEMP_NOTE, rewriteHome, scrubHubTempPaths } from "./policy";
+import { mountRunnerRoutes } from "./routes";
 import { type RunnerConfig, SessionRunners } from "./runners";
 
 const dirs: string[] = [];
@@ -149,6 +153,13 @@ class FakeSessions {
   inFlight = 0;
   leases = 0;
   readonly known = new Set<string>(["se_a", "se_b"]);
+  readonly state = new Map<string, string>();
+  readonly failed: Array<{ sessionId: string; reason: string }> = [];
+
+  async fail(sessionId: string, reason: string): Promise<void> {
+    this.failed.push({ sessionId, reason });
+    this.state.set(sessionId, "failed");
+  }
 
   async ensureBox(sessionId: string): Promise<BoxLease> {
     this.inFlight++;
@@ -173,7 +184,7 @@ class FakeSessions {
         code: "session.not-found",
       });
     }
-    return { id: sessionId } as SessionView;
+    return { id: sessionId, state: this.state.get(sessionId) ?? "idle" } as SessionView;
   }
 }
 
@@ -521,7 +532,56 @@ describe("crash isolation", () => {
     expect(h.events.types("se_b")).not.toContain("runner.failed");
     const view = await h.runners.view(LOCAL_PRINCIPAL, "se_a");
     expect(view.status).toBe("failed");
-    await expect(h.runners.send(LOCAL_PRINCIPAL, "se_a", "more")).rejects.toThrow("runner failed");
+    await expect(h.runners.send(LOCAL_PRINCIPAL, "se_a", "more")).rejects.toThrow("is failed");
+    // The session row goes to failed through the session manager, once.
+    expect(h.sessions.failed).toEqual([
+      { sessionId: "se_a", reason: "runner failed: disk full writing pi.message_end" },
+    ]);
+  });
+
+  test("a turn whose prompt() throws fails only its session, visibly, and never rejects", async () => {
+    const h = await harness();
+    const real = AgentSession.prototype.prompt;
+    const prompt = spyOn(AgentSession.prototype, "prompt").mockImplementation(function (
+      this: AgentSession,
+      ...args: Parameters<AgentSession["prompt"]>
+    ) {
+      if (args[0] === "explode") return Promise.reject(new Error("provider exploded"));
+      return real.apply(this, args);
+    });
+    try {
+      h.faux.setResponses([fauxAssistantMessage("fine")]);
+      await h.runners.send(LOCAL_PRINCIPAL, "se_a", "explode");
+      await h.runners.send(LOCAL_PRINCIPAL, "se_b", "hello");
+      const a = await h.runners.runner("se_a");
+      const b = await h.runners.runner("se_b");
+      // settled() never rejects: the turn's failure does not escape to the hub.
+      await a.settled();
+      await b.settled();
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(a.status).toBe("failed");
+      expect(a.failure).toBe("provider exploded");
+      // The runner itself refuses a new turn too, even if the row update were lost.
+      await expect(a.send("more")).rejects.toThrow("runner failed");
+      expect(h.events.of("se_a", "runner.failed").map((e) => e.payload)).toEqual([
+        { message: "provider exploded" },
+      ]);
+      expect(h.sessions.failed).toEqual([
+        { sessionId: "se_a", reason: "runner failed: provider exploded" },
+      ]);
+      expect(b.status).toBe("idle");
+      expect(h.events.types("se_b")).toContain("pi.agent_end");
+      expect(h.events.types("se_b")).not.toContain("runner.failed");
+      // A rebuilt runner (a new hub) refuses the failed session from its row.
+      const after = h.make();
+      const refused = (await after
+        .send(LOCAL_PRINCIPAL, "se_a", "again")
+        .catch((e: unknown) => e)) as HearthError;
+      expect(refused.code).toBe("runner.failed");
+      expect(refused.message).toContain("is failed");
+    } finally {
+      prompt.mockRestore();
+    }
   });
 });
 
@@ -635,5 +695,200 @@ describe("authorization", () => {
   test("an unknown session is refused", async () => {
     const h = await harness();
     await expect(h.runners.send(LOCAL_PRINCIPAL, "se_nope", "x")).rejects.toThrow("no session");
+  });
+});
+
+describe("HTTP routes behind the login", () => {
+  interface Call {
+    principal: string;
+    action: string;
+    id: string | undefined;
+  }
+
+  async function routed() {
+    const calls: Call[] = [];
+    const recording: Authorizer = {
+      authorize: async (principal, action, resource) => {
+        calls.push({ principal: principal.id, action, id: resource.id });
+        return { allowed: true, policy: "test" };
+      },
+    };
+    const h = await harness({}, { authorizer: recording });
+    const auth = new AuthService({ store: new SqliteLoginStore(openDatabase(":memory:")) });
+    const app = createApp({ boxes: {} as BoxConnections, auth });
+    mountRunnerRoutes(app, h.runners);
+    const cookie = `${SESSION_COOKIE}=${auth.issueSession(LOCAL_PRINCIPAL).token}`;
+    const request = (
+      path: string,
+      init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+    ) =>
+      app.request(`http://localhost${path}`, {
+        method: init.method ?? "GET",
+        headers: {
+          cookie,
+          ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+          ...init.headers,
+        },
+        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      });
+    return { h, calls, request };
+  }
+
+  const ROUTES = [
+    { method: "POST", path: "/v1/sessions/se_a/messages", body: { text: "hi" } },
+    { method: "POST", path: "/v1/sessions/se_a/interrupt", body: {} },
+    { method: "GET", path: "/v1/sessions/se_a/events?after=0&limit=10", body: undefined },
+    { method: "GET", path: "/v1/sessions/se_a/runner", body: undefined },
+    { method: "POST", path: "/v1/sessions/se_a/runner", body: { codemode: true } },
+  ] as const;
+
+  test("401 without a login session, 403 cross-origin, 415 without JSON; nothing authorized", async () => {
+    const { h, calls, request } = await routed();
+    for (const r of ROUTES) {
+      const anon = await request(r.path, {
+        method: r.method,
+        body: r.body,
+        headers: { cookie: "" },
+      });
+      expect({ path: r.path, status: anon.status }).toEqual({ path: r.path, status: 401 });
+      const forged = await request(r.path, {
+        method: r.method,
+        body: r.body,
+        headers: { cookie: `${SESSION_COOKIE}=hls_forged` },
+      });
+      expect({ path: r.path, status: forged.status }).toEqual({ path: r.path, status: 401 });
+      const cross = await request(r.path, {
+        method: r.method,
+        body: r.body,
+        headers: { origin: "https://evil.example" },
+      });
+      expect({ path: r.path, status: cross.status }).toEqual({ path: r.path, status: 403 });
+      if (r.method === "POST") {
+        const plain = await request(r.path, {
+          method: r.method,
+          body: r.body,
+          headers: { "content-type": "text/plain" },
+        });
+        expect({ path: r.path, status: plain.status }).toEqual({ path: r.path, status: 415 });
+      }
+    }
+    expect(calls).toEqual([]);
+    expect(h.events.types("se_a")).toEqual([]);
+  });
+
+  test("the signed-in principal reaches authorize on every route", async () => {
+    const { h, calls, request } = await routed();
+    h.faux.setResponses([fauxAssistantMessage("hello")]);
+    const configured = await request("/v1/sessions/se_a/runner", {
+      method: "POST",
+      body: { codemode: false },
+    });
+    expect(configured.status).toBe(200);
+    const sent = await request("/v1/sessions/se_a/messages", {
+      method: "POST",
+      body: { text: "hi" },
+    });
+    expect(sent.status).toBe(202);
+    await (await h.runners.runner("se_a")).settled();
+    const interrupted = await request("/v1/sessions/se_a/interrupt", { method: "POST", body: {} });
+    expect(interrupted.status).toBe(200);
+    expect((await request("/v1/sessions/se_a/events")).status).toBe(200);
+    expect((await request("/v1/sessions/se_a/runner")).status).toBe(200);
+    const actions = [...new Set(calls.map((c) => c.action))].sort();
+    expect(actions).toEqual([
+      "session.configure",
+      "session.events",
+      "session.interrupt",
+      "session.message",
+      "session.read",
+    ]);
+    for (const c of calls) {
+      expect(c).toEqual({ principal: LOCAL_PRINCIPAL.id, action: c.action, id: "se_a" });
+    }
+  });
+
+  test("events resume from the cursor and page with limit", async () => {
+    const { h, request } = await routed();
+    h.faux.setResponses([fauxAssistantMessage("hello there")]);
+    await request("/v1/sessions/se_a/messages", { method: "POST", body: { text: "hi" } });
+    await (await h.runners.runner("se_a")).settled();
+    const total = h.events.types("se_a").length;
+    expect(total).toBeGreaterThan(4);
+    type Page = {
+      ok: boolean;
+      events: { seq: number; type: string }[];
+      cursor: number;
+      hasMore: boolean;
+    };
+    const seen: number[] = [];
+    let after = 0;
+    for (let i = 0; i < 100; i++) {
+      const res = await request(`/v1/sessions/se_a/events?after=${after}&limit=2`);
+      expect(res.status).toBe(200);
+      const page = (await res.json()) as Page;
+      expect(page.events.length).toBeLessThanOrEqual(2);
+      seen.push(...page.events.map((e) => e.seq));
+      after = page.cursor;
+      if (!page.hasMore) break;
+    }
+    expect(seen).toEqual(Array.from({ length: total }, (_, i) => i + 1));
+    // Resume after the last cursor: nothing new, the cursor stays.
+    const tail = (await (await request(`/v1/sessions/se_a/events?after=${after}`)).json()) as Page;
+    expect(tail).toMatchObject({ ok: true, events: [], cursor: total, hasMore: false });
+    // Resume mid-way: exactly the events after it.
+    const mid = (await (await request("/v1/sessions/se_a/events?after=3")).json()) as Page;
+    expect(mid.events[0]?.seq).toBe(4);
+    expect(mid.events).toHaveLength(total - 3);
+  });
+
+  test("limit and after are bounded and validated", async () => {
+    const { h, request } = await routed();
+    for (let i = 0; i < 1005; i++) {
+      await h.events.append(undefined, "se_a", { type: "test.filler", payload: i });
+    }
+    const page = async (query: string) => {
+      const res = await request(`/v1/sessions/se_a/events${query}`);
+      const body = (await res.json()) as { events?: unknown[]; error?: { code: string } };
+      return { status: res.status, body };
+    };
+    expect((await page("")).body.events).toHaveLength(200);
+    expect((await page("?limit=1000")).body.events).toHaveLength(1000);
+    expect((await page("?limit=999999")).body.events).toHaveLength(1000);
+    expect((await page("?limit=1")).body.events).toHaveLength(1);
+    expect((await page("?after=1004&limit=5")).body.events).toHaveLength(1);
+    expect((await page("?after=999999999")).body.events).toHaveLength(0);
+    for (const bad of [
+      "?limit=0",
+      "?limit=-1",
+      "?limit=abc",
+      "?limit=1.5",
+      "?limit=",
+      "?after=-1",
+      "?after=x",
+      "?after=1e3",
+      "?after=1234567890123456",
+    ]) {
+      const res = await page(bad);
+      expect({ bad, status: res.status, code: res.body.error?.code }).toEqual({
+        bad,
+        status: 400,
+        code: "request.invalid",
+      });
+    }
+  });
+
+  test("message bodies are validated before anything runs", async () => {
+    const { h, calls, request } = await routed();
+    for (const body of [{}, { text: 1 }, { text: "x", extra: true }, ["x"], "x", null]) {
+      const res = await request("/v1/sessions/se_a/messages", { method: "POST", body });
+      expect({ body, status: res.status }).toEqual({ body, status: 400 });
+    }
+    const unknown = await request("/v1/sessions/se_nope/messages", {
+      method: "POST",
+      body: { text: "x" },
+    });
+    expect(unknown.status).toBe(404);
+    expect(calls.map((c) => c.action)).toEqual(["session.message"]);
+    expect(h.events.types("se_a")).toEqual([]);
   });
 });

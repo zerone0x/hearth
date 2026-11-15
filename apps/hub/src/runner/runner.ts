@@ -66,6 +66,11 @@ export interface SessionRunnerOptions {
   readonly boxCwd?: string;
   readonly hubTempDir?: string;
   readonly log?: (line: string) => void;
+  /**
+   * Called once when the runner fails, after `runner.failed` is recorded: the
+   * hub moves the session row to `failed` through the session manager.
+   */
+  readonly onFailure?: (message: string) => Promise<unknown>;
 }
 
 export type RunnerStatus = "idle" | "running" | "failed";
@@ -354,6 +359,13 @@ export class SessionRunner {
     } catch (appendError) {
       (this.#o.log ?? console.error)(
         `session ${this.sessionId}: could not record the failure: ${errorText(appendError)}`,
+      );
+    }
+    try {
+      await this.#o.onFailure?.(this.#failure);
+    } catch (stateError) {
+      (this.#o.log ?? console.error)(
+        `session ${this.sessionId}: could not mark the session failed: ${errorText(stateError)}`,
       );
     }
   }

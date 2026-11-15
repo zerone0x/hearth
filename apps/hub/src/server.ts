@@ -354,6 +354,7 @@ export function startHub(options: HubOptions) {
           sessions: {
             ensureBox: (sessionId) => sessions.ensureBox(sessionId),
             get: (principal, sessionId) => sessions.get(principal, sessionId),
+            fail: (sessionId, reason) => sessions.fail(sessionId, reason),
           },
           tools: toolRpc as ToolRpcClient,
           ...(options.log === undefined ? {} : { log: options.log }),

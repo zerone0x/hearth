@@ -1236,8 +1236,11 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 - **Crash isolation.** A turn runs in the background behind a catch. An
   exception from `prompt`, from the event subscriber, or a failed event append
   marks that runner `failed`, aborts its turn and appends `runner.failed`.
-  Other sessions and the hub go on. A failed runner refuses messages
-  (`runner.failed`, 409) until the hub restarts.
+  The hub then moves the session to `failed` with `SessionManager.fail`,
+  through the state machine (authorized as `session.fail`, audited, and
+  recorded as a `session.state` event), and stops its box; the volume stays.
+  Other sessions and the hub go on. A failed session refuses messages
+  (`runner.failed`, 409), also after a hub restart.
 - **AGENTS.md under lazy start: a hub-side cache.** The hub never starts a box
   just to read context files. On the first box lease of each turn (the box is
   up for a tool call anyway) the runner reads `/workspace/AGENTS.md` through
@@ -1274,8 +1277,5 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 - pi's file mutation queue is process-wide (#40): writes to the same path in
   two sessions serialize. Accepted for M1.
 - One message at a time per session; steering and follow-up queues come later.
-- A runner failure does not move the session row to `failed`; the runner
-  status and the `runner.failed` event carry it. Wiring it into the state
-  machine is a follow-up.
 - An exception thrown from a pi timer outside any runner callback is not
   attributable to a session and still reaches the process.

@@ -55,6 +55,8 @@ export interface RunnerConfig {
 export interface RunnerSessions {
   ensureBox(sessionId: SessionId): Promise<BoxLease>;
   get(principal: Principal, sessionId: SessionId): Promise<SessionView>;
+  /** Move the session to `failed` through the state machine (the runner failed). */
+  fail(sessionId: SessionId, reason: string): Promise<unknown>;
 }
 
 export interface SessionRunnersOptions {
@@ -156,7 +158,14 @@ export class SessionRunners {
 
   /** Send a user message: starts a turn in the background. */
   async send(principal: Principal, sessionId: SessionId, text: string): Promise<void> {
-    await this.#authorize(principal, "session.message", sessionId);
+    const session = await this.#authorize(principal, "session.message", sessionId);
+    if (session.state === "failed" || session.state === "archived") {
+      throw new HearthError(`session ${sessionId} is ${session.state}`, {
+        owner: "hub",
+        disposition: "give-up",
+        code: "runner.failed",
+      });
+    }
     if (text.length === 0) throw failure("request.invalid", "the message is empty");
     const runner = await this.runner(sessionId);
     this.#contextFresh.delete(sessionId);
@@ -229,6 +238,7 @@ export class SessionRunners {
       ...(this.#o.boxCwd === undefined ? {} : { boxCwd: this.#o.boxCwd }),
       ...(this.#o.hubTempDir === undefined ? {} : { hubTempDir: this.#o.hubTempDir }),
       ...(this.#o.log === undefined ? {} : { log: this.#o.log }),
+      onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });
   }
 
@@ -327,7 +337,11 @@ export class SessionRunners {
     return { header, entries, codemode, context };
   }
 
-  async #authorize(principal: Principal, action: `${string}.${string}`, sessionId: SessionId) {
+  async #authorize(
+    principal: Principal,
+    action: `${string}.${string}`,
+    sessionId: SessionId,
+  ): Promise<SessionView> {
     const decision = await this.#o.authorizer.authorize(principal, action, {
       workspaceId: this.#scope.workspaceId,
       type: "session",
@@ -341,6 +355,6 @@ export class SessionRunners {
       });
     }
     // Throws session.not-found for an unknown session.
-    await this.#o.sessions.get(principal, sessionId);
+    return await this.#o.sessions.get(principal, sessionId);
   }
 }
