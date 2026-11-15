@@ -1377,6 +1377,11 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 - **UI stack (owner decision).** `apps/web` uses React and Tailwind. Lit
   and other web-components UI libraries are not used; changing the stack
   needs a new decision.
+- **Maintained components (owner decision).** The UI uses maintained
+  packages wherever one fits (assistant-ui for chat, shadcn/ui primitives)
+  instead of components built from scratch. The chat view, tool cards and
+  pages in this change are hand-written; #77 replaces them with those
+  packages after this change merges.
 - **`apps/web`: React 19 + Vite 8 + Tailwind 4**, dependencies pinned
   exactly. It has its own `tsconfig.json` (DOM lib, `jsx: react-jsx`,
   `vite/client` types); the root `typecheck` runs both projects, and the root

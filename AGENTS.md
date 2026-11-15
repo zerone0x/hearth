@@ -38,6 +38,7 @@ there is no build step between workspaces. The one build is `apps/web`
 ## Web UI
 
 - `apps/web` is React + Tailwind (decision 0017); do not add Lit or other web-components UI libraries.
+- UI: use maintained packages wherever one fits (assistant-ui for chat, shadcn/ui primitives); do not build components from scratch.
 
 ## Boundary rules (PRD §7)
 
