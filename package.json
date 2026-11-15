@@ -1,0 +1,25 @@
+{
+  "name": "hearth",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run pins && bun test",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check --formatter-enabled=false .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "pins": "bun scripts/check-pins.ts",
+    "test": "bun test",
+    "dev:hub": "bun run --filter @hearth/hub dev"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.7",
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

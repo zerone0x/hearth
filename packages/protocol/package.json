@@ -1,0 +1,10 @@
+{
+  "name": "@hearth/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hub-box wire protocol (PRD §8.2). Pure types and encode/decode; no I/O.",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

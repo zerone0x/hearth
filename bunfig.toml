@@ -1,0 +1,3 @@
+[install]
+# Save exact versions by default. The pi packages must stay pinned (AGENTS.md).
+exact = true
