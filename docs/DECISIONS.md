@@ -58,3 +58,47 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
 - TypeScript 7 is the native compiler. If a tool the project adopts later only
   supports the TypeScript 5 API, that tool runs separately; the typecheck gate
   stays on `tsc` 7.
+
+## 0002: Hub-box protocol v1 wire format and validation
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #2
+
+### Decision
+
+- **Validation: hand-written guards, no schema library.** `packages/protocol`
+  has no runtime dependencies. A small `Fields` reader checks each field and
+  fails with the field's path; `decodeFrame` catches that at its boundary and
+  returns a typed `DecodeError`, so callers never see a throw. A schema library
+  (zod, valibot, TypeBox) would add a dependency to both the hub and the box
+  image for about twenty small frames; the guards are short and the round-trip
+  and rejection tests cover every frame type.
+- **Decoders build fresh objects from known fields only.** Unknown fields are
+  dropped, which lets a newer minor version add optional fields. Opaque JSON
+  payloads (`turn.event.event`, `rpc` params and results) are checked to be
+  JSON, depth-limited, and copied so a `__proto__` key stays plain data.
+- **JSON text for typed frames, binary for `stream.data`.** VNC traffic is the
+  bulk of the bytes, so stream data goes as a binary WebSocket message with a
+  9-byte header (tag, stream id, sequence) instead of base64 in JSON.
+- **At-least-once frames are exactly `turn.event`, `turn.end`,
+  `hibernate.done` and `usage.report`**, all box to hub. Hub-to-box commands are
+  fire-and-forget on the wire: the hub owns the session state machine and
+  re-drives commands after a reconnect. `rpc` is fire-and-forget; the caller
+  owns a named deadline.
+- **Fixed outcome sets.** `turn.end` is `completed`, `failed` or `cancelled`;
+  `hibernate.done` is `hibernated`, `busy` or `failed`. A `failed` outcome must
+  carry a failure classified by owner (`box`, `model-provider`, `gateway`,
+  `hub`, `user`) and retryability (PRD §8.1, principles 2 and 6).
+- **Desktop lock leases are durations (`leaseMs`), not timestamps**, so the box
+  never compares its clock with the hub's. An `epoch` orders lock updates.
+- **Stream ids: the hub opens even ids, the box opens odd ids.** File streams
+  name a path relative to the box workspace, and the decoder rejects absolute
+  paths, drive letters and `..` segments (PRD §8.2, no hub-local paths).
+
+### Consequences
+
+- Adding a frame type means a decoder, a `FRAME_SPECS` row, a README row and a
+  test sample; the test file's mapped sample type fails to compile until the
+  sample exists.
+- Moving to a schema library later would need a new decision entry.
