@@ -492,6 +492,41 @@ describe("chat view", () => {
     expect(html).toContain("echo &lt;hi&gt;");
   });
 
+  test("links in an assistant reply open in a new tab without an opener or referrer", () => {
+    const reply = assistant([text("See [the docs](https://example.com/docs).")]);
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.message_start", { message: user("where?") }),
+      ev("pi.message_start", { message: reply }),
+      ev("pi.message_end", { message: reply }),
+    ]);
+    const link = /<a[^>]*href="https:\/\/example\.com\/docs"[^>]*>/.exec(render(chat))?.[0];
+    expect(link).toBeDefined();
+    expect(link).toContain('target="_blank"');
+    expect(link).toContain('rel="noopener noreferrer"');
+  });
+
+  test("the action bars offer copy, but no regenerate, more menu or edit Hearth lacks", () => {
+    const reply = assistant([text("Done.")]);
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("pi.message_start", { message: user("do it") }),
+      ev("pi.message_start", { message: reply }),
+      ev("pi.message_end", { message: reply }),
+    ]);
+    const html = render(chat);
+    // The assistant action bar renders (copy is supported) ...
+    expect(html).toContain("aui-assistant-action-bar-root");
+    expect(html).toContain(">Copy<");
+    // ... without the registry's refresh (regenerate), "…" menu, or the user edit button.
+    expect(html).not.toContain(">Refresh<");
+    expect(html).not.toContain(">More<");
+    // The last message's user action bar renders, without the edit button.
+    const asked = render(
+      applyHubEvents(emptyChat(S), [ev("pi.message_start", { message: user("do it") })]),
+    );
+    expect(asked).toContain("aui-user-action-bar-root");
+    expect(asked).not.toContain(">Edit<");
+  });
+
   test("while a turn runs the composer offers Interrupt", () => {
     const chat = applyHubEvents(emptyChat(S), [ev("message.user", { text: "go" })]);
     const html = render(chat);

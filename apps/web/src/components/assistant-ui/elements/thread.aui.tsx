@@ -836,6 +836,8 @@ const AssistantActionBar: FC = () => {
           </TooltipIconButton>
         </ActionBarPrimitive.FeedbackNegative>
       </AuiIf>
+      {/* Hearth: regenerate and the "…" menu only when the runtime can reload (#84). */}
+      <AuiIf condition={(s) => s.thread.capabilities.reload}>
       <ActionBarPrimitive.Reload asChild>
         <TooltipIconButton tooltip="Refresh">
           <RefreshCwIcon />
@@ -864,6 +866,7 @@ const AssistantActionBar: FC = () => {
           </ActionBarPrimitive.ExportMarkdown>
         </ActionBarMorePrimitive.Content>
       </ActionBarMorePrimitive.Root>
+      </AuiIf>
     </ActionBarPrimitive.Root>
   );
 };
@@ -930,11 +933,14 @@ const UserActionBar: FC = () => {
       autohide="not-last"
       className="aui-user-action-bar-root flex flex-col items-end"
     >
+      {/* Hearth: the edit button only when the runtime can edit (#84). */}
+      <AuiIf condition={(s) => s.thread.capabilities.edit}>
       <ActionBarPrimitive.Edit asChild>
         <TooltipIconButton tooltip="Edit" className="aui-user-action-edit">
           <PencilIcon />
         </TooltipIconButton>
       </ActionBarPrimitive.Edit>
+      </AuiIf>
     </ActionBarPrimitive.Root>
   );
 };
