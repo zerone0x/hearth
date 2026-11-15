@@ -10,7 +10,7 @@ ARG BUN_VERSION=1.4.4
 # 1. The web UI, built once; only apps/web/dist reaches the final image.
 FROM oven/bun:${BUN_VERSION} AS web
 WORKDIR /src
-COPY package.json bun.lock bunfig.toml ./
+COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
 COPY apps/web/package.json apps/web/
 COPY apps/hub/package.json apps/hub/
 COPY apps/box-agent/package.json apps/box-agent/
@@ -25,7 +25,7 @@ RUN bun run --filter @hearth/web build
 # 2. The hub: production dependencies, sources, and the UI from stage 1.
 FROM oven/bun:${BUN_VERSION}-slim
 WORKDIR /opt/hearth
-COPY package.json bun.lock bunfig.toml ./
+COPY package.json bun.lock bunfig.toml tsconfig.base.json ./
 COPY apps/hub/package.json apps/hub/
 COPY packages/core/package.json packages/core/
 COPY packages/protocol/package.json packages/protocol/
