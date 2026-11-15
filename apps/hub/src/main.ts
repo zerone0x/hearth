@@ -10,6 +10,7 @@ import {
   parsePublicOrigin,
   startHub,
 } from "./server";
+import { DEFAULT_IDLE_MS } from "./session";
 
 /** Where the hub keeps its database when `HEARTH_DATA_DIR` is not set. */
 const DEFAULT_DATA_DIR = "data";
@@ -27,6 +28,21 @@ export function boxProviderFromEnv(
     throw new Error(`HEARTH_BOX_PROVIDER must be "docker" or "none", got "${kind}"`);
   }
   return new DockerBoxProvider({ config: dockerBoxConfigFromEnv(env) });
+}
+
+/**
+ * Minutes a session may sit idle before its box is stopped
+ * (`HEARTH_IDLE_MINUTES`, PRD §6.3: default 15). Rejects anything that is not
+ * a positive number instead of silently falling back.
+ */
+export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env["HEARTH_IDLE_MINUTES"];
+  if (raw === undefined || raw === "") return DEFAULT_IDLE_MS;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    throw new Error(`HEARTH_IDLE_MINUTES must be a positive number, got "${raw}"`);
+  }
+  return Math.round(minutes * 60_000);
 }
 
 if (import.meta.main) {
@@ -49,6 +65,8 @@ if (import.meta.main) {
     ...(provider === undefined ? {} : { provider }),
     boxEgress,
     dbPath: join(dataDir, "hearth.db"),
+    ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
+    sessions: { idleMs: idleMsFromEnv(process.env) },
     log: (line) => console.log(line),
   });
 

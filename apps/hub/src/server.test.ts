@@ -70,7 +70,7 @@ describe("GET /healthz", () => {
   test("returns 200 from the app", async () => {
     const res = await createApp().request("/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", protocol: "1.0" });
+    expect(await res.json()).toEqual({ status: "ok", protocol: "1.1" });
   });
 
   test("every other route, known or not, needs a session (decision 0014)", async () => {
@@ -306,6 +306,33 @@ describe("startHub", () => {
   function signedIn(hub: ReturnType<typeof startHub>): { cookie: string } {
     return { cookie: `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}` };
   }
+
+  test("the session API (decision 0013) is behind the login (decision 0014)", async () => {
+    const hub = start();
+    const routes: [string, string][] = [
+      ["POST", "/v1/sessions"],
+      ["GET", "/v1/sessions"],
+      ["GET", "/v1/sessions/ses_none"],
+      ["POST", "/v1/sessions/ses_none/archive"],
+    ];
+    const call = (method: string, path: string, headers: Record<string, string> = {}) =>
+      fetch(new URL(path, hub.url), {
+        method,
+        headers: { "content-type": "application/json", ...headers },
+        ...(method === "POST" ? { body: JSON.stringify({}) } : {}),
+        signal: AbortSignal.timeout(5_000),
+      });
+    for (const [method, path] of routes) {
+      const res = await call(method, path);
+      expect({ method, path, status: res.status }).toEqual({ method, path, status: 401 });
+      expect(await res.json()).toMatchObject({ ok: false, error: { code: "auth.required" } });
+    }
+    expect(await hub.sessions.list(LOCAL_PRINCIPAL)).toHaveLength(0);
+    // With a login session the same routes reach the session manager.
+    const session = signedIn(hub);
+    expect((await call("GET", "/v1/sessions", session)).status).toBe(200);
+    expect((await call("GET", "/v1/sessions/ses_none", session)).status).toBe(404);
+  });
 
   test("serves /healthz over a real socket on loopback", async () => {
     const hub = start();

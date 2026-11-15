@@ -18,3 +18,11 @@ export {
 } from "./event-store";
 export { SqliteLoginStore } from "./login-store";
 export { MIGRATIONS, type Migration, migrate, SCHEMA_VERSION } from "./migrations";
+export {
+  type BoxRow,
+  type OperationKind,
+  type OperationRow,
+  type OperationStatus,
+  type SessionRow,
+  SqliteSessionStore,
+} from "./sessions";

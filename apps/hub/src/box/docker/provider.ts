@@ -107,7 +107,7 @@ export interface DockerBoxProviderOptions {
 interface ContainerJson {
   readonly Id: string;
   readonly Created?: string;
-  readonly State?: { readonly Status?: string };
+  readonly State?: { readonly Status?: string; readonly ExitCode?: number };
   readonly Config?: { readonly Image?: string; readonly Labels?: Record<string, string> | null };
 }
 
@@ -495,6 +495,9 @@ export class DockerBoxProvider implements BoxProvider {
       volumeRef: this.objectName(boxId),
       labels: { ...labels },
       createdAt,
+      ...(state === "exited" && typeof container?.State?.ExitCode === "number"
+        ? { exitCode: container.State.ExitCode }
+        : {}),
     };
   }
 

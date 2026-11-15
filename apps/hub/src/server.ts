@@ -22,12 +22,14 @@ import {
   markerEgressCheck,
   requireBoxEgress,
 } from "./box/egress";
+import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
 import {
   openDatabase,
   SqliteAuditSink,
   SqliteBoxCredentialStore,
   SqliteEventStore,
   SqliteLoginStore,
+  SqliteSessionStore,
 } from "./store";
 
 export interface HubListenOptions {
@@ -77,7 +79,26 @@ export interface HubOptions extends HubListenOptions {
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
   readonly echoDeadlineMs?: number;
+  /** Image of session boxes (`HEARTH_BOX_IMAGE`). Defaults to `DEFAULT_BOX_IMAGE`. */
+  readonly boxImage?: string;
+  /** Session manager timings and bounds (idle time, relaunch bounds); see `SessionManagerOptions`. */
+  readonly sessions?: Partial<
+    Pick<
+      SessionManagerOptions,
+      | "idleMs"
+      | "runningGraceMs"
+      | "connectDeadlineMs"
+      | "exitPollMs"
+      | "superviseIntervalMs"
+      | "maxCredentialRelaunches"
+      | "maxCrashRetries"
+      | "stableMs"
+    >
+  >;
 }
+
+/** Image of session boxes when `boxImage` is not set. */
+export const DEFAULT_BOX_IMAGE = "hearth-box:local";
 
 export const DEFAULT_HOSTNAME = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
@@ -122,6 +143,7 @@ export function startHub(options: HubOptions) {
   const authorizer = new AllowAllAuthorizer({ audit });
   const events = new SqliteEventStore(db);
   const credentials = new SqliteBoxCredentialStore(db);
+  const sessionStore = new SqliteSessionStore(db);
   const boxes = new BoxConnections({
     authorizer,
     events,
@@ -187,7 +209,11 @@ export function startHub(options: HubOptions) {
       if (ws.data !== undefined) boxes.message(ws.data, message);
     },
     close(ws) {
-      if (ws.data !== undefined) boxes.closed(ws.data);
+      if (ws.data === undefined) return;
+      boxes.closed(ws.data);
+      // Supervision (#28): a dropped box may have exited; the manager looks.
+      const boxId = ws.data.binding?.boxId;
+      if (boxId !== undefined) sessions.boxClosed(boxId);
     },
   };
   function listenForBoxes(address: string): string {
@@ -259,6 +285,47 @@ export function startHub(options: HubOptions) {
     return options.provider;
   }
 
+  /**
+   * Start a box through the configured provider (decision 0012): `authorize`,
+   * refuse with `box.egress-unfiltered` unless box egress is filtered or
+   * explicitly unrestricted, create the box's network and volumes, open a box listener on the hub's
+   * address on that network, then boot the box with a fresh join token and
+   * that listener's URL.
+   */
+  async function startBox(principal: Principal, spec: BoxSpec) {
+    const provider = requireProvider();
+    await authorizeStart(principal, spec);
+    requireBoxEgress(boxEgress());
+    await provider.create(spec);
+    const hubUrl = listenForBoxes(await provider.hubAddress(spec.boxId));
+    return await bootBox(provider, spec, hubUrl);
+  }
+
+  // The session manager (decision 0013): it alone starts, stops and relaunches
+  // session boxes, through `startBox` and the provider.
+  const provider = options.provider;
+  const sessions = new SessionManager({
+    authorizer,
+    events,
+    store: sessionStore,
+    image: options.boxImage ?? DEFAULT_BOX_IMAGE,
+    ...options.sessions,
+    ...(options.log === undefined ? {} : { log: options.log }),
+    ...(provider === undefined
+      ? {}
+      : {
+          boxes: {
+            providerName: provider.name,
+            start: startBox,
+            stop: (boxId: BoxId) => provider.stop(boxId),
+            attach: (boxId: BoxId) => provider.attach(boxId),
+            isConnected: (boxId: BoxId) => boxes.isConnected(boxId),
+            waitForBox: (boxId: BoxId, deadlineMs: number) => boxes.waitForBox(boxId, deadlineMs),
+          },
+        }),
+  });
+  mountSessionRoutes(app, sessions);
+
   const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
     /** The public listener: UI/API only. */
@@ -278,6 +345,8 @@ export function startHub(options: HubOptions) {
     boxes,
     /** The local login: owner password and login sessions (decision 0014). */
     auth,
+    /** The session manager: sessions, lazy box start, hibernate, supervision (decision 0013). */
+    sessions,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
     issueJoinToken(boxId: string, sessionId: string, ttlMs?: number): Promise<IssuedJoinToken> {
       return credentials.issueJoinToken(scope, boxId, sessionId, ttlMs);
@@ -291,21 +360,8 @@ export function startHub(options: HubOptions) {
       await authorizeStart(principal, spec);
       return await bootBox(provider, spec, hubUrl);
     },
-    /**
-     * Start a box through the configured provider (decision 0012): `authorize`,
-     * refuse with `box.egress-unfiltered` unless box egress is filtered or
-     * explicitly unrestricted, create the box's network and volumes, open a box listener on the hub's
-     * address on that network, then boot the box with a fresh join token and
-     * that listener's URL.
-     */
-    async startBox(principal: Principal, spec: BoxSpec) {
-      const provider = requireProvider();
-      await authorizeStart(principal, spec);
-      requireBoxEgress(boxEgress());
-      await provider.create(spec);
-      const hubUrl = listenForBoxes(await provider.hubAddress(spec.boxId));
-      return await bootBox(provider, spec, hubUrl);
-    },
+    /** Start a box through the configured provider (decision 0012); see `startBox` above. */
+    startBox,
     /** The current box egress status (decision 0012); `/healthz` reports it too. */
     boxEgress(): BoxEgressStatus {
       return boxEgress();
@@ -352,8 +408,10 @@ export function startHub(options: HubOptions) {
     /** Close every box connection, stop listening and close the database. Idempotent. */
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
+      sessions.stop();
       boxes.shutdown();
       stopped = (async () => {
+        await sessions.ready.catch(() => undefined);
         await Promise.all([server, ...boxListeners.values()].map((srv) => srv.stop(true)));
         boxListeners.clear();
         db.close();

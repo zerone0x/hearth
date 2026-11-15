@@ -710,6 +710,118 @@ its listener is #27.
 - This is not authentication. Login still has to come before the API is
   exposed beyond the owner's machine.
 
+## 0011: Tool execution RPC (protocol 1.1) and the box-agent executor
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #41 (and its comment from the #38 verification)
+
+### Decision
+
+- **Protocol 1.1 adds tool methods, no frame types.** Twelve `rpc` methods in
+  `packages/protocol/src/tools.ts`: `tool.readFile`, `tool.access`,
+  `tool.imageMimeType`, `tool.writeFile`, `tool.mkdir`, `tool.exists`,
+  `tool.stat`, `tool.readdir`, `tool.glob`, `tool.grep`, `tool.exec` and
+  `tool.cancel`. They map one to one onto pi's `ReadOperations`,
+  `WriteOperations`, `EditOperations`, `BashOperations`, `LsOperations`,
+  `FindOperations` and `GrepOperations.isDirectory` (pi 1.5.2), so the runner
+  (#43) passes them to `create*ToolDefinition` unchanged. `tool.grep` is the
+  whole search, run as `rg` in the box (pi's grep always runs a local `rg`).
+  A minor bump: a 1.0 peer answers the methods as unknown.
+- **The idempotency key is the `rpc` id, not pi's tool call id.** One pi tool
+  call makes several operations (edit: access, read, write), so each call
+  carries pi's id as `callId` for logs and audit, and the box runs each `rpc`
+  id at most once per boot. The hub mints ids as `tool_<uuid>`, so a hub
+  restart never reuses one. The box keeps finished answers (8 MiB) to answer a
+  re-send, and remembers evicted ids so a re-send gets `tool.result-expired`
+  instead of a second run.
+- **Hub-side deadline per call** (`toolDeadlineMs`): the box's own budget for
+  the call plus a 5 s grace. For `tool.exec` that is the command timeout pi
+  passes in (default 10 min, max 1 h); search methods have 30 s; file methods
+  30 s. No global timeout (PRD §8.1, principles 3, 4 and 8). A command whose
+  deadline passes is cancelled.
+- **Reconnects.** A dropped connection does not fail a call. On the **same
+  boot** the hub re-sends the call with the same id and gets the box's one
+  answer. On a **new boot** the call fails with `tool.outcome-unknown` and is
+  never re-sent; a mutating call (`writeFile`, `mkdir`, `exec`) is `give-up`,
+  a read-only one is `retry`, since running it again changes nothing.
+- **Exec answers once; output is capped and spilled into the box.** The tail
+  (256 KiB) comes back in the result, behind a `[hearth: N bytes of earlier
+  output omitted; full output in the box at …]` marker, and the whole output
+  (up to 16 MiB) is written to `/workspace/.hearth/exec/<call>.log`, a box path
+  the model can `read`. This answers the spike's (#40) finding that pi points
+  at a hub temp file when it truncates. A chunked live stream was not chosen:
+  pi accepts one `onData` call, and live output needs a box → hub channel
+  (decision 0009, a later minor bump).
+- **No hub environment crosses.** `tool.exec` has no `env` field and the decoder
+  drops one. Commands get a box-defined environment (`PATH`, `HOME`, `LANG`,
+  `TERM`, `PWD`, and `DISPLAY` in the image, plus the per-run `HEARTH_EXEC`
+  marker below), never box-agent's own, which holds the join token.
+- **Paths are confined to `/workspace`.** This narrows PRD §8.2.1, which let an
+  absolute path name anything in the box; the issue asked for confinement, and
+  `bash` remains the way to reach the rest of the box. Relative paths resolve
+  against `/workspace`; an absolute path must be inside it; any `..` segment is
+  refused; the existing part of the path is resolved with `realpath` and must
+  stay inside, and a dangling symlink is refused. glob does not follow
+  symlinks while it walks, refuses `..` patterns and patterns whose literal
+  leading segments (`etclink/` in `etclink/pass*`) resolve outside, and drops
+  every match whose `realpath` is outside. **`~` means `/workspace`.** The box
+  does not expand it: pi expands it to the hub's home, so the runner (#43)
+  rewrites `~` to `/workspace` in `tool_call`, and a hub-home path that slips
+  through is refused as outside the workspace. `/workspace` rather than the box
+  user's home (`/home/hearth`, the spike's choice), because every tool path
+  must be inside `/workspace`, so a rewrite to the home would always be refused.
+- **Regular files only, each file method on a budget.** `readFile`,
+  `imageMimeType` and `writeFile` open without blocking and refuse a FIFO,
+  socket or device with `tool.not-regular-file` (owner `user`, `give-up`), so a
+  FIFO cannot hang a call. Every file method also has its own box-side budget,
+  `FILE_TIMEOUT_MS` (25 s, the hub's 30 s deadline less the grace), and ends on
+  `tool.cancel`: the call is answered with `tool.deadline` and its slot is freed
+  even if the I/O itself stays stuck in the kernel.
+- **The spill file never follows a symlink.** `/workspace/.hearth` and its
+  `exec/` are created if missing and must be plain directories by `lstat`, and
+  the file is opened with `O_NOFOLLOW`. If a segment is a symlink the output is
+  not spilled (`fullOutputPath: null`); the tail still comes back.
+- **Limits:** file reads and writes 1 MiB (larger files get `tool.too-large`;
+  the `file` byte stream is the later path for them), output 256 KiB, 10,000
+  list entries, 16 concurrent calls per box (`tool.busy`, retryable).
+- **Process groups and the run marker.** Each command leads its own process
+  group, and its environment carries `HEARTH_EXEC=<random uuid>`, which every
+  child inherits. A timeout or a cancel sends `SIGKILL` to the group, then
+  kills every process whose `/proc/<pid>/environ` carries the marker, in a few
+  rounds to catch forks; that catches a child that left the group (`setsid`, a
+  daemonizing double fork, `nohup` in a new session). The threat is a runaway
+  process in the box, not an escape from it: a process that deliberately
+  re-executes with an environment without the marker can survive the call, and
+  lives until the box stops (the box is the sandbox). A subreaper or a per-call
+  cgroup was not chosen: the image runs box-agent unprivileged under tini, with
+  no writable cgroup, and a subreaper would also have to reap and attribute
+  orphans of concurrent calls. After the shell exits the call ends within
+  200 ms even if a background child holds the pipe; such a child is left
+  running (a server the agent started), it is only killed on timeout or cancel.
+- **Errors are classified by code** (`TOOL_ERRORS`): the model's bad request
+  (`path-escape`, `not-found`, `too-large`, …) is owner `user`, `give-up`;
+  `busy` is `box`, `retry`; an unexpected executor fault is `box`,
+  `retry-cold`. The hub client raises them as `HearthError`s, and its pi-shaped
+  `bash.exec` throws exactly `aborted` and `timeout:<seconds>`, the strings pi
+  turns into "Command aborted" and "Command timed out".
+
+### Consequences
+
+- The runner (#43) adapts `ToolRpcClient.operations(boxId, toolCallId)` per
+  call, rewrites `~` to `/workspace`, and replaces pi's truncation hint with
+  the box path, or relies on the marker the box already puts in the output.
+- Files over 1 MiB cannot be read through `read` until the `file` stream path
+  lands; the model gets a clear error and can use `bash` (`head`, `sed`).
+- `/workspace/.hearth/` holds spill files; cleaning them up is the session
+  manager's call (they are small and per command).
+- Commands run as box-agent's uid, so they can read its initial environment
+  in `/proc/<box-agent pid>/environ` (the spent one-time join token, the hub
+  URL, the box id). That is a follow-up (a separate uid, or a re-exec without
+  those variables), not part of this decision.
+- The path check is check-then-use; code already running in the box could race
+  it. It guards against hostile paths from the model, not against `bash`.
+
 ## 0012: Box listeners on box-network gateways, and a host firewall for box egress
 
 - Date: 2026-11-15
@@ -873,6 +985,112 @@ its listener is #27.
 - Another provider (PRD §7 E4) implements `hubAddress` its own way; the hub
   only needs an address it can bind and the box can reach.
 
+## 0013: Session manager: state machine, lazy box start, hibernate as stop, box exit supervision
+
+- Date: 2026-11-15
+- Status: accepted
+- Issues: #42, #28
+
+### Decision
+
+- **The session manager lives in `apps/hub/src/session`** (`SessionManager`),
+  with its rows in `store/sessions.ts` (the store stays the only SQLite code,
+  0006). `startHub` builds it and exposes it as `hub.sessions`; it is the only
+  code that starts, stops or relaunches session boxes, through `hub.startBox`
+  (0012) and the provider.
+- **States** are those of PRD §5, persisted in `session.state`:
+  `creating → idle` (created, no box), `idle → running` (a tool call on a
+  connected box), `idle | hibernated → waking → running` (lazy start or wake),
+  `running → idle` (no tool call in flight), `idle → hibernated` (box stopped),
+  `running | idle → waking` (box relaunch), `waking → idle` (relaunched with no
+  call waiting), `waking → hibernated` (the box could not be started, or the
+  hub restarted mid-wake), `running | creating → idle` (hub restart), any
+  state but `archived` → `failed` / `archived`, and `failed → archived` only.
+  Anything else is `session.illegal-transition`. A failed session refuses tool
+  calls (`session.unavailable`) until it is archived; retrying a failed session
+  is a later decision.
+- **Every transition** is checked against that table, then authorized with
+  `session.<verb>` named by the target state (`session.create`, `.run`,
+  `.idle`, `.hibernate`, `.wake`, `.fail`, `.archive`; the authorizer audits
+  it), then written to the event log as `session.state {from, to, reason}`, and
+  only then written to the row. Hub-initiated transitions (idle timer,
+  supervision, restart recovery) use `SYSTEM_PRINCIPAL`.
+- **Lazy start: `ensureBox(sessionId, principal?)`** is the one entry point
+  that starts a box. The runner (#43) calls it before each routed tool call; it
+  returns a lease (`{ boxId, release() }`) once the box is connected, waiting
+  under the named deadline `connectDeadlineMs` (default 120 s). Creating a
+  session starts nothing. `withBox` wraps ensure/release.
+- **Hibernate means `BoxProvider.stop`** (the volume stays) after `idleMs`
+  (default 15 minutes, `HEARTH_IDLE_MINUTES`) with no lease held; a lease taken
+  meanwhile cancels it. `session.hibernate` / `hibernate.done` frames are not
+  used: the runner's state is in the hub, so there is nothing to quiesce in the
+  box (this settles the question 0009 left open).
+- **Running grace.** A session stays `running` for `runningGraceMs`
+  (`DEFAULT_RUNNING_GRACE_MS`, 3 s) after its last lease is released; each
+  release restarts it. The back-to-back tool calls of one turn so write one
+  `running` and one `idle`, not an `idle → running` pair (two audit rows, two
+  `session.state` events) per call. The grace counts toward `idleMs`: the
+  hibernate still comes `idleMs` after the last call ended.
+- **One lifecycle step at a time per session**: wakes, hibernates, relaunches,
+  state changes after a lease and archive run in a per-session queue, so a
+  wake waits for a hibernate in flight and runs on the next box (PRD §6.3).
+- **Every boot is cold and gets a fresh join token**: a wake stops whatever
+  runtime is left, then `startBox`, because `BoxProvider.start` leaves a running
+  box alone and would not apply the new token.
+- **In-flight orchestration is persisted** (migration 4, `session_operation`:
+  kind `wake` or `hibernate`, status `running`, `done`, `failed` or
+  `interrupted`), logged before it acts. At start the manager marks every
+  `running` operation `interrupted` and appends `session.operation {kind,
+  outcome: "interrupted"}`; a `waking` session goes to `hibernated` and a
+  `running` or `creating` one to `idle`, each with reason "the hub restarted".
+  Nothing is resumed silently: the next tool call wakes it again, visibly
+  (PRD §8.1 principle 7).
+- **No orphan box after a restart** (PRD §5: hibernated means the box is
+  stopped). Before that, recovery stops the box of every session that is not
+  `idle`/`running` and that was `waking`, had an operation in flight, or whose
+  box row still says `running` (a hibernate whose stop never reached the
+  provider). A stopped box's row becomes `stopped`, and the stop outcome
+  (`stop: "stopped" | "not-found"`) goes into the `interrupted` event and the
+  operation's detail; a box stopped with no operation in flight gets
+  `session.operation {kind: "recover"}`. A stop that fails is not swallowed:
+  `stop: "failed"` with its code and message in the event, a log line, and the
+  box row stays `running`, so the next wake stops it before it starts a new one.
+- **Box exit supervision (#28).** `BoxInfo` gains `exitCode` (present when the
+  state is `exited`; Docker's `State.ExitCode`). Exits are found by inspecting
+  the box (`BoxProvider.attach`): every `exitPollMs` (1 s) while a box boots,
+  shortly after any box connection closes, and on a sweep every
+  `superviseIntervalMs` (5 s) over sessions with a running box. Classification:
+  - `2` → `box.config`, give-up: `box.failed`, session `failed`.
+  - `3` → `box.credential-lost`, relaunch with a fresh join token, at most
+    `maxCredentialRelaunches` (3) times.
+  - anything else → `box.crashed`, retry-cold, at most `maxCrashRetries` (3).
+  - a box that never connects within `connectDeadlineMs` →
+    `box.connect-deadline`, counted with crashes.
+  Each relaunch appends `box.restarted {cause, code, exitCode, attempt,
+  maxAttempts}`; when the bound is used up or the cause gives up, `box.failed`
+  is appended and the session goes to `failed`. Both counters reset after a
+  hibernate, or when the box that exited had stayed connected for `stableMs`
+  (60 s), so stuck is counted, not timed (PRD §8.1 principle 4). A box that
+  exits while its session is idle is relaunched too. A start the provider
+  refuses (for example `box.egress-unfiltered`) appends `box.failed {cause:
+  "start"}` and returns the session to `hibernated`, since the owner can fix it.
+- **API** (`session/routes.ts`, mounted by `server.ts` on the app after its
+  request guard, so 0010 applies): `POST /v1/sessions` (`title`, `model`,
+  `repoUrl`, all optional strings), `GET /v1/sessions`, `GET /v1/sessions/:id`,
+  `POST /v1/sessions/:id/archive`. The caller is `LOCAL_PRINCIPAL` until login
+  (#44); list and get authorize `session.list` / `session.read`.
+
+### Consequences
+
+- The runner (#43) only calls `ensureBox` and releases the lease; it never
+  starts or stops a box. A tool RPC that fails because its box exited is the
+  runner's to report (PRD §6.3); the relaunch is the manager's.
+- A box that exits while idle costs a relaunch; making that lazy (stop and go
+  `hibernated` instead) is a small change if box churn matters.
+- The `box` table now tracks session boxes (`running`, `stopped`, `exited`).
+- Docker events would find exits faster than polling; polling needs no long
+  lived stream and works for any `BoxProvider`.
+
 ## 0014: Minimal local login: owner password, server-side sessions, session guard
 
 - Date: 2026-11-15
@@ -918,7 +1136,7 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   not NFKC: it changes no character the owner typed into a different one, so
   a password with "ﬁ" (U+FB01) or fullwidth letters is hashed as typed and
   the ASCII "fi" form does not log in.
-- **Server-side sessions.** Migration 4 adds `owner_password` and
+- **Server-side sessions.** Migration 5 adds `owner_password` and
   `login_session` (`session` is the agent session of PRD §5). A session id is
   `hls_` + 256 random bits; only its SHA-256 is stored, so the database never
   holds a usable cookie and the lookup by hash leaks nothing about the id.
