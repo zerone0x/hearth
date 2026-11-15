@@ -1,6 +1,7 @@
 import { createDefaultSecretStore, HearthError } from "@hearth/core";
 import { describeBoxAgent } from "./agent";
 import { BoxAgent } from "./connection";
+import { DEFAULT_EXEC_ENV } from "./tools/executor";
 
 /** Exit code when the boot environment is incomplete. */
 const EXIT_CONFIG = 2;
@@ -12,6 +13,11 @@ const HUB_URL_VAR = "HEARTH_HUB_URL";
 const BOX_ID_VAR = "HEARTH_BOX_ID";
 /** The join token is a secret, so it is read through the SecretStore, not `process.env`. */
 const JOIN_TOKEN_REF = "env:HEARTH_JOIN_TOKEN";
+/** Optional override of the workspace root, for running box-agent outside the image. */
+const WORKSPACE_VAR = "HEARTH_WORKSPACE";
+const DEFAULT_WORKSPACE = "/workspace";
+/** The desktop display commands may draw on; not a secret. */
+const DISPLAY_VAR = "HEARTH_DISPLAY";
 
 const info = describeBoxAgent();
 const banner = `hearth box-agent (protocol ${info.protocol}, pi ${info.pi})`;
@@ -32,7 +38,18 @@ async function main(): Promise<number> {
     return EXIT_CONFIG;
   }
 
-  const agent = new BoxAgent({ hubUrl, boxId, joinToken });
+  const display = process.env[DISPLAY_VAR];
+  const agent = new BoxAgent({
+    hubUrl,
+    boxId,
+    joinToken,
+    tools: {
+      root: process.env[WORKSPACE_VAR] || DEFAULT_WORKSPACE,
+      // Commands get the box's own minimal environment, never this process's,
+      // which holds the join token (PRD §8.2.1).
+      env: { ...DEFAULT_EXEC_ENV, ...(display ? { DISPLAY: display } : {}) },
+    },
+  });
   console.log(`${banner}: box ${boxId}, boot ${agent.bootId}, dialing ${hubUrl}`);
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => agent.stop());

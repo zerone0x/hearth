@@ -28,3 +28,4 @@ export {
 export * from "./frames";
 export { checkHelloVersion, rejectHello } from "./handshake";
 export { formatVersion, isCompatible, PROTOCOL_VERSION, type ProtocolVersion } from "./version";
+export * from "./tools";

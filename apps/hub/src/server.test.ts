@@ -9,7 +9,7 @@ describe("GET /healthz", () => {
   test("returns 200 from the app", async () => {
     const res = await createApp().request("/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", protocol: "1.0" });
+    expect(await res.json()).toEqual({ status: "ok", protocol: "1.1" });
   });
 
   test("unknown routes are 404", async () => {
