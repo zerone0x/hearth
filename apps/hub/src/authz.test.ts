@@ -68,16 +68,24 @@ class DenyingAuthorizer implements Authorizer {
   readonly #audit: SqliteAuditSink;
   readonly #denied: ReadonlySet<Action>;
 
-  constructor(audit: SqliteAuditSink, denied: readonly Action[]) {
+  readonly #allowEverything: boolean;
+
+  /** `allowEverything`: a broken policy that allows even another workspace's resources. */
+  constructor(audit: SqliteAuditSink, denied: readonly Action[], allowEverything = false) {
     this.#inner = new AllowAllAuthorizer({ audit });
     this.#audit = audit;
     this.#denied = new Set(denied);
+    this.#allowEverything = allowEverything;
   }
 
   async authorize(principal: Principal, action: Action, resource: Resource): Promise<Decision> {
     this.calls.push({ action, resource });
-    if (!this.#denied.has(action)) return await this.#inner.authorize(principal, action, resource);
-    const decision: Decision = { allowed: false, policy: "test-deny", reason: "denied by test" };
+    if (!this.#denied.has(action) && !this.#allowEverything) {
+      return await this.#inner.authorize(principal, action, resource);
+    }
+    const decision: Decision = this.#denied.has(action)
+      ? { allowed: false, policy: "test-deny", reason: "denied by test" }
+      : { allowed: true, policy: "test-allow-everything" };
     try {
       await this.#audit.write({
         workspaceId: principal.workspaceId,
@@ -128,14 +136,14 @@ interface AuditRow {
 }
 
 /** A `BoxConnections` over a fresh database, with `denied` actions refused. */
-function setup(denied: readonly Action[]) {
+function setup(denied: readonly Action[], options: { allowEverything?: boolean } = {}) {
   const db = openDatabase(tempDbPath());
   dbs.push(db);
   db.run("INSERT INTO workspace (id, name, created_at) VALUES (?, 'other', 0)", [
     OTHER_WORKSPACE_ID,
   ]);
   const audit = new SqliteAuditSink(db);
-  const authorizer = new DenyingAuthorizer(audit, denied);
+  const authorizer = new DenyingAuthorizer(audit, denied, options.allowEverything === true);
   const events = new SqliteEventStore(db);
   const credentials = new SqliteBoxCredentialStore(db);
   const applied: unknown[] = [];
@@ -396,13 +404,46 @@ describe("box.echo denied", () => {
     // LOCAL_PRINCIPAL lives in the default workspace; box_b does not.
     const res = await echoOverHttp(t, "box_b");
 
+    // The answer does not reveal that the box exists in another workspace.
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({ ok: false, error: { code: "box.not-connected" } });
     expect(socket.types()).toEqual(["welcome"]);
     expect(socket.closeCode).toBeUndefined();
-    // `authorize` ran first, as for every handler.
+    // `authorize` ran first, as for every handler, and saw the box's workspace:
+    // the real policy denied it, and the audit row says so (#50, decision 0022).
     expect(t.authorizer.calls.map((c) => c.action)).toEqual(["box.connect", "box.echo"]);
-    expect(t.auditRows("box.echo")).toHaveLength(1);
+    expect(t.auditRows("box.echo")).toEqual([
+      {
+        workspace_id: DEFAULT_WORKSPACE_ID,
+        principal_id: LOCAL_PRINCIPAL.id,
+        action: "box.echo",
+        resource_workspace_id: OTHER_WORKSPACE_ID,
+        resource_type: "box",
+        resource_id: "box_b",
+        allowed: 0,
+        reason: "resource is in another workspace",
+      },
+    ]);
+  });
+
+  test("a policy that allows a cross-workspace echo still sends no rpc to the box", async () => {
+    // A broken policy that allows everything, even across workspaces: the hub's
+    // own check after `authorize` still keeps the echo away from the box.
+    const t = setup([], { allowEverything: true });
+    const { token } = await t.credentials.issueJoinToken(
+      { workspaceId: OTHER_WORKSPACE_ID },
+      "box_b",
+      "ses_b",
+    );
+    const { socket } = await t.connect([hello("box_b", token)]);
+    const res = await echoOverHttp(t, "box_b");
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ ok: false, error: { code: "box.not-connected" } });
+    expect(socket.types()).toEqual(["welcome"]);
+    expect(t.auditRows("box.echo")).toMatchObject([
+      { resource_workspace_id: OTHER_WORKSPACE_ID, allowed: 1 },
+    ]);
   });
 });
 
