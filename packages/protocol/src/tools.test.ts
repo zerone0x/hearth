@@ -18,8 +18,8 @@ import {
 } from "./index";
 
 describe("tool RPC", () => {
-  test("is a minor bump of protocol 1", () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 1 });
+  test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2)", () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 2 });
   });
 
   test("exec params never carry an environment", () => {

@@ -9,7 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { HearthError } from "@hearth/core";
+import { HearthError, Logger } from "@hearth/core";
 import {
   type CommandHistory,
   decodeFrame,
@@ -123,6 +123,8 @@ export class BoxAgent {
         : new ToolExecutor({
             ...options.tools,
             log: this.#log,
+            // One JSON line per tool call with the hub's trace ids (decision 0021).
+            logger: options.tools.logger ?? new Logger({ component: "box-agent.tools" }),
             // An answer written while disconnected is lost; the hub re-sends the
             // call on the same boot and the executor answers it again.
             send: (frame) => {

@@ -33,7 +33,9 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
-import type { BoxToolOperations } from "../box/tool-rpc";
+import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
+import { registerSecret } from "../obs/redaction";
+import type { Telemetry } from "../obs/telemetry";
 import type { BoxLease, SessionView } from "../session/manager";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
@@ -76,7 +78,9 @@ export interface SessionRunnersOptions {
   readonly authorizer: Authorizer;
   readonly events: EventStore;
   readonly sessions: RunnerSessions;
-  readonly tools: { operations(boxId: string, callId: string): BoxToolOperations };
+  readonly tools: {
+    operations(boxId: string, callId: string, trace?: RpcTrace): BoxToolOperations;
+  };
   readonly secrets: SecretStore;
   readonly config: RunnerConfig;
   /** Tests pass a runtime with pi-ai's faux provider; otherwise one is created. */
@@ -86,6 +90,8 @@ export interface SessionRunnersOptions {
   readonly boxCwd?: string;
   readonly hubTempDir?: string;
   readonly log?: (line: string) => void;
+  /** Spans and metrics (decision 0021); exports nothing unless configured. */
+  readonly telemetry?: Telemetry;
 }
 
 export interface RunnerOptionsInput {
@@ -263,6 +269,7 @@ export class SessionRunners {
       ...(this.#o.hubTempDir === undefined ? {} : { hubTempDir: this.#o.hubTempDir }),
       log: (line) => this.#log(line),
       redact: (text) => this.redact(text),
+      ...(this.#o.telemetry === undefined ? {} : { telemetry: this.#o.telemetry }),
       onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });
   }
@@ -280,6 +287,7 @@ export class SessionRunners {
       if (this.#o.config.apiKeyRef !== undefined) {
         const key = (await this.#o.secrets.resolve(this.#o.config.apiKeyRef)).reveal();
         this.#secretValues.add(key);
+        registerSecret(key);
         await runtime.setRuntimeApiKey(this.#o.config.provider, key);
       }
       return runtime;
@@ -301,7 +309,7 @@ export class SessionRunners {
         this.#contextFresh.add(sessionId);
         await this.#refreshContext(sessionId, lease, boxCwd);
       },
-      operations: (boxId, callId) => this.#o.tools.operations(boxId, callId),
+      operations: (boxId, callId, trace) => this.#o.tools.operations(boxId, callId, trace),
     };
   }
 

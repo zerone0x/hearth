@@ -327,6 +327,40 @@ Stack (can change before implementation):
 | Gateway | `direct` with an API key from the SecretStore (prototype); then Bifrost (Go, self-hosted) | Bifrost: virtual keys, budgets, request log; small footprint; has an enterprise path |
 | Deploy | docker compose (hub, later bifrost, reverse proxy); hub manages boxes via the Docker socket | One command |
 
+### 8.5 Observability and trajectories
+
+From day one every session produces a complete trajectory (decision 0021).
+Sessions are the data for Retro (§6.8) and the M4 model router, and "no silent
+failure" (§8.1) needs evidence.
+
+- **Trajectory.** One per session, schema `hearth.trajectory/2`: turns made of
+  steps (model calls, tool calls), user inputs, box operations and outcome
+  labels, each with session, turn, step, tool call, box, trace and span ids,
+  wall and monotonic times, and the pi and hub versions. Enough to replay and
+  debug a turn: each model call has its request (model, thinking level, max
+  tokens, temperature, tools, system prompt hash and size, message count) and
+  its output (text, thinking, tool calls with arguments); every kept text is
+  redacted and capped at 16 KiB of UTF-8 with its size and hash. It is a projection of
+  the event log, served as JSON Lines by `GET /v1/sessions/:id/trajectory`
+  (behind `authorize`) and dumped by a CLI.
+- **Correlation.** Each tool RPC carries a W3C `traceparent` (protocol 1.2), so
+  box-agent's log lines for a call share the hub's trace id.
+- **Logs.** Hub and box-agent write JSON lines with level (warnings and errors
+  as such), component and the session, box and turn ids a line names.
+  Secrets are redacted at the sink, not only where events are written, and
+  are known from startup.
+- **Export.** OpenTelemetry spans and metrics (GenAI semantic conventions)
+  through the official OTLP exporter, to any OTLP backend, only when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Off by default: trajectories never
+  leave the hub unless an exporter is configured. Hearth builds no trace
+  viewer; it uses existing OTLP backends.
+- **Metrics.** Tokens, cost, turns, tool calls and failures by class, and box
+  start/wake latency, as OpenTelemetry metrics and in the trajectory summary.
+- **Outcome labels.** Task type, outcome and verdict per session or turn, set
+  through the API today and by Retro later.
+- **Retention.** A configurable retention period is a follow-up (#83): it
+  needs a migration of the append-only event log (decision 0006).
+
 ## 9. Data model (sketch)
 
 ```

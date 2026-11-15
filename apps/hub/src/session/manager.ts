@@ -638,7 +638,13 @@ export class SessionManager {
       throw e;
     }
     this.#store.finishOperation(op, "done", this.#now());
-    await this.#append(s.id, "session.operation", { operation: op, kind: "wake", outcome: "done" });
+    await this.#append(s.id, "session.operation", {
+      operation: op,
+      kind: "wake",
+      outcome: "done",
+      // The trajectory's box records name the box (decision 0021).
+      ...(s.boxId === null ? {} : { boxId: s.boxId }),
+    });
     const rt = this.#rt(s.id);
     rt.connectedAt = this.#now();
     await this.#transition(
@@ -751,6 +757,7 @@ export class SessionManager {
         owner: "box",
         disposition: "give-up",
         ...exit,
+        ...(s.boxId === null ? {} : { boxId: s.boxId }),
         message,
       });
       throw new BoxGaveUp(
@@ -765,6 +772,7 @@ export class SessionManager {
       ...exit,
       attempt: rt.attempts[counter],
       maxAttempts: max,
+      ...(s.boxId === null ? {} : { boxId: s.boxId }),
       message: `box restarted after ${cls.cause} (attempt ${rt.attempts[counter]} of ${max})`,
     });
   }

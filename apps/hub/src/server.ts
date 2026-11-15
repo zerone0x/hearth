@@ -1,3 +1,4 @@
+import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import {
   AllowAllAuthorizer,
   type BoxId,
@@ -30,6 +31,8 @@ import {
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
+import { mountTrajectoryRoutes, Trajectories } from "./obs/routes";
+import { HUB_VERSION } from "./obs/version";
 import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
 import {
@@ -361,6 +364,16 @@ export function startHub(options: HubOptions) {
         }),
   });
   mountSessionRoutes(app, sessions);
+  // Trajectories and outcome labels (decision 0021): served with or without a runner.
+  mountTrajectoryRoutes(
+    app,
+    new Trajectories({
+      authorizer,
+      events,
+      sessions,
+      versions: { pi: PI_VERSION, hub: HUB_VERSION },
+    }),
+  );
 
   // The runner (decision 0015): one pi session per hub session, tools routed
   // to the session's box through the tool RPC.

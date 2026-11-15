@@ -39,6 +39,7 @@ import {
   type StreamOpenFrame,
   type TurnEventFrame,
 } from "./frames";
+import { parseTraceparent } from "./trace";
 import { formatVersion, isCompatible, PROTOCOL_VERSION, type ProtocolVersion } from "./version";
 
 /** Tag byte of a binary `stream.data` message. */
@@ -342,6 +343,13 @@ function withFailure<T extends object>(
   return base;
 }
 
+/** `traceparent` (1.2): kept when well-formed, dropped otherwise (tracing never fails a call). */
+function traceparentField(f: Fields): { traceparent?: string } {
+  const raw = f.raw("traceparent");
+  if (typeof raw !== "string" || parseTraceparent(raw) === undefined) return {};
+  return { traceparent: raw };
+}
+
 function nullableId(f: Fields, key: string): string | null {
   return f.raw(key) === null ? null : f.id(key);
 }
@@ -489,6 +497,7 @@ const DECODERS: Decoders = {
     id: f.id("id"),
     method: f.string("method", MAX_ID_LENGTH, false),
     params: f.json("params"),
+    ...traceparentField(f),
   }),
   "rpc.result": (f): RpcResultFrame => {
     const id = f.id("id");

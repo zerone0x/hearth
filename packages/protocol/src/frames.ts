@@ -252,6 +252,12 @@ export interface RpcFrame {
   readonly id: string;
   readonly method: string;
   readonly params: JsonValue;
+  /**
+   * Since 1.2: the caller's W3C `traceparent` (src/trace.ts), so the callee's
+   * logs carry the same trace id (decision 0021). Optional; a 1.1 peer drops it.
+   * The decoder drops a malformed one rather than refusing the call.
+   */
+  readonly traceparent?: string;
 }
 
 export interface RpcError {

@@ -4,7 +4,7 @@
  * 0014). In v1 every login yields the owner, so a handler that hard-coded
  * `LOCAL_PRINCIPAL` would look right; here the guard returns another principal
  * of the same workspace, which tells the two apart. One test per route family:
- * sessions, runner, desktop, box echo. Driven through the real hub (`startHub`):
+ * sessions, runner, desktop, box echo, trajectory and labels. Driven through the real hub (`startHub`):
  * real routes, session manager, runners, desktop bridge, box connections,
  * `AllowAllAuthorizer` and SQLite audit sink.
  */
@@ -111,6 +111,36 @@ function fixture() {
       const res = await request("/v1/sessions", { body: { title: "t" } });
       expect(res.status).toBe(201);
       return ((await res.json()) as { session: { id: string } }).session.id;
+    },
+    /** The workspace the session row is in (the store's own record). */
+    sessionWorkspace(id: string): string {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const row = db
+          .query<{ workspace_id: string }, [string]>(
+            "SELECT workspace_id FROM session WHERE id = ?",
+          )
+          .get(id);
+        if (row === null) throw new Error(`no session row ${id}`);
+        return row.workspace_id;
+      } finally {
+        db.close();
+      }
+    },
+    /** How many events of `type` the session has. */
+    eventCount(id: string, type: string): number {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        return (
+          db
+            .query<{ n: number }, [string, string]>(
+              "SELECT count(*) AS n FROM event WHERE session_id = ? AND type = ?",
+            )
+            .get(id, type)?.n ?? 0
+        );
+      } finally {
+        db.close();
+      }
     },
     auditRows(): AuditRow[] {
       const db = new Database(dbPath, { readonly: true });
@@ -251,6 +281,61 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
       },
     ]);
     expect(woken).toEqual([]);
+  });
+
+  test("trajectory routes: the trajectory and its labels (decision 0021)", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const from = mark(f);
+    const got = await f.request(`/v1/sessions/${id}/trajectory`);
+    expect(got.status).toBe(200);
+    expect(await got.text()).toContain('"kind":"session"');
+    const labelled = await f.request(`/v1/sessions/${id}/labels`, {
+      body: { outcome: "success" },
+    });
+    expect(labelled.status).toBe(200);
+    // Each route authorizes its action, then reads the session (session.read).
+    expectOther(f, from, ["session.trajectory", "session.label", "session.read"]);
+    // The resource is the session, in the workspace its row is in.
+    const workspace = f.sessionWorkspace(id);
+    const rows = f.auditRows().slice(from.rows);
+    expect(rows.map((r) => [r.action, r.resource_workspace_id, r.allowed])).toEqual([
+      ["session.trajectory", workspace, 1],
+      ["session.read", workspace, 1],
+      ["session.label", workspace, 1],
+      ["session.read", workspace, 1],
+    ]);
+    expect(f.eventCount(id, "trajectory.label")).toBe(1);
+  });
+
+  test("trajectory routes: checked against the session's workspace, not the caller's", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const workspace = f.sessionWorkspace(id);
+    expect(workspace).not.toBe(STRANGER.workspaceId);
+    f.signedIn.principal = STRANGER;
+    const from = mark(f);
+    expect((await f.request(`/v1/sessions/${id}/trajectory`)).status).toBe(403);
+    const labelled = await f.request(`/v1/sessions/${id}/labels`, {
+      body: { outcome: "fail" },
+    });
+    expect(labelled.status).toBe(403);
+    expect(f.auditRows().slice(from.rows)).toEqual([
+      {
+        principal_id: STRANGER.id,
+        action: "session.trajectory",
+        resource_workspace_id: workspace,
+        allowed: 0,
+      },
+      {
+        principal_id: STRANGER.id,
+        action: "session.label",
+        resource_workspace_id: workspace,
+        allowed: 0,
+      },
+    ]);
+    // Denied before anything was written.
+    expect(f.eventCount(id, "trajectory.label")).toBe(0);
   });
 
   test("box echo", async () => {
