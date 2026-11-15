@@ -1,9 +1,18 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, Fragment, useEffect, useMemo, useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemSeparator,
+  ItemTitle,
+} from "@/components/ui/item";
 import { Label } from "@/components/ui/label";
 import { api } from "./api";
 import { DesktopPanel } from "./Desktop";
@@ -192,27 +201,30 @@ function SessionList() {
       ) : open.length === 0 ? (
         <p className="text-muted-foreground">No sessions yet.</p>
       ) : (
-        <Card className="gap-0 py-0">
-          <ul className="divide-y" aria-label="Sessions">
-            {open.map((s) => (
-              <li
-                key={s.id}
-                className="flex items-center gap-3 px-3 py-2"
-                data-testid="session-row"
-              >
-                <a className="min-w-0 flex-1" href={`#/s/${encodeURIComponent(s.id)}`}>
-                  <span className="block truncate font-medium">{s.title || s.id}</span>
-                  <span className="text-muted-foreground text-xs">
+        <ItemGroup aria-label="Sessions" className="rounded-xl border bg-card">
+          {open.map((s, i) => (
+            <Fragment key={s.id}>
+              {i > 0 ? <ItemSeparator /> : null}
+              <Item role="listitem" size="sm" data-testid="session-row">
+                <ItemContent className="min-w-0">
+                  <ItemTitle className="w-full">
+                    <a className="truncate" href={`#/s/${encodeURIComponent(s.id)}`}>
+                      {s.title || s.id}
+                    </a>
+                  </ItemTitle>
+                  <ItemDescription className="text-xs">
                     {s.state} · {new Date(s.lastActivityAt).toLocaleString()}
-                  </span>
-                </a>
-                <Button variant="ghost" size="sm" onClick={() => archive.mutate(s.id)}>
-                  Archive
-                </Button>
-              </li>
-            ))}
-          </ul>
-        </Card>
+                  </ItemDescription>
+                </ItemContent>
+                <ItemActions>
+                  <Button variant="ghost" size="sm" onClick={() => archive.mutate(s.id)}>
+                    Archive
+                  </Button>
+                </ItemActions>
+              </Item>
+            </Fragment>
+          ))}
+        </ItemGroup>
       )}
     </>
   );
@@ -262,6 +274,11 @@ function SessionPage({ sessionId }: { sessionId: string }) {
       </header>
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <div className="flex min-h-0 flex-1 flex-col">
+          {error === null ? null : (
+            <div className="px-4 pt-3">
+              <ErrorAlert error={error} />
+            </div>
+          )}
           <ChatRuntime
             messages={messages}
             isRunning={running}
@@ -272,7 +289,7 @@ function SessionPage({ sessionId }: { sessionId: string }) {
               await interrupt.mutateAsync();
             }}
           >
-            <Thread error={errorText(error)} />
+            <Thread />
           </ChatRuntime>
         </div>
         <aside

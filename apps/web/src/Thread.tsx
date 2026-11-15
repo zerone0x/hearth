@@ -1,26 +1,30 @@
 /**
- * The chat view: assistant-ui's primitives over Hearth's event log
- * (`hearthPi.ts`) through `useExternalStoreRuntime`. Tool calls render with
- * assistant-ui's tool-call UI (`ToolFallback`, from its shadcn registry),
- * labelled with Hearth's tool states.
+ * The chat view: assistant-ui's registry `Thread` (thread, messages,
+ * composer) over Hearth's event log (`hearthPi.ts`) through
+ * `useExternalStoreRuntime`. Hearth plugs its own pieces in through the
+ * registry component's slots: tool cards (`ToolFallback`), its notices
+ * (`AssistantMessage`, for system messages) and the empty state (`Welcome`).
  */
 
 import {
+  type AppendMessage,
+  type AssistantRuntime,
   AssistantRuntimeProvider,
-  AuiIf,
-  ComposerPrimitive,
   MessagePrimitive,
   type ThreadMessageLike,
-  ThreadPrimitive,
   type ToolCallMessagePartComponent,
+  useAuiState,
   useExternalStoreRuntime,
 } from "@assistant-ui/react";
-import { ArrowUpIcon, SquareIcon } from "lucide-react";
 import type { ReactNode } from "react";
+import {
+  AssistantMessage as RegistryAssistantMessage,
+  Thread as RegistryThread,
+  type ThreadComponents,
+} from "@/components/assistant-ui/elements/thread.aui";
 import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { type HearthToolStatus, hearthToolStatus, TOOL_STATUS_LABEL, toolTarget } from "./hearthPi";
 
@@ -42,7 +46,7 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
   const target = toolTarget(part.toolName, part.args);
   return (
     <ToolFallback.Root
-      className="rounded-md border bg-card px-3 text-sm"
+      className="my-2 rounded-md border bg-card px-3 text-sm"
       data-testid="tool-card"
       data-status={status}
     >
@@ -67,7 +71,7 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
       </div>
       <ToolFallback.Content>
         {status === "outcome-unknown" ? (
-          <Alert variant="destructive">
+          <Alert variant="destructive" data-testid="outcome-unknown">
             <AlertDescription>
               The box restarted during this call. It may or may not have taken effect, and it was
               not run again.
@@ -87,35 +91,74 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
   );
 };
 
-function UserMessage() {
-  return (
-    <MessagePrimitive.Root className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-primary-foreground">
-      <MessagePrimitive.Parts />
-    </MessagePrimitive.Root>
-  );
-}
-
-function AssistantMessage() {
-  return (
-    <MessagePrimitive.Root
-      className="flex max-w-[95%] flex-col gap-2 whitespace-pre-wrap"
-      data-testid="assistant"
-    >
-      <MessagePrimitive.Parts components={{ tools: { Fallback: ToolCard } }} />
-    </MessagePrimitive.Root>
-  );
-}
-
 /** Hearth's own notices (runner failed, interrupted) arrive as system messages. */
-function NoticeMessage({ tone }: { tone: unknown }) {
+export function NoticeMessage({ tone }: { tone: unknown }) {
   return (
     <MessagePrimitive.Root
-      className={cn("text-sm", tone === "error" ? "text-destructive" : "text-muted-foreground")}
+      className={cn(
+        "px-2 text-sm",
+        tone === "error" ? "text-destructive" : "text-muted-foreground",
+      )}
       role={tone === "error" ? "alert" : undefined}
+      data-testid="notice"
     >
       <MessagePrimitive.Parts />
     </MessagePrimitive.Root>
   );
+}
+
+/** The registry's assistant message, or Hearth's notice for a system message. */
+function AssistantOrNotice() {
+  const role = useAuiState((s) => s.message.role);
+  const tone = useAuiState((s) => s.message.metadata.custom["tone"]);
+  return role === "system" ? <NoticeMessage tone={tone} /> : <RegistryAssistantMessage />;
+}
+
+function EmptyThread() {
+  return (
+    <p className="mb-6 px-2 text-muted-foreground">No messages yet. Ask for something below.</p>
+  );
+}
+
+/**
+ * Tool calls stay flat, one card each, so every card keeps its stable name
+ * (`Tool call <tool>: <status>`) on screen instead of inside a collapsed group.
+ */
+function FlatToolGroup({ children }: { children?: ReactNode }) {
+  return <>{children}</>;
+}
+
+const THREAD_COMPONENTS: ThreadComponents = {
+  AssistantMessage: AssistantOrNotice,
+  ToolFallback: ToolCard,
+  ToolGroup: FlatToolGroup,
+  Welcome: EmptyThread,
+};
+
+/** The text of a composer message, trimmed. */
+export function messageText(message: Pick<AppendMessage, "content">): string {
+  return message.content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("")
+    .trim();
+}
+
+/**
+ * Sends what the composer submitted. assistant-ui clears the composer before
+ * `onNew` runs, so a send that fails puts the text back (unless something new
+ * was typed meanwhile); the page shows the error.
+ */
+export async function sendFromComposer(
+  text: string,
+  send: (text: string) => Promise<void>,
+  composer: { getState(): { text: string }; setText(text: string): void },
+): Promise<void> {
+  if (text === "") return;
+  try {
+    await send(text);
+  } catch {
+    if (composer.getState().text === "") composer.setText(text);
+  }
 }
 
 export interface ChatRuntimeProps {
@@ -134,73 +177,17 @@ export function ChatRuntime({
   onInterrupt,
   children,
 }: ChatRuntimeProps) {
-  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+  const runtime: AssistantRuntime = useExternalStoreRuntime<ThreadMessageLike>({
     messages,
     convertMessage: (message) => message,
     isRunning,
-    onNew: async (message) => {
-      const text = message.content
-        .map((part) => (part.type === "text" ? part.text : ""))
-        .join("")
-        .trim();
-      if (text !== "") await onSend(text);
-    },
+    onNew: (message) => sendFromComposer(messageText(message), onSend, runtime.thread.composer),
     onCancel: onInterrupt,
   });
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>;
 }
 
-export function Thread({ error }: { error?: string | undefined }) {
-  return (
-    <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
-      <ThreadPrimitive.Viewport
-        className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
-        data-testid="chat"
-      >
-        <ThreadPrimitive.Empty>
-          <p className="text-muted-foreground">No messages yet. Ask for something below.</p>
-        </ThreadPrimitive.Empty>
-        <ThreadPrimitive.Messages>
-          {({ message }) =>
-            message.role === "user" ? (
-              <UserMessage />
-            ) : message.role === "system" ? (
-              <NoticeMessage tone={message.metadata.custom["tone"]} />
-            ) : (
-              <AssistantMessage />
-            )
-          }
-        </ThreadPrimitive.Messages>
-      </ThreadPrimitive.Viewport>
-      {error === undefined ? null : (
-        <Alert variant="destructive" className="mx-4 w-auto" role="alert">
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-      <ComposerPrimitive.Root className="flex items-end gap-2 border-t bg-card p-3">
-        <ComposerPrimitive.Input
-          aria-label="Message"
-          placeholder="Message"
-          rows={2}
-          className="max-h-40 min-h-11 flex-1 resize-none rounded-md border border-input bg-transparent px-3 py-2 text-base shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 md:text-sm"
-        />
-        <AuiIf condition={(s) => !s.thread.isRunning}>
-          <ComposerPrimitive.Send asChild>
-            <Button>
-              <ArrowUpIcon aria-hidden />
-              Send
-            </Button>
-          </ComposerPrimitive.Send>
-        </AuiIf>
-        <AuiIf condition={(s) => s.thread.isRunning}>
-          <ComposerPrimitive.Cancel asChild>
-            <Button variant="destructive">
-              <SquareIcon aria-hidden />
-              Interrupt
-            </Button>
-          </ComposerPrimitive.Cancel>
-        </AuiIf>
-      </ComposerPrimitive.Root>
-    </ThreadPrimitive.Root>
-  );
+/** The registry thread with Hearth's slots; no autofocus, so a phone keyboard stays down on load. */
+export function Thread() {
+  return <RegistryThread components={THREAD_COMPONENTS} autoFocus={false} />;
 }
