@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   type Action,
   type Authorizer,
+  DEFAULT_WORKSPACE_ID,
   HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
@@ -26,6 +27,13 @@ import { SESSION_COOKIE } from "./auth";
 import { type Hub, startHub } from "./server";
 
 const OTHER: Principal = { ...LOCAL_PRINCIPAL, id: "usr_other", displayName: "other" };
+/** A principal of another workspace than the sessions' (`DEFAULT_WORKSPACE_ID`). */
+const STRANGER: Principal = {
+  ...LOCAL_PRINCIPAL,
+  id: "usr_stranger",
+  workspaceId: "ws_elsewhere",
+  displayName: "stranger",
+};
 
 const dirs: string[] = [];
 const hubs: Hub[] = [];
@@ -45,6 +53,8 @@ const noSecrets = {
 interface AuditRow {
   principal_id: string;
   action: string;
+  resource_workspace_id: string;
+  allowed: number;
 }
 
 /** A hub whose login guard returns `OTHER` for a live login, and records `authorize` calls. */
@@ -61,8 +71,11 @@ function fixture() {
   });
   hubs.push(hub);
 
+  // The principal the guard returns for a live login; a test may change it.
+  const signedIn = { principal: OTHER };
   const authenticate = hub.auth.authenticate.bind(hub.auth);
-  hub.auth.authenticate = (token) => (authenticate(token) === undefined ? undefined : OTHER);
+  hub.auth.authenticate = (token) =>
+    authenticate(token) === undefined ? undefined : signedIn.principal;
 
   // Every component holds this same authorizer object.
   const calls: { principal: string; action: Action }[] = [];
@@ -90,6 +103,7 @@ function fixture() {
 
   return {
     hub,
+    signedIn,
     calls,
     request,
     /** Creates a session through the API (as `OTHER`); returns its id. */
@@ -101,7 +115,11 @@ function fixture() {
     auditRows(): AuditRow[] {
       const db = new Database(dbPath, { readonly: true });
       try {
-        return db.query<AuditRow, []>("SELECT principal_id, action FROM audit ORDER BY id").all();
+        return db
+          .query<AuditRow, []>(
+            "SELECT principal_id, action, resource_workspace_id, allowed FROM audit ORDER BY id",
+          )
+          .all();
       } finally {
         db.close();
       }
@@ -203,6 +221,36 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     await res?.body?.cancel();
     expectOther(f, from, ["desktop.view", "session.read"]);
     expect(wokenFor).toEqual([OTHER.id]);
+  });
+
+  test("desktop: desktop.view is checked against the session's workspace, not the caller's", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const woken: string[] = [];
+    f.hub.sessions.ensureBox = async (sessionId) => {
+      woken.push(sessionId);
+      throw new Error("the box must not be woken for a caller of another workspace");
+    };
+    // The guard now returns a principal of another workspace than the session's.
+    f.signedIn.principal = STRANGER;
+    const from = mark(f);
+    const res = await f
+      .request(`/v1/sessions/${id}/desktop`, {
+        headers: { upgrade: "websocket", connection: "Upgrade" },
+      })
+      .catch(() => undefined);
+    expect(res?.status).toBe(403);
+    await res?.body?.cancel();
+    // `authorize` saw the session's workspace and denied; nothing ran after it.
+    expect(f.auditRows().slice(from.rows)).toEqual([
+      {
+        principal_id: STRANGER.id,
+        action: "desktop.view",
+        resource_workspace_id: DEFAULT_WORKSPACE_ID,
+        allowed: 0,
+      },
+    ]);
+    expect(woken).toEqual([]);
   });
 
   test("box echo", async () => {

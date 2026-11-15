@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import {
   type Authorizer,
   type BoxId,
+  DEFAULT_WORKSPACE_ID,
   HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
@@ -88,6 +89,7 @@ function setup(
     },
   };
   const sessions = {
+    scope: { workspaceId: DEFAULT_WORKSPACE_ID },
     async get(_p: Principal, id: string) {
       calls.push(`get ${id}`);
       return { id } as never;
