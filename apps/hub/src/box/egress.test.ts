@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -85,6 +86,25 @@ describe("marker trust", () => {
     const link = join(dir, "run", "link.applied");
     symlinkSync(marker, link);
     expect(untrustedMarker(link, me)).toBe("it is not a regular file");
+  });
+
+  test("a hard link to a trusted file is refused", () => {
+    const marker = writeMarker();
+    const other = join(dir, "run", "other.applied");
+    linkSync(marker, other);
+    expect(untrustedMarker(other, me)).toBe("it has 2 hard links, not 1");
+    expect(untrustedMarker(marker, me)).toBe("it has 2 hard links, not 1");
+  });
+
+  test("the file is looked up under the one resolved directory", () => {
+    const marker = writeMarker();
+    const seen: string[] = [];
+    symlinkSync(join(dir, "run"), join(dir, "alias"));
+    untrustedMarker(join(dir, "alias", "box-egress.applied"), me, (p) => {
+      seen.push(p);
+      return lstatSync(p);
+    });
+    expect(seen[0]).toBe(marker);
   });
 
   test("a directory anyone can write is refused unless it is sticky", () => {
