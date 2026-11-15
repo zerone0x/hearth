@@ -366,8 +366,8 @@ Branch `spike/chat-ui-assistant-ui` (never merged), directory
   Chromium, fails on any console error or CSP report, and saves a screenshot.
 
 Results: 3 tool cards rendered, `problems: []` (no CSP violations, no errors) at
-900×900 and 390×844; `tsc` 7.0.2 clean. Screenshots: `shot-desktop.png` and
-`shot-mobile.png` on the branch. A first attempt with `usePiRuntime` (react-pi's
+900×900 and 390×844; `tsc` 7.0.2 clean. Screenshots (spike commit `da5677d`):
+[desktop](https://github.com/zerone0x/hearth/blob/da5677d/spikes/chat-ui-assistant-ui/shot-desktop.png), [mobile](https://github.com/zerone0x/hearth/blob/da5677d/spikes/chat-ui-assistant-ui/shot-mobile.png). A first attempt with `usePiRuntime` (react-pi's
 full runtime with a thread list) rendered nothing within 10 s with a single
 `threadId`; I did not debug it, because the external-store path is the better fit
 for Hearth's one-session-per-page UI anyway.
