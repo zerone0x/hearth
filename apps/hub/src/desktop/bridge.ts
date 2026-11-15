@@ -80,7 +80,7 @@ export interface ViewerTicket {
 
 export interface DesktopBridgeOptions {
   readonly boxes: Pick<BoxConnections, "listen" | "sendStream">;
-  readonly sessions: Pick<SessionManager, "get" | "ensureBox">;
+  readonly sessions: Pick<SessionManager, "get" | "ensureBox" | "scope">;
   readonly authorizer: Authorizer;
   readonly log?: (line: string) => void;
   readonly highWaterBytes?: number;
@@ -158,8 +158,10 @@ export class DesktopBridge {
     authenticate: () => Principal | undefined,
   ): Promise<ViewerTicket> {
     if (this.#shutDown) throw unavailable("the hub is shutting down");
+    // The session's workspace, not the caller's: a caller of another
+    // workspace is denied and audited as such (#61).
     const decision = await this.#options.authorizer.authorize(principal, "desktop.view", {
-      workspaceId: principal.workspaceId,
+      workspaceId: this.#options.sessions.scope.workspaceId,
       type: "session",
       id: sessionId,
     });
