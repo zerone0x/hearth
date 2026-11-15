@@ -55,6 +55,7 @@ describe("request guard (decision 0010)", () => {
       { host: "LOCALHOST:8787" },
       { host: "127.0.0.1", "sec-fetch-site": "none" },
       { "content-type": "application/json; charset=utf-8" },
+      { "content-type": "Application/JSON" },
     ];
     for (const headers of cases) {
       const res = await echo(app, headers);
@@ -73,6 +74,7 @@ describe("request guard (decision 0010)", () => {
       "127.0.0.1.nip.io:8787",
       "evil@127.0.0.1:8787",
       "127.0.0.1:8787/x",
+      "localhost.:8787",
       "",
     ]) {
       const res = await echo(app, { host });
@@ -83,6 +85,21 @@ describe("request guard (decision 0010)", () => {
       });
     }
     expect(calls).toHaveLength(0);
+  });
+
+  test("proxy headers never stand in for Host (X-Forwarded-*, Forwarded)", async () => {
+    const { app, calls } = guardedApp();
+    for (const [name, loopback, foreign] of [
+      ["x-forwarded-host", "127.0.0.1", "attacker.example"],
+      ["x-forwarded-for", "127.0.0.1", "203.0.113.7"],
+      ["forwarded", "host=127.0.0.1", "host=attacker.example"],
+    ] as const) {
+      const spoofed = await echo(app, { host: "attacker.example", [name]: loopback });
+      expect({ name, status: spoofed.status }).toEqual({ name, status: 421 });
+      const ignored = await echo(app, { host: "127.0.0.1", [name]: foreign });
+      expect({ name, status: ignored.status }).toEqual({ name, status: 200 });
+    }
+    expect(calls).toHaveLength(3);
   });
 
   test("a cross-origin Origin gets 403 before the handler runs (CSRF)", async () => {
@@ -310,6 +327,7 @@ describe("parsePublicOrigin", () => {
       "https://hearth.example/?x=1",
       "https://hearth.example/#top",
       "https://user:pw@hearth.example",
+      "https://user@hearth.example",
       "*",
     ]) {
       expect(() => parsePublicOrigin(bad)).toThrow(`Invalid public origin "${bad}"`);

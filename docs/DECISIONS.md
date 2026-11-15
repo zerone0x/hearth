@@ -672,6 +672,9 @@ request except `GET /healthz`, in this order, before any handler or
   or the host of `HEARTH_PUBLIC_ORIGIN`. Anything else, or a malformed `Host`,
   gets `421 request.foreign-host`. This is what stops DNS rebinding: the
   rebound page's requests carry the attacker's host name.
+  `X-Forwarded-*` and `Forwarded` headers are not trusted: only `Host`
+  counts. A DNS-rebinding page is same-origin to the browser, so it can set
+  them freely.
 - **Origin.** If `Origin` is present it must equal the request's own origin
   (scheme + `Host` as the hub sees them) or `HEARTH_PUBLIC_ORIGIN` exactly;
   `null`, another port on localhost and every other site get
