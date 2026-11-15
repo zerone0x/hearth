@@ -14,8 +14,14 @@ import {
   toolTarget,
   toPiClientEvent,
 } from "./hearthPi";
-import { POLL_IDLE_MS, POLL_RUNNING_MS, pollInterval, readNewEvents } from "./queries";
-import { ChatRuntime, Thread } from "./Thread";
+import {
+  createQueryClient,
+  POLL_IDLE_MS,
+  POLL_RUNNING_MS,
+  pollInterval,
+  readNewEvents,
+} from "./queries";
+import { ChatRuntime, messageText, sendFromComposer, Thread } from "./Thread";
 
 let seq = 0;
 function ev(type: string, payload: unknown = {}): HubEvent {
@@ -214,6 +220,16 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     const html = render(chat);
     expect(html).toContain('data-status="outcome-unknown"');
     expect(html).toContain('aria-label="Tool call bash: interrupted"');
+    // assistant-ui's trigger marks outcome-unknown as failed, like a plain error.
+    const cardOf = (status: string) =>
+      html.split('data-testid="tool-card"').find((c) => c.includes(`data-status="${status}"`));
+    expect(cardOf("outcome-unknown")).toContain("Failed tool");
+    expect(cardOf("error")).toContain("Failed tool");
+    expect(cardOf("interrupted")).toContain("Cancelled tool");
+    // "Interrupted." is information, not an alert.
+    const notice = /<div[^>]*data-testid="notice"[^>]*>/.exec(html)?.[0];
+    expect(notice).toBeDefined();
+    expect(notice).not.toContain("role=");
     expect(projectChat(chat).at(-1)).toMatchObject({
       role: "system",
       content: [{ text: "Interrupted." }],
@@ -229,6 +245,9 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     expect(hearthToolStatus({ status: done, result: "x", isPreliminary: true })).toBe(
       "interrupted",
     );
+    const cut = { type: "incomplete" };
+    expect(hearthToolStatus({ status: cut })).toBe("interrupted");
+    expect(hearthToolStatus({ status: { type: "requires-action" } })).toBe("interrupted");
     expect(hearthToolStatus({ status: done, result: "x" })).toBe("ok");
     expect(hearthToolStatus({ status: done, result: "x", isError: false })).toBe("ok");
     expect(hearthToolStatus({ status: done, result: "boom", isError: true })).toBe("error");
@@ -342,8 +361,10 @@ describe("chat view", () => {
     const html = render(emptyChat(S));
     expect(html).toContain("No messages yet");
     expect(html).toContain('aria-label="Message"');
-    expect(html).toContain("Send");
-    expect(html).not.toContain("Interrupt");
+    expect(html).toContain('aria-label="Send"');
+    expect(html).not.toContain('aria-label="Interrupt"');
+    // No attachments in Hearth: the registry's attach button stays out.
+    expect(html).not.toContain("Add Attachment");
   });
 
   test("a tool card is collapsed, labelled with its tool and status, and escapes its target", () => {
@@ -362,7 +383,9 @@ describe("chat view", () => {
 
   test("while a turn runs the composer offers Interrupt", () => {
     const chat = applyHubEvents(emptyChat(S), [ev("message.user", { text: "go" })]);
-    expect(render(chat)).toContain("Interrupt");
+    const html = render(chat);
+    expect(html).toContain('aria-label="Interrupt"');
+    expect(html).not.toContain('aria-label="Send"');
   });
 });
 
@@ -415,5 +438,54 @@ describe("api", () => {
     expect(desktopUrl("s", { protocol: "https:", host: "h.example" })).toBe(
       "wss://h.example/v1/sessions/s/desktop",
     );
+  });
+});
+
+describe("composer send", () => {
+  const composer = (text = "") => {
+    const state = { text };
+    const setText = (t: string) => {
+      state.text = t;
+    };
+    return { state, getState: () => state, setText };
+  };
+
+  test("an empty or whitespace message is not sent", async () => {
+    const sent: string[] = [];
+    const send = async (t: string) => void sent.push(t);
+    expect(messageText({ content: [{ type: "text", text: "  \n " }] })).toBe("");
+    await sendFromComposer("", send, composer());
+    expect(sent).toEqual([]);
+    await sendFromComposer("hi", send, composer());
+    expect(sent).toEqual(["hi"]);
+  });
+
+  test("a failed send puts the text back, unless something new was typed", async () => {
+    const boom = async () => {
+      throw new Error("500");
+    };
+    const empty = composer();
+    await sendFromComposer("keep me", boom, empty);
+    expect(empty.state.text).toBe("keep me");
+    const typed = composer("newer");
+    await sendFromComposer("keep me", boom, typed);
+    expect(typed.state.text).toBe("newer");
+  });
+});
+
+describe("query client", () => {
+  const retry = createQueryClient().getDefaultOptions().queries?.retry as (
+    count: number,
+    error: unknown,
+  ) => boolean;
+
+  test("a refusal (4xx) is not retried; a 5xx or network error is, twice", () => {
+    for (const status of [400, 401, 404, 409, 499]) {
+      expect(retry(0, new ApiError(status, "x", "x"))).toBe(false);
+    }
+    expect(retry(0, new ApiError(500, "x", "x"))).toBe(true);
+    expect(retry(1, new ApiError(503, "x", "x"))).toBe(true);
+    expect(retry(2, new ApiError(503, "x", "x"))).toBe(false);
+    expect(retry(0, new TypeError("network"))).toBe(true);
   });
 });
