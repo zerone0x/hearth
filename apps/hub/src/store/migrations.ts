@@ -168,6 +168,32 @@ export const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    // The minimal local login (#44, decision 0014). `owner_password` holds the
+    // argon2id hash of the owner password (PHC string, parameters included).
+    // `login_session` is the server-side session behind the session cookie,
+    // keyed by the SHA-256 of its id; the raw id is only in the cookie. It is
+    // not `session`, which is the agent session of PRD §5.
+    version: 4,
+    name: "owner password and login sessions",
+    sql: `
+      CREATE TABLE owner_password (
+        principal_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE login_session (
+        id_hash TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        principal_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      ) STRICT;
+      CREATE INDEX login_session_by_expiry ON login_session (expires_at);
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

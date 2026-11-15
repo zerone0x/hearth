@@ -8,6 +8,7 @@ import {
   type Principal,
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
+import { AuthService } from "./auth";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -21,7 +22,13 @@ import {
   markerEgressCheck,
   requireBoxEgress,
 } from "./box/egress";
-import { openDatabase, SqliteAuditSink, SqliteBoxCredentialStore, SqliteEventStore } from "./store";
+import {
+  openDatabase,
+  SqliteAuditSink,
+  SqliteBoxCredentialStore,
+  SqliteEventStore,
+  SqliteLoginStore,
+} from "./store";
 
 export interface HubListenOptions {
   /** Interface to bind. Defaults to loopback: the hub is never public by default (PRD §10). */
@@ -125,8 +132,15 @@ export function startHub(options: HubOptions) {
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
   const boxEgress = options.boxEgress ?? markerEgressCheck();
+  // The local login (decision 0014). Until the owner sets a password, the
+  // setup token is logged: only whoever reads the hub's output can claim it.
+  const auth = new AuthService({ store: new SqliteLoginStore(db) });
+  const setupToken = auth.setupToken();
+  if (setupToken !== undefined) {
+    options.log?.(`first run: set the owner password with setup token ${setupToken}`);
+  }
   const app = createApp(
-    { boxes },
+    { boxes, auth },
     {
       allowedHosts: [...LOOPBACK_HOSTS, hostname],
       ...(options.provider === undefined ? {} : { boxEgress }),
@@ -262,6 +276,8 @@ export function startHub(options: HubOptions) {
     events,
     credentials,
     boxes,
+    /** The local login: owner password and login sessions (decision 0014). */
+    auth,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
     issueJoinToken(boxId: string, sessionId: string, ttlMs?: number): Promise<IssuedJoinToken> {
       return credentials.issueJoinToken(scope, boxId, sessionId, ttlMs);
