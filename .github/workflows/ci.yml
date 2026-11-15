@@ -124,6 +124,12 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/runner/runner.docker.test.ts
+      # Desktop stream (#45; decision 0016): the real Xvnc banner through the hub.
+      - name: Desktop stream reads the real Xvnc banner through the hub, egress filtered
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/desktop/desktop.docker.test.ts
       - name: Provider tests under the firewall
         env:
           HEARTH_DOCKER_TESTS: "1"
