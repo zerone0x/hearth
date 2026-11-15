@@ -29,6 +29,7 @@ RUN apt-get update \
     git \
     openssh-client \
     procps \
+    ripgrep \
     python3 \
     tini \
   && rm -rf /var/lib/apt/lists/* \
