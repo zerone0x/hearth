@@ -142,6 +142,84 @@ describe("web UI assets (decision 0017)", () => {
   });
 });
 
+/**
+ * The CSP as served, parsed into directives. This deliberately does not import
+ * `WEB_CSP`: comparing the header with the constant it is built from passes
+ * whatever the constant says, so a weakened policy would go unnoticed.
+ */
+function parseCsp(header: string): Map<string, string[]> {
+  const directives = new Map<string, string[]>();
+  for (const part of header.split(";")) {
+    const [name, ...sources] = part.trim().split(/\s+/);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    // A repeated directive is ignored by browsers; the first one wins. Refuse it
+    // here so a later, stricter copy cannot hide a loose first one.
+    expect({ duplicate: key, seen: directives.has(key) }).toEqual({ duplicate: key, seen: false });
+    directives.set(key, sources);
+  }
+  return directives;
+}
+
+describe("web UI CSP, checked against decision 0017 (not against WEB_CSP)", () => {
+  /** Decision 0017's policy, written out by hand. */
+  const EXPECTED: Record<string, string[]> = {
+    "default-src": ["'self'"],
+    "script-src": ["'self'"],
+    "style-src": ["'self'"],
+    "img-src": ["'self'", "data:", "blob:"],
+    "connect-src": ["'self'"],
+    "font-src": ["'self'"],
+    "object-src": ["'none'"],
+    "base-uri": ["'none'"],
+    "form-action": ["'self'"],
+    "frame-ancestors": ["'none'"],
+  };
+
+  async function servedCsp(path: string): Promise<Map<string, string[]>> {
+    const res = await harness(webRoot()).get(path);
+    expect(res.status).toBe(200);
+    const header = res.headers.get("content-security-policy");
+    expect(header).toBeString();
+    return parseCsp(header ?? "");
+  }
+
+  for (const path of ["/", "/index.html"]) {
+    test(`${path}: every directive is exactly the one 0017 justifies`, async () => {
+      const csp = await servedCsp(path);
+      expect(Object.fromEntries(csp)).toEqual(EXPECTED);
+    });
+
+    test(`${path}: scripts, styles and connections are same-origin only`, async () => {
+      const csp = await servedCsp(path);
+      for (const name of ["default-src", "script-src", "style-src", "connect-src"]) {
+        expect({ name, sources: csp.get(name) }).toEqual({ name, sources: ["'self'"] });
+      }
+    });
+
+    test(`${path}: no plugins, no framing, base and form targets locked`, async () => {
+      const csp = await servedCsp(path);
+      expect(csp.get("object-src")).toEqual(["'none'"]);
+      expect(csp.get("frame-ancestors")).toEqual(["'none'"]);
+      expect(csp.get("base-uri")).toEqual(["'none'"]);
+      expect(csp.get("form-action")).toEqual(["'self'"]);
+    });
+
+    test(`${path}: no directive allows unsafe-*, a wildcard or a bare scheme`, async () => {
+      const csp = await servedCsp(path);
+      for (const [name, sources] of csp) {
+        for (const source of sources) {
+          const loose =
+            source.toLowerCase().includes("'unsafe-") ||
+            source.includes("*") ||
+            ["http:", "https:", "ws:", "wss:"].includes(source.toLowerCase());
+          expect({ name, source, loose }).toEqual({ name, source, loose: false });
+        }
+      }
+    });
+  }
+});
+
 describe("webRootFromEnv", () => {
   test("HEARTH_WEB_DIR must hold an index.html; an unbuilt default is no UI", () => {
     const root = webRoot();
