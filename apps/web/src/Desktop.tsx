@@ -22,12 +22,9 @@ export const loadNoVnc = {
 export function DesktopPanel({ sessionId }: { sessionId: string }) {
   const screen = useRef<HTMLDivElement>(null);
   const rfb = useRef<RFB | undefined>(undefined);
-  /** Bumped by every connect and disconnect, so a connect still loading noVNC knows it is stale. */
-  const attempt = useRef(0);
   const [phase, setPhase] = useState<DesktopPhase>({ kind: "closed" });
 
   const disconnect = useCallback(() => {
-    attempt.current += 1;
     const current = rfb.current;
     rfb.current = undefined;
     try {
@@ -40,19 +37,17 @@ export function DesktopPanel({ sessionId }: { sessionId: string }) {
   const connect = useCallback(async () => {
     if (screen.current === null) return;
     disconnect();
-    const mine = attempt.current;
     setPhase({ kind: "connecting" });
     let Client: typeof RFB;
     try {
       Client = await loadNoVnc.load();
     } catch {
-      if (attempt.current === mine) {
-        setPhase({ kind: "ended", reason: "The desktop viewer did not load." });
-      }
+      setPhase({ kind: "ended", reason: "The desktop viewer did not load." });
       return;
     }
+    // React clears the ref on unmount: a panel gone while noVNC loaded opens nothing.
     const target = screen.current;
-    if (attempt.current !== mine || target === null) return;
+    if (target === null) return;
     const ws = new WebSocket(desktopUrl(sessionId, window.location));
     ws.addEventListener("close", (event) => {
       setPhase(desktopPhaseFor(event.code, event.reason));
