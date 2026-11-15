@@ -26,9 +26,16 @@ import {
 } from "@hearth/core";
 import { PROTOCOL_VERSION } from "@hearth/protocol";
 import { createApp } from "./app";
+import { AuthService, SESSION_COOKIE } from "./auth";
 import { type BoxConnection, BoxConnections, type BoxSocket, CLOSE_CODES } from "./box/connections";
 import { type Hub, startHub } from "./server";
-import { openDatabase, SqliteAuditSink, SqliteBoxCredentialStore, SqliteEventStore } from "./store";
+import {
+  openDatabase,
+  SqliteAuditSink,
+  SqliteBoxCredentialStore,
+  SqliteEventStore,
+  SqliteLoginStore,
+} from "./store";
 
 const OTHER_WORKSPACE_ID = "ws_other";
 
@@ -142,6 +149,8 @@ function setup(denied: readonly Action[]) {
     echoDeadlineMs: 2_000,
   });
   all.push(boxes);
+  const auth = new AuthService({ store: new SqliteLoginStore(db) });
+  const cookie = `${SESSION_COOKIE}=${auth.issueSession(LOCAL_PRINCIPAL).token}`;
 
   return {
     db,
@@ -151,7 +160,8 @@ function setup(denied: readonly Action[]) {
     boxes,
     applied,
     logs,
-    app: createApp({ boxes }),
+    app: createApp({ boxes, auth }),
+    cookie,
     auditRows(action?: string): AuditRow[] {
       const rows = db
         .query<AuditRow, []>(
@@ -199,10 +209,13 @@ function turnEvent(sessionId: string, deliveryId: number, bootId = "boot_1") {
 }
 
 /** POST /v1/boxes/:boxId/echo as the local UI would. */
-async function echoOverHttp(app: ReturnType<typeof createApp>, boxId: string) {
-  const res = await app.request(`/v1/boxes/${boxId}/echo`, {
+async function echoOverHttp(
+  t: { app: ReturnType<typeof createApp>; cookie: string },
+  boxId: string,
+) {
+  const res = await t.app.request(`/v1/boxes/${boxId}/echo`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", cookie: t.cookie },
     body: JSON.stringify({ ping: 1 }),
   });
   return { status: res.status, body: (await res.json()) as Record<string, unknown> };
@@ -260,7 +273,7 @@ describe("box.connect denied", () => {
       "ses_a",
     );
     const { socket } = await t.connect([hello("box_a", token)]);
-    const res = await echoOverHttp(t.app, "box_a");
+    const res = await echoOverHttp(t, "box_a");
 
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({ ok: false, error: { code: "box.not-connected" } });
@@ -349,7 +362,7 @@ describe("box.echo denied", () => {
     const { socket } = await t.connect([hello("box_a", token)]);
     expect(t.boxes.isConnected("box_a")).toBe(true);
 
-    const res = await echoOverHttp(t.app, "box_a");
+    const res = await echoOverHttp(t, "box_a");
 
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ ok: false, error: { code: "authz.denied" } });
@@ -381,7 +394,7 @@ describe("box.echo denied", () => {
     ]);
 
     // LOCAL_PRINCIPAL lives in the default workspace; box_b does not.
-    const res = await echoOverHttp(t.app, "box_b");
+    const res = await echoOverHttp(t, "box_b");
 
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({ ok: false, error: { code: "box.not-connected" } });

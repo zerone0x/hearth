@@ -872,3 +872,91 @@ its listener is #27.
   box's network.
 - Another provider (PRD §7 E4) implements `hubAddress` its own way; the hub
   only needs an address it can bind and the box can reach.
+
+## 0014: Minimal local login: owner password, server-side sessions, session guard
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #44
+
+### Decision
+
+PRD §10 and §11.1 item 6 put every route except `GET /healthz` behind a local
+login from the M1 prototype on. The login lives in `apps/hub/src/auth/`; its
+storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
+
+- **One owner password, set once.** While no password is stored the hub mints
+  a one-time setup token (`hst_` + 256 random bits, in memory only) and logs
+  `first run: set the owner password with setup token ...` at start.
+  `POST /v1/auth/setup {setupToken, password}` sets the password and signs in;
+  after that it answers `409 auth.already-set-up` and the token is gone. The
+  token keeps a fresh install that is already behind a public reverse proxy
+  from being claimed by whoever reaches it first: only someone who can read the
+  hub's output can set the password. A token in the log is a secret in the
+  log, which PRD §10 otherwise avoids; it is accepted because it is useless
+  once the password is set. Changing or resetting the password is a
+  follow-up.
+- **argon2id with named parameters.** `Bun.password` with `ARGON2ID_PARAMS`
+  (19 MiB, 2 passes, parallelism 1: the OWASP Password Storage Cheat Sheet's
+  first argon2id configuration), stored as the PHC string, so raising the
+  parameters later still verifies old hashes. Passwords are 12 to 1024
+  characters; the upper bound caps the KDF input.
+- **Server-side sessions.** Migration 4 adds `owner_password` and
+  `login_session` (`session` is the agent session of PRD §5). A session id is
+  `hls_` + 256 random bits; only its SHA-256 is stored, so the database never
+  holds a usable cookie and the lookup by hash leaks nothing about the id.
+  Sessions last `SESSION_TTL_MS` (7 days) from login, not extended by use;
+  an expired session is refused and its row deleted, and expired rows are swept
+  whenever a session is issued.
+- **Session fixation.** Login and setup always mint a new id. If the request
+  carried a session cookie, that session is deleted, whether it was valid or
+  not, so a planted or older id never becomes or stays a signed-in session.
+- **Cookie.** `hearth_session=<id>; Path=/; Max-Age=<TTL>; HttpOnly;
+  SameSite=Strict`, plus `Secure` when the request URL is `https:` or
+  `HEARTH_PUBLIC_ORIGIN` is `https:` (a TLS proxy that talks plain HTTP to the
+  hub). No `Domain`, so the cookie is host-only.
+- **Logout.** `POST /v1/auth/logout` deletes the session row and clears the
+  cookie (`Max-Age=0`). Replaying the old cookie value afterwards gets 401.
+- **Rate limit.** `LOGIN_RATE_LIMIT`: 10 failed login or setup attempts per
+  sliding 15 minutes, for the one account, not per client (behind a proxy every
+  client has the proxy's address, and `X-Forwarded-For` is not trusted, 0010).
+  An attempt counts from the moment it starts, so a parallel burst cannot get
+  more guesses to the KDF than the limit; past the limit the hub answers
+  `429 auth.rate-limited` with `Retry-After`, before the KDF runs, even for the
+  right password. A success clears the count. The cost: someone who can reach
+  the login can keep the owner out by guessing, and the owner then waits out
+  the window. The limit is in memory, so a hub restart resets it.
+- **Timing.** The password comparison is argon2's own (`Bun.password.verify`);
+  every admitted attempt runs it, whatever the input. The setup token is
+  compared with `secretsEqual`: SHA-256 of both sides, then `timingSafeEqual`
+  on the 32-byte digests, so neither content nor length shows in the time.
+- **Session guard.** A middleware in `createApp` runs after the request guard
+  of 0010 and lets through only `OPEN_ROUTES`: `GET /healthz`,
+  `GET /v1/auth/status` (whether to show the setup or the login form),
+  `POST /v1/auth/setup` and `POST /v1/auth/login`. Every other request,
+  including paths no handler serves, gets `401 auth.required` without a live
+  session, so new routes (the session API of #42) are covered without listing
+  them. The guard puts the session's principal on the request; handlers pass
+  it to `authorize` (the echo endpoint no longer uses `LOCAL_PRINCIPAL`
+  directly). In v1 a password login always yields the local owner principal.
+  The auth routes do not call `authorize`: before login there is no principal,
+  and they return no workspace data; this extends the exception of 0001 to
+  them. Because the 0010 guard runs first, a cross-origin page can neither
+  log in, set the password, log out nor run a command, and logout needs the
+  JSON content type like every other POST.
+- **The box listener is unchanged.** It never reaches the app (0012); boxes
+  authenticate with their join token and per-box credential (0008), not with
+  the login. The public listener stays on loopback by default.
+- **Passkeys** (optional in PRD §10) are not part of this; `auth/service.ts`
+  carries a TODO pointing at §10.
+
+### Consequences
+
+- A fresh hub serves nothing but `/healthz` and the auth routes until the
+  owner sets a password with the logged token. Scripts sign in first and send
+  the cookie (README); in-process callers and tests use
+  `hub.auth.issueSession(principal)`.
+- Login attempts are not written to the audit log yet; that needs an audit
+  record shape for unauthenticated events and is a follow-up.
+- Only one principal exists. A multi-user edition (PRD §7 E2) adds principals
+  to `owner_password` / `login_session` without changing the guard.

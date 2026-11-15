@@ -12,6 +12,8 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LOCAL_PRINCIPAL } from "@hearth/core";
+import { SESSION_COOKIE } from "./auth";
 import { BOX_ENV, startHub } from "./server";
 
 /** How long the demo waits for the box to dial in. */
@@ -43,8 +45,11 @@ try {
   await hub.boxes.waitForBox("box_demo", CONNECT_DEADLINE_MS);
   console.log("box_demo connected");
 
+  // Signed in as the owner (decision 0014); the demo has no password to type.
+  const session = hub.auth.issueSession(LOCAL_PRINCIPAL);
   const res = await fetch(new URL("/v1/boxes/box_demo/echo", hub.url), {
     method: "POST",
+    headers: { "content-type": "application/json", cookie: `${SESSION_COOKIE}=${session.token}` },
     body: JSON.stringify({ message: "hello from the hub" }),
     signal: AbortSignal.timeout(CONNECT_DEADLINE_MS),
   });

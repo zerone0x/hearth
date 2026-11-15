@@ -9,7 +9,6 @@ export {
   SqliteBoxCredentialStore,
   type SqliteBoxCredentialStoreOptions,
 } from "./box-credentials";
-export { SqliteLoginStore } from "./login-store";
 export { BUSY_TIMEOUT_MS, type OpenDatabaseOptions, openDatabase } from "./database";
 export {
   MAX_EVENT_PAYLOAD_BYTES,
@@ -17,4 +16,5 @@ export {
   SqliteEventStore,
   type SqliteEventStoreOptions,
 } from "./event-store";
+export { SqliteLoginStore } from "./login-store";
 export { MIGRATIONS, type Migration, migrate, SCHEMA_VERSION } from "./migrations";

@@ -58,16 +58,13 @@ async function stringFields<K extends string>(
 
 export interface AuthRouteOptions {
   readonly publicOrigin?: string | undefined;
-  readonly now?: () => number;
 }
 
 /** Mounts `/v1/auth/*` on `app`. */
 export function authRoutes(app: Hono<HubEnv>, auth: AuthService, options: AuthRouteOptions = {}) {
-  const now = options.now ?? Date.now;
-
   function signedIn(c: Context<HubEnv>, session: IssuedSession, status: 200 | 201) {
     const secure = isSecureContext(c.req.url, options.publicOrigin);
-    c.header("set-cookie", sessionCookie(session.token, session.expiresAt - now(), secure));
+    c.header("set-cookie", sessionCookie(session.token, session.ttlMs, secure));
     return c.json({ ok: true, expiresAt: session.expiresAt }, status);
   }
 
@@ -90,11 +87,7 @@ export function authRoutes(app: Hono<HubEnv>, auth: AuthService, options: AuthRo
     if (body === undefined) {
       return fail(c, 400, "request.invalid-body", "expected {setupToken, password} strings");
     }
-    const outcome = await auth.setup(
-      body.setupToken,
-      body.password,
-      getCookie(c, SESSION_COOKIE),
-    );
+    const outcome = await auth.setup(body.setupToken, body.password, getCookie(c, SESSION_COOKIE));
     switch (outcome.kind) {
       case "ok":
         return signedIn(c, outcome, 201);

@@ -47,6 +47,8 @@ export function secretsEqual(a: string, b: string): boolean {
 export interface IssuedSession {
   readonly token: string;
   readonly expiresAt: EpochMs;
+  /** Lifetime from now, for the cookie's `Max-Age`. */
+  readonly ttlMs: number;
 }
 
 export type LoginOutcome =
@@ -163,7 +165,7 @@ export class AuthService {
       createdAt: now,
       expiresAt,
     });
-    return { token, expiresAt };
+    return { token, expiresAt, ttlMs: this.#sessionTtlMs };
   }
 
   /** The principal of a live session, or undefined for a missing, unknown or expired one. */
