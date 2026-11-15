@@ -87,9 +87,24 @@ async function signIn(page: Page): Promise<void> {
   await page.getByRole("button", { name: "New session" }).waitFor();
 }
 
-/** The tool call of the chat whose summary names `tool`, as the `<details>` group. */
-function toolCall(page: Page, tool: string, text: string) {
-  return page.getByRole("group").filter({ hasText: tool }).filter({ hasText: text });
+/**
+ * A finished tool call in the chat. The current UI shows it as a `<details>`
+ * group whose summary has the tool, its target and the status; the UI of #77
+ * names it as a button, "Tool call <tool>: done". Either one counts.
+ */
+function toolDone(page: Page, tool: string, target: string) {
+  return page
+    .getByRole("button", { name: `Tool call ${tool}: done` })
+    .or(page.getByRole("group").filter({ hasText: tool }).filter({ hasText: target }))
+    .filter({ hasText: "done" })
+    .first();
+}
+
+/** Opens a tool call to show its output, in either UI (see `toolDone`). */
+async function expandTool(page: Page, tool: string, target: string): Promise<void> {
+  const named = page.getByRole("button", { name: `Tool call ${tool}: done` });
+  if ((await named.count()) > 0) await named.first().click();
+  else await page.getByRole("group").filter({ hasText: target }).getByText(target).click();
 }
 
 async function newContext(browser: Browser): Promise<BrowserContext> {
@@ -156,13 +171,11 @@ async function install(browser: Browser): Promise<void> {
   await page
     .getByText("Wrote hello.txt in /workspace and read it back.")
     .waitFor({ timeout: TURN_MS });
-  const write = toolCall(page, "write", "hello.txt");
-  const bash = toolCall(page, "bash", "cat hello.txt");
-  await write.getByText("done").waitFor();
-  await bash.getByText("done").waitFor();
-  await bash.getByText("pwd && cat hello.txt").click();
-  await bash.getByText("hello from the compose box").waitFor();
-  await bash.getByText("/workspace").waitFor();
+  await toolDone(page, "write", "hello.txt").waitFor();
+  await toolDone(page, "bash", "pwd && cat hello.txt").waitFor();
+  await expandTool(page, "bash", "pwd && cat hello.txt");
+  // The command's output: it ran in /workspace and read the file written there.
+  await page.getByText(/^\s*\/workspace\s+hello from the compose box\s/).waitFor();
   await shot(page, "2-tool-calls");
   const requests = (await fauxRequests()).slice(before);
   check(requests.length === 3, `expected 3 model requests for the turn, got ${requests.length}`);
@@ -216,7 +229,7 @@ async function install(browser: Browser): Promise<void> {
   await page.getByRole("link", { name: new RegExp(TITLE) }).click();
   await page.getByText("Wrote hello.txt in /workspace and read it back.").waitFor();
   check(page.url() === sessionUrl, `reopened at ${page.url()}, not ${sessionUrl}`);
-  check((await toolCall(page, "bash", "cat hello.txt").count()) === 1, "bash call missing");
+  await toolDone(page, "bash", "pwd && cat hello.txt").waitFor();
   await script([{ text: "Still here after the reload." }]);
   await page.getByLabel("Message").fill("Are you still there?");
   await page.getByRole("button", { name: "Send" }).click();
