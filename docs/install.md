@@ -4,8 +4,8 @@ This installs the M1 prototype (PRD §11.1) on one Docker host: the hub with
 its web UI, the box image, and the box egress firewall. The layout and its
 trade-offs are in decision 0020 (`docs/DECISIONS.md`).
 
-CI runs this page verbatim: every block tagged `install:<step>` is extracted
-with `scripts/doc-block.sh` and run, in order, by the `compose-e2e` job
+CI runs this page verbatim: every block tagged `install:<step>` is run, in
+order, by `scripts/run-doc-block.sh` in the `compose-e2e` job
 (`.github/workflows/ci.yml`). Untagged blocks are the ones CI cannot run (a
 clone of `main`, an interactive prompt, systemd).
 

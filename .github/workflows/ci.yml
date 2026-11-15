@@ -186,7 +186,7 @@ jobs:
     timeout-minutes: 45
     env:
       DOC: ${{ github.workspace }}/docs/install.md
-      BLOCK: ${{ github.workspace }}/scripts/doc-block.sh
+      RUN_BLOCK: ${{ github.workspace }}/scripts/run-doc-block.sh
       HEARTH_FAUX_KEY: sk-faux-compose-e2e
     steps:
       - uses: actions/checkout@v4
@@ -206,18 +206,19 @@ jobs:
         run: |
           docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/hub.Dockerfile
           docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/firewall.Dockerfile
-          shellcheck scripts/doc-block.sh deploy/firewall-entrypoint.sh
+          shellcheck scripts/doc-block.sh scripts/run-doc-block.sh deploy/firewall-entrypoint.sh
       - name: Start the faux model server (127.0.0.1:18080)
         run: |
           nohup bun deploy/e2e/faux-model.ts 18080 > "$RUNNER_TEMP/faux-model.log" 2>&1 &
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS http://127.0.0.1:18080/faux/requests
       - name: "install.md: prerequisites"
         working-directory: deploy
-        run: bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:prereq)"
+        run: |
+          "$RUN_BLOCK" -x "$DOC" install:prereq
       - name: "install.md: configure (then the owner's .env edit: the faux model)"
         working-directory: deploy
         run: |
-          bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:configure)"
+          "$RUN_BLOCK" -x "$DOC" install:configure
           # The edit install.md asks for, done with the models-file option it documents.
           cat > config/models.json <<'JSON'
           {"providers":{"faux-http":{"baseUrl":"http://127.0.0.1:18080/v1","api":"openai-completions","models":[{"id":"faux-1","name":"Faux"}]}}}
@@ -231,11 +232,11 @@ jobs:
         env:
           HEARTH_MODEL_KEY: ${{ env.HEARTH_FAUX_KEY }}
         run: |
-          bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:key)"
+          "$RUN_BLOCK" -x "$DOC" install:key
           test "$(stat -c %a secrets/model_key)" = 600
       - name: "install.md: start"
         working-directory: deploy
-        run: timeout 1800 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:up)"
+        run: timeout 1800 "$RUN_BLOCK" -x "$DOC" install:up
       - name: The firewall is in place
         run: |
           sudo iptables -S HEARTH-BOX-IN
@@ -245,7 +246,7 @@ jobs:
       - name: "install.md: setup token"
         working-directory: deploy
         run: |
-          out="$(bash -euo pipefail -c "$("$BLOCK" "$DOC" install:setup-token)")"
+          out="$("$RUN_BLOCK" "$DOC" install:setup-token)"
           token="$(grep -oE 'hst_[A-Za-z0-9_-]+' <<<"$out" | head -1)"
           test -n "$token"
           echo "::add-mask::$token"
@@ -255,25 +256,29 @@ jobs:
       - name: "install.md: upgrade"
         working-directory: deploy
         run: |
-          timeout 900 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:upgrade)"
+          timeout 900 "$RUN_BLOCK" -x "$DOC" install:upgrade
       - name: After the upgrade the session continues
         run: timeout 300 bun deploy/e2e/prototype.ts upgrade
       - name: "install.md: uninstall"
         working-directory: deploy
         run: |
-          timeout 300 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:uninstall)"
-          ! sudo iptables -S HEARTH-BOX-IN 2>/dev/null
+          timeout 300 "$RUN_BLOCK" -x "$DOC" install:uninstall
+          if sudo iptables -S HEARTH-BOX-IN >/dev/null 2>&1; then echo "HEARTH-BOX-IN chain left" >&2; exit 1; fi
+          if sudo iptables -S HEARTH-BOX-FWD >/dev/null 2>&1; then echo "HEARTH-BOX-FWD chain left" >&2; exit 1; fi
           test ! -e /run/hearth/box-egress.applied
-          test -z "$(docker ps -aq --filter label=dev.hearth.managed=true)"
-          test -z "$(docker network ls -q --filter label=dev.hearth.managed=true)"
+          left="$(docker ps -aq --filter label=dev.hearth.managed=true)"
+          test -z "$left"
+          left="$(docker network ls -q --filter label=dev.hearth.managed=true)"
+          test -z "$left"
           docker volume ls --filter label=dev.hearth.managed=true
       - name: "install.md: purge"
         working-directory: deploy
         run: |
-          timeout 300 bash -euxo pipefail -c "$("$BLOCK" "$DOC" install:purge)"
-          test -z "$(docker volume ls -q --filter label=dev.hearth.managed=true)"
-          ! docker volume inspect hearth_hearth-data >/dev/null 2>&1
-          ! docker image inspect hearth-hub:local >/dev/null 2>&1
+          timeout 300 "$RUN_BLOCK" -x "$DOC" install:purge
+          left="$(docker volume ls -q --filter label=dev.hearth.managed=true)"
+          test -z "$left"
+          if docker volume inspect hearth_hearth-data >/dev/null 2>&1; then echo "volume hearth_hearth-data left" >&2; exit 1; fi
+          if docker image inspect hearth-hub:local >/dev/null 2>&1; then echo "image hearth-hub:local left" >&2; exit 1; fi
       - name: Logs
         if: failure()
         working-directory: deploy

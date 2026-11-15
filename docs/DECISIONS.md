@@ -1622,7 +1622,9 @@ of box-agent's memory.
   file reaches the provider as the bearer token, and never the box.
 - **CI runs `docs/install.md` verbatim.** Each block the CI runs is fenced
   as ` ```sh install:<step>`; `scripts/doc-block.sh` extracts one by name
-  (one match exactly) and the `compose-e2e` job runs it in `deploy/`. Only the
+  (one match exactly) and `scripts/run-doc-block.sh` runs it in `deploy/`
+  under `bash -euo pipefail`, failing when the block is missing, duplicated
+  or empty (so a renamed tag cannot turn a step into an empty, passing script). Only the
   `git clone`, the interactive `read` of the key and systemd are untagged. The
   one step CI does in its own words is the `.env` edit the page asks for,
   done with the models-file option the page documents.
