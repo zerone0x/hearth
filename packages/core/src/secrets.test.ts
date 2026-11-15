@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { inspect } from "node:util";
 import {
   createDefaultSecretStore,
+  displayRef,
   fingerprint,
   parseSecretRef,
   ResolvingSecretStore,
@@ -15,6 +16,8 @@ import {
 } from "./secrets";
 
 const RAW = "sk-very-secret-value-123";
+/** Shaped like a GitHub token: only `[A-Za-z0-9_]`, so it passes the env-name lookup pattern. */
+const GHP = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
 
 let dir: string;
 beforeAll(async () => {
@@ -110,6 +113,45 @@ describe("env: and file: resolution", () => {
       expect(error.ref).not.toContain(RAW);
       expect(error.message).toContain(fingerprint(pasted));
     }
+  });
+
+  test("a token-shaped env: reference is shown only by fingerprint", async () => {
+    const pasted = `env:${GHP}`;
+    // Unset: the lookup runs, but neither the message nor `ref` names the token.
+    const missing = (await store.resolve(pasted).catch((e: unknown) => e)) as SecretError;
+    expect(missing).toBeInstanceOf(SecretError);
+    expect(missing.code).toBe("secret.not-found");
+    expect(missing.ref).toBe(redactRef(pasted));
+    expect(missing.message).toContain(fingerprint(pasted));
+    expect(missing.message).not.toContain(GHP);
+    // Set but blank: the store's own error is redacted the same way.
+    const blank = createDefaultSecretStore({ env: { [GHP]: " " } });
+    const empty = (await blank.resolve(pasted).catch((e: unknown) => e)) as SecretError;
+    expect(empty.code).toBe("secret.empty");
+    expect(empty.ref).toBe(redactRef(pasted));
+    expect(empty.message).not.toContain(GHP);
+  });
+
+  test("a conventional variable name is shown, an unconventional one is not", async () => {
+    expect(displayRef("env:HEARTH_TOKEN")).toBe("env:HEARTH_TOKEN");
+    expect(displayRef("env:_X9")).toBe("env:_X9");
+    expect(displayRef(`env:${"A".repeat(64)}`)).toBe(`env:${"A".repeat(64)}`);
+    expect(displayRef(`env:${"A".repeat(65)}`)).toBe(redactRef(`env:${"A".repeat(65)}`));
+    expect(displayRef("env:lower_case")).toBe(redactRef("env:lower_case"));
+    expect(displayRef(`env:${GHP}`)).toBe(redactRef(`env:${GHP}`));
+    expect(displayRef(RAW)).toBe(redactRef(RAW));
+    const path = `file:${join(dir, "token")}`;
+    expect(displayRef(path)).toBe(path);
+    const error = (await store
+      .resolve("env:HEARTH_MISSING")
+      .catch((e: unknown) => e)) as SecretError;
+    expect(error.ref).toBe("env:HEARTH_MISSING");
+    expect(error.message).toContain("variable HEARTH_MISSING is not set");
+  });
+
+  test("an unconventional variable name still resolves", async () => {
+    const lower = createDefaultSecretStore({ env: { lower_case: RAW } });
+    expect((await lower.resolve("env:lower_case")).reveal()).toBe(RAW);
   });
 
   test("whitespace-only values are empty", async () => {
@@ -218,6 +260,22 @@ describe("cache", () => {
     expect(state.calls).toBe(2);
   });
 
+  test("a resolve after invalidate() with no ref does not join the read in flight", async () => {
+    const values: Record<string, string> = { a: "old" };
+    const { resolver, state, hold } = gatedResolver(values);
+    const store = new ResolvingSecretStore({ resolvers: [resolver] });
+    hold();
+    const stale = store.resolve("test:a");
+    store.invalidate();
+    values["a"] = "rotated";
+    const fresh = store.resolve("test:a");
+    expect(fresh).not.toBe(stale);
+    state.release();
+    expect((await stale).reveal()).toBe("old");
+    expect((await fresh).reveal()).toBe("rotated");
+    expect(state.calls).toBe(2);
+  });
+
   test("a resolve after invalidate(ref) does not join the read in flight", async () => {
     const values: Record<string, string> = { a: "old" };
     const { resolver, state, hold } = gatedResolver(values);
@@ -278,6 +336,17 @@ describe("preflight", () => {
     expect(report.failures.map((f) => f.code)).toEqual(pasted.map(() => "secret.malformed-ref"));
     expect(report.failures.map((f) => f.ref)).toEqual(pasted.map((ref) => redactRef(ref)));
     expect(JSON.stringify(report)).not.toContain(RAW);
+  });
+
+  test("a token-shaped env: reference never reaches the report", async () => {
+    const store = createDefaultSecretStore({ env: { [`${GHP}_EMPTY`]: "" } });
+    const pasted = [`env:${GHP}`, `env:${GHP}_EMPTY`];
+    const report = await store.preflight(pasted);
+    expect(report.ok).toBe(false);
+    if (report.ok) return;
+    expect(report.failures.map((f) => f.code)).toEqual(["secret.not-found", "secret.empty"]);
+    expect(report.failures.map((f) => f.ref)).toEqual(pasted.map((ref) => redactRef(ref)));
+    expect(JSON.stringify(report)).not.toContain(GHP);
   });
 
   test("bypasses the cache, so a value removed since is reported", async () => {
