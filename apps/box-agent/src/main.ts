@@ -1,5 +1,6 @@
-import { createDefaultSecretStore, HearthError } from "@hearth/core";
+import { HearthError } from "@hearth/core";
 import { describeBoxAgent } from "./agent";
+import { makeNonDumpable, takeJoinToken } from "./boot";
 import { BoxAgent } from "./connection";
 import { DEFAULT_EXEC_ENV } from "./tools/executor";
 import { DEFAULT_VNC_PORT } from "./vnc";
@@ -12,8 +13,6 @@ const EXIT_REJECTED = 3;
 /** Boot environment the hub passes through `BoxProvider.start` (see the hub's `BOX_ENV`). */
 const HUB_URL_VAR = "HEARTH_HUB_URL";
 const BOX_ID_VAR = "HEARTH_BOX_ID";
-/** The join token is a secret, so it is read through the SecretStore, not `process.env`. */
-const JOIN_TOKEN_REF = "env:HEARTH_JOIN_TOKEN";
 /** Optional override of the workspace root, for running box-agent outside the image. */
 const WORKSPACE_VAR = "HEARTH_WORKSPACE";
 const DEFAULT_WORKSPACE = "/workspace";
@@ -26,6 +25,17 @@ const info = describeBoxAgent();
 const banner = `hearth box-agent (protocol ${info.protocol}, pi ${info.pi})`;
 
 async function main(): Promise<number> {
+  // First, before the join token is read: no command this process runs may
+  // read its environment or memory through /proc or ptrace (decision 0018).
+  try {
+    const dumpable = await makeNonDumpable();
+    if (dumpable.kind === "unsupported") {
+      console.warn(`${banner}: cannot make the process non-dumpable: ${dumpable.reason}`);
+    }
+  } catch (error) {
+    console.error(`${banner}: ${String(error)}`);
+    return EXIT_CONFIG;
+  }
   const hubUrl = process.env[HUB_URL_VAR];
   const boxId = process.env[BOX_ID_VAR];
   if (!hubUrl || !boxId) {
@@ -34,7 +44,9 @@ async function main(): Promise<number> {
   }
   let joinToken: string;
   try {
-    joinToken = (await createDefaultSecretStore().resolve(JOIN_TOKEN_REF)).reveal();
+    // From the file the entrypoint wrote (deleted here), or from the environment
+    // outside the image; both variables leave `process.env` (decision 0018).
+    joinToken = await takeJoinToken({ env: process.env });
   } catch (error) {
     const reason = error instanceof HearthError ? error.message : String(error);
     console.error(`${banner}: no join token: ${reason}`);
