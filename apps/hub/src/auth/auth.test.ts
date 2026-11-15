@@ -199,6 +199,34 @@ describe("every route except /healthz and the login needs a session", () => {
       await (await h.app.request("/v1/auth/status", { headers: { cookie: h.cookie } })).json(),
     ).toEqual({ setupRequired: false, authenticated: true });
   });
+
+  test("the handler passes the guard's principal to authorize, not a fixed one", async () => {
+    // In v1 every login yields the owner, so a handler that hard-coded
+    // LOCAL_PRINCIPAL would look right; a guard that returns another
+    // principal tells the two apart.
+    const other = {
+      ...LOCAL_PRINCIPAL,
+      id: "usr_other",
+      displayName: "other",
+    } as unknown as Principal;
+    const h = await withPassword();
+    const auth = Object.create(h.auth) as AuthService;
+    auth.authenticate = (token) => (h.auth.authenticate(token) === undefined ? undefined : other);
+    const boxes = {
+      echo: async (principal: Principal, _boxId: string, params: JsonValue) => {
+        h.commands.push(principal);
+        return params;
+      },
+    } as unknown as BoxConnections;
+    const app = createApp({ boxes, auth });
+    const res = await app.request("/v1/boxes/box_1/echo", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: h.cookie },
+      body: JSON.stringify({ x: 1 }),
+    });
+    expect(res.status).toBe(200);
+    expect(h.commands).toEqual([other]);
+  });
 });
 
 describe("first-run setup", () => {
@@ -459,6 +487,10 @@ describe("prototype exit criterion (PRD §11.1): no session and no command witho
       echo(h, { "sec-fetch-site": "cross-site", cookie: h.cookie }),
       post(h, "/v1/sessions", { title: "x" }),
       post(h, "/v1/sessions", { title: "x" }, { origin: "https://evil.example", cookie: h.cookie }),
+      // Starting a box has no HTTP route yet (`hub.startBox` is in-process);
+      // a future one under /v1/boxes sits behind the same two guards.
+      post(h, "/v1/boxes", { image: "x" }),
+      post(h, "/v1/boxes/box_1/start", {}, { origin: "https://evil.example", cookie: h.cookie }),
       login(h, PASSWORD, { origin: "https://evil.example" }),
       login(h, "wrong password!"),
     ];
