@@ -63,3 +63,8 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_IMAGE: hearth-box:ci-idle
         run: timeout 900 bun test apps/hub/src/box/docker/provider.docker.test.ts
+      - name: Hub-box echo round trip through the real image (M0 exit)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/box/echo.docker.test.ts

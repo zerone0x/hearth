@@ -77,9 +77,14 @@ user="$(docker image inspect -f '{{.Config.User}}' "${image}")"
 [[ -n "${user}" && "${user}" != "root" && "${user%%:*}" != "0" ]] || fail "image runs as root"
 ok "runs as user ${user}"
 
-# Default command: desktop, then box-agent (which exits until the hub connection lands).
-agent_out="$(timeout 120 docker run --rm "${image}" 2>&1)" || fail "default command failed: ${agent_out}"
+# Default command: desktop, then box-agent. Without a hub URL and join token in
+# its boot env, box-agent names what is missing and exits 2 (no silent idling).
+agent_code=0
+agent_out="$(timeout 120 docker run --rm "${image}" 2>&1)" || agent_code=$?
+[[ "${agent_code}" == 2 ]] || fail "default command exited ${agent_code}, expected 2: ${agent_out}"
 [[ "${agent_out}" == *"pi ${pi_version}"* ]] || fail "box-agent output: ${agent_out}"
+[[ "${agent_out}" == *"HEARTH_HUB_URL and HEARTH_BOX_ID must be set"* ]] ||
+  fail "box-agent output: ${agent_out}"
 ok "box-agent: ${agent_out}"
 
 # A running box to inspect.
