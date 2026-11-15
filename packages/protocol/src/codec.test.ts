@@ -56,7 +56,7 @@ const SAMPLES: { readonly [T in FrameType]: readonly FrameOf<T>[] } = {
       boxVersion: { major: 2, minor: 0 },
     },
   ],
-  "session.assign": [{ type: "session.assign", sessionId: "s1", resume: false }],
+  "session.assign": [{ type: "session.assign", sessionId: "s1", requestId: "a1", resume: false }],
   "turn.start": [{ type: "turn.start", sessionId: "s1", turnId: "t1", input: "hello\nworld ✓" }],
   "turn.event": [
     {
@@ -284,6 +284,16 @@ describe("rejects malformed messages", () => {
     const exact = "y".repeat(MAX_ECHOED_TYPE_LENGTH);
     const kept = decodeFrame(JSON.stringify({ type: exact }));
     expect(kept.ok ? null : kept.error.frameType).toBe(exact);
+  });
+
+  test("control and bidi characters in an unknown type are not echoed", () => {
+    for (const bad of ["\u202e", "\u2066", "\u200f", "\u0085", "\u0007", "\u061c"]) {
+      const result = decodeFrame(JSON.stringify({ type: `turn${bad}.start` }));
+      if (result.ok) throw new Error("expected an error");
+      expect(result.error.code).toBe("unknown-type");
+      expect(result.error.frameType).toBe("turn\ufffd.start");
+      expect(result.error.message).not.toContain(bad);
+    }
   });
 
   test("stream.data sent as text", () => {
@@ -514,7 +524,7 @@ describe("encode", () => {
     const bad = [
       { type: "ping", nonce: -1 },
       { type: "ping", nonce: 1.5 },
-      { type: "session.assign", sessionId: "a b", resume: false },
+      { type: "session.assign", sessionId: "a b", requestId: "a1", resume: false },
       { type: "stream.open", streamId: 2, kind: "vnc", mode: "read" },
       { type: "stream.open", streamId: 3, kind: "file", path: "../x", mode: "read" },
       { type: "turn.end", ...delivery, sessionId: "s", turnId: "t", outcome: "failed" },
@@ -531,6 +541,38 @@ describe("encode", () => {
       expect(thrown).toBeInstanceOf(EncodeError);
       expect(thrown).toBeInstanceOf(RangeError);
     }
+  });
+
+  test("refuses values JSON would change or cannot write", () => {
+    const rpc = { type: "rpc", id: "q", method: "m" };
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic["self"] = cyclic;
+    const cases: [unknown, string][] = [
+      [[1, undefined], "params"],
+      [{ list: [undefined] }, "params.list"],
+      [{ n: Number.NaN }, "params.n"],
+      [{ f: () => 1 }, "params.f"],
+      [new Date(0), "params"],
+      [{ at: new Date(0) }, "params.at"],
+      [10n, "params"],
+      [{ n: [1n] }, "params.n.0"],
+      [{ toJSON: () => "x" }, "params"],
+      [cyclic, "params.self"],
+    ];
+    for (const [params, path] of cases) {
+      let thrown: unknown;
+      try {
+        encodeFrame({ ...rpc, params } as unknown as Frame);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(EncodeError);
+      expect((thrown as EncodeError).error.path).toBe(path);
+    }
+    // A plain key named toJSON is ordinary JSON.
+    expect(typeof encodeFrame({ ...rpc, params: { toJSON: 1 } } as unknown as Frame)).toBe(
+      "string",
+    );
   });
 
   test("encodes a hello of another major (the version check is the decoder's)", () => {
@@ -752,6 +794,10 @@ const POOL: readonly unknown[] = [
   { major: 1, minor: 0 },
   { major: 2, minor: 0 },
   new Uint8Array([1, 2]),
+  [1, undefined],
+  { list: [undefined] },
+  new Date(0),
+  10n,
 ];
 
 /** A copy of `frame` with one field, top-level or one object down, replaced by a pool value. */

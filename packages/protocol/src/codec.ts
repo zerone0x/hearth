@@ -67,7 +67,8 @@ export interface DecodeError {
   readonly message: string;
   /**
    * The frame's `type`, when it could be read. For `unknown-type` it is
-   * capped at `MAX_ECHOED_TYPE_LENGTH` characters.
+   * capped at `MAX_ECHOED_TYPE_LENGTH` characters, with control and bidi
+   * characters replaced by U+FFFD.
    */
   readonly frameType?: string;
   /** Dotted path of the offending field, for `invalid-field`. */
@@ -108,35 +109,65 @@ export class EncodeError extends RangeError {
  * frame that fails validation throws `EncodeError` (a `RangeError`), and a
  * `stream.data` whose stream id or sequence number does not fit in 32 bits
  * throws `RangeError`. The version check is not applied, so a `hello` of
- * another major can still be encoded. A non-finite number is refused rather
- * than silently written as `null`.
+ * another major can still be encoded. Values JSON would silently change or
+ * cannot write are refused with `EncodeError` too: a non-finite number,
+ * `undefined` in an array, a `BigInt`, a function or symbol, a cycle, and any
+ * object that is not a plain object or array (a `Date`, a typed array,
+ * anything with `toJSON`). An `undefined` object property is omitted, as JSON
+ * does, so an absent optional field may be written as `undefined`.
  */
 export function encodeFrame(frame: Frame): string | Uint8Array {
   if (frame.type === "stream.data") return encodeStreamData(frame);
-  const text: string | undefined = JSON.stringify(frame, function (this: unknown, key, value) {
-    const lossy = (why: string) =>
-      new EncodeError({
-        code: "invalid-field",
-        message: `${key}: ${why}`,
-        frameType: frame.type,
-        path: key,
-      });
-    if (typeof value === "number" && !Number.isFinite(value)) {
-      throw lossy("expected a finite number");
-    }
-    if (value === undefined && Array.isArray(this)) throw lossy("undefined in an array");
-    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-      const proto = Object.getPrototypeOf(value);
-      if (proto !== Object.prototype && proto !== null) throw lossy("expected plain JSON");
-    }
-    return value;
-  });
+  // A walk before stringify, not a replacer: `JSON.stringify` calls `toJSON`
+  // (a `Date` becomes a string) before a replacer sees the value, and throws a
+  // plain `TypeError` for a `BigInt` or a cycle.
+  refuseUnwritable(frame, frame.type, "", new Set());
+  const text: string | undefined = JSON.stringify(frame);
   if (typeof text !== "string") {
     throw new EncodeError({ code: "not-a-frame", message: "frame is not JSON-serializable" });
   }
   const checked = decodeText(text, null);
   if (!checked.ok) throw new EncodeError(checked.error);
   return text;
+}
+
+/** Throws `EncodeError` for a value `JSON.stringify` would change or throw on. */
+function refuseUnwritable(
+  value: unknown,
+  frameType: string,
+  path: string,
+  ancestors: Set<object>,
+): void {
+  const refuse = (why: string): never => {
+    throw new EncodeError({
+      code: "invalid-field",
+      message: `${path || "frame"}: ${why}`,
+      frameType,
+      ...(path ? { path } : {}),
+    });
+  };
+  if (typeof value === "number" && !Number.isFinite(value)) refuse("expected a finite number");
+  if (typeof value === "bigint") refuse("expected a JSON number, not a BigInt");
+  if (typeof value === "function" || typeof value === "symbol") refuse("expected JSON");
+  if (typeof value !== "object" || value === null) return;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      // A hole reads as `undefined` too; JSON writes both as `null`.
+      if (value[i] === undefined) refuse(`undefined in an array at index ${i}`);
+    }
+  } else {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) refuse("expected plain JSON");
+    if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
+      refuse("expected plain JSON, not an object with toJSON");
+    }
+  }
+  if (ancestors.has(value)) refuse("cyclic value");
+  ancestors.add(value);
+  for (const [key, child] of Object.entries(value)) {
+    refuseUnwritable(child, frameType, path ? `${path}.${key}` : key, ancestors);
+  }
+  ancestors.delete(value);
 }
 
 function encodeStreamData(frame: StreamDataFrame): Uint8Array {
@@ -192,9 +223,15 @@ function decodeBinary(bytes: Uint8Array): DecodeResult {
   };
 }
 
-/** Caps a received string before it is echoed into an error. */
+/**
+ * Makes a received string safe to echo into an error: capped at
+ * `MAX_ECHOED_TYPE_LENGTH` characters, with control and bidi characters
+ * replaced by U+FFFD so the error cannot display as something else.
+ */
 function capType(type: string): string {
-  return type.length <= MAX_ECHOED_TYPE_LENGTH ? type : `${type.slice(0, MAX_ECHOED_TYPE_LENGTH)}…`;
+  const capped =
+    type.length <= MAX_ECHOED_TYPE_LENGTH ? type : `${type.slice(0, MAX_ECHOED_TYPE_LENGTH)}…`;
+  return capped.replace(UNSAFE_CHARS_GLOBAL, "\uFFFD");
 }
 
 function fieldFailure(error: unknown, type: string): DecodeResult {
@@ -320,6 +357,7 @@ function streamId(f: Fields): number {
  */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
 const UNSAFE_PATH_CHARS = /[\u0000-\u001f\u007f-\u009f؜‎‏‪-‮⁦-⁩]/;
+const UNSAFE_CHARS_GLOBAL = new RegExp(UNSAFE_PATH_CHARS.source, "g");
 
 /** A path relative to the box workspace: no leading `/` or `\`, no drive, no `..`. */
 function relativePath(f: Fields, key: string): string {
@@ -379,6 +417,7 @@ const DECODERS: Decoders = {
   "session.assign": (f) => ({
     type: "session.assign",
     sessionId: f.id("sessionId"),
+    requestId: f.id("requestId"),
     resume: f.bool("resume"),
   }),
   "turn.start": (f) => ({

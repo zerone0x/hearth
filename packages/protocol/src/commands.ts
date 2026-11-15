@@ -11,8 +11,8 @@ import type { CommandFrame, Frame } from "./frames";
 
 /** What the box remembers about commands in the current boot. */
 export interface CommandHistory {
-  /** The session assigned to the box now, or `null`. */
-  readonly sessionId: string | null;
+  /** Every assign `requestId` the box has received in this boot. */
+  readonly assignRequestIds: ReadonlySet<string>;
   /** Every `turnId` the box has started in this boot, running or ended. */
   readonly turnIds: ReadonlySet<string>;
   /** Every hibernate `requestId` the box has received in this boot. */
@@ -30,8 +30,9 @@ export function isCommand(frame: Frame): frame is CommandFrame {
 /**
  * True when the box must ignore `command` because it has already applied it:
  *
- * - `session.assign` for the session that is assigned now. Assigning the same
- *   session again after it was hibernated is a new command, not a duplicate.
+ * - `session.assign` with a `requestId` the box knows. A replayed assign is
+ *   ignored even after the session was hibernated, so it cannot wake the
+ *   session again; a real resume carries a new `requestId`.
  * - `turn.start` with a `turnId` the box knows, so a turn never runs twice.
  *   Its outcome reaches the hub anyway: `turn.event` and `turn.end` are
  *   at-least-once.
@@ -41,7 +42,7 @@ export function isCommand(frame: Frame): frame is CommandFrame {
 export function isDuplicateCommand(history: CommandHistory, command: CommandFrame): boolean {
   switch (command.type) {
     case "session.assign":
-      return history.sessionId === command.sessionId;
+      return history.assignRequestIds.has(command.requestId);
     case "turn.start":
       return history.turnIds.has(command.turnId);
     case "session.hibernate":

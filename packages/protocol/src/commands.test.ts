@@ -17,13 +17,14 @@ import {
  */
 class FakeBox {
   sessionId: string | null = null;
+  readonly assignRequestIds = new Set<string>();
   readonly turnIds = new Set<string>();
   readonly hibernateRequestIds = new Set<string>();
   readonly applied: string[] = [];
 
   history(): CommandHistory {
     return {
-      sessionId: this.sessionId,
+      assignRequestIds: this.assignRequestIds,
       turnIds: this.turnIds,
       hibernateRequestIds: this.hibernateRequestIds,
     };
@@ -37,6 +38,7 @@ class FakeBox {
     if (!isCommand(frame) || isDuplicateCommand(this.history(), frame)) return;
     switch (frame.type) {
       case "session.assign":
+        this.assignRequestIds.add(frame.requestId);
         this.sessionId = frame.sessionId;
         this.applied.push(`assign ${frame.sessionId}`);
         break;
@@ -53,7 +55,12 @@ class FakeBox {
   }
 }
 
-const assign: CommandFrame = { type: "session.assign", sessionId: "s1", resume: false };
+const assign: CommandFrame = {
+  type: "session.assign",
+  sessionId: "s1",
+  requestId: "a1",
+  resume: false,
+};
 const turn: CommandFrame = { type: "turn.start", sessionId: "s1", turnId: "t1", input: "hi" };
 const hibernate: CommandFrame = { type: "session.hibernate", sessionId: "s1", requestId: "r1" };
 
@@ -81,7 +88,7 @@ describe("re-sent commands are idempotent", () => {
 
   test("a turn stays known after it ended", () => {
     const history: CommandHistory = {
-      sessionId: "s1",
+      assignRequestIds: new Set(["a1"]),
       turnIds: new Set(["t1"]),
       hibernateRequestIds: new Set(),
     };
@@ -98,24 +105,44 @@ describe("re-sent commands are idempotent", () => {
     expect(box.applied.at(-1)).toBe("hibernate r2");
   });
 
-  test("session.assign is a duplicate only while that session is assigned", () => {
+  test("session.assign is applied once per requestId", () => {
     const box = new FakeBox();
     box.receive(encodeFrame(assign));
     box.receive(encodeFrame(assign));
     expect(box.applied).toEqual(["assign s1"]);
-    // After hibernation the same session may be assigned again, as a resume.
+    // A resume after hibernation is a new assignment with a new requestId.
     box.receive(encodeFrame(hibernate));
-    box.receive(encodeFrame({ ...assign, resume: true } as CommandFrame));
+    box.receive(encodeFrame({ ...assign, requestId: "a2", resume: true } as CommandFrame));
     expect(box.applied).toEqual(["assign s1", "hibernate r1", "assign s1"]);
-    // Another session is never a duplicate.
-    expect(isDuplicateCommand(box.history(), { ...assign, sessionId: "s2" } as CommandFrame)).toBe(
-      false,
-    );
+    expect(box.sessionId).toBe("s1");
+    // Another session with a new requestId is never a duplicate.
+    expect(
+      isDuplicateCommand(box.history(), {
+        ...assign,
+        sessionId: "s2",
+        requestId: "a3",
+      } as CommandFrame),
+    ).toBe(false);
+  });
+
+  test("replaying assign and hibernate after a hibernate leaves the session asleep", () => {
+    const box = new FakeBox();
+    box.receive(encodeFrame(assign));
+    box.receive(encodeFrame(turn));
+    box.receive(encodeFrame(hibernate));
+    expect(box.sessionId).toBeNull();
+    // Reconnect: the hub replays every command in its original order.
+    expect(isDuplicateCommand(box.history(), assign)).toBe(true);
+    box.receive(encodeFrame(assign));
+    box.receive(encodeFrame(turn));
+    box.receive(encodeFrame(hibernate));
+    expect(box.applied).toEqual(["assign s1", "turn t1", "hibernate r1"]);
+    expect(box.sessionId).toBeNull();
   });
 
   test("a new boot starts with an empty history", () => {
     const fresh: CommandHistory = {
-      sessionId: null,
+      assignRequestIds: new Set(),
       turnIds: new Set(),
       hibernateRequestIds: new Set(),
     };

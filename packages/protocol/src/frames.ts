@@ -149,11 +149,17 @@ export interface RejectFrame {
 
 /**
  * Hub → box: run this session in the box (fresh or restored from hibernation).
- * Idempotent: ignored while this session is already assigned to the box.
+ * Idempotent: ignored when the box already knows `requestId` in this boot.
  */
 export interface SessionAssignFrame {
   readonly type: "session.assign";
   readonly sessionId: string;
+  /**
+   * Names this assignment. The hub uses a new one for every assignment it
+   * decides on (a resume after hibernation is a new assignment) and the same
+   * one when it re-sends after a reconnect.
+   */
+  readonly requestId: string;
   /** `true` when the session is being restored rather than started. */
   readonly resume: boolean;
 }

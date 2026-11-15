@@ -232,8 +232,12 @@ bumping the minor.
 - **Hub → box commands stay fire-and-forget and are applied idempotently.** The
   hub re-sends any command whose effect it has not seen after a reconnect. The
   box ignores a `turn.start` whose `turnId` it knows in this boot (a turn never
-  runs twice), a `session.hibernate` whose `requestId` it knows, and a
-  `session.assign` for the session already assigned. `isDuplicateCommand` in
+  runs twice), and a `session.hibernate` or `session.assign` whose `requestId`
+  it knows. `session.assign` gets a required `requestId` for this (orchestrator
+  decision): deduping on "this session is assigned now" would let a replayed
+  assign wake a session that was hibernated after it. The hub mints a new
+  `requestId` for every assignment it decides on, including a resume, and
+  re-sends keep the original one. `isDuplicateCommand` in
   `packages/protocol` is the single definition. Commands were not made
   at-least-once: the hub owns the session state machine and must decide again
   after a reconnect anyway (a command may no longer apply), and a box-to-hub ack
@@ -256,8 +260,8 @@ bumping the minor.
   on the same box), `retry-cold` (retry only on a fresh box via a cold boot)
   and `give-up`. `FailureDisposition` is exported next to `FailureOwner`, whose
   values are unchanged (`box`, `model-provider`, `gateway`, `hub`, `user`).
-  `packages/core` imports both from `@hearth/protocol` instead of redefining
-  them.
+  `packages/core` imports both from `@hearth/protocol` and re-exports them
+  from `failure.ts` instead of redefining them.
 - **Variant fields are rejected consistently.** A field that belongs to another
   variant of the same frame is an `invalid-field` error (`path` or `mode` on a
   `vnc` stream, versions on a non-version-mismatch reject); a field no variant
@@ -277,8 +281,8 @@ bumping the minor.
 - A future major may change anything except the frozen fields; changing those
   would make version errors unreadable for older peers and needs a new
   decision entry.
-- The box-agent (#7) keeps, per boot, the set of turn ids and hibernate request
-  ids it has seen. They are small per session; bounding them is the
+- The box-agent (#7) keeps, per boot, the set of turn ids and of assign and
+  hibernate request ids it has seen. They are small per session; bounding them is the
   box-agent's call.
 - Code outside `packages/protocol` that classifies failures uses
   `FailureDisposition`; a boolean `retryable` must not come back.

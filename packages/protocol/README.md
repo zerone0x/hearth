@@ -109,8 +109,13 @@ and the box ignores a command it returns `true` for:
   at-least-once, so the hub gets the outcome anyway.
 - `session.hibernate` whose `requestId` the box already knows in this boot. Its
   one `hibernate.done` is at-least-once.
-- `session.assign` for the session that is assigned now. Assigning the same
-  session again after it was hibernated is a new command (a resume).
+- `session.assign` whose `requestId` the box already knows in this boot. The
+  hub gives every assignment it decides on a new `requestId` (a resume after
+  hibernation is a new assignment), so a replayed assign is ignored even after
+  the session was hibernated and cannot wake it again.
+
+A re-sent command always carries its original `turnId` or `requestId`; the
+hub never mints a new one for a re-send.
 
 ## Reconnect
 
@@ -135,7 +140,9 @@ it before it sends anything. On reconnect the hub:
 3. Re-sends what the box still lacks: `session.assign` when `state.sessionId`
    is not the session it assigned, `turn.start` for a turn with no `turn.end`
    that is not `state.turnId`, `session.hibernate` for a request with no
-   `hibernate.done`. Idempotent apply makes a needless re-send harmless.
+   `hibernate.done`. Each re-send keeps its original `turnId` or `requestId`,
+   so the box ignores one it already applied, in any order: a replayed assign
+   that arrives after the session was hibernated does not wake it.
 
 ## Versioning
 
