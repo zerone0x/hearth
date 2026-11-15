@@ -101,9 +101,7 @@ function fixture() {
     auditRows(): AuditRow[] {
       const db = new Database(dbPath, { readonly: true });
       try {
-        return db
-          .query<AuditRow, []>("SELECT principal_id, action FROM audit ORDER BY id")
-          .all();
+        return db.query<AuditRow, []>("SELECT principal_id, action FROM audit ORDER BY id").all();
       } finally {
         db.close();
       }
@@ -132,8 +130,16 @@ function expectOther(f: Fixture, from: { calls: number; rows: number }, actions:
   }
   expect(calls.length).toBeGreaterThan(0);
   expect(rows.length).toBe(calls.length);
-  for (const c of calls) expect({ action: c.action, principal: c.principal }).toEqual({ action: c.action, principal: OTHER.id });
-  for (const r of rows) expect({ action: r.action, principal: r.principal_id }).toEqual({ action: r.action, principal: OTHER.id });
+  for (const c of calls)
+    expect({ action: c.action, principal: c.principal }).toEqual({
+      action: c.action,
+      principal: OTHER.id,
+    });
+  for (const r of rows)
+    expect({ action: r.action, principal: r.principal_id }).toEqual({
+      action: r.action,
+      principal: OTHER.id,
+    });
 }
 
 function mark(f: Fixture) {
@@ -148,12 +154,7 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     expect((await f.request("/v1/sessions")).status).toBe(200);
     expect((await f.request(`/v1/sessions/${id}`)).status).toBe(200);
     expect((await f.request(`/v1/sessions/${id}/archive`, { body: {} })).status).toBe(200);
-    expectOther(f, from, [
-      "session.create",
-      "session.list",
-      "session.read",
-      "session.archive",
-    ]);
+    expectOther(f, from, ["session.create", "session.list", "session.read", "session.archive"]);
   });
 
   test("runner routes: messages, interrupt, events, runner options", async () => {
@@ -182,7 +183,10 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     const id = await f.createSession();
     // No box provider: the bridge authorizes and looks the session up, then
     // cannot get a box, so the upgrade is refused after `authorize` ran.
-    f.hub.sessions.ensureBox = async () => {
+    // It records the principal the box would be woken for (audited transitions).
+    const wokenFor: (string | undefined)[] = [];
+    f.hub.sessions.ensureBox = async (_sessionId, principal) => {
+      wokenFor.push(principal?.id);
       throw new HearthError("no box in this test", {
         owner: "hub",
         disposition: "give-up",
@@ -198,6 +202,7 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     expect(res?.status).toBe(409);
     await res?.body?.cancel();
     expectOther(f, from, ["desktop.view", "session.read"]);
+    expect(wokenFor).toEqual([OTHER.id]);
   });
 
   test("box echo", async () => {
