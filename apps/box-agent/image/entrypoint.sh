@@ -11,15 +11,23 @@ set -euo pipefail
 # environment of tini, Xvnc or Openbox would be readable by any tool command
 # through /proc/<pid>/environ. tini runs with -s when something else is PID 1
 # (`docker run --init`), so it still reaps orphans.
+# HEARTH_BOX_REEXEC marks stage 2, so a token that survived the re-exec stops the
+# box at once instead of re-executing it forever.
 token_file="/run/hearth/join-token"
-if [[ $$ -eq 1 || -n "${HEARTH_JOIN_TOKEN+set}" ]]; then
+if [[ -n "${HEARTH_BOX_REEXEC:-}" ]]; then
+  unset HEARTH_BOX_REEXEC
+  if [[ -n "${HEARTH_JOIN_TOKEN+set}" ]]; then
+    echo "hearth-box: HEARTH_JOIN_TOKEN is still set after the re-exec under tini" >&2
+    exit 1
+  fi
+elif [[ $$ -eq 1 || -n "${HEARTH_JOIN_TOKEN+set}" ]]; then
   if [[ -n "${HEARTH_JOIN_TOKEN:-}" ]]; then
     (umask 077 && printf '%s' "${HEARTH_JOIN_TOKEN}" >"${token_file}")
     export HEARTH_JOIN_TOKEN_FILE="${token_file}"
   fi
   tini_flags=()
   [[ $$ -eq 1 ]] || tini_flags=(-s)
-  exec env -u HEARTH_JOIN_TOKEN /usr/bin/tini "${tini_flags[@]}" -- "$0" "$@"
+  exec env -u HEARTH_JOIN_TOKEN HEARTH_BOX_REEXEC=1 /usr/bin/tini "${tini_flags[@]}" -- "$0" "$@"
 fi
 
 display="${HEARTH_DISPLAY:-:1}"

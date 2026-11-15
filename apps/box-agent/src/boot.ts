@@ -35,28 +35,87 @@ export type DumpableResult =
   | { readonly kind: "unsupported"; readonly reason: string };
 
 /**
- * Makes this process non-dumpable (Linux only) and checks that it took.
- * Throws when the kernel refused it; answers `unsupported` off Linux.
+ * `prctl(2)` with the four trailing words as `bigint`s. Tests pass a fake; the
+ * default calls libc through `bun:ffi`.
  */
-export async function makeNonDumpable(): Promise<DumpableResult> {
-  if (process.platform !== "linux") {
-    return { kind: "unsupported", reason: `no prctl on ${process.platform}` };
-  }
+export type Prctl = (option: number, ...words: [bigint, bigint, bigint, bigint]) => number;
+
+/** Calls `fn` with libc's `prctl`, then closes the library. */
+async function withLibcPrctl<T>(fn: (prctl: Prctl) => T): Promise<T> {
   const { dlopen, FFIType } = await import("bun:ffi");
   const word = FFIType.u64;
   const libc = dlopen("libc.so.6", {
     prctl: { args: [FFIType.i32, word, word, word, word], returns: FFIType.i32 },
   });
   try {
-    const set = libc.symbols.prctl(PR_SET_DUMPABLE, 0n, 0n, 0n, 0n);
-    const now = libc.symbols.prctl(PR_GET_DUMPABLE, 0n, 0n, 0n, 0n);
-    if (set !== 0 || now !== 0) {
-      throw new Error(`prctl(PR_SET_DUMPABLE, 0) failed (returned ${set}, dumpable ${now})`);
-    }
+    return fn((option, ...words) => libc.symbols.prctl(option, ...words));
   } finally {
     libc.close();
   }
+}
+
+/** Clears the dumpable flag through `prctl` and checks that it took; throws if not. */
+function clearDumpable(prctl: Prctl): void {
+  const set = prctl(PR_SET_DUMPABLE, 0n, 0n, 0n, 0n);
+  const now = prctl(PR_GET_DUMPABLE, 0n, 0n, 0n, 0n);
+  if (set !== 0 || now !== 0) {
+    throw new Error(`prctl(PR_SET_DUMPABLE, 0) failed (returned ${set}, dumpable ${now})`);
+  }
+}
+
+export interface MakeNonDumpableOptions {
+  /** The `prctl` to call; libc's through `bun:ffi` by default. */
+  readonly prctl?: Prctl;
+  /** The platform; `process.platform` by default. */
+  readonly platform?: NodeJS.Platform;
+}
+
+/**
+ * Makes this process non-dumpable (Linux only) and checks that it took.
+ * Throws when the kernel refused it; answers `unsupported` off Linux.
+ */
+export async function makeNonDumpable(
+  options: MakeNonDumpableOptions = {},
+): Promise<DumpableResult> {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") {
+    return { kind: "unsupported", reason: `no prctl on ${platform}` };
+  }
+  if (options.prctl) {
+    clearDumpable(options.prctl);
+  } else {
+    await withLibcPrctl(clearDumpable);
+  }
   return { kind: "set" };
+}
+
+/** Exit code box-agent returns when its boot environment is unusable. */
+export const EXIT_CONFIG = 2;
+
+export interface HardenOptions {
+  /** Where messages go, prefixed by the caller; `console` in production. */
+  readonly log: { warn(message: string): void; error(message: string): void };
+  /** The hardening step; `makeNonDumpable` by default. */
+  readonly harden?: () => Promise<DumpableResult>;
+}
+
+/**
+ * The first step of box-agent's `main`, before the join token is read. Answers
+ * `null` to go on, or `EXIT_CONFIG` when the process could not be made
+ * non-dumpable: box-agent then stops (fails closed) rather than run commands
+ * that could read its secrets.
+ */
+export async function hardenOrExit(options: HardenOptions): Promise<number | null> {
+  try {
+    const dumpable = await (options.harden ?? makeNonDumpable)();
+    if (dumpable.kind === "unsupported") {
+      options.log.warn(`cannot make the process non-dumpable: ${dumpable.reason}`);
+    }
+    return null;
+  } catch (error) {
+    options.log.error(String(error));
+    return EXIT_CONFIG;
+  }
 }
 
 export interface TakeJoinTokenOptions {

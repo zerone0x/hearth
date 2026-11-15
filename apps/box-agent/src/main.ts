@@ -1,12 +1,10 @@
 import { HearthError } from "@hearth/core";
 import { describeBoxAgent } from "./agent";
-import { makeNonDumpable, takeJoinToken } from "./boot";
+import { EXIT_CONFIG, hardenOrExit, takeJoinToken } from "./boot";
 import { BoxAgent } from "./connection";
 import { DEFAULT_EXEC_ENV } from "./tools/executor";
 import { DEFAULT_VNC_PORT } from "./vnc";
 
-/** Exit code when the boot environment is incomplete. */
-const EXIT_CONFIG = 2;
 /** Exit code when the hub refused the box for good (a `reject` retrying cannot fix). */
 const EXIT_REJECTED = 3;
 
@@ -27,15 +25,13 @@ const banner = `hearth box-agent (protocol ${info.protocol}, pi ${info.pi})`;
 async function main(): Promise<number> {
   // First, before the join token is read: no command this process runs may
   // read its environment or memory through /proc or ptrace (decision 0018).
-  try {
-    const dumpable = await makeNonDumpable();
-    if (dumpable.kind === "unsupported") {
-      console.warn(`${banner}: cannot make the process non-dumpable: ${dumpable.reason}`);
-    }
-  } catch (error) {
-    console.error(`${banner}: ${String(error)}`);
-    return EXIT_CONFIG;
-  }
+  const hardened = await hardenOrExit({
+    log: {
+      warn: (message) => console.warn(`${banner}: ${message}`),
+      error: (message) => console.error(`${banner}: ${message}`),
+    },
+  });
+  if (hardened !== null) return hardened;
   const hubUrl = process.env[HUB_URL_VAR];
   const boxId = process.env[BOX_ID_VAR];
   if (!hubUrl || !boxId) {

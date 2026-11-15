@@ -61,7 +61,7 @@ def read(pid, name):
             return f.read()
     except OSError as e:
         return e.errno
-report = {"tokenIn": [], "agent": None, "xvncEnviron": None, "tokenFile": os.path.exists("/run/hearth/join-token"), "processes": 0}
+report = {"tokenIn": [], "agent": None, "xvncEnviron": None, "tokenFile": os.path.exists("/run/hearth/join-token"), "processes": []}
 for entry in os.listdir("/proc"):
     if not entry.isdigit() or int(entry) in me:
         continue
@@ -69,7 +69,7 @@ for entry in os.listdir("/proc"):
     cmdline = read(pid, "cmdline")
     if not isinstance(cmdline, bytes):
         continue
-    report["processes"] += 1
+    report["processes"].append(os.path.basename(cmdline.split(b"\0")[0].decode(errors="replace")))
     environ = read(pid, "environ")
     for name, data in (("cmdline", cmdline), ("environ", environ)):
         if isinstance(data, bytes) and token in data:
@@ -106,7 +106,8 @@ interface ScanReport {
   } | null;
   readonly xvncEnviron: string | null;
   readonly tokenFile: boolean;
-  readonly processes: number;
+  /** The program name (argv[0] basename) of each process the scan read. */
+  readonly processes: string[];
 }
 
 async function containerEnv(containerId: string): Promise<Record<string, string>> {
@@ -183,7 +184,7 @@ describe.skipIf(!enabled)("box-agent's secrets through /proc in a real box", () 
     console.log(`proc scan: ${JSON.stringify(report)}`);
 
     // The scan saw the box's processes, and could read another process's environ.
-    expect(report.processes).toBeGreaterThanOrEqual(4);
+    expect(report.processes).toEqual(expect.arrayContaining(["tini", "Xvnc", "openbox", "bun"]));
     expect(report.xvncEnviron).toBe("has-box-id");
     // No process carries the join token, and its file is gone.
     expect(report.tokenIn).toEqual([]);

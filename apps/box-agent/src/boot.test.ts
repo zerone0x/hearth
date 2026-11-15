@@ -13,7 +13,15 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Subprocess, spawn } from "bun";
-import { JOIN_TOKEN_FILE_VAR, JOIN_TOKEN_VAR, takeJoinToken } from "./boot";
+import {
+  EXIT_CONFIG,
+  hardenOrExit,
+  JOIN_TOKEN_FILE_VAR,
+  JOIN_TOKEN_VAR,
+  makeNonDumpable,
+  type Prctl,
+  takeJoinToken,
+} from "./boot";
 
 const TOKEN = "hjt_test-join-token-0123456789";
 const linux = process.platform === "linux";
@@ -87,6 +95,125 @@ describe("takeJoinToken", () => {
     await expect(takeJoinToken({ env })).rejects.toThrow();
     expect(existsSync(file)).toBe(false);
   });
+});
+
+/** A fake `prctl` that answers SET and GET with the given values and records the calls. */
+function fakePrctl(set: number, get: number): { prctl: Prctl; calls: number[][] } {
+  const calls: number[][] = [];
+  const prctl: Prctl = (option, ...words) => {
+    calls.push([option, ...words.map(Number)]);
+    return option === 4 ? set : get;
+  };
+  return { prctl, calls };
+}
+
+describe("makeNonDumpable fails closed", () => {
+  test("clears the flag with PR_SET_DUMPABLE 0 and checks it with PR_GET_DUMPABLE", async () => {
+    const { prctl, calls } = fakePrctl(0, 0);
+    expect(await makeNonDumpable({ prctl, platform: "linux" })).toEqual({ kind: "set" });
+    expect(calls).toEqual([
+      [4, 0, 0, 0, 0],
+      [3, 0, 0, 0, 0],
+    ]);
+  });
+
+  test("throws when PR_SET_DUMPABLE returns -1", async () => {
+    const { prctl } = fakePrctl(-1, 0);
+    await expect(makeNonDumpable({ prctl, platform: "linux" })).rejects.toThrow(
+      "returned -1, dumpable 0",
+    );
+  });
+
+  test("throws when SET returns 0 but GET still reports dumpable", async () => {
+    const { prctl } = fakePrctl(0, 1);
+    await expect(makeNonDumpable({ prctl, platform: "linux" })).rejects.toThrow(
+      "returned 0, dumpable 1",
+    );
+  });
+
+  test("answers unsupported off Linux without calling prctl", async () => {
+    const { prctl, calls } = fakePrctl(0, 0);
+    expect(await makeNonDumpable({ prctl, platform: "darwin" })).toEqual({
+      kind: "unsupported",
+      reason: "no prctl on darwin",
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("hardenOrExit, box-agent's first boot step", () => {
+  function logger(): { warn(m: string): void; error(m: string): void; lines: string[] } {
+    const lines: string[] = [];
+    return {
+      lines,
+      warn: (m) => lines.push(`warn ${m}`),
+      error: (m) => lines.push(`error ${m}`),
+    };
+  }
+
+  test("exits with EXIT_CONFIG (2) when hardening throws", async () => {
+    const log = logger();
+    const code = await hardenOrExit({
+      log,
+      harden: () => makeNonDumpable({ prctl: fakePrctl(-1, 1).prctl, platform: "linux" }),
+    });
+    expect(EXIT_CONFIG).toBe(2);
+    expect(code).toBe(2);
+    expect(log.lines).toEqual([
+      "error Error: prctl(PR_SET_DUMPABLE, 0) failed (returned -1, dumpable 1)",
+    ]);
+  });
+
+  test("goes on (null) when the flag was set", async () => {
+    const log = logger();
+    expect(await hardenOrExit({ log, harden: async () => ({ kind: "set" }) })).toBeNull();
+    expect(log.lines).toEqual([]);
+  });
+
+  test("goes on with a warning when the platform has no prctl", async () => {
+    const log = logger();
+    const code = await hardenOrExit({
+      log,
+      harden: async () => ({ kind: "unsupported", reason: "no prctl on darwin" }),
+    });
+    expect(code).toBeNull();
+    expect(log.lines).toEqual(["warn cannot make the process non-dumpable: no prctl on darwin"]);
+  });
+});
+
+describe("box-agent's main stops when hardening fails", () => {
+  test("main.ts exits 2 before it dials, when hardenOrExit says so", async () => {
+    const dir = tempDir();
+    const boot = join(import.meta.dir, "boot.ts");
+    const preload = join(dir, "fail-harden.ts");
+    // Replaces hardenOrExit in main's import of ./boot with one that fails.
+    writeFileSync(
+      preload,
+      [
+        'import { mock } from "bun:test";',
+        `const real = await import(${JSON.stringify(boot)});`,
+        `mock.module(${JSON.stringify(boot)}, () => ({ ...real, hardenOrExit: async () => real.EXIT_CONFIG }));`,
+      ].join("\n"),
+    );
+    const run = Bun.spawn(["bun", "--preload", preload, join(import.meta.dir, "main.ts")], {
+      env: {
+        PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+        HOME: dir,
+        HEARTH_HUB_URL: "ws://127.0.0.1:9/box",
+        HEARTH_BOX_ID: "box_boot_test",
+        HEARTH_WORKSPACE: dir,
+        [JOIN_TOKEN_VAR]: TOKEN,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    children.push(run);
+    const timer = setTimeout(() => run.kill("SIGKILL"), 15_000);
+    const code = await run.exited;
+    clearTimeout(timer);
+    expect(code).toBe(2);
+    expect(await new Response(run.stdout).text()).not.toContain("dialing");
+  }, 30_000);
 });
 
 describe.skipIf(!linux)("a same-uid process reading box-agent through /proc", () => {
