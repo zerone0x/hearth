@@ -45,7 +45,7 @@ import { formatVersion, isCompatible, PROTOCOL_VERSION, type ProtocolVersion } f
 export const STREAM_DATA_TAG = 0x01;
 /** Bytes before the payload in a binary `stream.data` message. */
 export const STREAM_DATA_HEADER_BYTES = 9;
-/** Longest received `type` string echoed back in an `unknown-type` error. */
+/** Longest received `type` string, in code points, echoed back in an `unknown-type` error. */
 export const MAX_ECHOED_TYPE_LENGTH = 64;
 
 export type DecodeErrorCode =
@@ -67,7 +67,7 @@ export interface DecodeError {
   readonly message: string;
   /**
    * The frame's `type`, when it could be read. For `unknown-type` it is
-   * capped at `MAX_ECHOED_TYPE_LENGTH` characters, with control and bidi
+   * capped at `MAX_ECHOED_TYPE_LENGTH` code points, with control and bidi
    * characters replaced by U+FFFD.
    */
   readonly frameType?: string;
@@ -229,8 +229,16 @@ function decodeBinary(bytes: Uint8Array): DecodeResult {
  * replaced by U+FFFD so the error cannot display as something else.
  */
 function capType(type: string): string {
-  const capped =
-    type.length <= MAX_ECHOED_TYPE_LENGTH ? type : `${type.slice(0, MAX_ECHOED_TYPE_LENGTH)}…`;
+  // Count code points, not UTF-16 units, so the cut never splits a surrogate
+  // pair and leaves a lone surrogate behind. Stops early on a long type.
+  let end = 0;
+  let codePoints = 0;
+  while (end < type.length && codePoints < MAX_ECHOED_TYPE_LENGTH) {
+    const codePoint = type.codePointAt(end) ?? 0;
+    end += codePoint > 0xffff ? 2 : 1;
+    codePoints++;
+  }
+  const capped = end < type.length ? `${type.slice(0, end)}…` : type;
   return capped.replace(UNSAFE_CHARS_GLOBAL, "\uFFFD");
 }
 
