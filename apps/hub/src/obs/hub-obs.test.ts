@@ -243,9 +243,15 @@ describe("main.ts registers the model key before it serves", () => {
     const reader = proc.stderr.getReader();
     const deadline = Date.now() + 20_000;
     let buffered = "";
+    // One read stays pending until it resolves. Racing a fresh reader.read()
+    // against a timer each turn drops the chunk of the read that lost the race,
+    // which under load loses the warning line.
+    let pending: ReturnType<typeof reader.read> | undefined;
     while (!lines.some((l) => l.includes("listening on")) && Date.now() < deadline) {
-      const next = await Promise.race([reader.read(), Bun.sleep(1_000).then(() => undefined)]);
+      pending ??= reader.read();
+      const next = await Promise.race([pending, Bun.sleep(1_000).then(() => undefined)]);
       if (next === undefined) continue;
+      pending = undefined;
       if (next.done) break;
       buffered += decoder.decode(next.value, { stream: true });
       const parts = buffered.split("\n");
@@ -258,6 +264,12 @@ describe("main.ts registers the model key before it serves", () => {
     expect(listening).toBeGreaterThan(-1);
     expect(registered).toBeGreaterThan(-1);
     expect(registered).toBeLessThan(listening);
+    // startHub logs the setup token before it binds (Bun.serve), and the data
+    // directory is new, so this line always comes: the key must be registered
+    // before the hub can answer anything, not only before "listening on".
+    const serving = lines.findIndex((l) => l.includes("set the owner password with setup token"));
+    expect(serving).toBeGreaterThan(-1);
+    expect(registered).toBeLessThan(serving);
   }, 30_000);
 });
 
