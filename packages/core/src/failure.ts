@@ -7,26 +7,21 @@
  * failure never burns model retries.
  */
 
-import type { FailureOwner } from "@hearth/protocol";
+import type { FailureDisposition, FailureOwner } from "@hearth/protocol";
 
 /**
- * Who is responsible for a failure. `@hearth/protocol` owns this vocabulary
- * (decision 0003); core re-exports it.
- */
-export type { FailureOwner };
-
-/**
- * What the caller may do about a failure.
+ * Who is responsible for a failure (`box`, `model-provider`, `gateway`, `hub`,
+ * `user`), and what the caller may do about it:
  *
  * - `retry`: transient; the same call may succeed if retried (bounded, with backoff).
  * - `retry-cold`: the current runtime is suspect; retry after recreating it
  *   (for a box: a cold boot from the volume, PRD §6.3).
  * - `give-up`: retrying cannot help; surface the failure to the user.
  *
- * `@hearth/protocol` owns this vocabulary too (decision 0003). Until it exports
- * the union, core defines the identical one here; it then becomes a re-export.
+ * `@hearth/protocol` owns both vocabularies (decision 0005); core re-exports
+ * them and must not redefine them.
  */
-export type FailureDisposition = "retry" | "retry-cold" | "give-up";
+export type { FailureDisposition, FailureOwner };
 
 export interface FailureClass {
   readonly owner: FailureOwner;

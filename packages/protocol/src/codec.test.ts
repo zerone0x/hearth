@@ -3,6 +3,7 @@ import {
   checkHelloVersion,
   type DecodeErrorCode,
   decodeFrame,
+  EncodeError,
   encodeFrame,
   FRAME_SPECS,
   FRAME_TYPES,
@@ -10,9 +11,11 @@ import {
   type FrameOf,
   type FrameType,
   isReliable,
+  MAX_ECHOED_TYPE_LENGTH,
   MAX_ID_LENGTH,
   MAX_JSON_DEPTH,
   PROTOCOL_VERSION,
+  rejectHello,
   STREAM_DATA_HEADER_BYTES,
   type WireMessage,
 } from "./index";
@@ -28,6 +31,15 @@ const SAMPLES: { readonly [T in FrameType]: readonly FrameOf<T>[] } = {
       boxId: "box-1",
       bootId: "boot-1",
       credential: "tok",
+      state: { sessionId: null, turnId: null, lastDeliveryId: 0 },
+    },
+    {
+      type: "hello",
+      version: { major: 1, minor: 3 },
+      boxId: "box-1",
+      bootId: "boot-1",
+      credential: "per-box",
+      state: { sessionId: "s1", turnId: "t1", lastDeliveryId: 41 },
     },
   ],
   welcome: [
@@ -44,7 +56,7 @@ const SAMPLES: { readonly [T in FrameType]: readonly FrameOf<T>[] } = {
       boxVersion: { major: 2, minor: 0 },
     },
   ],
-  "session.assign": [{ type: "session.assign", sessionId: "s1", resume: false }],
+  "session.assign": [{ type: "session.assign", sessionId: "s1", requestId: "a1", resume: false }],
   "turn.start": [{ type: "turn.start", sessionId: "s1", turnId: "t1", input: "hello\nworld ✓" }],
   "turn.event": [
     {
@@ -64,7 +76,7 @@ const SAMPLES: { readonly [T in FrameType]: readonly FrameOf<T>[] } = {
       sessionId: "s1",
       turnId: "t1",
       outcome: "failed",
-      failure: { owner: "model-provider", retryable: true, message: "stream stalled" },
+      failure: { owner: "model-provider", disposition: "retry", message: "stream stalled" },
     },
   ],
   "session.hibernate": [{ type: "session.hibernate", sessionId: "s1", requestId: "r1" }],
@@ -76,7 +88,7 @@ const SAMPLES: { readonly [T in FrameType]: readonly FrameOf<T>[] } = {
       sessionId: "s1",
       requestId: "r1",
       outcome: "failed",
-      failure: { owner: "box", retryable: false, message: "disk full" },
+      failure: { owner: "box", disposition: "retry-cold", message: "disk full" },
     },
   ],
   "usage.report": [
@@ -262,6 +274,28 @@ describe("rejects malformed messages", () => {
     expectError('{"type":"toString"}', "unknown-type");
   });
 
+  test("an unknown type is capped before it is echoed", () => {
+    const long = "x".repeat(100_000);
+    const result = decodeFrame(JSON.stringify({ type: long }));
+    if (result.ok) throw new Error("expected an error");
+    expect(result.error.code).toBe("unknown-type");
+    expect(result.error.frameType).toBe(`${"x".repeat(MAX_ECHOED_TYPE_LENGTH)}…`);
+    expect(result.error.message.length).toBeLessThan(MAX_ECHOED_TYPE_LENGTH + 40);
+    const exact = "y".repeat(MAX_ECHOED_TYPE_LENGTH);
+    const kept = decodeFrame(JSON.stringify({ type: exact }));
+    expect(kept.ok ? null : kept.error.frameType).toBe(exact);
+  });
+
+  test("control and bidi characters in an unknown type are not echoed", () => {
+    for (const bad of ["\u202e", "\u2066", "\u200f", "\u0085", "\u0007", "\u061c"]) {
+      const result = decodeFrame(JSON.stringify({ type: `turn${bad}.start` }));
+      if (result.ok) throw new Error("expected an error");
+      expect(result.error.code).toBe("unknown-type");
+      expect(result.error.frameType).toBe("turn\ufffd.start");
+      expect(result.error.message).not.toContain(bad);
+    }
+  });
+
   test("stream.data sent as text", () => {
     expectError('{"type":"stream.data","streamId":1,"seq":0,"data":"AAE="}', "invalid-field");
   });
@@ -336,7 +370,7 @@ describe("rejects malformed messages", () => {
     expectError(
       JSON.stringify({
         ...sample("hibernate.done", 1),
-        failure: { owner: "nobody", retryable: true, message: "" },
+        failure: { owner: "nobody", disposition: "retry", message: "" },
       }),
       "invalid-field",
       "failure.owner",
@@ -349,10 +383,27 @@ describe("rejects malformed messages", () => {
     }
   });
 
-  test("opaque JSON payloads are depth-limited", () => {
-    let params: unknown = 1;
-    for (let i = 0; i <= MAX_JSON_DEPTH + 1; i++) params = [params];
-    expectError(JSON.stringify({ ...sample("rpc"), params }), "invalid-field");
+  test("opaque JSON payloads nest at most MAX_JSON_DEPTH levels", () => {
+    const nest = (levels: number, inner: unknown, wrap: (v: unknown) => unknown) => {
+      let value = inner;
+      for (let i = 0; i < levels; i++) value = wrap(value);
+      return value;
+    };
+    const rpc = (params: unknown) => JSON.stringify({ ...sample("rpc"), params });
+    for (const wrap of [(v: unknown) => [v], (v: unknown) => ({ k: v })]) {
+      // The innermost container counts as a level even when it is empty.
+      for (const inner of [1, [], {}]) {
+        const innerLevels = typeof inner === "object" ? 1 : 0;
+        const atLimit = nest(MAX_JSON_DEPTH - innerLevels, inner, wrap);
+        expect(decodeOk(rpc(atLimit))).toMatchObject({ params: atLimit });
+        expectError(rpc(nest(MAX_JSON_DEPTH + 1 - innerLevels, inner, wrap)), "invalid-field");
+      }
+    }
+    // The turn.event `event` object itself is the first level.
+    const event = nest(MAX_JSON_DEPTH - 1, { kind: "x" }, (v) => ({ kind: "x", v }));
+    expect(decodeOk(JSON.stringify({ ...sample("turn.event"), event }))).toMatchObject({ event });
+    const deeper = { kind: "x", v: event };
+    expectError(JSON.stringify({ ...sample("turn.event"), event: deeper }), "invalid-field");
   });
 
   test("a __proto__ key in a payload stays plain data", () => {
@@ -399,6 +450,27 @@ describe("rejects malformed messages", () => {
     delete broken["boxVersion"];
     expectError(JSON.stringify(broken), "invalid-field", "boxVersion");
   });
+
+  test("only version-mismatch rejects carry versions", () => {
+    for (const key of ["hubVersion", "boxVersion"]) {
+      const extra = { ...sample("reject"), [key]: { major: 1, minor: 0 } };
+      expectError(JSON.stringify(extra), "invalid-field", key);
+    }
+  });
+
+  test("failures carry a disposition, not a retryable flag", () => {
+    for (const disposition of ["retry", "retry-cold", "give-up"]) {
+      const frame = sample("turn.end", 1);
+      frame["failure"] = { owner: "gateway", disposition, message: "x" };
+      expect(decodeOk(JSON.stringify(frame))).toMatchObject({ failure: { disposition } });
+    }
+    const legacy = sample("turn.end", 1);
+    legacy["failure"] = { owner: "box", retryable: true, message: "x" };
+    expectError(JSON.stringify(legacy), "invalid-field", "failure.disposition");
+    const bad = sample("hibernate.done", 1);
+    bad["failure"] = { owner: "box", disposition: "later", message: "x" };
+    expectError(JSON.stringify(bad), "invalid-field", "failure.disposition");
+  });
 });
 
 describe("no hub-local paths", () => {
@@ -426,12 +498,115 @@ describe("no hub-local paths", () => {
     }
   });
 
-  test("vnc streams carry no path", () => {
+  test("control and bidi characters are rejected", () => {
+    for (const ch of ["\u0085", "\u009b", "؜", "‎", "‏", "‪", "‫", "‬", "‭", "‮", "⁦", "⁧", "⁨", "⁩"]) {
+      expectError(open(`invoice${ch}fdp.exe`), "invalid-field", "path");
+    }
+    expect(decodeOk(open("docs/résumé ✓.pdf"))).toMatchObject({ path: "docs/résumé ✓.pdf" });
+  });
+
+  test("vnc streams reject every file-only field alike", () => {
     expectError(JSON.stringify({ ...sample("stream.open"), path: "x" }), "invalid-field", "path");
+    expectError(
+      JSON.stringify({ ...sample("stream.open"), mode: "read" }),
+      "invalid-field",
+      "mode",
+    );
+    // A field no variant knows is still dropped, as for any frame.
+    expect(decodeOk(JSON.stringify({ ...sample("stream.open"), addedInMinor: 1 }))).toEqual(
+      SAMPLES["stream.open"][0] as Frame,
+    );
   });
 });
 
 describe("encode", () => {
+  test("throws instead of producing a text frame the decoder rejects", () => {
+    const bad = [
+      { type: "ping", nonce: -1 },
+      { type: "ping", nonce: 1.5 },
+      { type: "session.assign", sessionId: "a b", requestId: "a1", resume: false },
+      { type: "stream.open", streamId: 2, kind: "vnc", mode: "read" },
+      { type: "stream.open", streamId: 3, kind: "file", path: "../x", mode: "read" },
+      { type: "turn.end", ...delivery, sessionId: "s", turnId: "t", outcome: "failed" },
+      { type: "rpc", id: "q", method: "m", params: undefined },
+      { type: "nope" },
+    ] as unknown as Frame[];
+    for (const frame of bad) {
+      let thrown: unknown;
+      try {
+        encodeFrame(frame);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(EncodeError);
+      expect(thrown).toBeInstanceOf(RangeError);
+    }
+  });
+
+  test("refuses values JSON would change or cannot write", () => {
+    const rpc = { type: "rpc", id: "q", method: "m" };
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic["self"] = cyclic;
+    const cases: [unknown, string][] = [
+      [[1, undefined], "params"],
+      [{ list: [undefined] }, "params.list"],
+      [{ n: Number.NaN }, "params.n"],
+      [{ f: () => 1 }, "params.f"],
+      [new Date(0), "params"],
+      [{ at: new Date(0) }, "params.at"],
+      [10n, "params"],
+      [{ n: [1n] }, "params.n.0"],
+      [{ toJSON: () => "x" }, "params"],
+      [cyclic, "params.self"],
+    ];
+    for (const [params, path] of cases) {
+      let thrown: unknown;
+      try {
+        encodeFrame({ ...rpc, params } as unknown as Frame);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(EncodeError);
+      expect((thrown as EncodeError).error.path).toBe(path);
+    }
+    // A plain key named toJSON is ordinary JSON.
+    expect(typeof encodeFrame({ ...rpc, params: { toJSON: 1 } } as unknown as Frame)).toBe(
+      "string",
+    );
+  });
+
+  test("encodes a hello of another major (the version check is the decoder's)", () => {
+    const v2 = { ...SAMPLES.hello[0], version: { major: 2, minor: 0 } } as Frame;
+    expect(typeof encodeFrame(v2)).toBe("string");
+  });
+
+  test.each([0x5eed, 1, 2, 3, 99, 12345])(
+    "property: whatever encodes, decodes to the same frame (seed %d)",
+    (seed) => {
+      const random = seeded(seed);
+      let encoded = 0;
+      let refused = 0;
+      for (let i = 0; i < 4000; i++) {
+        const frame = mutate(ALL_SAMPLES[i % ALL_SAMPLES.length] as Frame, random);
+        let wire: string | Uint8Array;
+        try {
+          wire = encodeFrame(frame);
+        } catch (error) {
+          expect(error).toBeInstanceOf(RangeError);
+          refused++;
+          continue;
+        }
+        encoded++;
+        const result = decodeFrame(wire, frame.type === "hello" ? { version: frame.version } : {});
+        if (!result.ok) throw new Error(`encoded but rejected: ${JSON.stringify(result.error)}`);
+        expect(result.frame).toEqual(frame);
+      }
+      // Both branches must be exercised for the property to mean anything.
+      expect(encoded).toBeGreaterThan(500);
+      expect(refused).toBeGreaterThan(500);
+    },
+  );
+
   test("rejects stream ids and sequence numbers that do not fit in 32 bits", () => {
     for (const bad of [-1, 2 ** 32, 1.5, Number.NaN]) {
       const data = new Uint8Array();
@@ -467,3 +642,180 @@ describe("handshake version check", () => {
     expect(checkHelloVersion(hello(1, 0), { major: 2, minor: 0 })?.reason).toBe("version-mismatch");
   });
 });
+
+describe("version first", () => {
+  /** A hello as a hypothetical v2 might send it: same `type` and `version`, nothing else alike. */
+  const v2Hello = JSON.stringify({
+    type: "hello",
+    version: { major: 2, minor: 4 },
+    box: { id: 17, labels: ["gpu"] },
+    auth: { scheme: "mtls" },
+    resumeFrom: [3, 9],
+  });
+
+  test("a v2-shaped hello is a version-mismatch, not a malformed hello", () => {
+    const result = decodeFrame(v2Hello);
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: "version-mismatch",
+        message: "hello speaks protocol 2.4 but this side speaks 1.0; major versions must match",
+        frameType: "hello",
+        peerVersion: { major: 2, minor: 4 },
+      },
+    });
+    if (result.ok) return;
+    const reject = rejectHello(result.error);
+    expect(reject).toEqual({
+      type: "reject",
+      reason: "version-mismatch",
+      message: "box speaks protocol 2.4 but the hub speaks 1.0; major versions must match",
+      hubVersion: PROTOCOL_VERSION,
+      boxVersion: { major: 2, minor: 4 },
+    });
+    expect(decodeOk(encodeFrame(reject))).toEqual(reject);
+  });
+
+  test("an older major is refused the same way", () => {
+    const v0 = JSON.stringify({ type: "hello", version: { major: 0, minor: 9 } });
+    const result = decodeFrame(v0);
+    expect(result.ok ? null : result.error.code).toBe("version-mismatch");
+  });
+
+  test("the decoder checks against the version it is given", () => {
+    const ours = decodeFrame(JSON.stringify(SAMPLES.hello[0]), { version: { major: 2, minor: 0 } });
+    expect(ours.ok ? null : ours.error.peerVersion).toEqual({ major: 1, minor: 0 });
+    expect(decodeFrame(v2Hello, { version: { major: 2, minor: 0 } }).ok).toBe(false);
+  });
+
+  test("a same-major hello with a bad field is still malformed", () => {
+    const broken = sample("hello");
+    delete broken["boxId"];
+    const result = decodeFrame(JSON.stringify(broken));
+    if (result.ok) throw new Error("expected an error");
+    expect(result.error.code).toBe("invalid-field");
+    expect(rejectHello(result.error)).toEqual({
+      type: "reject",
+      reason: "malformed-hello",
+      message: result.error.message,
+    });
+    expectError(
+      JSON.stringify({ type: "hello", version: { major: "2" } }),
+      "invalid-field",
+      "version.major",
+    );
+  });
+});
+
+describe("box state in hello", () => {
+  const withState = (state: unknown) => JSON.stringify({ ...sample("hello"), state });
+
+  test("reports the session, the running turn and the last delivery id", () => {
+    expect(decodeOk(JSON.stringify(SAMPLES.hello[1]))).toMatchObject({
+      state: { sessionId: "s1", turnId: "t1", lastDeliveryId: 41 },
+    });
+    expect(decodeOk(withState({ sessionId: "s1", turnId: null, lastDeliveryId: 0 }))).toMatchObject(
+      {
+        state: { sessionId: "s1", turnId: null, lastDeliveryId: 0 },
+      },
+    );
+  });
+
+  test("is required and checked", () => {
+    expectError(withState(undefined), "invalid-field", "state");
+    expectError(
+      withState({ sessionId: null, turnId: "t1", lastDeliveryId: 0 }),
+      "invalid-field",
+      "state.turnId",
+    );
+    expectError(withState({ turnId: null, lastDeliveryId: 0 }), "invalid-field", "state.sessionId");
+    expectError(
+      withState({ sessionId: "a b", turnId: null, lastDeliveryId: 0 }),
+      "invalid-field",
+      "state.sessionId",
+    );
+    for (const bad of [-1, 1.5, "3", null]) {
+      expectError(
+        withState({ sessionId: null, turnId: null, lastDeliveryId: bad }),
+        "invalid-field",
+        "state.lastDeliveryId",
+      );
+    }
+  });
+
+  test("hello stays fire-and-forget: the state is a snapshot sent on every connect", () => {
+    expect(FRAME_SPECS.hello.guarantee).toBe("fire-and-forget");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Property-test helpers
+
+/** A small deterministic PRNG (mulberry32), so a failure reproduces. */
+function seeded(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Values that are valid for some fields and invalid for others. */
+const POOL: readonly unknown[] = [
+  undefined,
+  null,
+  true,
+  0,
+  1,
+  7,
+  -1,
+  1.5,
+  2 ** 32,
+  Number.MAX_SAFE_INTEGER + 1,
+  Number.NaN,
+  "",
+  "s1",
+  "a b",
+  "../x",
+  "dir/file.txt",
+  "x‮y",
+  "x".repeat(MAX_ID_LENGTH + 1),
+  "retry-cold",
+  "failed",
+  "file",
+  "vnc",
+  "read",
+  {},
+  [],
+  { kind: "text" },
+  { major: 1, minor: 0 },
+  { major: 2, minor: 0 },
+  new Uint8Array([1, 2]),
+  [1, undefined],
+  { list: [undefined] },
+  new Date(0),
+  10n,
+];
+
+/** A copy of `frame` with one field, top-level or one object down, replaced by a pool value. */
+function mutate(frame: Frame, random: () => number): Frame {
+  const copy = structuredClone(frame) as unknown as Record<string, unknown>;
+  if (random() < 0.15) return copy as unknown as Frame;
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+  let target = copy;
+  let keys = Object.keys(copy).filter((k) => k !== "type");
+  const nested = keys.filter((k) => {
+    const v = copy[k];
+    return typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Uint8Array);
+  });
+  if (nested.length > 0 && random() < 0.4) {
+    target = copy[pick(nested)] as Record<string, unknown>;
+    keys = Object.keys(target);
+  }
+  if (keys.length === 0) return copy as unknown as Frame;
+  target[pick(keys)] = structuredClone(pick(POOL));
+  return copy as unknown as Frame;
+}

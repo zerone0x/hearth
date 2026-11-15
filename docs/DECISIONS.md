@@ -211,3 +211,78 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
 - **`scripts/box-smoke.sh` is the image test**, run by the `box-image` CI job
   together with hadolint and shellcheck. It is not part of `bun run check`, which
   must pass without Docker.
+
+## 0005: Protocol v1 follow-ups: frozen handshake, idempotent commands, box state, failure vocabulary
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #14 (follow-ups from the verification of #2's protocol, PR #12)
+
+v1.0 has no released peer yet, so these change v1.0 in place instead of
+bumping the minor.
+
+### Decision
+
+- **Frozen across all major versions: `hello`'s `type` and `version`
+  (`{ major, minor }`, unsigned integers), and the whole `reject` frame.** The
+  decoder reads a hello's version before any other field and returns a
+  `version-mismatch` decode error carrying `peerVersion` when the major differs.
+  So a v2 hello of any other shape gets a clear `version-mismatch` reject, not
+  `malformed-hello`. `rejectHello(error)` builds the reject the hub sends.
+- **Hub → box commands stay fire-and-forget and are applied idempotently.** The
+  hub re-sends any command whose effect it has not seen after a reconnect. The
+  box ignores a `turn.start` whose `turnId` it knows in this boot (a turn never
+  runs twice), and a `session.hibernate` or `session.assign` whose `requestId`
+  it knows. `session.assign` gets a required `requestId` for this (orchestrator
+  decision): deduping on "this session is assigned now" would let a replayed
+  assign wake a session that was hibernated after it. The hub mints a new
+  `requestId` for every assignment it decides on, including a resume, and
+  re-sends keep the original one. `isDuplicateCommand` in
+  `packages/protocol` is the single definition. Commands were not made
+  at-least-once: the hub owns the session state machine and must decide again
+  after a reconnect anyway (a command may no longer apply), and a box-to-hub ack
+  path for commands would duplicate what the box's at-least-once answers
+  (`turn.end`, `hibernate.done`) already tell the hub.
+- **The box reports its state in `hello`**: `state.sessionId`, `state.turnId`
+  (the running turn) and `state.lastDeliveryId` (highest delivery id sent in
+  this boot, 0 for none). It is **fire-and-forget**, as part of the handshake,
+  deliberately: the state is a snapshot that is only valid when it is taken.
+  At-least-once redelivery would replay a stale snapshot after newer facts, and
+  every connect already sends a fresh one. Putting it in `hello` rather than a
+  separate frame means the hub has it before it can send any command, with no
+  ordering race. The hub re-sends only after it has applied redelivered frames
+  up to `lastDeliveryId`. On a new `bootId`, a turn that was running on the old
+  boot is ended visibly as failed and is never re-sent (PRD §8.1, principles 1
+  and 7).
+- **`packages/protocol` owns the failure vocabulary** (orchestrator decision).
+  `Failure.retryable: boolean` is replaced by
+  `disposition: FailureDisposition`, one of `retry` (the same work may succeed
+  on the same box), `retry-cold` (retry only on a fresh box via a cold boot)
+  and `give-up`. `FailureDisposition` is exported next to `FailureOwner`, whose
+  values are unchanged (`box`, `model-provider`, `gateway`, `hub`, `user`).
+  `packages/core` imports both from `@hearth/protocol` and re-exports them
+  from `failure.ts` instead of redefining them.
+- **Variant fields are rejected consistently.** A field that belongs to another
+  variant of the same frame is an `invalid-field` error (`path` or `mode` on a
+  `vnc` stream, versions on a non-version-mismatch reject); a field no variant
+  knows is dropped.
+- **`encodeFrame` validates text frames with the decoder** and throws
+  `EncodeError` (a `RangeError`) instead of writing a frame the peer would
+  reject, including values JSON would silently change (`NaN`, typed arrays in
+  a payload). A seeded property test checks that whatever encodes decodes back
+  to an equal frame.
+- **Smaller limits.** Opaque JSON nests at most `MAX_JSON_DEPTH` (64) arrays and
+  objects, counting the outermost one (65 was accepted before). File-stream
+  paths reject C1 controls and Unicode bidi controls. `unknown-type` errors echo
+  at most 64 characters of the received type.
+
+### Consequences
+
+- A future major may change anything except the frozen fields; changing those
+  would make version errors unreadable for older peers and needs a new
+  decision entry.
+- The box-agent (#7) keeps, per boot, the set of turn ids and of assign and
+  hibernate request ids it has seen. They are small per session; bounding them is the
+  box-agent's call.
+- Code outside `packages/protocol` that classifies failures uses
+  `FailureDisposition`; a boolean `retryable` must not come back.
