@@ -60,6 +60,11 @@ jobs:
             --build-arg "PI_VERSION=${pi_version}" -t hearth-box:ci .
           printf 'FROM hearth-box:ci\nCMD ["sleep", "infinity"]\n' |
             docker build -t hearth-box:ci-idle -
+      # The firewall script against real iptables in throwaway network
+      # namespaces: validation before any change, atomic apply, marker last
+      # (decision 0012). As root, so `unshare -n` needs no user namespace.
+      - name: Box firewall script in a network namespace
+        run: sudo HEARTH_FIREWALL_TESTS=1 timeout 300 "$(command -v bun)" test apps/hub/src/box/firewall.test.ts
       # A stand-in for the owner's LAN (decision 0012): a web server on
       # 192.168.77.2 in a network namespace behind a veth pair, so traffic
       # from a box to it is forwarded by the host like traffic to a LAN host.
@@ -93,6 +98,8 @@ jobs:
           sudo iptables -S HEARTH-BOX-IN
           sudo iptables -S HEARTH-BOX-FWD
           sudo iptables -S DOCKER-USER
+          sudo iptables -S FORWARD
+          cat /run/hearth/box-egress.applied
       - name: Hub-box echo round trip on production defaults, egress filtered (M0 exit, #27, #20)
         env:
           HEARTH_DOCKER_TESTS: "1"

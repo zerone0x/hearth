@@ -1,11 +1,68 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type JsonValue, LOCAL_PRINCIPAL } from "@hearth/core";
+import {
+  type BoxInfo,
+  type BoxState,
+  HearthError,
+  type JsonValue,
+  LOCAL_PRINCIPAL,
+} from "@hearth/core";
 import { type AppOptions, createApp } from "./app";
 import { BOX_SOCKET_PATH, type BoxConnections } from "./box/connections";
+import {
+  type BoxEgressCheck,
+  boxEgressFromEnv,
+  DEFAULT_BOX_EGRESS_MARKER,
+  markerEgressCheck,
+  UNRESTRICTED_EGRESS,
+} from "./box/egress";
 import { BOX_ENV, type BoxNetworkProvider, parsePort, parsePublicOrigin, startHub } from "./server";
+
+const FILTERED: BoxEgressCheck = () => ({ state: "filtered", detail: "test" });
+const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
+
+function boxInfo(boxId: string, state: BoxState = "running"): BoxInfo {
+  return {
+    boxId,
+    workspaceId: "ws_default",
+    sessionId: "se",
+    state,
+    image: "img",
+    volumeRef: "v",
+    labels: {},
+    createdAt: 0,
+  };
+}
+
+/** A provider whose boxes listen on loopback; `calls` records create, hubAddress and start. */
+function stubProvider(
+  calls: string[],
+  overrides: Partial<BoxNetworkProvider> = {},
+): BoxNetworkProvider {
+  return {
+    name: "stub",
+    create: async (s) => {
+      calls.push("create");
+      return boxInfo(s.boxId);
+    },
+    hubAddress: async (boxId) => {
+      calls.push(`hubAddress ${boxId}`);
+      return "127.0.0.1";
+    },
+    start: async (s) => {
+      calls.push("start");
+      return boxInfo(s.boxId);
+    },
+    stop: async () => "stopped",
+    destroy: async () => "destroyed",
+    snapshot: async () => ({ kind: "not-supported" }),
+    attach: async (boxId) => boxInfo(boxId),
+    adopt: async () => [boxInfo("bx")],
+    ...overrides,
+  };
+}
 
 describe("GET /healthz", () => {
   test("returns 200 from the app", async () => {
@@ -335,57 +392,246 @@ describe("startHub", () => {
   test("startBox creates the box, listens on its hub address, then boots it with that URL", async () => {
     const calls: string[] = [];
     let bootEnv: Readonly<Record<string, string>> = {};
-    const info = {
-      boxId: "bx",
-      workspaceId: "ws_default",
-      sessionId: "se",
-      state: "running" as const,
-      image: "img",
-      volumeRef: "v",
-      labels: {},
-      createdAt: 0,
-    };
-    const provider: BoxNetworkProvider = {
-      name: "stub",
-      create: async () => {
-        calls.push("create");
-        return info;
-      },
-      hubAddress: async (boxId) => {
-        calls.push(`hubAddress ${boxId}`);
-        return "127.0.0.1";
-      },
-      start: async (_spec, boot) => {
+    const provider = stubProvider(calls, {
+      start: async (spec, boot) => {
         calls.push("start");
         bootEnv = boot.env;
-        return info;
+        return boxInfo(spec.boxId);
       },
-      stop: async () => "stopped",
-      destroy: async () => "destroyed",
-      snapshot: async () => ({ kind: "not-supported" }),
-      attach: async () => info,
-      adopt: async () => [info],
-    };
+    });
     dir = mkdtempSync(join(tmpdir(), "hearth-server-"));
-    server = startHub({ port: 0, boxPort: 0, provider, dbPath: join(dir, "hub.db") });
-    const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
+    server = startHub({
+      port: 0,
+      boxPort: 0,
+      provider,
+      boxEgress: FILTERED,
+      dbPath: join(dir, "hub.db"),
+    });
     await server.startBox(LOCAL_PRINCIPAL, spec);
     expect(calls).toEqual(["create", "hubAddress bx", "start"]);
     const listener = server.boxListeners.get("127.0.0.1");
     expect(listener).toBeDefined();
     expect(bootEnv[BOX_ENV.hubUrl]).toBe(`ws://127.0.0.1:${listener?.port}${BOX_SOCKET_PATH}`);
     expect(bootEnv[BOX_ENV.joinToken]).toMatch(/^hjt_/);
-    expect(await server.listenForRunningBoxes()).toEqual(["bx"]);
+    expect(await server.listenForRunningBoxes()).toEqual({ listening: ["bx"], failed: [] });
     expect(server.boxListeners.size).toBe(1);
   });
 
   test("startBox without a provider fails as the hub's", async () => {
     const hub = start();
-    const spec = { boxId: "bx", workspaceId: "ws_default", sessionId: "se", image: "img" };
     await expect(hub.startBox(LOCAL_PRINCIPAL, spec)).rejects.toMatchObject({
       code: "box.no-provider",
       owner: "hub",
     });
+  });
+});
+
+describe("box egress gate (decision 0012)", () => {
+  let server: ReturnType<typeof startHub> | undefined;
+  let dir = "";
+  let lines: string[] = [];
+  afterEach(async () => {
+    await server?.stop();
+    server = undefined;
+    if (dir !== "") rmSync(dir, { recursive: true, force: true });
+    dir = "";
+  });
+
+  function start(boxEgress: BoxEgressCheck | undefined, calls: string[] = []) {
+    dir = mkdtempSync(join(tmpdir(), "hearth-egress-"));
+    lines = [];
+    server = startHub({
+      port: 0,
+      boxPort: 0,
+      provider: stubProvider(calls),
+      ...(boxEgress === undefined ? {} : { boxEgress }),
+      dbPath: join(dir, "hub.db"),
+      log: (line) => lines.push(line),
+    });
+    return server;
+  }
+
+  async function healthEgress(hub: ReturnType<typeof startHub>): Promise<unknown> {
+    const res = await fetch(new URL("/healthz", hub.url), { signal: AbortSignal.timeout(5_000) });
+    return ((await res.json()) as { boxEgress?: unknown }).boxEgress;
+  }
+
+  test("without the firewall marker startBox is refused as the box's, before anything starts", async () => {
+    const calls: string[] = [];
+    const hub = start(markerEgressCheck("/nonexistent/hearth/box-egress.applied"), calls);
+    expect(lines.some((l) => l.startsWith("WARNING: box egress unfiltered"))).toBe(true);
+    const refused = hub.startBox(LOCAL_PRINCIPAL, spec);
+    await expect(refused).rejects.toBeInstanceOf(HearthError);
+    await expect(refused).rejects.toMatchObject({
+      code: "box.egress-unfiltered",
+      owner: "box",
+      disposition: "give-up",
+    });
+    await expect(refused).rejects.toThrow("box-firewall.sh apply");
+    expect(calls).toEqual([]);
+    expect(hub.boxListeners.size).toBe(0);
+    expect(hub.boxEgress().state).toBe("unfiltered");
+    expect(await healthEgress(hub)).toBe("unfiltered");
+  });
+
+  test("with the marker startBox works, and the marker is read on every start", async () => {
+    const calls: string[] = [];
+    const markerDir = mkdtempSync(join(tmpdir(), "hearth-marker-"));
+    try {
+      const marker = join(markerDir, "box-egress.applied");
+      const hub = start(markerEgressCheck(marker), calls);
+      await expect(hub.startBox(LOCAL_PRINCIPAL, spec)).rejects.toMatchObject({
+        code: "box.egress-unfiltered",
+      });
+      writeFileSync(marker, "applied\n");
+      await hub.startBox(LOCAL_PRINCIPAL, spec);
+      expect(calls).toEqual(["create", "hubAddress bx", "start"]);
+      expect(hub.boxEgress().state).toBe("filtered");
+      expect(await healthEgress(hub)).toBe("filtered");
+    } finally {
+      rmSync(markerDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a hub that finds the marker at start logs no warning", () => {
+    start(FILTERED);
+    expect(lines.filter((l) => l.startsWith("WARNING"))).toEqual([]);
+  });
+
+  test("HEARTH_BOX_EGRESS=unrestricted starts boxes and says so on start", async () => {
+    const calls: string[] = [];
+    const hub = start(boxEgressFromEnv({ HEARTH_BOX_EGRESS: "unrestricted" }), calls);
+    expect(lines.filter((l) => l.startsWith("WARNING"))).toEqual([
+      `WARNING: box egress unrestricted: ${UNRESTRICTED_EGRESS().detail}`,
+    ]);
+    await hub.startBox(LOCAL_PRINCIPAL, spec);
+    expect(calls).toEqual(["create", "hubAddress bx", "start"]);
+    expect(await healthEgress(hub)).toBe("unrestricted");
+  });
+
+  test("by default the hub checks the marker under /run", () => {
+    const hub = start(undefined);
+    const expected = existsSync(DEFAULT_BOX_EGRESS_MARKER) ? "filtered" : "unfiltered";
+    expect(hub.boxEgress().state).toBe(expected);
+  });
+
+  test("a hub without a provider reports no egress state", async () => {
+    dir = mkdtempSync(join(tmpdir(), "hearth-egress-"));
+    server = startHub({ port: 0, dbPath: join(dir, "hub.db") });
+    expect(await healthEgress(server)).toBeUndefined();
+  });
+});
+
+describe("boxEgressFromEnv", () => {
+  test("defaults to the marker under /run; HEARTH_BOX_EGRESS_MARKER moves it", () => {
+    const missing = boxEgressFromEnv({ HEARTH_BOX_EGRESS_MARKER: "/nonexistent/marker" })();
+    expect(missing.state).toBe("unfiltered");
+    expect(missing.detail).toContain("/nonexistent/marker");
+    expect(boxEgressFromEnv({ HEARTH_BOX_EGRESS: "filtered" })().detail).toContain(
+      DEFAULT_BOX_EGRESS_MARKER,
+    );
+    expect(boxEgressFromEnv({})().detail).toContain(DEFAULT_BOX_EGRESS_MARKER);
+  });
+
+  test("unrestricted is the explicit opt-out; anything else is refused", () => {
+    expect(boxEgressFromEnv({ HEARTH_BOX_EGRESS: "unrestricted" })().state).toBe("unrestricted");
+    expect(() => boxEgressFromEnv({ HEARTH_BOX_EGRESS: "off" })).toThrow("HEARTH_BOX_EGRESS");
+  });
+});
+
+describe("listenForRunningBoxes", () => {
+  let server: ReturnType<typeof startHub> | undefined;
+  let dir = "";
+  let lines: string[] = [];
+  afterEach(async () => {
+    await server?.stop();
+    server = undefined;
+    if (dir !== "") rmSync(dir, { recursive: true, force: true });
+    dir = "";
+  });
+
+  function start(provider: BoxNetworkProvider) {
+    dir = mkdtempSync(join(tmpdir(), "hearth-adopt-"));
+    lines = [];
+    server = startHub({
+      port: 0,
+      boxPort: 0,
+      provider,
+      boxEgress: FILTERED,
+      dbPath: join(dir, "hub.db"),
+      log: (line) => lines.push(line),
+    });
+    return server;
+  }
+
+  test("a fresh hub opens the listener of every running box, and only of running boxes", async () => {
+    const calls: string[] = [];
+    const hub = start(
+      stubProvider(calls, {
+        adopt: async () => [boxInfo("up"), boxInfo("down", "stopped"), boxInfo("gone", "exited")],
+      }),
+    );
+    expect(hub.boxListeners.size).toBe(0);
+    expect(await hub.listenForRunningBoxes()).toEqual({ listening: ["up"], failed: [] });
+    expect(calls).toEqual(["hubAddress up"]);
+    expect([...hub.boxListeners.keys()]).toEqual(["127.0.0.1"]);
+  });
+
+  test("one box that fails does not keep the others from their listeners", async () => {
+    const calls: string[] = [];
+    const broken = new Error("network hearth-box-a does not exist");
+    const hub = start(
+      stubProvider(calls, {
+        adopt: async () => [boxInfo("a"), boxInfo("b")],
+        hubAddress: async (boxId) => {
+          calls.push(`hubAddress ${boxId}`);
+          if (boxId === "a") throw broken;
+          return "127.0.0.1";
+        },
+      }),
+    );
+    expect(await hub.listenForRunningBoxes()).toEqual({
+      listening: ["b"],
+      failed: [{ boxId: "a", error: broken }],
+    });
+    expect(hub.boxListeners.size).toBe(1);
+    expect(lines).toContain(`could not listen again for box a: ${String(broken)}`);
+  });
+
+  test("retries with backoff while the provider cannot list its boxes", async () => {
+    let attempts = 0;
+    const hub = start(
+      stubProvider([], {
+        adopt: async () => {
+          attempts++;
+          if (attempts < 3) throw new Error("connect ENOENT /var/run/docker.sock");
+          return [boxInfo("bx")];
+        },
+      }),
+    );
+    expect(await hub.listenForRunningBoxes({ delayMs: 1, maxDelayMs: 2 })).toEqual({
+      listening: ["bx"],
+      failed: [],
+    });
+    expect(attempts).toBe(3);
+    expect(lines.filter((l) => l.startsWith("could not list running boxes"))).toEqual([
+      "could not list running boxes (attempt 1), retrying in 1 ms: Error: connect ENOENT /var/run/docker.sock",
+      "could not list running boxes (attempt 2), retrying in 2 ms: Error: connect ENOENT /var/run/docker.sock",
+    ]);
+  });
+
+  test("stops retrying once the hub stops", async () => {
+    const hub = start(
+      stubProvider([], {
+        adopt: async () => {
+          throw new Error("daemon down");
+        },
+      }),
+    );
+    const pending = hub.listenForRunningBoxes({ delayMs: 5 });
+    await Bun.sleep(20);
+    await hub.stop();
+    expect(await pending).toEqual({ listening: [], failed: [] });
   });
 });
 

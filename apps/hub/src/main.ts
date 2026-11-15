@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
+import { boxEgressFromEnv } from "./box/egress";
 import {
   type BoxNetworkProvider,
   DEFAULT_BOX_PORT,
@@ -36,6 +37,8 @@ if (import.meta.main) {
   // The origin of a reverse proxy in front of the hub (docs/DECISIONS.md, 0010).
   const publicOrigin = parsePublicOrigin(process.env["HEARTH_PUBLIC_ORIGIN"]);
   const provider = boxProviderFromEnv(process.env);
+  // Box egress gate (0012): the firewall marker, or HEARTH_BOX_EGRESS=unrestricted.
+  const boxEgress = boxEgressFromEnv(process.env);
   mkdirSync(dataDir, { recursive: true });
   const hub = startHub({
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
@@ -44,6 +47,7 @@ if (import.meta.main) {
     boxPort: parsePort(process.env["HEARTH_BOX_PORT"], DEFAULT_BOX_PORT),
     ...(publicOrigin === undefined ? {} : { publicOrigin }),
     ...(provider === undefined ? {} : { provider }),
+    boxEgress,
     dbPath: join(dataDir, "hearth.db"),
     log: (line) => console.log(line),
   });
@@ -51,10 +55,13 @@ if (import.meta.main) {
   console.log(`hearth hub listening on ${hub.url} (box provider: ${provider?.name ?? "none"})`);
   if (provider !== undefined) {
     // Boxes still running from before a restart get their listeners back. A
-    // daemon that is down is not fatal: the hub serves the API without boxes.
+    // daemon that is down is not fatal: the hub serves the API and keeps
+    // retrying in the background; one box that fails does not stop the rest.
     hub.listenForRunningBoxes().then(
-      (ids) => {
-        if (ids.length > 0) console.log(`listening again for running boxes: ${ids.join(", ")}`);
+      ({ listening }) => {
+        if (listening.length > 0) {
+          console.log(`listening again for running boxes: ${listening.join(", ")}`);
+        }
       },
       (error: unknown) => console.error(`could not list running boxes: ${String(error)}`),
     );

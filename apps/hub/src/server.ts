@@ -15,6 +15,12 @@ import {
   BoxConnections,
 } from "./box/connections";
 import type { IssuedJoinToken } from "./box/credentials";
+import {
+  type BoxEgressCheck,
+  type BoxEgressStatus,
+  markerEgressCheck,
+  requireBoxEgress,
+} from "./box/egress";
 import { openDatabase, SqliteAuditSink, SqliteBoxCredentialStore, SqliteEventStore } from "./store";
 
 export interface HubListenOptions {
@@ -51,6 +57,12 @@ export interface HubOptions extends HubListenOptions {
   readonly boxPort?: number;
   /** Starts boxes for `startBox`. Without one, `startBox` fails with `box.no-provider`. */
   readonly provider?: BoxNetworkProvider;
+  /**
+   * Whether boxes have filtered egress (`box/egress.ts`, decision 0012), read
+   * on every `startBox`. Defaults to the marker that `scripts/box-firewall.sh
+   * apply` writes; while it reports `unfiltered`, `startBox` is refused.
+   */
+  readonly boxEgress?: BoxEgressCheck;
   /** Path of the hub's SQLite database. Created and migrated on start. */
   readonly dbPath: string;
   readonly log?: (line: string) => void;
@@ -64,6 +76,20 @@ export const DEFAULT_HOSTNAME = "127.0.0.1";
 export const DEFAULT_PORT = 8787;
 /** Port of the box listeners, one per box-network address (docs/DECISIONS.md, 0012). */
 export const DEFAULT_BOX_PORT = 8788;
+
+/** Retry pacing of `listenForRunningBoxes` while the provider cannot list boxes. */
+export interface AdoptRetry {
+  /** First delay after a failed listing (default 1 s); doubles per attempt. */
+  readonly delayMs?: number;
+  /** Ceiling of the delay (default 30 s). */
+  readonly maxDelayMs?: number;
+}
+
+/** What `listenForRunningBoxes` did: the boxes it listens for again, and the ones it could not. */
+export interface RunningBoxes {
+  readonly listening: string[];
+  readonly failed: { readonly boxId: string; readonly error: unknown }[];
+}
 
 /** Addresses that bind every interface; never used for a box listener. */
 const UNSPECIFIED_HOSTS = new Set(["0.0.0.0", "[::]", "[0:0:0:0:0:0:0:0]", ""]);
@@ -98,10 +124,12 @@ export function startHub(options: HubOptions) {
     ...(options.echoDeadlineMs === undefined ? {} : { echoDeadlineMs: options.echoDeadlineMs }),
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
+  const boxEgress = options.boxEgress ?? markerEgressCheck();
   const app = createApp(
     { boxes },
     {
       allowedHosts: [...LOOPBACK_HOSTS, hostname],
+      ...(options.provider === undefined ? {} : { boxEgress }),
       ...(options.publicOrigin === undefined ? {} : { publicOrigin: options.publicOrigin }),
     },
   );
@@ -121,6 +149,16 @@ export function startHub(options: HubOptions) {
   }
 
   let stopped: Promise<void> | undefined;
+
+  // A hub that starts boxes says loudly when they would not be filtered
+  // (decision 0012): `unfiltered` refuses every start, `unrestricted` is the
+  // owner's explicit choice but still worth a line on every start of the hub.
+  if (options.provider !== undefined) {
+    const status = boxEgress();
+    if (status.state !== "filtered") {
+      options.log?.(`WARNING: box egress ${status.state}: ${status.detail}`);
+    }
+  }
 
   // Box listeners: the box socket only, one per box-network address
   // (docs/DECISIONS.md, 0012). Nothing else is served on them, so the API and
@@ -239,30 +277,61 @@ export function startHub(options: HubOptions) {
     },
     /**
      * Start a box through the configured provider (decision 0012): `authorize`,
-     * create the box's network and volumes, open a box listener on the hub's
+     * refuse with `box.egress-unfiltered` unless box egress is filtered or
+     * explicitly unrestricted, create the box's network and volumes, open a box listener on the hub's
      * address on that network, then boot the box with a fresh join token and
      * that listener's URL.
      */
     async startBox(principal: Principal, spec: BoxSpec) {
       const provider = requireProvider();
       await authorizeStart(principal, spec);
+      requireBoxEgress(boxEgress());
       await provider.create(spec);
       const hubUrl = listenForBoxes(await provider.hubAddress(spec.boxId));
       return await bootBox(provider, spec, hubUrl);
     },
+    /** The current box egress status (decision 0012); `/healthz` reports it too. */
+    boxEgress(): BoxEgressStatus {
+      return boxEgress();
+    },
     /**
      * After a hub restart: open the box listeners of the boxes the provider
-     * still runs, so they can reconnect. Returns their ids.
+     * still runs, so they can reconnect. While the provider cannot list its
+     * boxes (the Docker daemon is down) it retries with backoff until it can
+     * or the hub stops. A box whose listener cannot be opened is logged and
+     * reported in `failed`; the other boxes still get theirs.
      */
-    async listenForRunningBoxes(): Promise<string[]> {
+    async listenForRunningBoxes(retry: AdoptRetry = {}): Promise<RunningBoxes> {
       const provider = requireProvider();
-      const ids: string[] = [];
-      for (const box of await provider.adopt()) {
-        if (box.state !== "running") continue;
-        listenForBoxes(await provider.hubAddress(box.boxId));
-        ids.push(box.boxId);
+      const maxDelayMs = retry.maxDelayMs ?? 30_000;
+      let delayMs = retry.delayMs ?? 1_000;
+      let running: Awaited<ReturnType<BoxProvider["adopt"]>>;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          running = await provider.adopt();
+          break;
+        } catch (error) {
+          if (stopped !== undefined) return { listening: [], failed: [] };
+          options.log?.(
+            `could not list running boxes (attempt ${attempt}), retrying in ${delayMs} ms: ${String(error)}`,
+          );
+          await Bun.sleep(delayMs);
+          if (stopped !== undefined) return { listening: [], failed: [] };
+          delayMs = Math.min(delayMs * 2, maxDelayMs);
+        }
       }
-      return ids;
+      const result: RunningBoxes = { listening: [], failed: [] };
+      for (const box of running) {
+        if (box.state !== "running") continue;
+        try {
+          listenForBoxes(await provider.hubAddress(box.boxId));
+          result.listening.push(box.boxId);
+        } catch (error) {
+          options.log?.(`could not listen again for box ${box.boxId}: ${String(error)}`);
+          result.failed.push({ boxId: box.boxId, error });
+        }
+      }
+      return result;
     },
     /** Close every box connection, stop listening and close the database. Idempotent. */
     stop(): Promise<void> {

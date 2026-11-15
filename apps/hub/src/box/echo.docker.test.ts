@@ -16,9 +16,12 @@
  *                           host (CI: a network namespace on 192.168.77.2).
  *   HEARTH_TEST_EGRESS      `filtered` (default): `scripts/box-firewall.sh
  *                           apply` ran, so the host, the LAN and the metadata
- *                           IP must be out of reach. `open`: no firewall; the
- *                           same probes must reach the host and the LAN, which
- *                           proves they can tell the two apart.
+ *                           IP must be out of reach, and the hub starts the
+ *                           box only because the script's marker exists
+ *                           (default egress check). `open`: no firewall and
+ *                           HEARTH_BOX_EGRESS=unrestricted; the same probes
+ *                           must reach the host and the LAN, which proves
+ *                           they can tell the two apart.
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
@@ -30,6 +33,7 @@ import { DEFAULT_BOX_PORT, type Hub, parsePort, startHub } from "../server";
 import { DEFAULT_DOCKER_API_VERSION, DEFAULT_DOCKER_SOCKET } from "./docker/config";
 import { DockerEngine } from "./docker/engine";
 import { DockerBoxProvider } from "./docker/provider";
+import { UNRESTRICTED_EGRESS } from "./egress";
 
 const enabled = process.env["HEARTH_DOCKER_TESTS"] === "1";
 const image = process.env["HEARTH_BOX_AGENT_IMAGE"] || "hearth-box:ci";
@@ -134,9 +138,17 @@ describe.skipIf(!enabled)("echo and egress through a hub on production defaults"
 
   test("the hub starts a box, the box dials its box listener, and echo comes back", async () => {
     dir = mkdtempSync(join(tmpdir(), "hearth-echo-docker-"));
-    // Production defaults: no hostname (loopback), the configured box port.
-    hub = startHub({ port: 0, boxPort, provider, dbPath: join(dir, "hub.db") });
+    // Production defaults: no hostname (loopback), the configured box port,
+    // and (filtered) the default egress check, the firewall script's marker.
+    hub = startHub({
+      port: 0,
+      boxPort,
+      provider,
+      ...(egress === "open" ? { boxEgress: UNRESTRICTED_EGRESS } : {}),
+      dbPath: join(dir, "hub.db"),
+    });
     expect(hub.server.hostname).toBe("127.0.0.1");
+    expect(hub.boxEgress().state).toBe(egress === "open" ? "unrestricted" : "filtered");
 
     const info = await hub.startBox(LOCAL_PRINCIPAL, spec);
     expect(info.state).toBe("running");
