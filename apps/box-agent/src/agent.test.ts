@@ -4,7 +4,7 @@ import { describeBoxAgent } from "./agent";
 
 describe("describeBoxAgent", () => {
   test("reports the protocol version", () => {
-    expect(describeBoxAgent().protocol).toBe("1.1");
+    expect(describeBoxAgent().protocol).toBe("1.2");
   });
 
   test("reports the installed pi version, which matches the pin", () => {

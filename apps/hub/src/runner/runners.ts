@@ -33,7 +33,7 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
-import type { BoxToolOperations } from "../box/tool-rpc";
+import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { BoxLease, SessionView } from "../session/manager";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
@@ -70,7 +70,9 @@ export interface SessionRunnersOptions {
   readonly authorizer: Authorizer;
   readonly events: EventStore;
   readonly sessions: RunnerSessions;
-  readonly tools: { operations(boxId: string, callId: string): BoxToolOperations };
+  readonly tools: {
+    operations(boxId: string, callId: string, trace?: RpcTrace): BoxToolOperations;
+  };
   readonly secrets: SecretStore;
   readonly config: RunnerConfig;
   /** Tests pass a runtime with pi-ai's faux provider; otherwise one is created. */
@@ -295,7 +297,7 @@ export class SessionRunners {
         this.#contextFresh.add(sessionId);
         await this.#refreshContext(sessionId, lease, boxCwd);
       },
-      operations: (boxId, callId) => this.#o.tools.operations(boxId, callId),
+      operations: (boxId, callId, trace) => this.#o.tools.operations(boxId, callId, trace),
     };
   }
 

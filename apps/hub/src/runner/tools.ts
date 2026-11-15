@@ -27,7 +27,7 @@ import {
   type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import type { BoxId } from "@hearth/core";
-import type { BoxToolOperations } from "../box/tool-rpc";
+import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { BoxLease } from "../session/manager";
 import {
   type CompiledDenyRule,
@@ -42,10 +42,10 @@ export const ROUTED_TOOLS = ["read", "write", "edit", "bash", "ls", "find", "gre
 
 /** What the extension needs from the hub for one session. */
 export interface RunnerBox {
-  /** `SessionManager.ensureBox` for this session. */
-  ensureBox(): Promise<BoxLease>;
-  /** `ToolRpcClient.operations`. */
-  operations(boxId: BoxId, callId: string): BoxToolOperations;
+  /** `SessionManager.ensureBox` for this session; `callId` is the pi tool call it is for. */
+  ensureBox(callId?: string): Promise<BoxLease>;
+  /** `ToolRpcClient.operations`; `trace` observes each RPC (decision 0021). */
+  operations(boxId: BoxId, callId: string, trace?: RpcTrace): BoxToolOperations;
   /**
    * Runs after the lease is taken and before the call, inside the lease's
    * try/finally (the AGENTS.md refresh). If it throws, the lease is released
@@ -73,7 +73,7 @@ async function withOps<T>(
   callId: string,
   fn: (ops: BoxToolOperations) => Promise<T>,
 ): Promise<T> {
-  const lease = await box.ensureBox();
+  const lease = await box.ensureBox(callId);
   try {
     await box.prepare?.(lease);
     return await fn(box.operations(lease.boxId, callId));
