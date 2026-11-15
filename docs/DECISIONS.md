@@ -286,3 +286,81 @@ bumping the minor.
   box-agent's call.
 - Code outside `packages/protocol` that classifies failures uses
   `FailureDisposition`; a boolean `retryable` must not come back.
+
+## 0006: Hub SQLite store, event log and audit log
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #4
+
+### Decision
+
+- **Hub persistence lives in `apps/hub/src/store`**, not in a new workspace: the
+  hub owns all state (AGENTS.md, layout) and is the only user of SQLite. The
+  store is the only code that imports `bun:sqlite`; the rest of the hub uses the
+  `EventStore` and `AuditSink` interfaces from `@hearth/core`.
+- **Connection settings** (`openDatabase`): `journal_mode = WAL`,
+  `synchronous = FULL`, `foreign_keys = ON`, `recursive_triggers = ON` and
+  `busy_timeout = BUSY_TIMEOUT_MS` (5 s). `FULL` rather than WAL's usual
+  `NORMAL`, because "ack on apply" and "audit before act" both need a commit to
+  be on disk when it returns. `recursive_triggers` makes SQLite fire DELETE
+  triggers for the rows a `REPLACE` removes (see append-only below).
+- **Migrations** are a numbered, forward-only list in `migrations.ts`, recorded
+  in `schema_migration`. Each runs in its own `BEGIN IMMEDIATE` transaction
+  together with its record, so it applies fully or not at all, and two hubs
+  starting at once never apply one twice (a test races four processes on a
+  fresh file). The runner runs at every open and is
+  re-runnable. A database at a newer version than the code knows is refused
+  (`store.schema-too-new`). Shipped migrations are never edited.
+- **M0 schema** (migration 1): `workspace` (seeded with `ws_default`),
+  `session`, `box`, `event`, `audit`, with the columns of PRD §9. Every table
+  except `workspace` (whose `id` is the workspace) has `workspace_id`. `event`
+  has no foreign key to `session`, so the event log does not depend on the
+  session manager's write order.
+- **The `event` primary key is `(workspace_id, session_id, seq)`**, a widening
+  of PRD §9's `(session_id, seq)`, so a session id can never collide across
+  workspaces (E1). Box deliveries are unique on
+  `(workspace_id, boot_id, delivery_id)` through a partial unique index.
+- **`seq` assignment**: `max(seq) + 1` for the session inside a
+  `BEGIN IMMEDIATE` transaction, which takes the write lock before the read, so
+  concurrent appends from any connection or process stay gap-free.
+- **Idempotent apply**: a delivery already stored for the same session returns
+  its original `seq` with `duplicate: true`. The same delivery key on a
+  different session is a box bug, not a redelivery: the append rejects with a
+  `box`-owned `event.delivery-conflict`, so the hub never acks an event it did
+  not store.
+- **Append-only in the database** (PRD §10), on `audit` and `event`, with every
+  guard aborting with `<table> is append-only`:
+  - `BEFORE UPDATE` and `BEFORE DELETE` triggers (migration 1). These also catch
+    an upsert's `DO UPDATE`.
+  - `REPLACE` / `INSERT OR REPLACE` resolve a key conflict by deleting the old
+    row, and SQLite skips DELETE triggers for that unless `recursive_triggers`
+    is on. Defence in depth, each half enough alone: `openDatabase` turns the
+    pragma on, and migration 2 adds `BEFORE INSERT` triggers that abort when
+    the new row's key is already taken (`event`: the primary key or the
+    delivery key; `audit`: an explicit `id`), so a connection opened without
+    the pragma cannot overwrite a row either. Migration 2 is a new migration
+    rather than an edit of 1, by the migration rule above.
+- **`audit` stores the record flat**: principal, action, the resource's
+  workspace, type and id, the decision (`allowed`, `policy`, `reason`, all null
+  for an admin action audited directly) and `detail_json`. `SqliteAuditSink`
+  plugs into `withAudit` and `AllowAllAuthorizer` from core unchanged.
+- **Reads** return at most `MAX_READ_LIMIT` (1000) events per page, whatever the
+  caller asks for; `hasMore` comes from fetching one extra row in the same
+  statement. A negative or fractional cursor, or a limit below 1, rejects with
+  `event.invalid`.
+- **Payloads must be JSON**: a payload `JSON.stringify` cannot serialize
+  (BigInt, a cycle, a throwing `toJSON`) or would silently drop (a function or
+  symbol anywhere in it) rejects with `event.invalid`, never a raw `TypeError`.
+  Its JSON may be at most `MAX_EVENT_PAYLOAD_BYTES` (4 MiB, UTF-8 bytes); a
+  bigger one rejects with `event.invalid`. Events are replayed to every
+  reconnecting client, so bulk data does not belong in them.
+
+### Consequences
+
+- Schema changes are new migrations; editing migration 1 after it ships would
+  leave existing databases behind.
+- Removing event or audit rows (for example a retention policy) needs a
+  migration that drops the triggers, and a new decision entry.
+- Producers that need to attach more than 4 MiB (files, screenshots) need a
+  separate store for the bytes and a reference in the event.
