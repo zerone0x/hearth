@@ -2093,3 +2093,30 @@ mode 0644. So the marker must also have exactly one hard link
 has one). The check resolves the marker's directory once and uses that
 resolved path for both the file `lstat` and the directory walk. The
 supported place for the marker stays a root-only directory.
+
+## 0025: Web: an error boundary around the lazy session page
+
+Status: accepted. Extends 0017's web dependencies.
+
+The session page is a lazy chunk (#84). Its file name is a content hash, so
+a hub upgrade removes the old file while a tab that has not opened a
+session yet still asks for it. The import then fails, and without an error
+boundary React unmounts the whole tree: a blank page with no way out.
+
+- **`react-error-boundary` 6.1.6**, pinned exactly. It is maintained, MIT,
+  about 3 KB (1.2 KB gzip), imports only React, and renders no styles and
+  evaluates no code, so 0017's CSP holds (the web e2e stays fail-closed on
+  any violation and passes). The owner's rule is maintained packages over
+  hand-rolled components, so not a hand-written class component.
+- **The fallback keeps the app shell**: the header, Sign out, and a
+  shadcn `Alert` ("The session page did not load.") with Reload and a
+  Sessions link. React.lazy keeps a failed import, so Reload reloads the
+  page, which also fetches the new `index.html`.
+- **The web e2e 404s the chunk** on direct navigation and in-app, checks the
+  alert, Reload, Sessions and Sign out, then lets the chunk load and checks
+  that Reload opens the session.
+- **The "…" menu (Export as Markdown) stays and is non-modal.** It runs in
+  the browser. Radix's modal dropdown injects a scroll-lock `<style>`
+  element, which `style-src 'self'` blocks, so the registry thread passes
+  `modal={false}` (a marked local edit, listed in `apps/web/README.md`).
+  Only Refresh (regenerate) is gated on the runtime's reload capability.

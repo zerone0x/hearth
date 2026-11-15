@@ -836,14 +836,16 @@ const AssistantActionBar: FC = () => {
           </TooltipIconButton>
         </ActionBarPrimitive.FeedbackNegative>
       </AuiIf>
-      {/* Hearth: regenerate and the "…" menu only when the runtime can reload (#84). */}
+      {/* Hearth: regenerate only when the runtime can reload (#84). */}
       <AuiIf condition={(s) => s.thread.capabilities.reload}>
       <ActionBarPrimitive.Reload asChild>
         <TooltipIconButton tooltip="Refresh">
           <RefreshCwIcon />
         </TooltipIconButton>
       </ActionBarPrimitive.Reload>
-      <ActionBarMorePrimitive.Root>
+      </AuiIf>
+      {/* Hearth: non-modal, so Radix does not inject a scroll-lock <style> (CSP, 0017). */}
+      <ActionBarMorePrimitive.Root modal={false}>
         <ActionBarMorePrimitive.Trigger asChild>
           <TooltipIconButton
             tooltip="More"
@@ -866,7 +868,6 @@ const AssistantActionBar: FC = () => {
           </ActionBarPrimitive.ExportMarkdown>
         </ActionBarMorePrimitive.Content>
       </ActionBarMorePrimitive.Root>
-      </AuiIf>
     </ActionBarPrimitive.Root>
   );
 };

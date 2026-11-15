@@ -505,7 +505,7 @@ describe("chat view", () => {
     expect(link).toContain('rel="noopener noreferrer"');
   });
 
-  test("the action bars offer copy, but no regenerate, more menu or edit Hearth lacks", () => {
+  test("the action bars offer copy and the export menu, but no regenerate or edit Hearth lacks", () => {
     const reply = assistant([text("Done.")]);
     const chat = applyHubEvents(emptyChat(S), [
       ev("pi.message_start", { message: user("do it") }),
@@ -516,9 +516,10 @@ describe("chat view", () => {
     // The assistant action bar renders (copy is supported) ...
     expect(html).toContain("aui-assistant-action-bar-root");
     expect(html).toContain(">Copy<");
-    // ... without the registry's refresh (regenerate), "…" menu, or the user edit button.
+    // ... and the "…" menu (Export as Markdown runs in the browser) ...
+    expect(html).toContain(">More<");
+    // ... without the registry's refresh (regenerate) or the user edit button.
     expect(html).not.toContain(">Refresh<");
-    expect(html).not.toContain(">More<");
     // The last message's user action bar renders, without the edit button.
     const asked = render(
       applyHubEvents(emptyChat(S), [ev("pi.message_start", { message: user("do it") })]),

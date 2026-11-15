@@ -1,5 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, Fragment, lazy, Suspense, useEffect, useState } from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -53,24 +55,56 @@ export function App() {
       </Shell>
     );
   }
+  const signOut = (
+    <Button variant="link" onClick={() => logout.mutate()}>
+      Sign out
+    </Button>
+  );
   const match = /^\/s\/([^/]+)$/.exec(route);
   if (match?.[1] !== undefined) {
+    // A chunk that fails to load (a hub upgrade replaced the hashed files while
+    // the tab was open) must not blank the app: the shell stays, with a way out.
     return (
-      <Suspense fallback={<Shell>Loading…</Shell>}>
-        <SessionPage sessionId={decodeURIComponent(match[1])} />
-      </Suspense>
+      <ErrorBoundary
+        fallback={
+          <Shell action={signOut}>
+            <SessionPageFailed />
+          </Shell>
+        }
+      >
+        <Suspense fallback={<Shell action={signOut}>Loading…</Shell>}>
+          <SessionPage sessionId={decodeURIComponent(match[1])} />
+        </Suspense>
+      </ErrorBoundary>
     );
   }
   return (
-    <Shell
-      action={
-        <Button variant="link" onClick={() => logout.mutate()}>
-          Sign out
-        </Button>
-      }
-    >
+    <Shell action={signOut}>
       <SessionList />
     </Shell>
+  );
+}
+
+/**
+ * React.lazy keeps a failed import, so only a page reload fetches the chunk again
+ * (and the new index.html, after a hub upgrade).
+ */
+function SessionPageFailed() {
+  return (
+    <Alert variant="destructive">
+      <AlertTitle>The session page did not load.</AlertTitle>
+      <AlertDescription>
+        <p>The hub may have been upgraded since this tab opened.</p>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
+          <Button variant="link" size="sm" asChild>
+            <a href="#/">Sessions</a>
+          </Button>
+        </div>
+      </AlertDescription>
+    </Alert>
   );
 }
 
