@@ -315,8 +315,9 @@ export class BoxConnections {
       type: "box",
       id: boxId,
     });
-    const conn = this.#byBox.get(boxId);
-    if (conn?.state !== "open" || conn.binding?.workspaceId !== principal.workspaceId) {
+    // `#byBox` holds open connections only (`#hello` adds a box as it opens,
+    // `#forget` removes it as it closes), each with its binding.
+    if (this.#byBox.get(boxId)?.binding?.workspaceId !== principal.workspaceId) {
       throw notConnected(boxId);
     }
     if (!decision.allowed) {
