@@ -31,6 +31,7 @@ class FakeBoxes implements SessionBoxes {
   readonly exited = new Map<string, number>();
   readonly running = new Set<string>();
   stopGate: Promise<void> | undefined;
+  attachGate: Promise<void> | undefined;
   startError: HearthError | undefined;
   readonly #waiters = new Map<string, Set<() => void>>();
 
@@ -55,6 +56,7 @@ class FakeBoxes implements SessionBoxes {
   }
 
   async attach(boxId: string): Promise<BoxInfo | undefined> {
+    if (this.attachGate !== undefined) await this.attachGate;
     const code = this.exited.get(boxId);
     if (code !== undefined) return { ...this.#info(boxId, "exited"), exitCode: code };
     return this.running.has(boxId) ? this.#info(boxId, "running") : undefined;
@@ -304,6 +306,36 @@ describe("SessionManager", () => {
     ]);
   });
 
+  test("a tool call that arrives after the idle timer fired, before the hibernate ran, keeps the box", async () => {
+    const r = rig({ idleMs: 40 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    (await r.manager.ensureBox(s.id)).release();
+    await until(async () => (await r.manager.get(LOCAL_PRINCIPAL, s.id)).state === "idle");
+    await Bun.sleep(2);
+    // Hold the session's lifecycle queue with a supervision step stuck in attach,
+    // so the hibernate step the idle timer queues cannot run yet.
+    let open: () => void = () => {};
+    r.boxes.attachGate = new Promise((resolve) => {
+      open = resolve;
+    });
+    const supervising = r.manager.supervise(s.id);
+    await Bun.sleep(80); // the idle timer fires and queues the hibernate step
+    const stops = () => r.boxes.calls.filter((c) => c.startsWith("stop")).length;
+    const stopsBefore = stops();
+    const pending = r.manager.ensureBox(s.id); // a tool call is now in flight
+    await Bun.sleep(5);
+    r.boxes.attachGate = undefined;
+    open();
+    await supervising;
+    const lease = await pending;
+    expect(stops()).toBe(stopsBefore);
+    expect(r.boxes.calls.filter((c) => c.startsWith("start"))).toHaveLength(1);
+    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("running");
+    expect(await statesOf(r, s.id)).not.toContain("hibernated");
+    expect(r.store.operations(scope, s.id).map((o) => o.kind)).toEqual(["wake"]);
+    lease.release();
+  });
+
   test("a wake waits for a hibernate in flight", async () => {
     const r = rig({ idleMs: 5 });
     const s = await r.manager.create(LOCAL_PRINCIPAL);
@@ -436,6 +468,48 @@ describe("SessionManager", () => {
     }
     expect(await eventsOf(r, s.id, "box.restarted")).toHaveLength(3);
     expect(await eventsOf(r, s.id, "box.failed")).toHaveLength(0);
+  });
+
+  test("a hibernate starts a fresh relaunch count", async () => {
+    const r = rig({ idleMs: 20, maxCrashRetries: 1 });
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    r.boxes.plan.push({ exit: 137 }, "connect");
+    (await r.manager.ensureBox(s.id)).release(); // uses the one crash retry
+    await until(async () => (await r.manager.get(LOCAL_PRINCIPAL, s.id)).state === "hibernated");
+    r.boxes.plan.push({ exit: 137 }, "connect");
+    const lease = await r.manager.ensureBox(s.id); // a fresh count: retried, not given up
+    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("running");
+    expect(
+      (await eventsOf(r, s.id, "box.restarted")).map(
+        (e) => (e.payload as { attempt: number }).attempt,
+      ),
+    ).toEqual([1, 1]);
+    expect(await eventsOf(r, s.id, "box.failed")).toHaveLength(0);
+    lease.release();
+  });
+
+  test("a tool call queued behind the release of the last one keeps the session running", async () => {
+    const r = rig();
+    const s = await r.manager.create(LOCAL_PRINCIPAL);
+    const first = await r.manager.ensureBox(s.id);
+    // Hold the lifecycle queue so the release step and the next ensureBox queue up together.
+    let open: () => void = () => {};
+    r.boxes.attachGate = new Promise((resolve) => {
+      open = resolve;
+    });
+    const supervising = r.manager.supervise(s.id);
+    await Bun.sleep(5);
+    first.release();
+    const pending = r.manager.ensureBox(s.id);
+    await Bun.sleep(5);
+    r.boxes.attachGate = undefined;
+    open();
+    await supervising;
+    const second = await pending;
+    expect((await r.manager.get(LOCAL_PRINCIPAL, s.id)).state).toBe("running");
+    expect(await statesOf(r, s.id)).toEqual(["creating", "idle", "waking", "running"]);
+    second.release();
+    await until(async () => (await r.manager.get(LOCAL_PRINCIPAL, s.id)).state === "idle");
   });
 
   test("a start the provider refuses goes back to hibernated with a visible box.failed", async () => {
