@@ -360,7 +360,8 @@ v0.3 changes (decision 0009):
 ## 10. Security and privacy
 
 - The hub is the only exposed service; it listens on localhost by default. Public access requires the user to set up a reverse proxy with TLS.
-- Login: password + optional passkey; session cookie `HttpOnly`, `SameSite=Strict`.
+- Login: password + optional passkey; session cookie `HttpOnly`, `SameSite=Strict`. Every route except `GET /healthz` requires it, from the M1 prototype on (§11.1).
+- The API accepts only an allow-listed Host, an Origin that is same-origin or the configured `HEARTH_PUBLIC_ORIGIN`, and JSON request bodies (#33).
 - Boxes are network-isolated from each other (one Docker network per box, egress only to the internet and the hub).
 - Boxes hold no model credentials at all and no long-lived secrets: only the one-time join token and the per-box credential (decision 0008). Model keys, virtual keys and subscription tokens stay in the hub (§6.4).
 - The runner runs pi in the hub process, so pi extensions are code running with the hub's rights. The runner loads only Hearth's own extension (§8.2.1).
@@ -392,6 +393,7 @@ Scope, in order:
 3. **pi on Bun spike**, then the **hub-side pi runner + tool RPC to the box**: `createAgentSession` in the hub, the routed tools of §8.2.1, the tool RPC methods in `packages/protocol` and their executor in box-agent, the runner's state in the event log (§9).
 4. **Minimal web UI**: session list, a chat stream that shows tool calls, and a noVNC view of the box's desktop.
 5. **Model via an API key through the SecretStore** (`direct` gateway, §6.4). No Bifrost yet.
+6. **Minimal local login and API request checks.** The prototype lets a web page create sessions and have pi run shell commands, so every route except `GET /healthz` sits behind the local login of §10 (password, optional passkey; session cookie `HttpOnly`, `SameSite=Strict`). The API also checks Host, Origin and Content-Type: an allow-listed Host, an Origin that is same-origin or the configured `HEARTH_PUBLIC_ORIGIN`, and a JSON content type (#33).
 
 Exit criteria:
 
@@ -400,6 +402,7 @@ Exit criteria:
 - pi edits files and runs commands in the box (`/workspace`), and the chat shows the tool calls.
 - The box's desktop is visible in the web UI.
 - Closing and reopening the page continues the session.
+- An unauthenticated or cross-origin request cannot create a session or run a command (#33).
 
 After the prototype, still in scope and kept in this PRD: Bifrost (§6.4), Telegram (§6.6), hibernation polish (§6.3), triggers (§6.7) and Retro (§6.8), in M2–M4 above.
 

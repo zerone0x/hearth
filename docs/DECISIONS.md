@@ -647,5 +647,7 @@ sandbox starts only when a tool needs it; and pi's containerization guide.
   workspace. `apps/box-agent` drops them when nothing in it uses pi.
 - The M1 prototype (PRD §11.1) builds on this: box listener and compose install
   (#27, with #20), session manager and box supervision (#28), the pi-on-Bun
-  spike, the hub-side runner with tool RPC, a minimal web UI, and a model API key
-  through the SecretStore.
+  spike, the hub-side runner with tool RPC, a minimal web UI, a model API key
+  through the SecretStore, and a minimal local login with Host, Origin and
+  Content-Type checks on the API (#33), since a web page can now make pi run
+  commands.
