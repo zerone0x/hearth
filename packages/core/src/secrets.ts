@@ -28,9 +28,10 @@ export type SecretErrorCode =
   | "secret.empty";
 
 /**
- * How a reference appears in messages. A reference that does not parse, or
- * names an unknown scheme, may be a raw secret pasted where a reference
- * belongs, so it is shown only as a fingerprint.
+ * How a reference appears in messages. A reference that does not parse, names
+ * an unknown scheme, or has a body its scheme rejects (`env:` not followed by a
+ * variable name, `file:` not followed by an absolute path) may be a raw secret
+ * pasted where a reference belongs, so it is shown only as a fingerprint.
  */
 export function redactRef(ref: SecretRef): string {
   return `<unrecognized reference ${fingerprint(ref)}>`;
@@ -117,13 +118,33 @@ export class SecretValue {
  * else does.
  *
  * Called only by a `SecretStore`. Guarantees: returns the raw value, possibly
- * empty (the store rejects empty values); throws a `SecretError` on failure,
- * with a message that contains no secret value.
+ * empty (the store rejects values that are empty after trimming); throws a
+ * `SecretError` on failure, with a message that contains no secret value. A
+ * body that fails the scheme's validation is reported with `redactRef`.
  */
 export interface SecretResolver {
   /** The scheme handled, without the colon, e.g. `env`. */
   readonly scheme: string;
   resolve(body: string, ref: SecretRef): Promise<string>;
+}
+
+/** A well-formed `env:` body: a portable environment variable name. */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
+const CONTROL_CHAR = /[\u0000-\u001f\u007f]/;
+
+/**
+ * A reference whose body fails its scheme's validation. Such a body may be a
+ * raw secret pasted after a known scheme, so only the fingerprint is shown.
+ */
+function malformedBody(ref: SecretRef, expected: string): SecretError {
+  const shown = redactRef(ref);
+  return new SecretError(
+    shown,
+    "secret.malformed-ref",
+    `Malformed secret reference ${shown}: ${expected}`,
+  );
 }
 
 /** `env:NAME`: reads a variable from the given environment (default `process.env`). */
@@ -136,6 +157,10 @@ export class EnvSecretResolver implements SecretResolver {
   }
 
   async resolve(body: string, ref: SecretRef): Promise<string> {
+    if (!ENV_NAME.test(body)) {
+      // Not a variable name, so possibly a raw secret pasted after `env:`.
+      throw malformedBody(ref, "env: expects a variable name");
+    }
     const value = this.#env[body];
     if (value === undefined) {
       throw new SecretError(ref, "secret.not-found", `Secret ${ref}: variable ${body} is not set`);
@@ -153,8 +178,9 @@ export class FileSecretResolver implements SecretResolver {
   readonly scheme = "file";
 
   async resolve(body: string, ref: SecretRef): Promise<string> {
-    if (!isAbsolute(body)) {
-      throw new SecretError(ref, "secret.malformed-ref", `Secret ${ref}: path must be absolute`);
+    if (!isAbsolute(body) || CONTROL_CHAR.test(body)) {
+      // Not an absolute path, so possibly a raw secret pasted after `file:`.
+      throw malformedBody(ref, "file: expects an absolute path");
     }
     let text: string;
     try {
@@ -199,10 +225,11 @@ export type PreflightReport =
  * Called by implementations of other extension points (the model gateway, the
  * Telegram channel, the join-token signer) at the moment they need a value, and
  * by hub startup through `preflight`. Guarantees:
- * - `resolve` returns a non-empty `SecretValue` or rejects with a `SecretError`
+ * - `resolve` returns a `SecretValue` that is not blank or rejects with a `SecretError`
  *   whose message names the reference, never the value.
  * - Values are cached for a short TTL; concurrent lookups of the same reference
- *   share one underlying read. Failures are not cached.
+ *   share one underlying read; `invalidate` detaches a read in flight. Failures
+ *   are not cached.
  */
 export interface SecretStore {
   resolve(ref: SecretRef): Promise<SecretValue>;
@@ -321,10 +348,14 @@ export class ResolvingSecretStore implements SecretStore {
 
   invalidate(ref?: SecretRef): void {
     this.#generation++;
+    // Detach reads in flight too, so a resolve after this starts a fresh read
+    // instead of joining one that may return the pre-rotation value.
     if (ref === undefined) {
       this.#cache.clear();
+      this.#inFlight.clear();
     } else {
       this.#cache.delete(ref);
+      this.#inFlight.delete(ref);
     }
   }
 
@@ -349,7 +380,8 @@ export class ResolvingSecretStore implements SecretStore {
       // could contain anything, so it is not passed on.
       throw new SecretError(ref, "secret.unreadable", `Secret ${ref}: resolver failed`);
     }
-    if (raw.length === 0) {
+    if (raw.trim().length === 0) {
+      // Whitespace only is as useless as nothing, and usually a broken file.
       throw new SecretError(ref, "secret.empty", `Secret ${ref}: value is empty`);
     }
     return new SecretValue(raw);

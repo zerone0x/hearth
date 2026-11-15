@@ -7,8 +7,13 @@
  * failure never burns model retries.
  */
 
-/** Who is responsible for a failure. */
-export type FailureOwner = "box" | "model-provider" | "gateway" | "hub" | "user";
+import type { FailureOwner } from "@hearth/protocol";
+
+/**
+ * Who is responsible for a failure. `@hearth/protocol` owns this vocabulary
+ * (decision 0003); core re-exports it.
+ */
+export type { FailureOwner };
 
 /**
  * What the caller may do about a failure.
@@ -17,12 +22,15 @@ export type FailureOwner = "box" | "model-provider" | "gateway" | "hub" | "user"
  * - `retry-cold`: the current runtime is suspect; retry after recreating it
  *   (for a box: a cold boot from the volume, PRD §6.3).
  * - `give-up`: retrying cannot help; surface the failure to the user.
+ *
+ * `@hearth/protocol` owns this vocabulary too (decision 0003). Until it exports
+ * the union, core defines the identical one here; it then becomes a re-export.
  */
-export type RetryDisposition = "retry" | "retry-cold" | "give-up";
+export type FailureDisposition = "retry" | "retry-cold" | "give-up";
 
 export interface FailureClass {
   readonly owner: FailureOwner;
-  readonly disposition: RetryDisposition;
+  readonly disposition: FailureDisposition;
 }
 
 export interface HearthErrorOptions extends FailureClass {
@@ -37,7 +45,7 @@ export interface HearthErrorOptions extends FailureClass {
  */
 export class HearthError extends Error {
   readonly owner: FailureOwner;
-  readonly disposition: RetryDisposition;
+  readonly disposition: FailureDisposition;
   readonly code: string;
 
   constructor(message: string, options: HearthErrorOptions) {

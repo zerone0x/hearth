@@ -115,10 +115,14 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
   `authorize`, `box`, `events`, `secrets`, `gateway`, `channel`, `audit`), all
   re-exported from `@hearth/core`. Ids are plain string aliases (no branding),
   so they cross SQLite, the wire protocol and logs without conversion.
-- **Failure classification is a type in core.** `HearthError` carries an `owner`
+- **Failure classification.** `HearthError` carries an `owner`
   (`box`, `model-provider`, `gateway`, `hub`, `user`), a `disposition`
   (`retry`, `retry-cold`, `give-up`) and a stable `code` (PRD §8.1 principle 2).
-  Implementations of every extension point reject with it.
+  Implementations of every extension point reject with it. `@hearth/protocol`
+  owns the vocabulary, so a failure means the same thing in core and on the wire:
+  core imports and re-exports `FailureOwner` from it. Until the protocol exports
+  the disposition union (#14), core defines `FailureDisposition` as the identical
+  union; a follow-up turns it into a re-export.
 - **Every store call takes a `WorkspaceScope`** as its first argument (E1). v1
   has one fixed workspace, `ws_default`, and one local principal, `pr_local`.
 - **`authorize` fails closed on audit.** `AllowAllAuthorizer` allows anything
@@ -147,9 +151,13 @@ change in scope. To reverse a decision, add a new entry that supersedes it.
   (`SECRET_CACHE_TTL_MS`); concurrent lookups of one reference share one read;
   failures are not cached; `preflight` bypasses the cache. A resolved secret is a
   `SecretValue` whose string, JSON and inspect forms show only its fingerprint,
-  `sha256:` plus 12 hex characters. A reference that does not parse, or names an
-  unknown scheme, may be a pasted raw secret, so errors show only its
-  fingerprint.
+  `sha256:` plus 12 hex characters. A reference that does not parse, names an
+  unknown scheme, or has a body its scheme rejects (`env:` not followed by a
+  name matching `^[A-Za-z_][A-Za-z0-9_]*$`, `file:` not followed by an absolute
+  path free of control characters) may be a pasted raw secret, so errors and
+  `preflight` show only its fingerprint. A value that is empty after trimming is
+  `secret.empty`. `invalidate` also detaches reads in flight, so a lookup after
+  it never returns a value read before it.
 - **`ModelGateway`** issues one credential per session (idempotent), replaces its
   model allowlist (an empty list allows no model), revokes it, and reports usage
   from the gateway's own log.
