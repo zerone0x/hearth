@@ -42,6 +42,19 @@ describe("desktop pixel check (#92)", () => {
     expect(desktopProblem(stats)).toBeNull();
   });
 
+  test("a colour that matches the accent in two channels only is not the accent", () => {
+    const [r, g, b] = START_PAGE_ACCENT;
+    for (const miss of [
+      [r, g, b + 0x71],
+      [r, g - 0x48, b],
+      [r - 0x60, g, b],
+    ] as const) {
+      const pixels = [...fill(2_000, miss), ...fill(14_000, [0xf7, 0xf4, 0xef])];
+      expect(desktopStats(pixels).accentShare).toBe(0);
+      expect(desktopProblem(desktopStats(pixels))).toContain("start page is not on the desktop");
+    }
+  });
+
   test("the accent is the start page's header colour", () => {
     const page = readFileSync(
       join(import.meta.dir, "../../apps/box-agent/image/start.html"),

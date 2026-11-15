@@ -2201,4 +2201,14 @@ passed on that black screen.
   tab), inside the box's memory limit.
 - Browser tools for the agent (navigate, click, screenshot over CDP) are a
   separate issue; they can use this browser through its CDP port.
+- CDP has no authentication: any command the agent runs in the box can drive
+  this browser on `127.0.0.1:9222` and read its pages, cookies and storage,
+  including anything the owner signs into on the desktop. The box is one trust
+  domain (the agent already has its shell); do not sign into accounts on a box
+  desktop that the agent should not use.
+- The browser is not shut down cleanly: tini (without `-g`) forwards SIGTERM
+  to box-agent only, and the supervisor and Chromium are killed with the
+  container on stop or hibernate. The profile under `/home/hearth` survives,
+  but Chromium may report that it did not shut down correctly on the next
+  start.
 - Desktop supervision beyond Chromium (Xvnc or Openbox dying) is still #15.
