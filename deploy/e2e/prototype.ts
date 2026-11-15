@@ -111,10 +111,17 @@ async function signIn(page: Page): Promise<void> {
  * names it as a button, "Tool call <tool>: done". Either one counts.
  */
 function toolDone(page: Page, tool: string, target: string) {
+  // The named trigger already carries the status in its accessible name; its badge
+  // may sit outside the button, so only the unnamed (older) card is filtered by text.
   return page
     .getByRole("button", { name: `Tool call ${tool}: done` })
-    .or(page.getByRole("group").filter({ hasText: tool }).filter({ hasText: target }))
-    .filter({ hasText: "done" })
+    .or(
+      page
+        .getByRole("group")
+        .filter({ hasText: tool })
+        .filter({ hasText: target })
+        .filter({ hasText: "done" }),
+    )
     .first();
 }
 
