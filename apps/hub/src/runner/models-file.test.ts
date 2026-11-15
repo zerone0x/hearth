@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import {
   type AppendResult,
   createDefaultSecretStore,
@@ -89,7 +89,9 @@ describe("runnerConfigFromEnv: HEARTH_MODELS_FILE", () => {
 
   test("a relative or missing file is refused at startup", () => {
     const base = { HEARTH_MODEL_PROVIDER: "faux-http", HEARTH_MODEL: "faux-1" };
-    expect(() => runnerConfigFromEnv({ ...base, HEARTH_MODELS_FILE: "models.json" })).toThrow(
+    // Relative, although it names an existing file from here.
+    const existing = relative(process.cwd(), modelsFile(tempDir(), "http://127.0.0.1:1"));
+    expect(() => runnerConfigFromEnv({ ...base, HEARTH_MODELS_FILE: existing })).toThrow(
       /HEARTH_MODELS_FILE/,
     );
     expect(() =>

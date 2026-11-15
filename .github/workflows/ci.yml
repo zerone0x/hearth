@@ -180,11 +180,13 @@ jobs:
     env:
       DOC: ${{ github.workspace }}/docs/install.md
       BLOCK: ${{ github.workspace }}/scripts/doc-block.sh
-      HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/compose-e2e
-      HEARTH_E2E_STATE: ${{ runner.temp }}/compose-e2e-state.json
       HEARTH_FAUX_KEY: sk-faux-compose-e2e
     steps:
       - uses: actions/checkout@v4
+      - name: E2e paths
+        run: |
+          echo "HEARTH_E2E_SCREENSHOTS=$RUNNER_TEMP/compose-e2e" >> "$GITHUB_ENV"
+          echo "HEARTH_E2E_STATE=$RUNNER_TEMP/compose-e2e-state.json" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
