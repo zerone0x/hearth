@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { HearthError } from "@hearth/core";
 import {
   type CommandHistory,
   decodeFrame,
@@ -221,6 +222,27 @@ export class BoxAgent {
     this.#timer = setTimeout(() => this.#dial(), delay);
   }
 
+  /**
+   * Queue the answer to a hub command. The caller records the command id in
+   * its history only when this returns `true`, so a command whose answer was
+   * never queued is not mistaken for a duplicate: the hub re-sends any command
+   * whose effect it has not seen (decision 0005), and that re-send is applied.
+   * A full outbox is logged by name, never dropped silently (PRD §8.1
+   * principle 1). Any other error is a bug and is rethrown.
+   */
+  #answer(command: string, frame: OutboundFrame): boolean {
+    try {
+      this.send(frame);
+      return true;
+    } catch (error) {
+      if (!(error instanceof HearthError) || error.code !== "outbox.full") throw error;
+      this.#log(
+        `box-agent: refused ${command}: its ${frame.type} could not be queued (${error.code}: ${error.message}); a re-send from the hub will be applied`,
+      );
+      return false;
+    }
+  }
+
   #write(frame: Frame): void {
     this.#socket?.send(encodeFrame(frame));
   }
@@ -293,35 +315,43 @@ export class BoxAgent {
         return;
       case "turn.start":
         if (isDuplicateCommand(this.#history, frame)) return;
-        this.#history.turnIds.add(frame.turnId);
         // pi is wired in M1. Until then every turn ends visibly, never silently
         // (PRD §8.1 principle 1).
-        this.send({
-          type: "turn.end",
-          sessionId: frame.sessionId,
-          turnId: frame.turnId,
-          outcome: "failed",
-          failure: {
-            owner: "box",
-            disposition: "give-up",
-            message: "this box-agent cannot run turns yet",
-          },
-        });
+        if (
+          !this.#answer(`turn.start ${frame.turnId}`, {
+            type: "turn.end",
+            sessionId: frame.sessionId,
+            turnId: frame.turnId,
+            outcome: "failed",
+            failure: {
+              owner: "box",
+              disposition: "give-up",
+              message: "this box-agent cannot run turns yet",
+            },
+          })
+        ) {
+          return;
+        }
+        this.#history.turnIds.add(frame.turnId);
         return;
       case "session.hibernate":
         if (isDuplicateCommand(this.#history, frame)) return;
+        if (
+          !this.#answer(`session.hibernate ${frame.requestId}`, {
+            type: "hibernate.done",
+            sessionId: frame.sessionId,
+            requestId: frame.requestId,
+            outcome: "failed",
+            failure: {
+              owner: "box",
+              disposition: "give-up",
+              message: "this box-agent cannot hibernate yet",
+            },
+          })
+        ) {
+          return;
+        }
         this.#history.hibernateRequestIds.add(frame.requestId);
-        this.send({
-          type: "hibernate.done",
-          sessionId: frame.sessionId,
-          requestId: frame.requestId,
-          outcome: "failed",
-          failure: {
-            owner: "box",
-            disposition: "give-up",
-            message: "this box-agent cannot hibernate yet",
-          },
-        });
         return;
       default:
         return;
