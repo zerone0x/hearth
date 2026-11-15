@@ -5,6 +5,7 @@ import { getCookie } from "hono/cookie";
 import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
+import { isWebAssetRequest, mountWebAssets } from "./web/static";
 
 export interface AppDeps {
   readonly boxes: BoxConnections;
@@ -34,6 +35,12 @@ export interface AppOptions {
    * hub; `startHub` sets it whenever a box provider is configured.
    */
   readonly boxEgress?: BoxEgressCheck;
+  /**
+   * Directory of the built web UI (`apps/web/dist`, decision 0017). When set,
+   * `GET`/`HEAD` outside `/v1/` are served from it without a login; the
+   * request guard still runs on them. Unset: the hub serves no UI.
+   */
+  readonly webRoot?: string;
 }
 
 /** Methods that carry a request body; their API calls must be JSON. */
@@ -139,9 +146,12 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   // socket is on the box listeners and never reaches this app (0012). Without
   // `deps` there is no login, so nothing but /healthz is served.
   const openRoutes = new Set(OPEN_ROUTES);
+  const webRoot = deps === undefined ? undefined : options.webRoot;
   app.use("*", async (c, next) => {
     if (c.req.path === "/healthz") return next();
     if (deps !== undefined && openRoutes.has(`${c.req.method} ${c.req.path}`)) return next();
+    // The web UI's assets (decision 0017): public, same-origin, never `/v1/`.
+    if (webRoot !== undefined && isWebAssetRequest(c.req.method, c.req.path)) return next();
     const principal = deps?.auth.authenticate(getCookie(c, SESSION_COOKIE));
     if (principal === undefined) return refuse(401, "auth.required", "sign in first");
     c.set("principal", principal);
@@ -196,6 +206,9 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
       }
     });
   }
+
+  // Last, and only outside `/v1/`, so it never shadows an API route.
+  if (webRoot !== undefined) mountWebAssets(app, webRoot);
 
   return app;
 }
