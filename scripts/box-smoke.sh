@@ -135,6 +135,8 @@ if [[ "${cdp}" != *Browser* ]]; then
   fail "Chromium CDP did not answer on 127.0.0.1:${cdp_port}"
 fi
 ok "Chromium CDP answers on 127.0.0.1:${cdp_port}"
+in_box test -r /usr/share/hearth/start.html || fail "the start page is not readable by the box user"
+ok "the start page is readable"
 
 # Listening sockets in the box's network namespace, from /proc/net (no ss/netstat needed).
 listeners="$(in_box cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6)" ||

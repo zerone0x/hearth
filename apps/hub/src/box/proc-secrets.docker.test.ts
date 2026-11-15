@@ -105,6 +105,13 @@ print(json.dumps(report))
 /** Waits up to 60 s for the desktop Chromium's CDP on loopback. */
 const WAIT_FOR_CDP = `for _ in $(seq 1 120); do python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=1)" 2>/dev/null && break; sleep 0.5; done`;
 
+/**
+ * Variables Debian's `/usr/bin/chromium` wrapper sets itself before it execs
+ * the browser (its public API keys, flags, `PWD`): not from the box's
+ * environment, so the clean-environment checks set them aside.
+ */
+const CHROMIUM_WRAPPER_ENV = /^(CHROME_[A-Z_]+|CHROMIUM_FLAGS|GOOGLE_[A-Z_]+|PWD)$/;
+
 interface ScanReport {
   readonly tokenIn: string[];
   readonly agent: {
@@ -201,15 +208,10 @@ describe.skipIf(!enabled)("box-agent's secrets through /proc in a real box", () 
     expect(report.xvncEnviron).toBe("has-box-id");
     // The desktop's Chromium (#92, decision 0026) starts from a clean
     // environment: readable to the command, and nothing of the boot env in it.
-    expect(report.chromiumEnv).toEqual([
-      "DISPLAY",
-      "HOME",
-      "LANG",
-      "LOGNAME",
-      "PATH",
-      "SHELL",
-      "USER",
-    ]);
+    const chromiumEnv = Array.isArray(report.chromiumEnv)
+      ? report.chromiumEnv.filter((k) => !CHROMIUM_WRAPPER_ENV.test(k))
+      : report.chromiumEnv;
+    expect(chromiumEnv).toEqual(["DISPLAY", "HOME", "LANG", "LOGNAME", "PATH", "SHELL", "USER"]);
     // No process carries the join token, and its file is gone.
     expect(report.tokenIn).toEqual([]);
     expect(report.tokenFile).toBe(false);

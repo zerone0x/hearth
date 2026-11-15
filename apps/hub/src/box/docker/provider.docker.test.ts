@@ -151,6 +151,13 @@ print(json.dumps({
 }))
 `;
 
+/**
+ * Variables Debian's `/usr/bin/chromium` wrapper sets itself before it execs
+ * the browser (its public API keys, flags, `PWD`): not from the box's
+ * environment, so the clean-environment checks set them aside.
+ */
+const CHROMIUM_WRAPPER_ENV = /^(CHROME_[A-Z_]+|CHROMIUM_FLAGS|GOOGLE_[A-Z_]+|PWD)$/;
+
 interface DesktopChromium {
   readonly browser: string | null;
   readonly pid: number | null;
@@ -234,7 +241,15 @@ describe.skipIf(!enabled)("DockerBoxProvider against a real daemon", () => {
     expect(first.uids).toEqual(["1000", "1000", "1000", "1000"]);
     expect(first.loopbackOnly).toBe(true);
     // Only the variables the entrypoint hands it: nothing from the boot env.
-    expect(first.envKeys).toEqual(["DISPLAY", "HOME", "LANG", "LOGNAME", "PATH", "SHELL", "USER"]);
+    expect(first.envKeys.filter((k) => !CHROMIUM_WRAPPER_ENV.test(k))).toEqual([
+      "DISPLAY",
+      "HOME",
+      "LANG",
+      "LOGNAME",
+      "PATH",
+      "SHELL",
+      "USER",
+    ]);
     expect(first.tokenIn).toEqual([]);
     expect(first.flags).toEqual(
       expect.arrayContaining(["--remote-debugging-address=127.0.0.1", "--no-sandbox"]),

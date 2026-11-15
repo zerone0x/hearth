@@ -2132,7 +2132,9 @@ passed on that black screen.
   Chromium with `env -i` and a fixed list: `HOME`, `USER`, `LOGNAME`,
   `SHELL`, `PATH`, `LANG`, `DISPLAY`. Nothing from the provider's boot env
   (`HEARTH_HUB_URL`, `HEARTH_BOX_ID`, `HEARTH_JOIN_TOKEN_FILE`, ...) reaches
-  the browser, its renderers, or a page.
+  the browser, its renderers, or a page. Debian's `/usr/bin/chromium`
+  wrapper adds its own (`CHROMIUM_FLAGS`, `CHROME_*`, Debian's public
+  `GOOGLE_*` API keys, `PWD`); none come from the box.
 - **Sandbox: `--no-sandbox`, because the box is the sandbox.** This applies
   the reasoning of 0007, now checked against the real box: with all
   capabilities dropped, `no-new-privileges` and Docker's default seccomp
@@ -2157,8 +2159,8 @@ passed on that black screen.
   layer, so editing it rebuilds neither the desktop nor pi.
 - **Proof.** `provider.docker.test.ts`: CDP `/json/version` answers inside
   the box, every CDP listener is on loopback, the browser process runs as
-  uid 1000 with exactly the variables above, no Chromium process holds the
-  join token, and after a `kill` a new browser process answers CDP.
+  uid 1000 with exactly the variables above (plus the wrapper's), no
+  Chromium process holds the join token, and after a `kill` a new browser process answers CDP.
   `proc-secrets.docker.test.ts` sees Chromium among the box's processes with
   the same clean environment. The compose e2e samples the desktop canvas and
   fails when one colour covers more than 95% of it or the start page's

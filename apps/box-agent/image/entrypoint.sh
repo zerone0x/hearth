@@ -77,13 +77,14 @@ start_url="file:///usr/share/hearth/start.html"
 if [[ "${HEARTH_SESSION_ID:-}" =~ ^[A-Za-z0-9_-]+$ ]]; then
   start_url+="#session=${HEARTH_SESSION_ID}"
 fi
+window_size="${screen/x/,}"
 chromium_flags=(
   --remote-debugging-address=127.0.0.1
   --remote-debugging-port="${cdp_port}"
   --user-data-dir="${chromium_profile}"
   --start-maximized
   --window-position=0,0
-  --window-size="${screen/x/,}"
+  --window-size="${window_size}"
   --no-first-run
   --no-default-browser-check
   --password-store=basic

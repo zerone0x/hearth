@@ -88,8 +88,9 @@ COPY packages/core/src packages/core/src
 COPY packages/protocol/src packages/protocol/src
 COPY apps/box-agent/src apps/box-agent/src
 COPY --chmod=0755 apps/box-agent/image/entrypoint.sh /usr/local/bin/hearth-box-entrypoint
-# The page the desktop's Chromium opens on (decision 0026).
-COPY --chmod=0644 apps/box-agent/image/start.html /usr/share/hearth/start.html
+# The page the desktop's Chromium opens on (decision 0026). No --chmod: BuildKit
+# applies it to the directory it creates too, and a 0644 directory hides the page.
+COPY apps/box-agent/image/start.html /usr/share/hearth/start.html
 
 ENV HEARTH_DISPLAY=:1 \
     HEARTH_VNC_PORT=5901 \
