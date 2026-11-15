@@ -1214,8 +1214,14 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   builds `ToolRpcClient.operations(boxId, toolCallId)`, and releases the lease
   when the call ends. `grep` replaces `execute()`; `bash` drops pi's `env`.
 - **`tool_call`** rewrites `~` to `/workspace` (0011) and applies the config
-  deny-list (`{tool, pattern, reason}`; the pattern is tested against the bash
-  command or the path). A blocked call never reaches the box. **`tool_result`**
+  deny-list (`{tool, pattern?, reason?}`; `tool` may be `*`; a rule without a
+  pattern blocks every call of its tool; the pattern is tested against the bash
+  command or the path, and a path also in its normalized form, resolved against
+  `/workspace` with `//` and `..` collapsed). A blocked call never reaches the
+  box. The deny-list is **best-effort, not a boundary**: shell spellings
+  (`rm -fr`, `$X -rf`, `base64 -d | sh`) and write content get past a regex.
+  The box is the boundary; stopping those is the job of the M3 approvals.
+  **`tool_result`**
   rewrites every path under the hub's temp dir (pi's bash truncation hint,
   codemode's spilled output and saved images) to a note that it is a hub file.
   The box keeps its own full exec output (0011), so the model loses nothing.
@@ -1223,6 +1229,9 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   `SecretStore` (`HEARTH_MODEL_KEY_REF`) and applied in memory with
   `ModelRuntime.setRuntimeApiKey`; pi gets no auth file and no hub env. The
   provider and model are config (`HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL`).
+  The key, and any other SecretStore value the runner uses, is redacted
+  (`[redacted]`) from provider error text and every other event payload,
+  failure message and log line before it is stored or logged.
 - **Events.** Every pi session event is appended as `pi.<type>` (without the
   `partial`, `messages` and `toolResults` fields, which repeat other events),
   plus `message.user`, `runner.usage`, `runner.interrupted`, `runner.failed`,
@@ -1233,6 +1242,11 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   `tool.outcome-unknown` ("its outcome is unknown and it was not re-run"); pi
   turns it into a tool error the model sees, and the turn goes on. The next
   call's `ensureBox` gets the relaunched box. Nothing re-runs the call.
+- **Hub restart mid-tool.** A rebuilt runner gives every tool call on the
+  branch that has no result an error result saying its outcome is unknown and
+  it was not re-run, persists it as `runner.entry`, and records
+  `runner.outcome-unknown`. The model does not get pi-ai's synthetic
+  "No result provided", which reads as if the call never ran.
 - **Crash isolation.** A turn runs in the background behind a catch. An
   exception from `prompt`, from the event subscriber, or a failed event append
   marks that runner `failed`, aborts its turn and appends `runner.failed`.
@@ -1244,7 +1258,10 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 - **AGENTS.md under lazy start: a hub-side cache.** The hub never starts a box
   just to read context files. On the first box lease of each turn (the box is
   up for a tool call anyway) the runner reads `/workspace/AGENTS.md` through
-  the tool RPC. A changed copy is stored as `runner.context` and used from the
+  the tool RPC, inside that call's lease (its try/finally), so the lease is
+  released whatever happens. A failed read keeps the last copy; a failed
+  `runner.context` append fails the call and the runner, like any failed
+  append. A changed copy is stored as `runner.context` and used from the
   next turn on (`session.reload()`) and after a restart. The first turn of a
   new session runs without it. Starting the box on session create was not
   chosen: it breaks lazy start (PRD §6.2) for every chat that never touches

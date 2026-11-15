@@ -46,6 +46,12 @@ export interface RunnerBox {
   ensureBox(): Promise<BoxLease>;
   /** `ToolRpcClient.operations`. */
   operations(boxId: BoxId, callId: string): BoxToolOperations;
+  /**
+   * Runs after the lease is taken and before the call, inside the lease's
+   * try/finally (the AGENTS.md refresh). If it throws, the lease is released
+   * and the call fails.
+   */
+  prepare?(lease: BoxLease): Promise<void>;
 }
 
 export interface HearthToolsOptions {
@@ -69,6 +75,7 @@ async function withOps<T>(
 ): Promise<T> {
   const lease = await box.ensureBox();
   try {
+    await box.prepare?.(lease);
     return await fn(box.operations(lease.boxId, callId));
   } finally {
     lease.release();
@@ -196,7 +203,7 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         const input = event.input as { path?: unknown };
         if (typeof input.path === "string") input.path = rewriteHome(input.path, boxCwd);
       }
-      const rule = denied(options.denyList, event.toolName, event.input);
+      const rule = denied(options.denyList, event.toolName, event.input, boxCwd);
       if (rule === undefined) return undefined;
       options.onDenied?.(event.toolName, event.toolCallId, rule.reason);
       return { block: true, reason: rule.reason };

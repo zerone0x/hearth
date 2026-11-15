@@ -39,9 +39,17 @@ import { ToolRpcClient } from "../box/tool-rpc";
 import type { BoxLease, SessionView } from "../session/manager";
 import { openDatabase, SqliteLoginStore } from "../store";
 import type { PinnedExtension } from "./extensions";
-import { HUB_TEMP_NOTE, rewriteHome, scrubHubTempPaths } from "./policy";
+import {
+  compileDenyList,
+  denied,
+  HUB_TEMP_NOTE,
+  normalizeBoxPath,
+  rewriteHome,
+  scrubHubTempPaths,
+} from "./policy";
 import { mountRunnerRoutes } from "./routes";
-import { type RunnerConfig, SessionRunners } from "./runners";
+import { REDACTED, RESTART_OUTCOME_UNKNOWN } from "./runner";
+import { type RunnerConfig, SessionRunners, type SessionRunnersOptions } from "./runners";
 
 const dirs: string[] = [];
 const closers: Array<() => unknown> = [];
@@ -890,5 +898,260 @@ describe("HTTP routes behind the login", () => {
     expect(unknown.status).toBe(404);
     expect(calls.map((c) => c.action)).toEqual(["session.message"]);
     expect(h.events.types("se_a")).toEqual([]);
+  });
+});
+
+describe("deny-list rules (review of #63)", () => {
+  test("a `*` rule blocks any tool and a rule without a pattern blocks every call of its tool", async () => {
+    const h = await harness({
+      denyList: [
+        { tool: "*", pattern: "forbidden", reason: "the wildcard rule" },
+        { tool: "write", reason: "no writes at all" },
+      ],
+    });
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo forbidden > f.txt" }, "c_w1"),
+      call("read", { path: "forbidden.txt" }, "c_w2"),
+      call("write", { path: "ok.txt", content: "x" }, "c_w3"),
+      call("bash", { command: "echo fine" }, "c_ok"),
+      fauxAssistantMessage("done"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results.map((r) => r.isError)).toEqual([true, true, true, false]);
+    expect(results[0]?.text).toContain("the wildcard rule");
+    expect(results[1]?.text).toContain("the wildcard rule");
+    expect(results[2]?.text).toContain("no writes at all");
+    // Nothing blocked reached the box: one lease, one exec, no file written.
+    expect(h.sessions.leases).toBe(1);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(1);
+    expect(JSON.stringify(h.boxes.sent)).not.toContain("forbidden");
+    expect(existsSync(join(h.root, "ok.txt"))).toBe(false);
+    expect(existsSync(join(h.root, "f.txt"))).toBe(false);
+  });
+
+  test("paths are normalized before matching: `..`, `//` and relative paths are blocked", async () => {
+    expect(normalizeBoxPath("/workspace/../etc/passwd", "/workspace")).toBe("/etc/passwd");
+    expect(normalizeBoxPath("//etc//passwd", "/workspace")).toBe("/etc/passwd");
+    expect(normalizeBoxPath("../../etc/passwd", "/workspace")).toBe("/etc/passwd");
+    expect(normalizeBoxPath("a/./b.txt", "/workspace")).toBe("/workspace/a/b.txt");
+    const rules = compileDenyList([
+      { tool: "read", pattern: "^/etc/", reason: "no etc" },
+      { tool: "*", pattern: "^/workspace/secret", reason: "no secret" },
+    ]);
+    const blocked: Array<[string, unknown, string]> = [
+      ["read", { path: "/etc/passwd" }, "no etc"],
+      ["read", { path: "/workspace/../etc/passwd" }, "no etc"],
+      ["read", { path: "../../etc/passwd" }, "no etc"],
+      ["read", { path: "//etc/passwd" }, "no etc"],
+      ["read", { path: "/workspace/./../etc/shadow" }, "no etc"],
+      ["grep", { pattern: "x", path: "secret/keys" }, "no secret"],
+      ["write", { path: "./secret/a.txt", content: "x" }, "no secret"],
+      ["ls", { path: "/workspace//secret" }, "no secret"],
+    ];
+    for (const [tool, input, reason] of blocked) {
+      expect([tool, input, denied(rules, tool, input)?.reason]).toEqual([tool, input, reason]);
+    }
+    // Through a real turn, with the test's box cwd: nothing reaches the box.
+    const h = await harness({ denyList: [{ tool: "read", pattern: "^/etc/", reason: "no etc" }] });
+    const runner = await turn(h, "se_a", "go", [
+      call("read", { path: "//etc/hostname" }, "c_p1"),
+      call("read", { path: "../../../../../../../../../../etc/hostname" }, "c_p2"),
+      fauxAssistantMessage("done"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results.map((r) => r.isError)).toEqual([true, true]);
+    expect(results.map((r) => r.text)).toEqual(["no etc", "no etc"]);
+    expect(h.sessions.leases).toBe(0);
+  });
+
+  test("known bypasses: shell spellings get past the deny-list (best-effort; the box is the boundary)", () => {
+    const rules = compileDenyList([{ tool: "bash", pattern: "rm\\s+-rf", reason: "no rm" }]);
+    expect(denied(rules, "bash", { command: "rm -rf /workspace" })?.reason).toBe("no rm");
+    expect(denied(rules, "bash", { command: "echo ok; rm\t-rf x" })?.reason).toBe("no rm");
+    // Known and documented (decision 0015, docs/runner.md); M3 approvals handle these:
+    for (const command of [
+      "rm -fr x",
+      "rm -r -f x",
+      "X=rm; $X -rf x",
+      'bash -c "r""m -rf x"',
+      "echo cm0gLXJmIHgK | base64 -d | sh",
+    ]) {
+      expect(denied(rules, "bash", { command })).toBeUndefined();
+    }
+    // Write content is not a subject: only the path is.
+    const secret = compileDenyList([{ tool: "*", pattern: "secret", reason: "no secret" }]);
+    expect(denied(secret, "write", { path: "a.txt", content: "secret" })).toBeUndefined();
+  });
+});
+
+describe("lease and AGENTS.md refresh (review of #63)", () => {
+  test("a failed runner.context append releases the lease and fails the runner", async () => {
+    const h = await harness();
+    writeFileSync(join(h.root, "AGENTS.md"), "hi\n");
+    h.events.failOn = (_s, e) => e.type === "runner.context";
+    // A slow state change: settled() must still wait for it.
+    const fail = h.sessions.fail.bind(h.sessions);
+    h.sessions.fail = async (sessionId, reason) => {
+      await Bun.sleep(100);
+      await fail(sessionId, reason);
+    };
+    const runner = await turn(h, "se_a", "one", [
+      call("ls", { path: "." }, "c1"),
+      fauxAssistantMessage("ok"),
+    ]);
+    expect(h.sessions.leases).toBe(1);
+    expect(h.sessions.inFlight).toBe(0);
+    expect(runner.status).toBe("failed");
+    expect(runner.failure).toContain("disk full writing runner.context");
+    expect(h.events.types("se_a")).toContain("runner.failed");
+    expect(h.sessions.failed).toEqual([
+      { sessionId: "se_a", reason: "runner failed: disk full writing runner.context" },
+    ]);
+  });
+});
+
+describe("hub restart mid-tool (review of #63)", () => {
+  test("an orphaned tool call gets an explicit outcome-unknown result, once, and is not re-run", async () => {
+    const h = await harness();
+    h.faux.setResponses([
+      call("bash", { command: "sleep 2; echo done > mid.txt" }, "c_mid"),
+      fauxAssistantMessage("after"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "start");
+    const old = await h.runners.runner("se_a");
+    const started = Date.now();
+    while (!h.boxes.methods().includes("tool.exec") && Date.now() - started < 5000) {
+      await Bun.sleep(10);
+    }
+    await Bun.sleep(50);
+    // The hub dies here: the log stops at the in-flight call.
+    const snapshot = structuredClone(h.events.all.get("se_a") ?? []);
+    await h.runners.close();
+    await old.settled();
+    h.events.all.set("se_a", snapshot);
+    expect(snapshot.some((e) => e.type === "pi.tool_execution_end")).toBe(false);
+
+    const again = h.make();
+    const rebuilt = await again.runner("se_a");
+    expect(toolResults(rebuilt.messages)).toEqual([
+      { id: "c_mid", isError: true, text: RESTART_OUTCOME_UNKNOWN },
+    ]);
+    expect(h.events.of("se_a", "runner.outcome-unknown")).toHaveLength(1);
+    // Persisted at rebuild, before any new turn: another restart now would keep it.
+    const stored = h.events.of("se_a", "runner.entry").map((e) => JSON.stringify(e.payload));
+    expect(stored.filter((p) => p.includes(RESTART_OUTCOME_UNKNOWN))).toHaveLength(1);
+    let seen = "";
+    h.faux.setResponses([
+      (context) => {
+        seen = JSON.stringify(context.messages);
+        return fauxAssistantMessage("I will check mid.txt first");
+      },
+    ]);
+    await again.send(LOCAL_PRINCIPAL, "se_a", "continue");
+    await rebuilt.settled();
+    expect(rebuilt.status).toBe("idle");
+    expect(seen).toContain("its outcome is unknown and it was not re-run");
+    expect(seen).not.toContain("No result provided");
+    expect(h.boxes.methods().filter((m) => m === "tool.exec")).toHaveLength(1);
+
+    // A second restart finds nothing orphaned and adds nothing.
+    await again.close();
+    const third = await h.make().runner("se_a");
+    expect(toolResults(third.messages)).toHaveLength(1);
+    expect(h.events.of("se_a", "runner.outcome-unknown")).toHaveLength(1);
+  });
+});
+
+describe("model key redaction (review of #63)", () => {
+  const KEY = "sk-ant-PLANTED-9f8e7d6c5b4a";
+  const keyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(KEY) };
+
+  async function keyedRunners(
+    h: Harness,
+    logs: string[],
+    tools: SessionRunnersOptions["tools"] = h.rpc,
+  ): Promise<SessionRunners> {
+    const runners = new SessionRunners({
+      authorizer: allowAll,
+      events: h.events,
+      sessions: h.sessions,
+      tools,
+      secrets: keyed,
+      config: { provider: "faux", model: h.faux.getModel().id, apiKeyRef: "env:X" },
+      modelRuntime: h.runtime,
+      boxCwd: h.root,
+      log: (line) => logs.push(line),
+    });
+    closers.push(() => runners.close());
+    return runners;
+  }
+
+  test("a provider error that echoes the key is redacted before it is stored or logged", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs);
+    h.faux.setResponses([
+      () => {
+        throw new Error(`401 invalid x-api-key: ${KEY}`);
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    const stored = JSON.stringify([...h.events.all.values()]);
+    expect(stored).toContain("401 invalid x-api-key");
+    expect(stored).toContain(REDACTED);
+    for (const text of [stored, logs.join("\n"), JSON.stringify(runner.messages)]) {
+      expect(text).not.toContain(KEY);
+    }
+  });
+
+  test("a hub log line that names the key is redacted", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs, {
+      operations: (boxId, callId) => {
+        const ops = h.rpc.operations(boxId, callId);
+        if (!callId.startsWith("context_")) return ops;
+        return {
+          ...ops,
+          ls: {
+            ...ops.ls,
+            exists: async () => {
+              throw new Error(`box echoed ${KEY}`);
+            },
+          },
+        };
+      },
+    });
+    h.faux.setResponses([call("ls", { path: "." }, "c1"), fauxAssistantMessage("ok")]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    await (await runners.runner("se_a")).settled();
+    const text = logs.join("\n");
+    expect(text).toContain(`could not read`);
+    expect(text).toContain(REDACTED);
+    expect(text).not.toContain(KEY);
+  });
+
+  test("a runner failure whose error names the key is redacted in the failure, log and event", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs);
+    const prompt = spyOn(AgentSession.prototype, "prompt").mockImplementation(async () => {
+      throw new Error(`provider said: bad key "${KEY}"`);
+    });
+    try {
+      await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+      const runner = await runners.runner("se_a");
+      await runner.settled();
+      expect(runner.status).toBe("failed");
+      expect(runner.failure).toBe(`provider said: bad key "${REDACTED}"`);
+      const all = JSON.stringify([...h.events.all.values()]) + logs.join("\n");
+      expect(all).toContain(REDACTED);
+      expect(all).not.toContain(KEY);
+      expect(JSON.stringify(h.sessions.failed)).not.toContain(KEY);
+    } finally {
+      prompt.mockRestore();
+    }
   });
 });

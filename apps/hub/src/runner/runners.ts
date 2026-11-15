@@ -6,7 +6,8 @@
  *   `session.events`, `session.configure`), then checks the session exists.
  * - The model key comes from the `SecretStore` and is applied in memory with
  *   `ModelRuntime.setRuntimeApiKey`: the `direct` model gateway of PRD §6.4.
- *   No auth file, no hub environment variable reaches pi.
+ *   No auth file, no hub environment variable reaches pi. The key is
+ *   redacted from everything the runners store or log.
  * - AGENTS.md: the hub keeps the last copy read from the box (`runner.context`
  *   in the event log) and refreshes it on the first box lease of each turn. It
  *   never starts a box just to read it.
@@ -36,7 +37,13 @@ import type { BoxToolOperations } from "../box/tool-rpc";
 import type { BoxLease, SessionView } from "../session/manager";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
-import { BOX_CWD, type ContextFile, type RunnerStatus, SessionRunner } from "./runner";
+import {
+  BOX_CWD,
+  type ContextFile,
+  type RunnerStatus,
+  redactSecrets,
+  SessionRunner,
+} from "./runner";
 import type { RunnerBox } from "./tools";
 
 /** The runner's config (hub config; see docs/runner.md). */
@@ -106,6 +113,8 @@ export class SessionRunners {
   readonly #denyList: readonly CompiledDenyRule[];
   readonly #extensions: readonly PinnedExtension[];
   #runtime: Promise<ModelRuntime> | undefined;
+  /** SecretStore values the runners use (the model key): redacted from stored and logged text. */
+  readonly #secretValues = new Set<string>();
 
   constructor(options: SessionRunnersOptions) {
     this.#o = options;
@@ -118,6 +127,15 @@ export class SessionRunners {
       (options.log ?? console.error)(`runner: extension ${r.name} not loaded: ${r.reason}`);
     }
     this.#extensions = selection.loaded;
+  }
+
+  /** `text` with every secret the runners use replaced (decision 0015). */
+  redact(text: string): string {
+    return redactSecrets(text, this.#secretValues);
+  }
+
+  #log(line: string): void {
+    (this.#o.log ?? console.error)(this.redact(line));
   }
 
   /** Names of the extensions that load besides Hearth's own. */
@@ -237,7 +255,8 @@ export class SessionRunners {
       contextFiles: () => this.#context.get(sessionId) ?? [],
       ...(this.#o.boxCwd === undefined ? {} : { boxCwd: this.#o.boxCwd }),
       ...(this.#o.hubTempDir === undefined ? {} : { hubTempDir: this.#o.hubTempDir }),
-      ...(this.#o.log === undefined ? {} : { log: this.#o.log }),
+      log: (line) => this.#log(line),
+      redact: (text) => this.redact(text),
       onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });
   }
@@ -253,8 +272,9 @@ export class SessionRunners {
           refreshOnCreate: false,
         }));
       if (this.#o.config.apiKeyRef !== undefined) {
-        const key = await this.#o.secrets.resolve(this.#o.config.apiKeyRef);
-        await runtime.setRuntimeApiKey(this.#o.config.provider, key.reveal());
+        const key = (await this.#o.secrets.resolve(this.#o.config.apiKeyRef)).reveal();
+        this.#secretValues.add(key);
+        await runtime.setRuntimeApiKey(this.#o.config.provider, key);
       }
       return runtime;
     })();
@@ -267,13 +287,13 @@ export class SessionRunners {
   #box(sessionId: SessionId): RunnerBox {
     const boxCwd = this.#o.boxCwd ?? BOX_CWD;
     return {
-      ensureBox: async () => {
-        const lease = await this.#o.sessions.ensureBox(sessionId);
-        if (!this.#contextFresh.has(sessionId)) {
-          this.#contextFresh.add(sessionId);
-          await this.#refreshContext(sessionId, lease, boxCwd);
-        }
-        return lease;
+      ensureBox: () => this.#o.sessions.ensureBox(sessionId),
+      // Inside the call's lease try/finally: a failed `runner.context` append
+      // releases the lease and fails the runner (runner.ts).
+      prepare: async (lease) => {
+        if (this.#contextFresh.has(sessionId)) return;
+        this.#contextFresh.add(sessionId);
+        await this.#refreshContext(sessionId, lease, boxCwd);
       },
       operations: (boxId, callId) => this.#o.tools.operations(boxId, callId),
     };
@@ -289,9 +309,7 @@ export class SessionRunners {
         if (!(await ops.ls.exists(path))) continue;
         files.push({ path, content: (await ops.read.readFile(path)).toString("utf8") });
       } catch (error) {
-        (this.#o.log ?? console.error)(
-          `session ${sessionId}: could not read ${path} from the box: ${String(error)}`,
-        );
+        this.#log(`session ${sessionId}: could not read ${path} from the box: ${String(error)}`);
         return;
       }
     }

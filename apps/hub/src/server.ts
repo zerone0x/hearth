@@ -362,14 +362,6 @@ export function startHub(options: HubOptions) {
   });
   mountSessionRoutes(app, sessions);
 
-  // The desktop stream (decision 0016): behind the login guard, owner only.
-  desktop = new DesktopBridge({
-    boxes,
-    sessions,
-    authorizer,
-    ...(options.log === undefined ? {} : { log: options.log }),
-  });
-  mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
   // The runner (decision 0015): one pi session per hub session, tools routed
   // to the session's box through the tool RPC.
   // Only with a runner: the client claims every `tool_` rpc answer, so a second
@@ -397,6 +389,14 @@ export function startHub(options: HubOptions) {
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
+  // The desktop stream (decision 0016): behind the login guard, owner only.
+  desktop = new DesktopBridge({
+    boxes,
+    sessions,
+    authorizer,
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+  mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
 
   const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
@@ -485,9 +485,9 @@ export function startHub(options: HubOptions) {
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
       sessions.stop();
-      desktop?.shutdown();
       toolRpc?.close();
       void runners?.close();
+      desktop?.shutdown();
       boxes.shutdown();
       stopped = (async () => {
         await sessions.ready.catch(() => undefined);
