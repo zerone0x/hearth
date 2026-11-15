@@ -114,6 +114,33 @@ export const MIGRATIONS: readonly Migration[] = [
       ${appendOnly("audit")}
     `,
   },
+  {
+    // `REPLACE` / `INSERT OR REPLACE` resolve a key conflict by deleting the old
+    // row, and SQLite skips DELETE triggers for that unless the connection set
+    // `recursive_triggers`. `openDatabase` sets it; these guards close the gap
+    // for any connection that did not, by refusing an INSERT whose key is
+    // already taken before the conflict is resolved.
+    version: 2,
+    name: "append-only guards against REPLACE on event and audit",
+    sql: `
+      CREATE TRIGGER event_no_replace BEFORE INSERT ON event
+      WHEN EXISTS (
+        SELECT 1 FROM event
+        WHERE workspace_id = NEW.workspace_id AND session_id = NEW.session_id AND seq = NEW.seq
+      ) OR (
+        NEW.boot_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM event
+          WHERE workspace_id = NEW.workspace_id AND boot_id = NEW.boot_id
+            AND delivery_id = NEW.delivery_id
+        )
+      )
+      BEGIN SELECT RAISE(ABORT, 'event is append-only'); END;
+
+      CREATE TRIGGER audit_no_replace BEFORE INSERT ON audit
+      WHEN NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM audit WHERE id = NEW.id)
+      BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

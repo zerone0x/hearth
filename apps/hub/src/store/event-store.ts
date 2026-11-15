@@ -23,6 +23,14 @@ import {
  */
 export const MAX_READ_LIMIT = 1_000;
 
+/**
+ * The largest event payload `append` stores, measured as UTF-8 bytes of its
+ * JSON. Events are streamed to clients and replayed on reconnect, so one
+ * runaway payload must not bloat every read of the session; anything bigger
+ * belongs outside the event log.
+ */
+export const MAX_EVENT_PAYLOAD_BYTES = 4 * 1024 * 1024;
+
 export interface SqliteEventStoreOptions {
   readonly now?: () => EpochMs;
 }
@@ -72,11 +80,35 @@ function checkEvent(event: NewEvent): string {
       throw invalid(`The delivery id ${String(deliveryId)} is not a positive integer`);
     }
   }
-  const json = JSON.stringify(event.payload);
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(event.payload, rejectNonJson);
+  } catch {
+    // A BigInt, a cycle, a function or symbol, or a throwing `toJSON`.
+    json = undefined;
+  }
   if (json === undefined) {
     throw invalid("The event payload is not JSON");
   }
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes > MAX_EVENT_PAYLOAD_BYTES) {
+    throw invalid(
+      `The event payload is ${bytes} bytes as JSON, over the ${MAX_EVENT_PAYLOAD_BYTES}-byte limit`,
+    );
+  }
   return json;
+}
+
+/**
+ * `JSON.stringify` drops functions and symbols inside objects silently; a
+ * payload holding one is a caller bug, so reject it instead of storing less
+ * than was given.
+ */
+function rejectNonJson(_key: string, value: unknown): unknown {
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new TypeError(`A ${typeof value} is not JSON`);
+  }
+  return value;
 }
 
 function toStoredEvent(row: EventRow): StoredEvent {
@@ -107,7 +139,7 @@ function toStoredEvent(row: EventRow): StoredEvent {
  * - A delivery key already applied to a different session is not a
  *   redelivery but a box bug; the append rejects with `event.delivery-conflict`
  *   rather than ack an event it did not store.
- * - Triggers reject UPDATE and DELETE on `event`.
+ * - Triggers reject UPDATE, DELETE and REPLACE on `event` (migrations 1, 2).
  */
 export class SqliteEventStore implements EventStore {
   readonly #db: Database;

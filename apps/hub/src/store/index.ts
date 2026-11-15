@@ -6,5 +6,10 @@
 
 export { SqliteAuditSink } from "./audit-sink";
 export { BUSY_TIMEOUT_MS, type OpenDatabaseOptions, openDatabase } from "./database";
-export { MAX_READ_LIMIT, SqliteEventStore, type SqliteEventStoreOptions } from "./event-store";
+export {
+  MAX_EVENT_PAYLOAD_BYTES,
+  MAX_READ_LIMIT,
+  SqliteEventStore,
+  type SqliteEventStoreOptions,
+} from "./event-store";
 export { MIGRATIONS, type Migration, migrate, SCHEMA_VERSION } from "./migrations";

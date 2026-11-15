@@ -11,8 +11,8 @@ import { type AuditRecord, type AuditSink, HearthError } from "@hearth/core";
  *
  * `write` is one autocommit INSERT: when it returns, the row is committed and,
  * with `synchronous = FULL` (see `openDatabase`), on disk. Any failure rejects,
- * so `withAudit` does not run the action. Triggers in the schema reject UPDATE
- * and DELETE on `audit`.
+ * so `withAudit` does not run the action. Triggers in the schema reject UPDATE,
+ * DELETE and REPLACE on `audit`.
  */
 export class SqliteAuditSink implements AuditSink {
   readonly #insert: (record: AuditRecord) => void;

@@ -31,6 +31,10 @@ export interface OpenDatabaseOptions {
  *   mode but can lose the last commits on power loss.
  * - `busy_timeout = BUSY_TIMEOUT_MS`.
  * - `foreign_keys = ON`.
+ * - `recursive_triggers = ON`: without it SQLite skips DELETE triggers when
+ *   `REPLACE` removes a conflicting row, which would let `INSERT OR REPLACE`
+ *   overwrite an `event` or `audit` row past the append-only triggers.
+ *   Migration 2 also guards against that on connections opened elsewhere.
  *
  * `":memory:"` gives a private in-memory database (WAL does not apply there).
  */
@@ -42,6 +46,7 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
     db.run("PRAGMA journal_mode = WAL");
     db.run("PRAGMA synchronous = FULL");
     db.run("PRAGMA foreign_keys = ON");
+    db.run("PRAGMA recursive_triggers = ON");
     if (options.migrate ?? true) {
       migrate(db);
     }

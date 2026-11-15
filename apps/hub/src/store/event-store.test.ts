@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HearthError, type NewEvent, type StoredEvent } from "@hearth/core";
 import { openDatabase } from "./database";
-import { MAX_READ_LIMIT, SqliteEventStore } from "./event-store";
+import { MAX_EVENT_PAYLOAD_BYTES, MAX_READ_LIMIT, SqliteEventStore } from "./event-store";
 
 const scope = { workspaceId: "ws_default" };
 const other = { workspaceId: "ws_other" };
@@ -163,6 +163,54 @@ describe("append", () => {
       (await rejection(store.append({ workspaceId: "" }, S, { type: "x", payload: 1 }))).code,
     ).toBe("event.invalid");
     expect(rowCount()).toBe(0);
+  });
+
+  test("a payload that is not JSON rejects as event.invalid, not a raw TypeError", async () => {
+    const cycle: Record<string, unknown> = {};
+    cycle["self"] = cycle;
+    const payloads: unknown[] = [
+      10n,
+      { n: 10n },
+      cycle,
+      () => 1,
+      { f: () => 1 },
+      [Symbol("s")],
+      {
+        toJSON() {
+          throw new Error("boom");
+        },
+      },
+    ];
+    for (const payload of payloads) {
+      const error = await rejection(
+        store.append(scope, S, { type: "x", payload: payload as NewEvent["payload"] }),
+      );
+      expect(error.code).toBe("event.invalid");
+      expect(error.owner).toBe("hub");
+    }
+    expect(rowCount()).toBe(0);
+  });
+
+  test("caps the serialized payload at MAX_EVENT_PAYLOAD_BYTES", async () => {
+    expect(MAX_EVENT_PAYLOAD_BYTES).toBe(4 * 1024 * 1024);
+    // JSON.stringify of a string adds two quote bytes.
+    const atCap = "a".repeat(MAX_EVENT_PAYLOAD_BYTES - 2);
+    expect(await store.append(scope, S, { type: "x", payload: atCap })).toEqual({
+      seq: 1,
+      duplicate: false,
+    });
+    const overCap = `${atCap}a`;
+    expect((await rejection(store.append(scope, S, { type: "x", payload: overCap }))).code).toBe(
+      "event.invalid",
+    );
+    // The cap is in UTF-8 bytes, not characters: "é" is two bytes.
+    const multiByte = "é".repeat(MAX_EVENT_PAYLOAD_BYTES / 2);
+    expect((await rejection(store.append(scope, S, { type: "x", payload: multiByte }))).code).toBe(
+      "event.invalid",
+    );
+    expect(rowCount()).toBe(1);
+    const page = await store.read(scope, S, 0, 10);
+    expect(page.events[0]?.payload).toBe(atCap);
   });
 
   test("a failed write rejects with a hub-owned error and writes nothing", async () => {
