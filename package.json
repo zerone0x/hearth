@@ -5,7 +5,8 @@
   "packageManager": "bun@1.4.4",
   "workspaces": [
     "apps/*",
-    "packages/*"
+    "packages/*",
+    "spikes/*"
   ],
   "scripts": {
     "check": "bun run typecheck && bun run lint && bun run format:check && bun run pins && bun test",
