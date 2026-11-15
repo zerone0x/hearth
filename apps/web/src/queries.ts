@@ -74,6 +74,11 @@ export async function readNewEvents(
   }
 }
 
+/** How long until the next poll of a chat. */
+export function pollInterval(chat: HearthChat | undefined): number {
+  return chat !== undefined && isRunning(chat) ? POLL_RUNNING_MS : POLL_IDLE_MS;
+}
+
 /** The session's chat, polled from the last cursor: every 0.7 s while a turn runs, else every 3 s. */
 export function useChat(sessionId: string, client: QueryClient) {
   return useQuery({
@@ -86,10 +91,7 @@ export function useChat(sessionId: string, client: QueryClient) {
     structuralSharing: false,
     // Leaving the page drops the chat; coming back rebuilds it from the log.
     gcTime: 0,
-    refetchInterval: (query) =>
-      query.state.data !== undefined && isRunning(query.state.data)
-        ? POLL_RUNNING_MS
-        : POLL_IDLE_MS,
+    refetchInterval: (query) => pollInterval(query.state.data),
     refetchIntervalInBackground: true,
   });
 }

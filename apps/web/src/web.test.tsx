@@ -14,7 +14,7 @@ import {
   toolTarget,
   toPiClientEvent,
 } from "./hearthPi";
-import { readNewEvents } from "./queries";
+import { POLL_IDLE_MS, POLL_RUNNING_MS, pollInterval, readNewEvents } from "./queries";
 import { ChatRuntime, Thread } from "./Thread";
 
 let seq = 0;
@@ -255,6 +255,26 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     const html = render(chat);
     expect(html).toContain('role="alert"');
     expect(html).toContain("The runner failed: disk full");
+  });
+
+  test("runner.failed during a running turn stops it", () => {
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("message.user", { text: "go" }),
+      ev("pi.agent_start"),
+      ev("pi.message_start", { message: user("go") }),
+      ev("runner.failed", { message: "boom" }),
+    ]);
+    expect(chat.pi.runStatus).toBe("failed");
+    expect(isRunning(chat)).toBe(false);
+  });
+
+  test("the poll is fast while a turn runs and slow otherwise", () => {
+    expect(POLL_RUNNING_MS).toBeLessThan(POLL_IDLE_MS);
+    expect(pollInterval(undefined)).toBe(POLL_IDLE_MS);
+    expect(pollInterval(emptyChat(S))).toBe(POLL_IDLE_MS);
+    expect(pollInterval(applyHubEvents(emptyChat(S), [ev("pi.agent_start")]))).toBe(
+      POLL_RUNNING_MS,
+    );
   });
 
   test("a notice stays between the turns it happened between", () => {
