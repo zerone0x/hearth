@@ -35,6 +35,10 @@ there is no build step between workspaces. The one build is `apps/web`
 `tsconfig.json` (DOM types), checked by `bun run typecheck`. Tests sit next to the code as
 `*.test.ts`.
 
+## Web UI
+
+- `apps/web` is React + Tailwind (decision 0017); do not add Lit or other web-components UI libraries.
+
 ## Boundary rules (PRD §7)
 
 - Business code never calls Docker, reads or writes SQLite, or reads secrets from

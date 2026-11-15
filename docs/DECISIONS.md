@@ -1374,6 +1374,9 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
 
 ### Decision
 
+- **UI stack (owner decision).** `apps/web` uses React and Tailwind. Lit
+  and other web-components UI libraries are not used; changing the stack
+  needs a new decision.
 - **`apps/web`: React 19 + Vite 8 + Tailwind 4**, dependencies pinned
   exactly. It has its own `tsconfig.json` (DOM lib, `jsx: react-jsx`,
   `vite/client` types); the root `typecheck` runs both projects, and the root
