@@ -13,9 +13,10 @@
   [handling-secrets], [warden-guardrails], [autopilot], [rulebooks],
   [how-to-write-a-rulebook].
 - **Not read, so unverified:** the Warden binary itself. The CLI downloads it as a
-  plugin (`cli/src/commands/warden.rs:193-211`); its source is not in this repo, so
-  anything about Warden's policy engine comes only from its CLI flags and the docs.
-  Also unverified: the stakpak.dev backend that stores rulebooks.
+  plugin (`get_warden_plugin_path`, `cli/src/commands/warden.rs:166-183`); its
+  source is not in this repo, so anything about Warden's policy engine comes only
+  from its CLI flags and the docs. Also unverified: the stakpak.dev backend that
+  stores rulebooks.
 - **Clean room.** This doc describes mechanisms in our own words. No stakpak code
   is copied into Hearth. If we build one of these ideas, we build it from this
   description and credit the idea in a DECISIONS entry.
@@ -71,14 +72,15 @@ boundary**. There is no vault, and no network proxy is involved.
    chars>]` (`libs/shared/src/secrets/mod.rs:247-250`). `redact_secrets`
    (`mod.rs:59-169`) also re-redacts every value **already in the session map**
    wherever it appears, even if no rule would match it now (`mod.rs:80-104`). It
-   keeps the longest of any overlapping matches and skips text that is already a
-   token (`mod.rs:11-31`, `65-71`). The same value always maps to the same token.
+   keeps the longest of any overlapping matches (`mod.rs:112-142`) and skips text
+   that is already a token (`mod.rs:11-31`, `65-71`). The same value always maps
+   to the same token.
 3. **Where redaction runs.**
    - On user input before it goes to the model
      (`cli/src/commands/agent/run/mode_async.rs:427`, `:479`;
      `tui/src/services/handlers/input.rs:773`, `:994`).
    - On every **text** content item of every tool result, in the host-side MCP
-     proxy (`libs/mcp/proxy/src/server/mod.rs:396-410`, called at `:699`).
+     proxy (`libs/mcp/proxy/src/server/mod.rs:397-412`, called at `:696`).
 4. **Restoration.** Before a tool call is forwarded to the real MCP server, the
    proxy walks the whole JSON argument tree and replaces tokens with the real
    values from the map (`libs/mcp/proxy/src/server/mod.rs:327-345`). It uses a
@@ -144,8 +146,10 @@ they reach your environment" ([warden-guardrails], line 7).
 
 - Warden is a **separate binary**. The CLI downloads it from
   `warden-cli-releases.s3.amazonaws.com` for linux-x86_64, darwin and windows
-  (`cli/src/commands/warden.rs:193-211`; plugin fallbacks at `:640-700`). Its source
-  is not in `stakpak/agent`.
+  (`get_warden_plugin_path`, `cli/src/commands/warden.rs:166-183`). The generic
+  plugin loader builds the URL (`cli/src/utils/plugins.rs:462-508`) and, if the download
+  fails, falls back to an older copy in the plugins dir or one on `PATH`
+  (`plugins.rs:39-151`, `318-361`). Its source is not in `stakpak/agent`.
 - `warden wrap <image> -- <cmd>` runs a container image "through Warden's network
   firewall (sidecar pattern)", with Docker or Podman (`warden.rs:17-39`).
   `warden logs --blocked-only --detailed` shows stored requests, including "headers
@@ -155,7 +159,8 @@ they reach your environment" ([warden-guardrails], line 7).
   a CA it injects into the container. Unverified.
 - **Enabling it.** When a profile has `warden.enabled = true`, a top-level
   `stakpak` invocation re-executes itself inside `warden wrap ghcr.io/stakpak/agent:v<ver>`
-  (`cli/src/main.rs:316-332`; `warden.rs:350-405`). The env var
+  (`cli/src/main.rs:316-332`; `warden.rs:348-407`; image name at
+  `libs/shared/src/container.rs:9-12`). The env var
   `STAKPAK_SKIP_WARDEN=1` is set inside the container to stop recursion
   (`warden.rs:379-380`). Autopilot schedules have a `--sandbox` flag
   (`cli/src/commands/autopilot/mod.rs:192-194`). The server can run a persistent
@@ -180,13 +185,15 @@ The **in-repo** guard against destructive commands is a different thing: the
 - `ToolApprovalPolicy` maps a tool name to `Approve` / `Ask` / `Deny`, ordered from
   least to most restrictive (`libs/agent-core/src/types.rs:263-280`). Defaults:
   read-only tools are approved, mutating tools (`run_command`, `create`,
-  `str_replace`, …) ask, and anything unknown asks (`types.rs:105-136`).
+  `str_replace`, …) ask, and anything unknown asks (`types.rs:90-136`).
   Unattended use takes an allowlist where everything else is denied
   (`types.rs:138-155`).
 - For shell tools, the command string is **parsed with tree-sitter-bash** into
   every simple command, recursing into pipelines, `&&`/`||`/`;` lists, subshells,
   `$(...)`, backticks and `bash -c` nesting
-  (`libs/shell-tool-approvals/src/parse.rs:43-63`;
+  (`libs/shell-tool-approvals/src/parse.rs:63-111`: a stack walk visits every
+  `command` node in the syntax tree, and `bash -c` / `env sh -c` / `xargs sh -c`
+  scripts are queued and parsed again up to depth 5, `:87-96`, `:217-268`;
   spec in `docs/architecture-enhancements/09-hierarchical-run_command-approvals.md:46-80`).
   Rules are keys like `run_command::rm::-rf`. In one scope the most specific key
   wins, and **across the sub-commands of one script the most restrictive action
@@ -228,8 +235,8 @@ are matched only as well as the regex happens to allow. See F1.
 - `up` installs an **OS user service** and lets the OS supervise it. On Linux this
   is a systemd user unit with `Type=simple`, `Restart=on-failure`, `RestartSec=5`,
   stdout and stderr appended to log files, and `WantedBy=default.target`
-  (`autopilot/mod.rs:4136-4180`, unit text at `:4172`). On macOS it is a launchd
-  agent (`:4030-4085`). `--foreground` skips the service.
+  (`autopilot/mod.rs:4136-4196`, unit text at `:4172`). On macOS it is a launchd
+  agent (`:4230-4316`). `--foreground` skips the service.
 - One process runs everything: the embedded HTTP server, the chat gateway
   (`:1416`) and the scheduler task (`:1506`) are tokio tasks in
   `start_foreground_runtime` (`:1125`). If one crashes, the whole service restarts.
@@ -247,7 +254,7 @@ A schedule is cron + prompt + an optional **check script**. The scheduler is
    (`has_running_run`), not a conditional claim.
 2. The check script runs with a timeout (default 30 s, `watch/config.rs:162-164`).
    It must be executable. Its stdout, stderr, exit code and a timed-out flag are
-   kept (`watch/executor.rs:112-215`). On timeout the child is killed through
+   kept (`watch/executor.rs:110-220`). On timeout the child is killed through
    `kill_on_drop` (`executor.rs:82`, `:188`), which kills **only the direct
    child**, not its process group.
 3. The agent is woken only if the exit code matches `trigger_on`: `failure`
@@ -271,7 +278,7 @@ whose errors are ignored (`db.rs:203-215`).
 
 ### What `doctor` checks
 
-`run_autopilot_probes` (`cli/src/commands/autopilot/probes.rs:221-273`). Each probe
+`run_autopilot_probes` (`cli/src/commands/autopilot/probes.rs:221-274`). Each probe
 has an id, a severity (blocking or not), a status (pass, warn, fail or skip), a
 summary and a remediation command:
 
@@ -282,7 +289,7 @@ summary and a remediation command:
 - memory, with 2 GB+ recommended (`:413`; [autopilot] lines 43-46)
 - bind port free, or already held by the running server (`:514`)
 - **systemd linger**, so user services survive logout, with the remediation
-  `sudo loginctl enable-linger <user>` (`:636-690`)
+  `sudo loginctl enable-linger <user>` (`:636-703`)
 - doctor only: disk headroom in `$HOME` (`:705`) and sandbox mount inputs, meaning
   the host paths that Warden will mount (`:773`)
 
@@ -321,7 +328,8 @@ service). Hearth is a compose deployment (#47), where Docker's
   (`libs/api/src/local/skills/mod.rs:7-40`). Only **metadata** (the one-line
   description) goes into context, as an `<available_skills>` block added to the
   first user message (`cli/src/utils/agent_context.rs:42-96`). The body is fetched
-  on demand by the `load_skill` tool (`libs/agent-core/src/types.rs:95`). The docs
+  on demand by the `load_skill` tool (`libs/mcp/server/src/remote_tools.rs:348-407`),
+  which is auto-approved (`libs/agent-core/src/types.rs:95`). The docs
   say tags are what "the agent uses to decide when to pull the rule book"
   ([how-to-write-a-rulebook], line 23).
 
@@ -385,8 +393,10 @@ See F6.
     (`libs/gateway/src/dispatcher.rs:58-60`).
   - A new user message to a session that is waiting **rejects the pending batch**
     and queues the message (`dispatcher.rs:333-337`).
-  - Approvals **expire**: the prompt is edited to say it expired, and the run
-    resumes with the remaining time budget (`dispatcher.rs:675-690`, `:740`).
+  - Approvals **expire**: a press that arrives after the run stopped waiting only
+    edits the prompt to say it expired (`dispatcher.rs:728-745`). After a decision
+    that goes through, the run resumes with what is left of its time budget
+    (`:778-788`).
   - In a **direct chat only the requester** can resolve. In **group chats anyone**
     can, and only a warning is logged (`dispatcher.rs:699-717`).
   - The gateway-wide mode is `allow_all` (default), `deny_all` or `allowlist`
