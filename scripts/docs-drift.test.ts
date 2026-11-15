@@ -86,6 +86,19 @@ describe("README configuration table", () => {
     ]);
   });
 
+  test("a row with an empty Read by cell is drift", () => {
+    const readme = `## Configuration
+
+| Variable | Default | Read by | Meaning |
+| --- | --- | --- | --- |
+| \`HEARTH_A\` | \`1\` |  | a |
+`;
+    const files = [{ path: "a.ts", text: 'env["HEARTH_A"]' }];
+    expect(configDrift(readmeConfigRows(readme), files, files)).toEqual([
+      "README row HEARTH_A names no file that reads it",
+    ]);
+  });
+
   test("lists every variable the code reads, each with a file that reads it", () => {
     const files = trackedFiles();
     const readme = readFileSync(join(root, "README.md"), "utf8");

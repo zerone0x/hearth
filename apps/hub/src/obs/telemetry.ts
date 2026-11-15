@@ -7,7 +7,7 @@
  *   and the tool RPC carries them to the box (`traceparent`, protocol 1.2).
  * - **Export is off by default.** Spans and metrics leave the hub only when
  *   `OTEL_EXPORTER_OTLP_ENDPOINT` (or the per-signal
- *   `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `..._METRICS_ENDPOINT`) is set; any
+ *   `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) is set; any
  *   OTLP/HTTP backend works (Jaeger, Grafana, Langfuse, Phoenix). Without
  *   one, ended spans go nowhere.
  * - Spans carry ids, names, models, token counts and timings, never message

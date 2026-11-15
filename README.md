@@ -74,7 +74,8 @@ Hub:
 | `HEARTH_VERSION` | package version + git sha | `apps/hub/src/obs/version.ts` | build stamped on `/healthz`, trajectories and spans (0021) |
 | `HEARTH_LOG_LEVEL` | `info` | `apps/hub/src/obs/setup.ts` | `debug`, `info`, `warn` or `error` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no export) | `apps/hub/src/obs/telemetry.ts` | OTLP endpoint for traces and metrics (0021) |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | `apps/hub/src/obs/telemetry.ts` | per-signal endpoint (`..._METRICS_ENDPOINT` likewise) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | `apps/hub/src/obs/telemetry.ts` | per-signal endpoint for traces |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | unset | `apps/hub/src/obs/telemetry.ts` | per-signal endpoint for metrics (the name is built at run time, so the drift check cannot see it) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | `apps/hub/src/obs/telemetry.ts` | headers for the exporter |
 | `OTEL_SDK_DISABLED` | unset | `apps/hub/src/obs/telemetry.ts` | `true` turns export off |
 
