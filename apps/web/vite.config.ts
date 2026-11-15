@@ -1,11 +1,14 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
 // Static assets for the hub to serve same-origin (decision 0017). No inline
 // scripts: the entry is a module file, so the hub's CSP needs no 'unsafe-inline'.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // shadcn/ui source imports `@/…` (components.json).
+  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
   build: {
     outDir: "dist",
     emptyOutDir: true,
