@@ -22,6 +22,7 @@ import {
   markerEgressCheck,
   requireBoxEgress,
 } from "./box/egress";
+import { ToolRpcClient } from "./box/tool-rpc";
 import {
   DESKTOP_CLOSE,
   DesktopBridge,
@@ -29,7 +30,6 @@ import {
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
-import { ToolRpcClient } from "./box/tool-rpc";
 import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
 import {

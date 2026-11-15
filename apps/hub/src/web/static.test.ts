@@ -28,7 +28,10 @@ function webRoot(): string {
   const dir = tempDir();
   const root = join(dir, "dist");
   mkdirSync(join(root, "assets"), { recursive: true });
-  writeFileSync(join(root, "index.html"), '<!doctype html><script type="module" src="/assets/a.js">');
+  writeFileSync(
+    join(root, "index.html"),
+    '<!doctype html><script type="module" src="/assets/a.js">',
+  );
   writeFileSync(join(root, "assets", "a.js"), "console.log(1)");
   writeFileSync(join(dir, "secret.txt"), "hub secret");
   symlinkSync(join(dir, "secret.txt"), join(root, "assets", "link.txt"));
@@ -99,7 +102,10 @@ describe("web UI assets (decision 0017)", () => {
     expect((await h.get("/v1/sessions")).status).toBe(401);
     expect((await h.get("/v1/nope")).status).toBe(401);
     expect((await h.get("/v1")).status).toBe(401);
-    const post = await h.get("/", { method: "POST", headers: { "content-type": "application/json" } });
+    const post = await h.get("/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
     expect(post.status).toBe(401);
     // Signed in, a /v1 path is still the API's, never a file.
     const session = h.auth.issueSession(LOCAL_PRINCIPAL);
