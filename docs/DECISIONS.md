@@ -2212,3 +2212,34 @@ passed on that black screen.
   but Chromium may report that it did not shut down correctly on the next
   start.
 - Desktop supervision beyond Chromium (Xvnc or Openbox dying) is still #15.
+
+## 0027: Runner restart: a finished but unpersisted tool call is marked outcome-unknown
+
+Status: accepted. Clarifies 0015 ("Hub restart mid-tool"); behavior unchanged.
+
+When one assistant message holds two tool calls and the hub restarts after the
+first call finished but before its result was stored as `runner.entry`, the
+rebuilt runner treats that call like any call with no stored result: it gets
+the `RESTART_OUTCOME_UNKNOWN` error result, even though the event log may
+already hold its `pi.tool_execution_end`.
+
+- **Kept as is, not recovered from the log.** The safe direction: the model is
+  told to check the box before it repeats the call, and nothing re-runs it.
+  Recovering would trust a second record (`pi.tool_execution_end` has no
+  `runner.entry`, so the result's message shape and ordering would have to be
+  rebuilt by hand) for a rare window, with a wrong-result risk that outweighs
+  one extra check by the model.
+- The rule is therefore simple: a call has a result only when its result entry
+  is persisted.
+- Two records then differ on purpose. The trajectory (0021) keeps the call's
+  real outcome, from the `runner.step` (`kind: "tool_call"`) that the turn
+  tracer stored at `tool_execution_end`; the rebuilt model context gets the
+  outcome-unknown result. The trajectory shows what happened in the box; the
+  model context shows only what the runner can vouch for.
+- The rebuild also records `runner.outcome-unknown` for this call, as 0015
+  says, with the call's id in `toolCallIds` (one event per rebuild that found
+  orphans), so the trajectory shows an `outcome_unknown` entry next to the
+  real step.
+
+Test follow-ups from #75 (JSON-escaped secret redaction and the failed
+`runner.context` call result) are in `runner.test.ts`.

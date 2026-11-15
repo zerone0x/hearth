@@ -1003,6 +1003,11 @@ describe("lease and AGENTS.md refresh (review of #63)", () => {
     expect(h.sessions.inFlight).toBe(0);
     expect(runner.status).toBe("failed");
     expect(runner.failure).toContain("disk full writing runner.context");
+    // The failed call's own result is the append error (prepare rethrows it).
+    const [first] = toolResults(runner.messages);
+    expect(first?.id).toBe("c1");
+    expect(first?.isError).toBe(true);
+    expect(first?.text).toContain("disk full writing runner.context");
     expect(h.events.types("se_a")).toContain("runner.failed");
     expect(h.sessions.failed).toEqual([
       { sessionId: "se_a", reason: "runner failed: disk full writing runner.context" },
@@ -1070,13 +1075,14 @@ describe("model key redaction (review of #63)", () => {
     h: Harness,
     logs: string[],
     tools: SessionRunnersOptions["tools"] = h.rpc,
+    secrets: SecretStore = keyed,
   ): Promise<SessionRunners> {
     const runners = new SessionRunners({
       authorizer: allowAll,
       events: h.events,
       sessions: h.sessions,
       tools,
-      secrets: keyed,
+      secrets,
       config: { provider: "faux", model: h.faux.getModel().id, apiKeyRef: "env:X" },
       modelRuntime: h.runtime,
       boxCwd: h.root,
@@ -1153,5 +1159,83 @@ describe("model key redaction (review of #63)", () => {
     } finally {
       prompt.mockRestore();
     }
+  });
+
+  // A key with characters JSON escapes (`"` and `\`): the escaped form differs
+  // from the raw one, so each redaction site must replace both.
+  const TRICKY = 'sk-"a\\b-9f8e7d6c';
+  const TRICKY_ESCAPED = JSON.stringify(TRICKY).slice(1, -1);
+  const trickyKeyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(TRICKY) };
+
+  test("a runner failure naming a JSON-escapable key redacts both forms everywhere", async () => {
+    expect(TRICKY_ESCAPED).not.toBe(TRICKY);
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs, h.rpc, trickyKeyed);
+    writeFileSync(join(h.root, "AGENTS.md"), "hi\n");
+    // The runner.context append fails with an error that holds the key twice:
+    // escaped inside a JSON body, and raw after it.
+    h.events.failOn = (_s, e) => {
+      if (e.type !== "runner.context") return false;
+      throw new Error(`store said ${JSON.stringify({ key: TRICKY })} for ${TRICKY}`);
+    };
+    h.faux.setResponses([call("ls", { path: "." }, "c1"), fauxAssistantMessage("ok")]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    expect(runner.status).toBe("failed");
+    expect(runner.failure).toBe(`store said {"key":"${REDACTED}"} for ${REDACTED}`);
+    expect(logs).not.toHaveLength(0);
+    expect(h.sessions.failed).not.toHaveLength(0);
+    const failedEvents = h.events.of("se_a", "runner.failed");
+    expect(failedEvents).toHaveLength(1);
+    const texts = {
+      failure: runner.failure ?? "",
+      event: JSON.stringify(failedEvents),
+      logs: logs.join("\n"),
+      failed: JSON.stringify(h.sessions.failed),
+      stored: JSON.stringify([...h.events.all.values()]),
+    };
+    // Not checked: the in-memory tool result of c1 is the raw append error. The
+    // runner is failed, so it is never stored (`stored` above) or sent to the model.
+    for (const [where, text] of Object.entries(texts)) {
+      expect([where, text.includes(REDACTED)]).toEqual([where, true]);
+      expect([where, text.includes(TRICKY)]).toEqual([where, false]);
+      expect([where, text.includes(TRICKY_ESCAPED)]).toEqual([where, false]);
+    }
+  });
+
+  test("a hub log line naming a JSON-escapable key redacts both forms", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    // The box read error reaches the hub log unredacted (runners.ts, AGENTS.md
+    // refresh): only the runners' own log redaction stands between it and the log.
+    const runners = await keyedRunners(
+      h,
+      logs,
+      {
+        operations: (boxId, callId) => {
+          const ops = h.rpc.operations(boxId, callId);
+          if (!callId.startsWith("context_")) return ops;
+          return {
+            ...ops,
+            ls: {
+              ...ops.ls,
+              exists: async () => {
+                throw new Error(`box echoed ${JSON.stringify({ key: TRICKY })} and ${TRICKY}`);
+              },
+            },
+          };
+        },
+      },
+      trickyKeyed,
+    );
+    h.faux.setResponses([call("ls", { path: "." }, "c1"), fauxAssistantMessage("ok")]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    await (await runners.runner("se_a")).settled();
+    const text = logs.join("\n");
+    expect(text).toContain(`box echoed {"key":"${REDACTED}"} and ${REDACTED}`);
+    expect(text).not.toContain(TRICKY);
+    expect(text).not.toContain(TRICKY_ESCAPED);
   });
 });
