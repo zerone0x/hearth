@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.0** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.1** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -70,7 +70,7 @@ Direction: **B→H** box to hub, **H→B** hub to box, **both** either side.
 | `session.hibernate` | H→B | fire-and-forget | Hibernate a session |
 | `hibernate.done` | B→H | at-least-once | Answer to `session.hibernate`: `hibernated`, `busy` or `failed` |
 | `usage.report` | B→H | at-least-once | Token usage of one model call |
-| `rpc` | both | fire-and-forget | Request; the caller times it out with its own deadline |
+| `rpc` | both | fire-and-forget | Request; the caller times it out with its own deadline. Tool methods: [Tool RPC](#tool-rpc-11) |
 | `rpc.result` | both | fire-and-forget | Answer to the `rpc` with the same `id`: a result or an error |
 | `delivery.ack` | H→B | fire-and-forget | A delivery was applied (written), not just received |
 | `desktop.lock` | H→B | fire-and-forget | Current desktop lock holder and lease (PRD §8.3) |
@@ -143,6 +143,70 @@ it before it sends anything. On reconnect the hub:
    `hibernate.done`. Each re-send keeps its original `turnId` or `requestId`,
    so the box ignores one it already applied, in any order: a replayed assign
    that arrives after the session was hibernated does not wake it.
+
+## Tool RPC (1.1)
+
+The hub-side pi runner sends tool calls to the box as ordinary `rpc` frames,
+answered by `rpc.result` (PRD §8.2.1, decisions 0009 and 0011). Types, guards
+and limits are in `src/tools.ts`: `decodeToolParams`, `decodeToolResult`,
+`toolDeadlineMs`, `classifyToolError`.
+
+| Method | pi operation | Params (besides `callId`) | Result |
+|---|---|---|---|
+| `tool.readFile` | `ReadOperations.readFile`, `EditOperations.readFile` | `path` | `data` (base64), `size` |
+| `tool.access` | `ReadOperations.access` (`write: false`), `EditOperations.access` (`write: true`) | `path`, `write` | `{}` |
+| `tool.imageMimeType` | `ReadOperations.detectImageMimeType` | `path` | `mimeType` or `null` |
+| `tool.writeFile` | `WriteOperations.writeFile`, `EditOperations.writeFile` | `path`, `content` (UTF-8) | `bytes` |
+| `tool.mkdir` | `WriteOperations.mkdir` (recursive) | `path` | `{}` |
+| `tool.exists` | `LsOperations.exists`, `FindOperations.exists` | `path` | `exists` |
+| `tool.stat` | `LsOperations.stat`, `GrepOperations.isDirectory` | `path` | `isDirectory`, `isFile`, `size` |
+| `tool.readdir` | `LsOperations.readdir` | `path` | `entries`, `omitted` |
+| `tool.glob` | `FindOperations.glob` | `pattern`, `cwd`, `ignore`, `limit` | `paths` (relative to `cwd`), `limitReached` |
+| `tool.grep` | the grep tool's `execute()`, run as `rg` in the box | `pattern`, `path`, `glob?`, `ignoreCase`, `literal`, `context`, `limit` | `output`, `matches`, `limitReached`, `truncatedBytes` |
+| `tool.exec` | `BashOperations.exec` | `command`, `cwd`, `timeoutMs` | `outcome` (`exited`, `timed-out`, `cancelled`), `exitCode`, `output`, `truncatedBytes`, `fullOutputPath` |
+| `tool.cancel` | pi's abort signal | `target` (the `rpc` id) | `found` |
+
+Rules:
+
+- **`callId`** is pi's tool call id, for logs and audit. The **`rpc` id is the
+  idempotency key**: the box runs an id at most once per boot. A re-send of a
+  running id is answered when it ends, of a finished id with the same answer,
+  and of an id whose answer was evicted with `tool.result-expired`. The hub
+  mints ids as `tool_<uuid>`.
+- **No environment crosses.** `tool.exec` has no `env` field (the decoder drops
+  one). The box runs commands with its own minimal environment.
+- **Paths are box paths inside `/workspace`.** Relative ones resolve against
+  it. The box refuses absolute paths outside it, any `..` segment, and paths
+  that leave it through a symlink (`tool.path-escape`). The box does not
+  expand `~`; the runner rewrites it before the call.
+- **Limits:** files up to `MAX_TOOL_FILE_BYTES` (1 MiB) per read or write;
+  output up to `MAX_TOOL_OUTPUT_BYTES` (256 KiB), keeping the tail behind a
+  `truncationMarker`; a truncated command's whole output (up to 16 MiB) is
+  written in the box under `/workspace/.hearth/exec/` and named by
+  `fullOutputPath`; lists up to 10,000 entries; `MAX_CONCURRENT_TOOL_CALLS`
+  (16) per box, past which a call gets `tool.busy`. A command runs for
+  `timeoutMs` (at most 1 h) and is then killed with its whole process group,
+  as on `tool.cancel`; searches stop after `SEARCH_TIMEOUT_MS` (30 s).
+- **Deadline.** The hub times every call with `toolDeadlineMs(method, params)`:
+  the box's own budget for the call plus `TOOL_DEADLINE_GRACE_MS` (5 s). A
+  call past it fails with `tool.deadline`; a command is cancelled.
+- **Reconnect mid-call.** A dropped connection does not end a call. If the box
+  comes back with the **same `bootId`**, the hub re-sends the call with the
+  same id and gets its one answer. If it comes back with a **new `bootId`**,
+  the call's outcome is unknown: it fails with `tool.outcome-unknown` and is
+  never re-sent. Mutating methods (`tool.writeFile`, `tool.mkdir`,
+  `tool.exec`) are then `give-up`; read-only ones are `retry`.
+
+Error codes and their classification (`TOOL_ERRORS`):
+
+| Code | Owner | Disposition |
+|---|---|---|
+| `tool.bad-params` | `hub` | `give-up` |
+| `tool.path-escape`, `tool.not-found`, `tool.permission`, `tool.not-a-directory`, `tool.is-a-directory`, `tool.too-large` | `user` | `give-up` |
+| `tool.busy` | `box` | `retry` |
+| `tool.io`, `tool.result-expired` | `box` | `give-up` |
+| `tool.internal` | `box` | `retry-cold` |
+| `tool.deadline`, `tool.outcome-unknown` | `box` | `give-up` when mutating, `retry` when read-only |
 
 ## Versioning
 

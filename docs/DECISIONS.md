@@ -651,3 +651,86 @@ sandbox starts only when a tool needs it; and pi's containerization guide.
   through the SecretStore, and a minimal local login with Host, Origin and
   Content-Type checks on the API (#33), since a web page can now make pi run
   commands.
+
+## 0011: Tool execution RPC (protocol 1.1) and the box-agent executor
+
+- Date: 2026-11-15
+- Status: accepted
+- Issue: #41 (and its comment from the #38 verification)
+
+### Decision
+
+- **Protocol 1.1 adds tool methods, no frame types.** Twelve `rpc` methods in
+  `packages/protocol/src/tools.ts`: `tool.readFile`, `tool.access`,
+  `tool.imageMimeType`, `tool.writeFile`, `tool.mkdir`, `tool.exists`,
+  `tool.stat`, `tool.readdir`, `tool.glob`, `tool.grep`, `tool.exec` and
+  `tool.cancel`. They map one to one onto pi's `ReadOperations`,
+  `WriteOperations`, `EditOperations`, `BashOperations`, `LsOperations`,
+  `FindOperations` and `GrepOperations.isDirectory` (pi 1.5.2), so the runner
+  (#43) passes them to `create*ToolDefinition` unchanged. `tool.grep` is the
+  whole search, run as `rg` in the box (pi's grep always runs a local `rg`).
+  A minor bump: a 1.0 peer answers the methods as unknown.
+- **The idempotency key is the `rpc` id, not pi's tool call id.** One pi tool
+  call makes several operations (edit: access, read, write), so each call
+  carries pi's id as `callId` for logs and audit, and the box runs each `rpc`
+  id at most once per boot. The hub mints ids as `tool_<uuid>`, so a hub
+  restart never reuses one. The box keeps finished answers (8 MiB) to answer a
+  re-send, and remembers evicted ids so a re-send gets `tool.result-expired`
+  instead of a second run.
+- **Hub-side deadline per call** (`toolDeadlineMs`): the box's own budget for
+  the call plus a 5 s grace. For `tool.exec` that is the command timeout pi
+  passes in (default 10 min, max 1 h); search methods have 30 s; file methods
+  30 s. No global timeout (PRD §8.1, principles 3, 4 and 8). A command whose
+  deadline passes is cancelled.
+- **Reconnects.** A dropped connection does not fail a call. On the **same
+  boot** the hub re-sends the call with the same id and gets the box's one
+  answer. On a **new boot** the call fails with `tool.outcome-unknown` and is
+  never re-sent; a mutating call (`writeFile`, `mkdir`, `exec`) is `give-up`,
+  a read-only one is `retry`, since running it again changes nothing.
+- **Exec answers once; output is capped and spilled into the box.** The tail
+  (256 KiB) comes back in the result, behind a `[hearth: N bytes of earlier
+  output omitted; full output in the box at …]` marker, and the whole output
+  (up to 16 MiB) is written to `/workspace/.hearth/exec/<call>.log`, a box path
+  the model can `read`. This answers the spike's (#40) finding that pi points
+  at a hub temp file when it truncates. A chunked live stream was not chosen:
+  pi accepts one `onData` call, and live output needs a box → hub channel
+  (decision 0009, a later minor bump).
+- **No hub environment crosses.** `tool.exec` has no `env` field and the decoder
+  drops one. Commands get a box-defined environment (`PATH`, `HOME`, `LANG`,
+  `TERM`, `PWD`, and `DISPLAY` in the image), never box-agent's own, which holds
+  the join token.
+- **Paths are confined to `/workspace`.** This narrows PRD §8.2.1, which let an
+  absolute path name anything in the box; the issue asked for confinement, and
+  `bash` remains the way to reach the rest of the box. Relative paths resolve
+  against `/workspace`; an absolute path must be inside it; any `..` segment is
+  refused; the existing part of the path is resolved with `realpath` and must
+  stay inside, and a dangling symlink is refused. glob does not follow
+  symlinks and refuses `..` patterns. `~` is not expanded by the box: pi
+  expands it to the hub's home, so the runner rewrites it in `tool_call`
+  (as the spike does), and a hub-home path that slips through is refused as
+  outside the workspace.
+- **Limits:** file reads and writes 1 MiB (larger files get `tool.too-large`;
+  the `file` byte stream is the later path for them), output 256 KiB, 10,000
+  list entries, 16 concurrent calls per box (`tool.busy`, retryable).
+- **Process groups.** Each command leads its own process group; a timeout or a
+  cancel sends `SIGKILL` to the group. After the shell exits the call ends
+  within 200 ms even if a background child holds the pipe; such a child is left
+  running (a server the agent started), it is only killed on timeout or cancel.
+- **Errors are classified by code** (`TOOL_ERRORS`): the model's bad request
+  (`path-escape`, `not-found`, `too-large`, …) is owner `user`, `give-up`;
+  `busy` is `box`, `retry`; an unexpected executor fault is `box`,
+  `retry-cold`. The hub client raises them as `HearthError`s, and its pi-shaped
+  `bash.exec` throws exactly `aborted` and `timeout:<seconds>`, the strings pi
+  turns into "Command aborted" and "Command timed out".
+
+### Consequences
+
+- The runner (#43) adapts `ToolRpcClient.operations(boxId, toolCallId)` per
+  call, rewrites `~`, and replaces pi's truncation hint with the box path, or
+  relies on the marker the box already puts in the output.
+- Files over 1 MiB cannot be read through `read` until the `file` stream path
+  lands; the model gets a clear error and can use `bash` (`head`, `sed`).
+- `/workspace/.hearth/` holds spill files; cleaning them up is the session
+  manager's call (they are small and per command).
+- The path check is check-then-use; code already running in the box could race
+  it. It guards against hostile paths from the model, not against `bash`.

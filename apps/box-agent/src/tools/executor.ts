@@ -383,7 +383,7 @@ export class ToolExecutor {
       "--color=never",
       "--hidden",
       "--no-follow",
-      `--max-count=${p.limit}`,
+      `--max-count=${p.limit + 1}`,
       ...(p.ignoreCase ? ["--ignore-case"] : []),
       ...(p.literal ? ["--fixed-strings"] : []),
       ...(p.context > 0 ? [`--context=${p.context}`] : []),

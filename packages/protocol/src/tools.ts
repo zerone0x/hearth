@@ -125,8 +125,9 @@ export interface ToolResults {
     readonly truncatedBytes: number;
   };
   /**
-   * `exited` with the code (`null` when a signal ended it: pi treats that as a
-   * failure), `timed-out` or `cancelled` (the process group was killed).
+   * `exited` with the code (128 + the signal number when a signal ended it, as
+   * pi asks), or `timed-out` / `cancelled` with `exitCode: null` (the box
+   * killed the process group).
    * `output` is the tail; when `truncatedBytes > 0` it starts with
    * `truncationMarker`, and `fullOutputPath` names a box path holding the
    * whole output (up to `MAX_EXEC_SPILL_BYTES`).
