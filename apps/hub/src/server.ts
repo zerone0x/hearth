@@ -6,7 +6,7 @@ import {
   HearthError,
   type Principal,
 } from "@hearth/core";
-import { createApp } from "./app";
+import { createApp, LOOPBACK_HOSTS } from "./app";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -21,6 +21,12 @@ export interface HubListenOptions {
   readonly hostname?: string;
   /** TCP port. 0 picks a free port (used by tests). */
   readonly port?: number;
+  /**
+   * Public origin behind the owner's reverse proxy (`HEARTH_PUBLIC_ORIGIN`),
+   * normalized by `parsePublicOrigin`. The API answers it besides loopback
+   * and the bound address (docs/DECISIONS.md, 0010).
+   */
+  readonly publicOrigin?: string;
 }
 
 export interface HubOptions extends HubListenOptions {
@@ -65,12 +71,19 @@ export function startHub(options: HubOptions) {
     ...(options.onApplied === undefined ? {} : { onApplied: options.onApplied }),
     ...(options.echoDeadlineMs === undefined ? {} : { echoDeadlineMs: options.echoDeadlineMs }),
   });
-  const app = createApp({ boxes });
+  const hostname = options.hostname ?? DEFAULT_HOSTNAME;
+  const app = createApp(
+    { boxes },
+    {
+      allowedHosts: [...LOOPBACK_HOSTS, hostname],
+      ...(options.publicOrigin === undefined ? {} : { publicOrigin: options.publicOrigin }),
+    },
+  );
 
   let server: Bun.Server<BoxConnection | undefined>;
   try {
     server = Bun.serve<BoxConnection | undefined>({
-      hostname: options.hostname ?? DEFAULT_HOSTNAME,
+      hostname,
       port: options.port ?? DEFAULT_PORT,
       fetch(req, srv) {
         if (new URL(req.url).pathname === BOX_SOCKET_PATH) {
@@ -170,4 +183,34 @@ export function parsePort(raw: string | undefined, fallback = DEFAULT_PORT): num
     throw new Error(`Invalid port "${raw}": expected an integer from 0 to 65535`);
   }
   return port;
+}
+
+/**
+ * Parses `HEARTH_PUBLIC_ORIGIN`: an http(s) origin such as
+ * `https://hearth.example`, returned in the form browsers send in `Origin`.
+ * Unset or empty means none. Rejects paths, queries, fragments and
+ * credentials instead of silently dropping them.
+ */
+export function parsePublicOrigin(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const invalid = () =>
+    new Error(
+      `Invalid public origin "${raw}": expected http(s)://host[:port] with nothing after it`,
+    );
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw invalid();
+  }
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    /[?#]/.test(raw)
+  ) {
+    throw invalid();
+  }
+  return url.origin;
 }

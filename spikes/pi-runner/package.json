@@ -1,0 +1,15 @@
+{
+  "name": "@hearth/spike-pi-runner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike (issue #40): pi as the hub-side brain on Bun, tools routed to a fake box, faux model. Findings: docs/spikes/pi-runner.md.",
+  "scripts": {
+    "measure": "bun src/measure.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2"
+  }
+}
