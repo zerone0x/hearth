@@ -34,13 +34,15 @@ jobs:
       - name: Lint Dockerfile
         run: docker run --rm -i hadolint/hadolint:v2.15.1 < apps/box-agent/Dockerfile
       - name: Lint shell scripts
-        run: shellcheck scripts/box-smoke.sh apps/box-agent/image/entrypoint.sh
+        run: shellcheck scripts/box-smoke.sh scripts/box-firewall.sh apps/box-agent/image/entrypoint.sh
       - name: Build and smoke-test the box image
         run: scripts/box-smoke.sh
 
   # DockerBoxProvider against a real daemon (issue #6, decision 0007). Builds the
   # box image again (jobs do not share the local image store), derives an idle
-  # variant that keeps the box running, and runs the HEARTH_DOCKER_TESTS suite.
+  # variant that keeps the box running, and runs the HEARTH_DOCKER_TESTS suites:
+  # the echo e2e on production defaults without and with the box firewall
+  # (decision 0012), then the provider tests under the firewall.
   box-provider:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -58,13 +60,55 @@ jobs:
             --build-arg "PI_VERSION=${pi_version}" -t hearth-box:ci .
           printf 'FROM hearth-box:ci\nCMD ["sleep", "infinity"]\n' |
             docker build -t hearth-box:ci-idle -
-      - name: Docker integration tests
+      # The firewall script against real iptables in throwaway network
+      # namespaces: validation before any change, atomic apply, marker last
+      # (decision 0012). As root, so `unshare -n` needs no user namespace.
+      - name: Box firewall script in a network namespace
+        run: sudo HEARTH_FIREWALL_TESTS=1 timeout 300 "$(command -v bun)" test apps/hub/src/box/firewall.test.ts
+      # A stand-in for the owner's LAN (decision 0012): a web server on
+      # 192.168.77.2 in a network namespace behind a veth pair, so traffic
+      # from a box to it is forwarded by the host like traffic to a LAN host.
+      - name: Set up a LAN host
+        run: |
+          sudo ip netns add hearthlan
+          sudo ip link add hlan-host type veth peer name hlan-ns
+          sudo ip link set hlan-ns netns hearthlan
+          sudo ip addr add 192.168.77.1/24 dev hlan-host
+          sudo ip link set hlan-host up
+          sudo ip netns exec hearthlan ip addr add 192.168.77.2/24 dev hlan-ns
+          sudo ip netns exec hearthlan ip link set lo up
+          sudo ip netns exec hearthlan ip link set hlan-ns up
+          sudo ip netns exec hearthlan ip route add default via 192.168.77.1
+          sudo ip netns exec hearthlan sh -c \
+            'nohup python3 -m http.server 8080 --bind 192.168.77.2 >/tmp/lan.log 2>&1 &'
+          curl --retry 10 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://192.168.77.2:8080/
+      # Mutation guard: without the firewall the same probes reach the host
+      # and the LAN, so the filtered run below cannot pass by accident.
+      - name: Echo on production defaults, egress open (no firewall)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+          HEARTH_TEST_LAN_URL: http://192.168.77.2:8080/
+          HEARTH_TEST_EGRESS: open
+        run: timeout 600 bun test apps/hub/src/box/echo.docker.test.ts
+      - name: Apply the box firewall
+        run: |
+          sudo scripts/box-firewall.sh apply
+          sudo scripts/box-firewall.sh apply
+          sudo iptables -S HEARTH-BOX-IN
+          sudo iptables -S HEARTH-BOX-FWD
+          sudo iptables -S DOCKER-USER
+          sudo iptables -S FORWARD
+          cat /run/hearth/box-egress.applied
+      - name: Hub-box echo round trip on production defaults, egress filtered (M0 exit, #27, #20)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+          HEARTH_TEST_LAN_URL: http://192.168.77.2:8080/
+          HEARTH_TEST_EGRESS: filtered
+        run: timeout 600 bun test apps/hub/src/box/echo.docker.test.ts
+      - name: Provider tests under the firewall
         env:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_IMAGE: hearth-box:ci-idle
         run: timeout 900 bun test apps/hub/src/box/docker/provider.docker.test.ts
-      - name: Hub-box echo round trip through the real image (M0 exit)
-        env:
-          HEARTH_DOCKER_TESTS: "1"
-          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
-        run: timeout 600 bun test apps/hub/src/box/echo.docker.test.ts

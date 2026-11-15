@@ -37,6 +37,8 @@ export interface FakeNetwork {
   Labels: Record<string, string>;
   Options: Record<string, string>;
   Internal: boolean;
+  EnableIPv6: boolean;
+  IPAM: { Config: { Subnet: string; Gateway: string }[] };
 }
 
 type Override = (req: RecordedRequest) => Response | undefined;
@@ -246,6 +248,10 @@ export class FakeDockerEngine {
         Labels: (body["Labels"] ?? {}) as Record<string, string>,
         Options: (body["Options"] ?? {}) as Record<string, string>,
         Internal: Boolean(body["Internal"]),
+        EnableIPv6: Boolean(body["EnableIPv6"]),
+        IPAM: {
+          Config: [{ Subnet: `172.30.${this.#seq}.0/24`, Gateway: `172.30.${this.#seq}.1` }],
+        },
       });
       return json(201, { Id: id, Warning: "" });
     }

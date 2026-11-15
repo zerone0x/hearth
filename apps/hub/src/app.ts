@@ -2,6 +2,7 @@ import { HearthError, type JsonValue, LOCAL_PRINCIPAL } from "@hearth/core";
 import { formatVersion, PROTOCOL_VERSION } from "@hearth/protocol";
 import { Hono } from "hono";
 import type { BoxConnections } from "./box/connections";
+import type { BoxEgressCheck } from "./box/egress";
 
 export interface AppDeps {
   readonly boxes: BoxConnections;
@@ -23,6 +24,12 @@ export interface AppOptions {
    * `parsePublicOrigin`. Its host name is allowed too.
    */
   readonly publicOrigin?: string;
+  /**
+   * The hub's box egress status (decision 0012). When set, `/healthz` reports
+   * its state as `boxEgress` so the UI can show an unfiltered or unrestricted
+   * hub; `startHub` sets it whenever a box provider is configured.
+   */
+  readonly boxEgress?: BoxEgressCheck;
 }
 
 /** Methods that carry a request body; their API calls must be JSON. */
@@ -122,8 +129,17 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
 
   // Liveness probe. The one route that does not call `authorize`: it takes no
   // input and returns no workspace data (docs/DECISIONS.md, 0001).
+  // `boxEgress` is the hub's own state, not workspace data.
+  const boxEgress = options.boxEgress;
   app.get("/healthz", (c) =>
-    c.json({ status: "ok", protocol: formatVersion(PROTOCOL_VERSION) }, 200),
+    c.json(
+      {
+        status: "ok",
+        protocol: formatVersion(PROTOCOL_VERSION),
+        ...(boxEgress === undefined ? {} : { boxEgress: boxEgress().state }),
+      },
+      200,
+    ),
   );
 
   if (deps !== undefined) {

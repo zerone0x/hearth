@@ -442,12 +442,12 @@ describe("box.start denied", () => {
 
   test("a principal of another workspace is denied: no start, no join token, audited", async () => {
     const dbPath = tempDbPath();
-    const h = startHub({ dbPath, port: 0, log: () => {} });
+    const h = startHub({ dbPath, port: 0, boxPort: 0, log: () => {} });
     hubs.push(h);
     const { provider, starts } = recordingProvider();
     const stranger: Principal = { ...LOCAL_PRINCIPAL, id: "pr_stranger", workspaceId: "ws_x" };
 
-    const error = await h.launchBox(stranger, provider, spec, h.boxSocketUrl).then(
+    const error = await h.launchBox(stranger, provider, spec, h.listenForBoxes("127.0.0.1")).then(
       () => undefined,
       (e: unknown) => e,
     );
@@ -476,11 +476,11 @@ describe("box.start denied", () => {
 
   test("the control: the owner's launch starts the box with a join token", async () => {
     const dbPath = tempDbPath();
-    const h = startHub({ dbPath, port: 0, log: () => {} });
+    const h = startHub({ dbPath, port: 0, boxPort: 0, log: () => {} });
     hubs.push(h);
     const { provider, starts } = recordingProvider();
 
-    await h.launchBox(LOCAL_PRINCIPAL, provider, spec, h.boxSocketUrl);
+    await h.launchBox(LOCAL_PRINCIPAL, provider, spec, h.listenForBoxes("127.0.0.1"));
 
     expect(starts).toHaveLength(1);
     expect(starts[0]?.env["HEARTH_JOIN_TOKEN"]).toStartWith("hjt_");

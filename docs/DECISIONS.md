@@ -709,3 +709,166 @@ its listener is #27.
   a new decision.
 - This is not authentication. Login still has to come before the API is
   exposed beyond the owner's machine.
+
+## 0012: Box listeners on box-network gateways, and a host firewall for box egress
+
+- Date: 2026-11-15
+- Status: accepted
+- Issues: #27, #20
+
+### Decision
+
+- **Two kinds of listener.** The public listener serves the UI/API only and
+  binds `HEARTH_HOST` (default `127.0.0.1`, PRD §10); the Host/Origin/JSON
+  guard of 0010 applies to it and nowhere else. It no longer upgrades
+  `/v1/box/socket`: that path is a 404 there. **Box listeners** serve only the
+  box socket (every other path is 404) and each binds **one box network's
+  gateway address** on `HEARTH_BOX_PORT` (default 8788). The gateway is the
+  host's own address on the box's bridge, so a box listener is reachable from
+  that box network and from the host, and from nowhere else. `listenForBoxes`
+  refuses `0.0.0.0`, `::` and the empty host, so the hub never binds every
+  interface for boxes. This supersedes the "hub on `0.0.0.0`" part of 0008.
+- **`DockerBoxProvider` is wired into startup.** `main.ts` builds it from
+  `HEARTH_BOX_PROVIDER` (`docker`, the default, or `none`) and
+  `dockerBoxConfigFromEnv`. `hub.startBox(principal, spec)` authorizes
+  `box.start`, runs `provider.create` (network and volumes), asks the provider
+  for the box's hub address (`hubAddress`: the IPv4 gateway of the box's
+  network), opens or reuses the box listener there, and boots the box with a
+  join token and that listener's URL. After a restart,
+  `listenForRunningBoxes` reopens the listeners of the boxes still running.
+  A box whose listener fails is logged and reported, and the others still get
+  theirs; while the provider cannot list boxes (Docker daemon down) it retries
+  with backoff (1 s doubling to 30 s) until it can or the hub stops.
+  Listeners stay open until the hub stops: one idle socket per box is cheap,
+  and reuse keeps a restarting box's address stable.
+- **Box networks are recognisable and IPv4 only.** Each box network's Linux
+  bridge is named `hbx` + 12 hex digits of the SHA-256 of the network name
+  (`com.docker.network.bridge.name`; 15 characters, the kernel's limit), the
+  network has `EnableIPv6: false`, and every box runs with
+  `net.ipv6.conf.{all,default}.disable_ipv6=1`. With no IPv6 in the box, ULA
+  and link-local IPv6 addresses are out of reach without IPv6 rules.
+- **Egress is restricted by a host firewall, `scripts/box-firewall.sh`.** The
+  owner runs `sudo scripts/box-firewall.sh apply` once per boot, after Docker
+  starts (the systemd unit in `docs/demo.md`, `After=docker.service`). It is
+  idempotent and matches the interface wildcard `hbx+`, so boxes created later
+  are covered without per-box changes:
+  - `INPUT` (anything addressed to the host itself, whichever of its
+    addresses): from `hbx+`, only TCP `HEARTH_BOX_PORT` to the address of the
+    box's own bridge (`addrtype --dst-type LOCAL --limit-iface-in`), plus
+    replies; the rest is rejected. A box reaches its own box listener, but not
+    the host's other services, not the public API and not another box's
+    listener.
+  - `DOCKER-USER` (forwarded traffic, evaluated before Docker's own rules).
+    The script makes sure `FORWARD` jumps to `DOCKER-USER`: Docker in iptables
+    mode adds that jump itself, but with its nftables firewall backend or
+    `"iptables": false` nothing would, and the chain would never be reached.
+    `FORWARD` in the iptables `filter` table is a base chain of its own, so
+    its rejects apply whatever Docker's own tables accept. From `hbx+`:
+    from `hbx+`, everything to `0/8`, `10/8`, `100.64/10`, `127/8`,
+    `169.254/16` (the cloud metadata IP), `172.16/12`, `192.0.0/24`, the
+    documentation and benchmarking nets, `192.168/16`, multicast and `240/4`
+    is rejected (TCP reset, otherwise ICMP admin-prohibited, so tools fail
+    fast). `HEARTH_BOX_EGRESS_ALLOW` lets listed IPv4 CIDRs through, for
+    example a LAN DNS resolver that Docker's embedded DNS forwards to.
+  - IPv6 from `hbx+` is dropped in `INPUT` and `FORWARD` when `ip6tables`
+    exists.
+- **Apply is validated first and atomic.** Before any rule changes, the script
+  checks the port and every `HEARTH_BOX_EGRESS_ALLOW` entry (dotted-quad IPv4,
+  prefix 1-32; a `/0` such as `0.0.0.0/0` and any IPv6 entry such as `::/0` are
+  refused) and exits 2 on the first bad one. It then writes the whole IPv4 rule
+  set, chains and jumps, as one `iptables-restore --noflush` transaction:
+  declaring `HEARTH-BOX-IN` and `HEARTH-BOX-FWD` empties and refills them in the
+  same commit, and `DOCKER-USER` is declared only when it does not exist, so
+  its other rules are kept. A failed apply therefore leaves the previous rules
+  exactly as they were, never a half-built chain. It reads back the `INPUT`,
+  `DOCKER-USER` and `FORWARD` jumps and fails rather than print "applied" when
+  one is missing.
+- **The hub refuses to start boxes without the firewall.** The script writes a
+  marker, `/run/hearth/box-egress.applied` (`HEARTH_BOX_EGRESS_MARKER`), after
+  every rule is in place; it removes the marker before it changes rules and on
+  `remove`. `/run` is tmpfs, so the marker disappears on reboot together with
+  the rules. The hub checks the marker on every `startBox`: without it
+  `startBox` fails with `box.egress-unfiltered` (owner `box`, `give-up`; the
+  message says to run the script), before `create`.
+  `HEARTH_BOX_EGRESS=unrestricted` is the owner's explicit opt-out (boxes then
+  have the egress of 0007). A hub with a provider logs `WARNING: box egress unfiltered|unrestricted`
+  at startup, and `/healthz` reports `boxEgress: "filtered" | "unrestricted" |
+  "unfiltered"` for the UI. The hub only reads a file; it still needs no
+  network privileges. The marker cannot see rules flushed by hand or by a
+  firewalld reload; the systemd unit in `docs/demo.md` re-applies on a
+  firewalld reload (`ReloadPropagatedFrom=firewalld.service`).
+- **LAN-only DNS is detected.** After `apply` the script reads the resolvers
+  Docker's embedded DNS forwards to (systemd-resolved's upstream file when the
+  host uses the stub, else `/etc/resolv.conf`; `HEARTH_RESOLV_CONF` overrides)
+  and, for each one the rules block and the allow list does not cover, prints
+  a warning and the exact `HEARTH_BOX_EGRESS_ALLOW="..."` line to apply with.
+  It is a warning, not a failure: whether such a resolver breaks box DNS
+  depends on where Docker's embedded DNS sends the query from. From the box's
+  network namespace the rules reject it; from the host's own namespace it never
+  crosses them. The CI runner shows the second case: its resolver is
+  `10.0.0.2`, the script warns, and boxes still resolve `github.com` under
+  the firewall. The warning says how to check (`getent hosts` in a box).
+- **Why a host firewall rather than the alternatives.**
+  - *An egress proxy container on an internal network* needs no host rules,
+    but only proxy-aware HTTP(S) gets out: `git` over SSH, package managers
+    with their own transports and raw TCP break, and it is one more container
+    to run, supervise and keep patched. An internal network also still leaves
+    the bridge's gateway address on the host reachable, so host services bound
+    to all interfaces stay exposed without host rules anyway.
+  - *A userspace network (slirp4netns, pasta)* belongs to rootless Docker or
+    Podman; the Docker Engine API has no per-container switch for it.
+  - *One internal network shared by the hub and all boxes* puts boxes on one L2
+    segment: ICC off would also cut the hub off, ICC on lets boxes reach each
+    other (0007).
+  - *Rules managed by the hub itself* would need `CAP_NET_ADMIN` in the host's
+    network namespace for the long-running, network-facing process. A one-shot
+    root script keeps that privilege out of the hub.
+  - A personal self-hosted install already runs Docker as root and gives the
+    hub the Docker socket, which is root-equivalent. A root one-shot at boot is
+    no new trust, and `iptables` (nft-backed on current distributions) is on
+    every Docker host.
+- **Where the hub runs.** The hub must own the gateway addresses it binds, so
+  it runs on the host or, under compose, with `network_mode: host` (the compose
+  file of PRD §11.1 item 1 follows this). Its public listener still binds
+  loopback; a reverse proxy publishes it (0010).
+- **Tests.** Unit tests cover the listener split over real sockets (the public
+  listener answers 404 on the box socket path and refuses the upgrade; a box
+  listener answers only the socket path, whatever the Host and Origin; no box
+  listener binds an unspecified address), `startBox`'s order with a stub
+  provider, the egress gate (no marker: refused, nothing created, warning
+  logged, `/healthz` says `unfiltered`; marker: starts, read again on each
+  start; `unrestricted`: starts and is logged), `listenForRunningBoxes` on a
+  fresh hub (only running boxes, per-box isolation, retry and stop) and
+  `boxProviderFromEnv`. `firewall.test.ts` runs the script against real
+  iptables in a throwaway network namespace (`unshare -rn`, or `unshare -n` as
+  root in CI with `HEARTH_FIREWALL_TESTS=1`): idempotence, the three jumps,
+  bad allow entries change nothing, a transaction the kernel refuses leaves
+  the previous rules intact and no marker, existing `DOCKER-USER` rules are
+  kept, the DNS allow line, and `remove`. In CI, the `box-provider` job runs `echo.docker.test.ts` with the
+  hub on production defaults (API on loopback, box listener on the gateway,
+  port 8788) twice. First without the firewall: the box's probes must reach a
+  host service bound to all interfaces (by the host's IP and by the gateway)
+  and a LAN host (a web server in a network namespace on `192.168.77.2`),
+  which proves the probes detect a missing rule. Then after
+  `box-firewall.sh apply`: the same probes, and `169.254.169.254`, must fail,
+  while the box listener and `https://github.com` stay reachable. In both runs
+  the public API is unreachable from the box. The provider suite then runs
+  under the firewall.
+
+### Consequences
+
+- A fresh install, and every reboot, starts boxes only after
+  `box-firewall.sh apply` (or the explicit `HEARTH_BOX_EGRESS=unrestricted`).
+  The marker says the script completed since boot, not that the rules are
+  still there; checking the live rules needs the privileges this decision
+  keeps out of the hub. A startup self-check (a throwaway box probing the
+  host) is a possible follow-up.
+- Box networks created before this change have no `hbx` bridge name and are
+  not covered; `destroy` and a fresh `create` fix them. No install depends on
+  them: a loopback hub could not run boxes before this change.
+- A home install whose only DNS resolver is on the LAN may need that resolver
+  in `HEARTH_BOX_EGRESS_ALLOW` (the script prints the line), or a public
+  resolver configured for Docker, when its Docker forwards box DNS from the
+  box's network.
+- Another provider (PRD §7 E4) implements `hubAddress` its own way; the hub
+  only needs an address it can bind and the box can reach.

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type BoxSpec, HearthError } from "@hearth/core";
 import { dockerBoxConfigFromEnv } from "./config";
 import { FakeDockerEngine, type FakeNetwork } from "./fake-engine";
-import { DockerBoxProvider, LABEL } from "./provider";
+import { BOX_BRIDGE_PREFIX, bridgeName, DockerBoxProvider, LABEL } from "./provider";
 
 const IMAGE = "ghcr.io/zerone0x/hearth-box:test";
 const spec: BoxSpec = {
@@ -45,6 +45,27 @@ beforeEach(() => {
 });
 afterEach(() => fake.close());
 
+describe("hubAddress", () => {
+  test("is the IPv4 gateway of the box's own network", async () => {
+    await provider.create(spec);
+    const network = fake.networks.get("t-box-bx_1");
+    network?.IPAM.Config.unshift({ Subnet: "fd00::/64", Gateway: "fd00::1" });
+    expect(await provider.hubAddress("bx_1")).toBe(network?.IPAM.Config[1]?.Gateway as string);
+    expect(BOX_BRIDGE_PREFIX).toBe("hbx");
+  });
+
+  test("fails for a missing network, a foreign one, or one without an IPv4 gateway", async () => {
+    expect((await rejection(provider.hubAddress("bx_1"))).code).toBe("box.network-missing");
+    fake.networks.set(NET, foreignNetwork({}));
+    expect((await rejection(provider.hubAddress("bx_1"))).code).toBe("box.name-conflict");
+    fake.networks.clear();
+    await provider.create(spec);
+    const network = fake.networks.get("t-box-bx_1");
+    if (network !== undefined) network.IPAM.Config = [];
+    expect((await rejection(provider.hubAddress("bx_1"))).code).toBe("box.network-invalid");
+  });
+});
+
 describe("create", () => {
   test("creates a labeled network and two labeled volumes, and no container", async () => {
     const info = await provider.create(spec);
@@ -63,7 +84,15 @@ describe("create", () => {
 
     const network = fake.networks.get("t-box-bx_1");
     expect(network?.Internal).toBe(false);
-    expect(network?.Options).toEqual({ "com.docker.network.bridge.enable_icc": "false" });
+    // IPv4 only, no inter-container traffic, and a bridge the host firewall
+    // matches by its `hbx` prefix (decision 0012).
+    expect(network?.EnableIPv6).toBe(false);
+    expect(network?.Options).toEqual({
+      "com.docker.network.bridge.enable_icc": "false",
+      "com.docker.network.bridge.name": bridgeName("t-box-bx_1"),
+    });
+    expect(bridgeName("t-box-bx_1")).toMatch(/^hbx[0-9a-f]{12}$/);
+    expect(bridgeName("t-box-bx_2")).not.toBe(bridgeName("t-box-bx_1"));
     expect([...fake.volumes.keys()].sort()).toEqual(["t-box-bx_1", "t-box-bx_1-home"]);
     for (const labels of [network?.Labels, fake.volumes.get("t-box-bx_1")?.Labels]) {
       expect(labels).toMatchObject({
@@ -151,6 +180,10 @@ describe("start", () => {
       MemorySwap: 2 * 1024 ** 3,
       PidsLimit: 1024,
       ShmSize: 256 * 1024 ** 2,
+      Sysctls: {
+        "net.ipv6.conf.all.disable_ipv6": "1",
+        "net.ipv6.conf.default.disable_ipv6": "1",
+      },
       CapDrop: ["ALL"],
       SecurityOpt: ["no-new-privileges:true"],
       Privileged: false,
@@ -357,6 +390,8 @@ const foreignNetwork = (labels: Record<string, string>): FakeNetwork => ({
   Labels: { ...labels },
   Options: {},
   Internal: false,
+  EnableIPv6: false,
+  IPAM: { Config: [{ Subnet: "172.31.0.0/24", Gateway: "172.31.0.1" }] },
 });
 
 /**
