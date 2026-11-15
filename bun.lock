@@ -41,6 +41,15 @@
       "name": "@hearth/protocol",
       "version": "0.0.0",
     },
+    "spikes/pi-runner": {
+      "name": "@hearth/spike-pi-runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@earendil-works/pi-agent-core": "1.5.2",
+        "@earendil-works/pi-ai": "1.5.2",
+        "@earendil-works/pi-coding-agent": "1.5.2",
+      },
+    },
   },
   "packages": {
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.129.0", "", { "dependencies": { "json-schema-to-ts": "^3.1.1", "standardwebhooks": "^1.0.0" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "optionalPeers": ["zod"], "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-MH7LB20kNpGLUpPTe2OG5XvL/KhX8HUO9XyBaFjgFk6TLS4Xjt0VPIuMKywe7POKKPslX+QxSlVok9e+8kG5Nw=="],
@@ -132,6 +141,8 @@
     "@hearth/hub": ["@hearth/hub@workspace:apps/hub"],
 
     "@hearth/protocol": ["@hearth/protocol@workspace:packages/protocol"],
+
+    "@hearth/spike-pi-runner": ["@hearth/spike-pi-runner@workspace:spikes/pi-runner"],
 
     "@isaacs/nonrecursive-glob-match": ["@isaacs/nonrecursive-glob-match@1.1.0", "", {}, "sha512-GPm/Dbvk5RLmhRnxXIa7nTpK0xtl4E0wj0MslsuNiJ1FIROU+2+9lgUC/dgF7Ey4QCWhfEsgxilMRMCdHPfDfw=="],
 
