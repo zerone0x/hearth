@@ -22,6 +22,7 @@ import {
   type ReliableFrame,
 } from "@hearth/protocol";
 import { type OutboundFrame, Outbox } from "./outbox";
+import { ToolExecutor, type ToolExecutorOptions } from "./tools/executor";
 
 /** First reconnect delay; it doubles per failed attempt up to `RECONNECT_MAX_MS`. */
 export const RECONNECT_BASE_MS = 250;
@@ -71,6 +72,8 @@ export interface BoxAgentOptions {
   readonly reconnectBaseMs?: number;
   readonly reconnectMaxMs?: number;
   readonly log?: (line: string) => void;
+  /** The tool executor's settings; without them, tool methods are refused. */
+  readonly tools?: Omit<ToolExecutorOptions, "send" | "log">;
 }
 
 /** How the agent ended: stopped on request, or refused by the hub for good. */
@@ -99,6 +102,7 @@ export class BoxAgent {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #sessionId: string | null = null;
   #connects = 0;
+  readonly #tools: ToolExecutor | undefined;
 
   constructor(options: BoxAgentOptions) {
     this.#options = options;
@@ -109,6 +113,18 @@ export class BoxAgent {
     this.done = new Promise((resolve) => {
       this.#finish = resolve;
     });
+    this.#tools =
+      options.tools === undefined
+        ? undefined
+        : new ToolExecutor({
+            ...options.tools,
+            log: this.#log,
+            // An answer written while disconnected is lost; the hub re-sends the
+            // call on the same boot and the executor answers it again.
+            send: (frame) => {
+              if (this.#phase === "open") this.#write(frame);
+            },
+          });
   }
 
   /** True between `welcome` and the next disconnect. */
@@ -251,6 +267,7 @@ export class BoxAgent {
     if (this.#phase === "ended") return;
     this.#phase = "ended";
     clearTimeout(this.#timer);
+    this.#tools?.abortAll();
     const socket = this.#socket;
     this.#socket = undefined;
     socket?.close();
@@ -296,6 +313,8 @@ export class BoxAgent {
       case "rpc":
         if (frame.method === "echo") {
           this.#write({ type: "rpc.result", id: frame.id, ok: true, result: frame.params });
+        } else if (this.#tools?.handles(frame.method)) {
+          this.#tools.handle(frame);
         } else {
           this.#write({
             type: "rpc.result",

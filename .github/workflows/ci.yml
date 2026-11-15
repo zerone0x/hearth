@@ -21,6 +21,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
+      - name: Install ripgrep (the box image has it; the grep executor test needs it)
+        run: command -v rg || { sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep; }
       - name: Install
         run: bun install --frozen-lockfile
       - name: Check
@@ -119,3 +121,8 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_IMAGE: hearth-box:ci-idle
         run: timeout 900 bun test apps/hub/src/box/docker/provider.docker.test.ts
+      - name: Tool RPC through the real image (write, read, grep, exec, setsid kill, FIFO), egress filtered
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/box/tools.docker.test.ts
