@@ -32,10 +32,10 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from "@opentelemetry/semantic-conventions/incubating";
 import type { RpcOutcome, RpcTrace } from "../box/tool-rpc";
+import { capJson, capText, type Redact } from "./cap";
 import { spanIds, type Telemetry } from "./telemetry";
 
-/** Bytes of a tool result kept in the trajectory; the rest is summarized by size and hash. */
-export const MAX_RESULT_CHARS = 16 * 1024;
+export { MAX_TEXT_BYTES } from "./cap";
 
 export interface Clock {
   /** Wall time, epoch ms. */
@@ -52,6 +52,115 @@ export interface TurnTracerOptions {
   readonly versions: { readonly pi: string; readonly hub: string };
   readonly clock?: Clock;
   readonly newId?: (prefix: string) => string;
+  /**
+   * The runner's redactor. Every text the tracer keeps (model output, tool
+   * arguments and results, errors) is redacted before it is capped and hashed.
+   */
+  readonly redact?: Redact;
+}
+
+/**
+ * What one model request asked for (schema `hearth.trajectory/2`): enough to
+ * replay it against the same model, without storing the system prompt or the
+ * tool schemas themselves (they are hashed; the event log has the messages).
+ */
+export interface ModelRequest {
+  provider: string;
+  model: string;
+  api: string | null;
+  thinking_level: string | null;
+  /** Sent in the provider payload (`before_provider_request`); null when pi did not set it. */
+  max_tokens: number | null;
+  temperature: number | null;
+  /** The model's own output limit and context window, from its definition. */
+  model_max_tokens: number | null;
+  context_window: number | null;
+  /** Provider reasoning settings found in the payload (`thinking`, `reasoning`, `reasoning_effort`). */
+  reasoning: unknown;
+  tools: string[];
+  /** sha256 of the tool declarations (name, description, parameters) as sent. */
+  tools_sha256: string;
+  system_prompt: { bytes: number; sha256: string };
+  /** Messages in the request's context, system messages excluded. */
+  message_count: number;
+}
+
+export interface RequestSnapshot {
+  readonly provider: string;
+  readonly model: string;
+  readonly api?: string | undefined;
+  readonly thinkingLevel?: string | undefined;
+  readonly modelMaxTokens?: number | undefined;
+  readonly contextWindow?: number | undefined;
+  readonly systemPrompt: string;
+  readonly tools: ReadonlyArray<{ name: string; description?: string; parameters?: unknown }>;
+  readonly messageCount: number;
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function numOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** The request record for a snapshot of pi's state just before the call. */
+export function modelRequest(s: RequestSnapshot): ModelRequest {
+  return {
+    provider: s.provider,
+    model: s.model,
+    api: s.api ?? null,
+    thinking_level: s.thinkingLevel ?? null,
+    max_tokens: null,
+    temperature: null,
+    model_max_tokens: numOrNull(s.modelMaxTokens),
+    context_window: numOrNull(s.contextWindow),
+    reasoning: null,
+    tools: s.tools.map((t) => t.name),
+    tools_sha256: sha256(
+      JSON.stringify(
+        s.tools.map((t) => ({
+          name: t.name,
+          description: t.description ?? null,
+          parameters: t.parameters ?? null,
+        })),
+      ),
+    ),
+    system_prompt: {
+      bytes: Buffer.byteLength(s.systemPrompt, "utf8"),
+      sha256: sha256(s.systemPrompt),
+    },
+    message_count: s.messageCount,
+  };
+}
+
+/** Sampling and limit fields from a provider payload, whatever the API's naming. */
+export function payloadParams(payload: unknown): {
+  max_tokens: number | null;
+  temperature: number | null;
+  reasoning: unknown;
+} {
+  const p = (payload !== null && typeof payload === "object" ? payload : {}) as Record<
+    string,
+    unknown
+  >;
+  const gen = (
+    p["generationConfig"] !== null && typeof p["generationConfig"] === "object"
+      ? p["generationConfig"]
+      : {}
+  ) as Record<string, unknown>;
+  const reasoning =
+    p["thinking"] ?? p["reasoning"] ?? p["reasoning_effort"] ?? gen["thinkingConfig"];
+  return {
+    max_tokens:
+      numOrNull(p["max_tokens"]) ??
+      numOrNull(p["max_completion_tokens"]) ??
+      numOrNull(p["max_output_tokens"]) ??
+      numOrNull(gen["maxOutputTokens"]),
+    temperature: numOrNull(p["temperature"]) ?? numOrNull(gen["temperature"]),
+    reasoning: reasoning === undefined ? null : reasoning,
+  };
 }
 
 /** What the runner records: a type and a payload, under the current turn. */
@@ -120,6 +229,8 @@ interface Turn {
         firstMono: number | undefined;
       }
     | undefined;
+  /** The request of the model call in progress (pi's `context` event). */
+  request: ModelRequest | undefined;
 }
 
 function round(ms: number): number {
@@ -138,16 +249,40 @@ function textOf(result: unknown): { text: string; images: number } {
   return { text, images };
 }
 
-/** The size-capped tool result: head, byte count and sha256 of the full text. */
-export function capResult(result: unknown): Record<string, unknown> {
+/** The size-capped tool result: redacted head, byte count and sha256 of the full text. */
+export function capResult(result: unknown, redact?: Redact): Record<string, unknown> {
   const { text, images } = textOf(result);
-  const bytes = Buffer.byteLength(text, "utf8");
+  return { ...capText(text, redact), ...(images > 0 ? { images } : {}) };
+}
+
+/**
+ * What the model answered (schema `hearth.trajectory/2`): its text, its
+ * thinking and the tool calls it asked for, each redacted and capped.
+ */
+export function modelOutput(content: unknown, redact?: Redact): Record<string, unknown> {
+  let text = "";
+  let thinking = "";
+  let redactedThinking = 0;
+  const toolCalls: Array<Record<string, unknown>> = [];
+  for (const part of Array.isArray(content) ? content : []) {
+    const p = (part ?? {}) as Record<string, unknown>;
+    if (p["type"] === "text" && typeof p["text"] === "string") text += p["text"];
+    else if (p["type"] === "thinking") {
+      if (p["redacted"] === true) redactedThinking++;
+      else if (typeof p["thinking"] === "string") thinking += p["thinking"];
+    } else if (p["type"] === "toolCall") {
+      toolCalls.push({
+        id: typeof p["id"] === "string" ? p["id"] : null,
+        name: typeof p["name"] === "string" ? p["name"] : null,
+        args: capJson(p["arguments"], redact),
+      });
+    }
+  }
   return {
-    text: text.length > MAX_RESULT_CHARS ? text.slice(0, MAX_RESULT_CHARS) : text,
-    truncated: text.length > MAX_RESULT_CHARS,
-    bytes,
-    sha256: createHash("sha256").update(text).digest("hex"),
-    ...(images > 0 ? { images } : {}),
+    text: text === "" ? null : capText(text, redact),
+    thinking: thinking === "" ? null : capText(thinking, redact),
+    ...(redactedThinking > 0 ? { redacted_thinking_blocks: redactedThinking } : {}),
+    tool_calls: toolCalls,
   };
 }
 
@@ -175,12 +310,19 @@ export class TurnTracer {
   readonly #clock: Clock;
   readonly #newId: (prefix: string) => string;
   readonly #tools = new Map<string, ToolState>();
+  readonly #redact: Redact;
   #turn: Turn | undefined;
 
   constructor(options: TurnTracerOptions) {
     this.#o = options;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#newId = options.newId ?? ((prefix) => `${prefix}_${randomUUID()}`);
+    this.#redact = options.redact ?? ((text) => text);
+  }
+
+  /** The tracer's clock, so the runner times box waits on the same one. */
+  get clock(): Clock {
+    return this.#clock;
   }
 
   get turnId(): string | undefined {
@@ -222,6 +364,7 @@ export class TurnTracer {
       tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
       cost: 0,
       model: undefined,
+      request: undefined,
     };
     const ids = spanIds(span);
     return {
@@ -296,6 +439,20 @@ export class TurnTracer {
     }
   }
 
+  /** The request pi is about to send (its `context` event), for the next model call. */
+  onRequest(snapshot: RequestSnapshot): void {
+    const turn = this.#turn;
+    if (turn === undefined) return;
+    turn.request = modelRequest(snapshot);
+  }
+
+  /** The provider payload (`before_provider_request`): the sampling and limit fields pi set. */
+  onPayload(payload: unknown): void {
+    const request = this.#turn?.request;
+    if (request === undefined) return;
+    Object.assign(request, payloadParams(payload));
+  }
+
   #startModelCall(turn: Turn): void {
     turn.model?.span.end();
     const startedWall = this.#clock.wall();
@@ -320,6 +477,8 @@ export class TurnTracer {
     if (turn.model === undefined) this.#startModelCall(turn);
     const model = turn.model as NonNullable<Turn["model"]>;
     turn.model = undefined;
+    const request = turn.request ?? null;
+    turn.request = undefined;
     const now = this.#clock.mono();
     const usage = (m["usage"] ?? {}) as Usage;
     const tokens = {
@@ -337,7 +496,8 @@ export class TurnTracer {
       total: usage.cost?.total ?? 0,
     };
     const stopReason = typeof m["stopReason"] === "string" ? m["stopReason"] : "unknown";
-    const errorMessage = typeof m["errorMessage"] === "string" ? m["errorMessage"] : undefined;
+    const errorMessage =
+      typeof m["errorMessage"] === "string" ? this.#redact(m["errorMessage"]) : undefined;
     const errorClass =
       stopReason === "aborted" ? "aborted" : stopReason === "error" ? "provider-error" : undefined;
     const provider = String(m["provider"] ?? "unknown");
@@ -395,6 +555,8 @@ export class TurnTracer {
         provider,
         model: modelId,
         api: typeof m["api"] === "string" ? m["api"] : null,
+        request,
+        output: modelOutput(m["content"], this.#redact),
         tokens,
         cost_usd: cost,
         latency_ms: latencyMs,
@@ -506,7 +668,7 @@ export class TurnTracer {
     if (tool === undefined) return undefined;
     this.#tools.delete(toolCallId);
     const now = this.#clock.mono();
-    const capped = capResult(result);
+    const capped = capResult(result, this.#redact);
     const outcome = toolOutcome(isError, String(capped["text"]), tool.rpcs, tool.denied);
     const exec = [...tool.rpcs].reverse().find((r) => r.method === "tool.exec");
     turn.step++;
@@ -541,7 +703,7 @@ export class TurnTracer {
         span_id: ids.spanId,
         parent_span_id: spanIds(turn.span).spanId,
         name: tool.name,
-        args: tool.args ?? null,
+        args: capJson(tool.args, this.#redact),
         result: capped,
         is_error: isError,
         outcome,

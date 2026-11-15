@@ -1,6 +1,6 @@
 /**
  * The session trajectory (decision 0021): a projection of the append-only
- * event log, schema `hearth.trajectory/1`, one JSON object per line.
+ * event log, schema `hearth.trajectory/2`, one JSON object per line.
  *
  * Lines, in event order: one `session` header; `user_input`, `turn_start`,
  * `model_call`, `tool_call`, `turn_end`, `box`, `outcome_unknown`,
@@ -10,13 +10,21 @@
  * `hub_version` (null where they do not apply). Model and tool steps add
  * `mono_ms` (monotonic) and their durations.
  *
+ * `/2` (rework of #80): a `model_call` carries its `request` (model, thinking
+ * level, max tokens, temperature, tool names and hash, system prompt size and
+ * hash, message count) and its `output` (text, thinking, tool calls with their
+ * arguments); `user_input` prompts and every kept text are capped at 16 KiB of
+ * UTF-8 with their byte count and sha256. Events written before `/2` project
+ * with `request: null` and `output: null`.
+ *
  * Built at read time, so older sessions get the current projection and the
  * log stays the only source of truth. Payloads were redacted when written.
  */
 
 import type { StoredEvent } from "@hearth/core";
+import { capText } from "./cap";
 
-export const TRAJECTORY_SCHEMA = "hearth.trajectory/1";
+export const TRAJECTORY_SCHEMA = "hearth.trajectory/2";
 
 /** Outcome labels (issue #80): placeholders the UI or the API sets, Retro later. */
 export const LABEL_OUTCOMES = ["success", "partial", "fail", "abandoned"] as const;
@@ -111,7 +119,12 @@ export function buildTrajectory(
     const p = obj(e.payload);
     switch (e.type) {
       case "message.user":
-        out.push({ ...base(e), kind: "user_input", input: "prompt", text: p["text"] ?? null });
+        out.push({
+          ...base(e),
+          kind: "user_input",
+          input: "prompt",
+          prompt: typeof p["text"] === "string" ? capText(p["text"]) : null,
+        });
         break;
       case "runner.interrupted":
         sum.interrupts++;
@@ -172,7 +185,13 @@ export function buildTrajectory(
           sum.model_latency_ms += num(p["latency_ms"]);
         }
         const { kind: _kind, ...rest } = p;
-        out.push({ ...base(e, rest), kind });
+        out.push({
+          ...base(e, rest),
+          kind,
+          ...(kind === "model_call"
+            ? { request: p["request"] ?? null, output: p["output"] ?? null }
+            : {}),
+        });
         break;
       }
       case "runner.outcome-unknown":

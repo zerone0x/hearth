@@ -3,7 +3,7 @@
  * route; each handler authorizes the signed-in principal first.
  *
  * - `GET /v1/sessions/:id/trajectory`: the session's trajectory as JSON Lines
- *   (`application/x-ndjson`, `hearth.trajectory/1`). `session.trajectory`.
+ *   (`application/x-ndjson`, `hearth.trajectory/2`). `session.trajectory`.
  * - `POST /v1/sessions/:id/labels {turn_id?, task_type?, outcome?, verdict?}`:
  *   an outcome label for the session or one turn, appended to the event log
  *   as `trajectory.label`. `session.label`.

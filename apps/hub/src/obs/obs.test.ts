@@ -7,18 +7,26 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type AssistantMessage,
+  type AssistantMessageEventStream,
+  createAssistantMessageEventStream,
+  createProvider,
   type FauxProviderHandle,
   type FauxResponseStep,
   fauxAssistantMessage,
   fauxProvider,
+  fauxText,
+  fauxThinking,
   fauxToolCall,
+  type Provider,
+  type Usage,
 } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { type FileEntry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type AppendResult,
   type EventPage,
@@ -37,11 +45,14 @@ import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import type { HubEnv } from "../auth";
 import type { BoxConnectionListener } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
+import { type CompiledDenyRule, compileDenyList } from "../runner/policy";
 import { redactSecrets, SessionRunner } from "../runner/runner";
+import { capText, MAX_TEXT_BYTES, utf8Head } from "./cap";
 import { registerSecret } from "./redaction";
 import { mountTrajectoryRoutes, Trajectories } from "./routes";
 import { Telemetry } from "./telemetry";
 import { buildTrajectory, type TrajectoryRecord, toJsonl } from "./trajectory";
+import { payloadParams, TurnTracer } from "./turn-tracer";
 
 const SECRET = "sk-hearth-test-SECRET-0123456789abcdef";
 const dirs: string[] = [];
@@ -161,6 +172,50 @@ function call(
   return fauxAssistantMessage([fauxToolCall(name, args, { id })], { stopReason: "toolUse" });
 }
 
+/**
+ * Every model call reports this usage and cost (pi-ai's faux provider
+ * estimates tokens from the prompt, which names the temp workspace, and its
+ * cost is always 0). Costs are powers of two, so sums are exact.
+ */
+const USAGE: Usage = {
+  input: 100,
+  output: 20,
+  cacheRead: 30,
+  cacheWrite: 5,
+  totalTokens: 155,
+  cost: { input: 0.5, output: 0.25, cacheRead: 0.125, cacheWrite: 0.0625, total: 0.9375 },
+};
+
+/** The faux provider, with `USAGE` on every final message. */
+function withFixedUsage(faux: FauxProviderHandle): Provider {
+  type Stream = Provider["streamSimple"];
+  const wrap =
+    (inner: Stream): Stream =>
+    (model, context, options) => {
+      const source = inner(model, context, options);
+      const out: AssistantMessageEventStream = createAssistantMessageEventStream();
+      void (async () => {
+        for await (const event of source) {
+          if (event.type === "done") event.message.usage = structuredClone(USAGE);
+          if (event.type === "error") event.error.usage = structuredClone(USAGE);
+          out.push(event);
+        }
+        out.end();
+      })();
+      return out;
+    };
+  const p = faux.provider;
+  return createProvider({
+    id: p.id,
+    auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+    models: faux.models,
+    api: {
+      stream: wrap(p.stream.bind(p) as Stream) as Provider["stream"],
+      streamSimple: wrap(p.streamSimple.bind(p)),
+    },
+  });
+}
+
 interface Setup {
   root: string;
   boxes: FakeBoxes;
@@ -169,9 +224,26 @@ interface Setup {
   runner: SessionRunner;
   telemetry: Telemetry;
   logs: string[];
+  /** The tool call id of every box lease the runner asked for. */
+  leases: string[];
 }
 
-async function setup(options: { exportTo?: string } = {}): Promise<Setup> {
+interface SetupOptions {
+  exportTo?: string;
+  denyList?: CompiledDenyRule[];
+  /** Box start or wake latency: the test clock moves this far during each lease. */
+  leaseWaitMs?: number;
+  /** Runs after each lease (the AGENTS.md refresh); a throw fails the runner. */
+  prepare?: () => Promise<void>;
+  /** A rebuilt runner (hub restart): the old one's event log and pi entries. */
+  events?: MemoryEvents;
+  entries?: FileEntry[];
+}
+
+/** Each box lease takes `leaseWaitMs` on the test clock, plus one tick. */
+const LEASE_WAIT_MS = 250;
+
+async function setup(options: SetupOptions = {}): Promise<Setup> {
   const dir = tempDir();
   const root = join(dir, "workspace");
   mkdirSync(root);
@@ -179,14 +251,14 @@ async function setup(options: { exportTo?: string } = {}): Promise<Setup> {
   const logs: string[] = [];
   const rpc = new ToolRpcClient({ boxes, log: (l) => logs.push(l) });
   closers.push(() => rpc.close());
-  const events = new MemoryEvents();
+  const events = options.events ?? new MemoryEvents();
   const faux = fauxProvider({ provider: "faux" });
   const runtime = await ModelRuntime.create({
     authPath: join(dir, "auth.json"),
     modelsPath: null,
     refreshOnCreate: false,
   });
-  runtime.registerNativeProvider(faux.provider);
+  runtime.registerNativeProvider(withFixedUsage(faux));
   const redact = (text: string) => redactSecrets(text, [SECRET]);
   const telemetry = new Telemetry({
     ...(options.exportTo === undefined
@@ -198,17 +270,24 @@ async function setup(options: { exportTo?: string } = {}): Promise<Setup> {
   let mono = 0;
   let id = 0;
   const logger = new Logger({ component: "runner", sink: (l) => logs.push(l), redact });
+  const leases: string[] = [];
   const runner = await SessionRunner.create({
     sessionId: "se_obs",
     scope: { workspaceId: "ws_default" },
     events,
     box: {
-      ensureBox: async () => ({ sessionId: "se_obs", boxId: "box_1", release: () => {} }),
+      ensureBox: async (callId) => {
+        leases.push(callId ?? "");
+        mono += options.leaseWaitMs ?? LEASE_WAIT_MS;
+        return { sessionId: "se_obs", boxId: "box_1", release: () => {} };
+      },
       operations: (boxId, callId, trace) => rpc.operations(boxId, callId, trace),
+      ...(options.prepare === undefined ? {} : { prepare: options.prepare }),
     },
     modelRuntime: runtime,
     model: faux.getModel(),
-    denyList: [],
+    denyList: options.denyList ?? [],
+    ...(options.entries === undefined ? {} : { entries: options.entries }),
     boxCwd: root,
     log: logger.lines("error"),
     redact,
@@ -217,7 +296,7 @@ async function setup(options: { exportTo?: string } = {}): Promise<Setup> {
     newId: (prefix) => `${prefix}_${++id}`,
   });
   closers.push(() => runner.dispose());
-  return { root, boxes, events, faux, runner, telemetry, logs };
+  return { root, boxes, events, faux, runner, telemetry, logs, leases };
 }
 
 async function turn(s: Setup, text: string, steps: FauxResponseStep[]) {
@@ -247,12 +326,11 @@ function normalize(records: readonly TrajectoryRecord[], root: string): string {
     return names.get(key) as string;
   };
   const text = JSON.stringify(records, (key, value: unknown) => {
-    // Token counts depend on the system prompt, which names the temp workspace.
-    if (key === "tokens" && value !== null && typeof value === "object") {
-      return Object.fromEntries(
-        Object.entries(value).map(([k, v]) => [k, typeof v === "number" && v >= 0 ? "<n>" : v]),
-      );
+    // The system prompt names the temp workspace; the hub version names the git commit.
+    if (key === "system_prompt" && value !== null && typeof value === "object") {
+      return { bytes: "<n>", sha256: "<sha>" };
     }
+    if (key === "hub_version") return "<hub>";
     if (key === "api") return "<api>";
     // pi streams a varying number of deltas, so event counts and seqs vary.
     if (key === "seq" || key === "events" || key === "last_seq") return "<seq>";
@@ -329,6 +407,17 @@ describe("trajectory", () => {
     expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
     const summary = records.at(-1) as Record<string, unknown>;
     expect(summary).toMatchObject({ turns: 1, model_calls: 4, tool_calls: 3 });
+    // The answer and every tool request the model made are in the trajectory.
+    const outputs = records.filter((r) => r.kind === "model_call").map((r) => r["output"]);
+    expect(outputs.at(-1)).toMatchObject({ text: { text: "done", truncated: false, bytes: 4 } });
+    expect(outputs.slice(0, 3)).toMatchObject([
+      { text: null, tool_calls: [{ id: "c_write", name: "write" }] },
+      { text: null, tool_calls: [{ id: "c_edit", name: "edit" }] },
+      { text: null, tool_calls: [{ id: "c_bash", args: { command: "cat a.txt; exit 3" } }] },
+    ]);
+    expect(records.find((r) => r.kind === "user_input")).toMatchObject({
+      prompt: { text: "make a and run it", truncated: false, bytes: 17 },
+    });
     const normalized = normalize(records, s.root);
     if (process.env["UPDATE_GOLDEN"] === "1") {
       writeFileSync(GOLDEN, normalized);
@@ -382,6 +471,303 @@ describe("trajectory", () => {
     expect(records.some((r) => r.kind === "user_input" && r["input"] === "interrupt")).toBe(true);
     expect(records.find((r) => r.kind === "turn_end")).toMatchObject({ outcome: "interrupted" });
     expect(records.find((r) => r.kind === "tool_call")).toMatchObject({ outcome: "aborted" });
+    expect(records.at(-1)).toMatchObject({
+      interrupts: 1,
+      turns_by_outcome: { interrupted: 1 },
+      tool_failures_by_class: { aborted: 1 },
+    });
+  });
+});
+
+describe("trajectory numbers (review of #82)", () => {
+  test("tokens, cost, durations and box waits are exact, and the turn and summary sum them", async () => {
+    const s = await setup();
+    await turn(s, "two tools", [
+      call("write", { path: "a.txt", content: "x" }, "c_w"),
+      call("bash", { command: "echo hi" }, "c_b"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const records = trajectory(s);
+    const models = records.filter((r) => r.kind === "model_call");
+    expect(models).toHaveLength(3);
+    for (const m of models) {
+      expect(m["tokens"]).toEqual({
+        input: 100,
+        output: 20,
+        cache_read: 30,
+        cache_write: 5,
+        total: 155,
+      });
+      expect(m["cost_usd"]).toEqual({
+        input: 0.5,
+        output: 0.25,
+        cache_read: 0.125,
+        cache_write: 0.0625,
+        total: 0.9375,
+      });
+    }
+    const tools = records.filter((r) => r.kind === "tool_call");
+    expect(tools).toHaveLength(2);
+    for (const t of tools) {
+      const leases = s.leases.filter((id) => id === t["tool_call_id"]).length;
+      expect(leases).toBeGreaterThan(0);
+      // Each lease took LEASE_WAIT_MS plus the clock's own tick; every one is added.
+      expect(t["box_wait_ms"]).toBe(leases * (LEASE_WAIT_MS + 1));
+      expect(t["duration_ms"] as number).toBeGreaterThan(t["box_wait_ms"] as number);
+    }
+    const sumTokens = { input: 300, output: 60, cache_read: 90, cache_write: 15 };
+    expect(records.find((r) => r.kind === "turn_end")).toMatchObject({
+      outcome: "done",
+      model_calls: 3,
+      tool_calls: 2,
+      tool_failures: 0,
+      tokens: sumTokens,
+      cost_usd: 2.8125,
+    });
+    const waits = tools.map((t) => t["box_wait_ms"] as number);
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    expect(records.at(-1)).toMatchObject({
+      kind: "summary",
+      turns: 1,
+      turns_by_outcome: { done: 1 },
+      model_calls: 3,
+      model_errors: 0,
+      tool_calls: 2,
+      tokens: sumTokens,
+      cost_usd: 2.8125,
+      interrupts: 0,
+      outcome_unknown: 0,
+      box_wait_ms: { total: sum(waits), max: Math.max(...waits), count: 2 },
+      tool_duration_ms: sum(tools.map((t) => t["duration_ms"] as number)),
+      model_latency_ms: sum(models.map((m) => m["latency_ms"] as number)),
+    });
+  });
+
+  test("a denied call and a timed-out command are classified, and counted by class", async () => {
+    const s = await setup({
+      denyList: compileDenyList([{ tool: "bash", pattern: "rm -rf", reason: "no rm -rf here" }]),
+    });
+    await turn(s, "go", [
+      call("bash", { command: "rm -rf /tmp/nothing" }, "c_deny"),
+      call("bash", { command: "sleep 5", timeout: 1 }, "c_slow"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const records = trajectory(s);
+    const byId = (id: string) =>
+      records.find((r) => r.kind === "tool_call" && r["tool_call_id"] === id);
+    expect(byId("c_deny")).toMatchObject({
+      outcome: "denied",
+      denied_reason: "no rm -rf here",
+      is_error: true,
+      rpcs: [],
+    });
+    const slow = byId("c_slow") as Record<string, unknown>;
+    expect(slow).toMatchObject({ outcome: "timeout", is_error: true, exit_code: null });
+    expect(slow["rpcs"]).toMatchObject([
+      { method: "tool.exec", ok: false, error_code: "timed-out" },
+    ]);
+    expect(records.at(-1)).toMatchObject({
+      tool_calls: 2,
+      tool_failures_by_class: { denied: 1, timeout: 1 },
+    });
+    expect(records.find((r) => r.kind === "turn_end")).toMatchObject({ tool_failures: 2 });
+  });
+});
+
+describe("model calls carry their request and output (schema /2)", () => {
+  test("request: model, settings, tools, system prompt and message count, from pi's state", async () => {
+    const s = await setup();
+    await turn(s, "hi", [call("bash", { command: "echo 1" }, "c_1"), fauxAssistantMessage("ok")]);
+    const models = trajectory(s).filter((r) => r.kind === "model_call");
+    const prompt = s.runner.systemPrompt;
+    const tools = s.runner.activeTools;
+    expect(tools.length).toBeGreaterThan(0);
+    for (const [i, m] of models.entries()) {
+      expect(m["request"]).toMatchObject({
+        provider: "faux",
+        model: "faux-1",
+        thinking_level: "off",
+        model_max_tokens: s.faux.getModel().maxTokens,
+        context_window: s.faux.getModel().contextWindow,
+        tools,
+        system_prompt: {
+          bytes: Buffer.byteLength(prompt, "utf8"),
+          sha256: createHash("sha256").update(prompt).digest("hex"),
+        },
+        // The prompt, then each assistant message and tool result before the call.
+        message_count: 1 + 2 * i,
+      });
+      expect((m["request"] as { tools_sha256: string }).tools_sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  test("output: text, thinking and tool calls with their arguments, redacted", async () => {
+    const s = await setup();
+    await turn(s, "think", [
+      fauxAssistantMessage(
+        [
+          fauxThinking(`plan: use ${SECRET}`),
+          fauxText("running it"),
+          fauxToolCall("bash", { command: `echo ${SECRET}` }, { id: "c_t" }),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("all done"),
+    ]);
+    const records = trajectory(s);
+    const [first, last] = records.filter((r) => r.kind === "model_call");
+    expect(first?.["output"]).toMatchObject({
+      text: { text: "running it", truncated: false, bytes: 10 },
+      thinking: { text: "plan: use [redacted]", truncated: false },
+      tool_calls: [{ id: "c_t", name: "bash", args: { command: "echo [redacted]" } }],
+    });
+    expect(last?.["output"]).toMatchObject({
+      text: { text: "all done" },
+      thinking: null,
+      tool_calls: [],
+    });
+    expect(toJsonl(records)).not.toContain(SECRET);
+  });
+
+  test("provider payload fields: max tokens, temperature and reasoning, whatever the API calls them", () => {
+    const t = new TurnTracer({
+      sessionId: "se_p",
+      telemetry: new Telemetry(),
+      versions: { pi: "p", hub: "h" },
+    });
+    t.startTurn();
+    t.onRequest({
+      provider: "x",
+      model: "m",
+      systemPrompt: "sys",
+      tools: [],
+      messageCount: 1,
+    });
+    t.onPayload({
+      max_tokens: 4096,
+      temperature: 0.2,
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    });
+    t.onEvent({ type: "turn_start" } as never);
+    const step = t.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "stop", usage: USAGE },
+    } as never);
+    expect(step?.payload["request"]).toMatchObject({
+      max_tokens: 4096,
+      temperature: 0.2,
+      reasoning: { type: "enabled", budget_tokens: 1024 },
+      system_prompt: { bytes: 3 },
+    });
+    expect(payloadParams({ max_output_tokens: 10, reasoning: { effort: "high" } })).toEqual({
+      max_tokens: 10,
+      temperature: null,
+      reasoning: { effort: "high" },
+    });
+    expect(
+      payloadParams({ generationConfig: { maxOutputTokens: 7, temperature: 1 } }),
+    ).toMatchObject({ max_tokens: 7, temperature: 1 });
+    expect(payloadParams({ max_completion_tokens: 5, reasoning_effort: "low" })).toEqual({
+      max_tokens: 5,
+      temperature: null,
+      reasoning: "low",
+    });
+  });
+});
+
+describe("caps count UTF-8 bytes (review of #82)", () => {
+  test("CJK: the kept head is at most 16 KiB of bytes, in whole characters, with the full size and hash", () => {
+    const text = "中".repeat(40_000);
+    const c = capText(text);
+    expect(c.truncated).toBe(true);
+    expect(c.bytes).toBe(120_000);
+    expect(c.text).toBe("中".repeat(Math.floor(MAX_TEXT_BYTES / 3)));
+    expect(Buffer.byteLength(c.text, "utf8")).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+    expect(c.sha256).toBe(createHash("sha256").update(text).digest("hex"));
+    expect(capText("中".repeat(5461)).truncated).toBe(false);
+  });
+
+  test("an emoji across the boundary is dropped whole, never split", () => {
+    const a = "a".repeat(MAX_TEXT_BYTES - 2);
+    const cut = capText(`${a}😀b`);
+    expect(cut.text).toBe(a);
+    expect(cut.text).not.toContain("�");
+    expect(cut.bytes).toBe(MAX_TEXT_BYTES + 3);
+    const fits = "a".repeat(MAX_TEXT_BYTES - 4);
+    expect(capText(`${fits}😀`)).toMatchObject({ text: `${fits}😀`, truncated: false });
+    expect(capText(`${fits}😀b`).text).toBe(`${fits}😀`);
+    expect(utf8Head("é😀", 3)).toBe("é");
+    expect(utf8Head("é😀", 1)).toBe("");
+  });
+
+  test("a secret straddling the cut is redacted before the cut, so no prefix of it is kept", () => {
+    const text = `${"a".repeat(MAX_TEXT_BYTES - 10)}${SECRET}`;
+    const c = capText(text, (x) => redactSecrets(x, [SECRET]));
+    expect(c.text).not.toContain(SECRET.slice(0, 10));
+    expect(c.truncated).toBe(false);
+  });
+
+  test("through the runner: a CJK tool result and a long answer are capped by bytes", async () => {
+    const s = await setup();
+    await turn(s, "big", [
+      call("bash", { command: "for i in $(seq 1 8000); do printf '中'; done" }, "c_big"),
+      fauxAssistantMessage("文".repeat(7000)),
+    ]);
+    const records = trajectory(s);
+    const tool = records.find((r) => r.kind === "tool_call") as Record<string, unknown>;
+    const result = tool["result"] as { text: string; truncated: boolean; bytes: number };
+    expect(result.truncated).toBe(true);
+    expect(result.bytes).toBe(24_000);
+    expect(result.text).toBe("中".repeat(5461));
+    const last = records.filter((r) => r.kind === "model_call").at(-1) as Record<string, unknown>;
+    expect((last["output"] as { text: unknown }).text).toMatchObject({
+      text: "文".repeat(5461),
+      truncated: true,
+      bytes: 21_000,
+    });
+  });
+});
+
+describe("failure records (review of #82)", () => {
+  test("a runner failure is a runner_failed record and the turn ends failed", async () => {
+    const s = await setup({
+      prepare: async () => {
+        throw new Error("disk full writing runner.context");
+      },
+    });
+    await turn(s, "go", [call("bash", { command: "echo 1" }, "c_1"), fauxAssistantMessage("x")]);
+    expect(s.runner.status).toBe("failed");
+    const records = trajectory(s);
+    expect(records.find((r) => r.kind === "runner_failed")).toMatchObject({
+      error: expect.stringContaining("disk full writing runner.context"),
+    });
+    expect(records.at(-1)).toMatchObject({ kind: "summary" });
+  });
+
+  test("a hub restart mid-tool is an outcome_unknown record naming the call", async () => {
+    const s = await setup();
+    s.faux.setResponses([
+      call("bash", { command: "sleep 20" }, "c_mid"),
+      fauxAssistantMessage("x"),
+    ]);
+    await s.runner.send("start");
+    const started = Date.now();
+    while (!s.boxes.sent.some((f) => f.method === "tool.exec") && Date.now() - started < 5000) {
+      await Bun.sleep(10);
+    }
+    await Bun.sleep(50);
+    const snapshot = structuredClone(s.events.list);
+    const entries = s.runner.storedEntries();
+    const events = new MemoryEvents();
+    events.list.push(...snapshot);
+    await setup({ events, entries });
+    const records = buildTrajectory(events.list, {
+      sessionId: "se_obs",
+      versions: { pi: "test", hub: "test" },
+    });
+    const unknown = records.find((r) => r.kind === "outcome_unknown");
+    expect(unknown).toMatchObject({ reason: "hub restart", tool_call_ids: ["c_mid"] });
+    expect(records.at(-1)).toMatchObject({ outcome_unknown: 1 });
   });
 });
 
@@ -443,7 +829,11 @@ describe("no secret leaves the hub", () => {
     expect(all).not.toContain(SECRET);
     expect(all).not.toContain("0123456789abcdef");
     const model = trajectory(s).find((r) => r.kind === "model_call" && r["error_class"] !== null);
-    expect(model).toMatchObject({ error_class: "provider-error" });
+    expect(model).toMatchObject({
+      error_class: "provider-error",
+      error: "invalid x-api-key [redacted]",
+    });
+    expect(trajectory(s).at(-1)).toMatchObject({ model_calls: 2, model_errors: 1 });
   });
 
   test("the trajectory API redacts at the sink, even an event that skipped the runner's redaction", async () => {

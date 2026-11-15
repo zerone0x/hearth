@@ -23,6 +23,7 @@ import {
   createAgentSession,
   createCodemodeExtension,
   DefaultResourceLoader,
+  type ExtensionAPI,
   type FileEntry,
   type ModelRuntime,
   VERSION as PI_VERSION,
@@ -37,7 +38,7 @@ import {
   type WorkspaceScope,
 } from "@hearth/core";
 import { Telemetry } from "../obs/telemetry";
-import { type Clock, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
+import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
 import type { PinnedExtension } from "./extensions";
 import type { CompiledDenyRule } from "./policy";
@@ -204,9 +205,11 @@ export class SessionRunner {
     // The lease wait (box start or wake) and each RPC's span go to the tracer.
     const box: RunnerBox = {
       ensureBox: async (callId) => {
-        const started = performance.now();
+        // Timed on the tracer's clock, like the tool call it is part of.
+        const clock = options.clock ?? SYSTEM_CLOCK;
+        const started = clock.mono();
         const lease = await inner.ensureBox(callId);
-        self?.observe(() => self?.tracer.onLease(callId, lease.boxId, performance.now() - started));
+        self?.observe(() => self?.tracer.onLease(callId, lease.boxId, clock.mono() - started));
         return lease;
       },
       operations: (boxId, callId, trace) =>
@@ -244,6 +247,20 @@ export class SessionRunner {
         ...(options.codemode === true
           ? [{ name: "codemode", factory: createCodemodeExtension({ models: false }) }]
           : []),
+        // Last, so it sees each request as the other extensions left it (decision 0021).
+        {
+          name: "hearth-trace",
+          factory: (pi: ExtensionAPI) => {
+            pi.on("context", (event) => {
+              self?.observe(() => self?.observeRequest(event.messages.length));
+              return undefined;
+            });
+            pi.on("before_provider_request", (event) => {
+              self?.observe(() => self?.tracer.onPayload(event.payload));
+              return undefined;
+            });
+          },
+        },
       ];
       const loader = new DefaultResourceLoader({
         cwd: boxCwd,
@@ -501,6 +518,27 @@ export class SessionRunner {
     }
   }
 
+  /** What the next model request asks for: pi's model, settings, prompt and tools. */
+  observeRequest(messageCount: number): void {
+    const s = this.#session;
+    const model = s.model;
+    this.tracer.onRequest({
+      provider: String(model?.provider ?? "unknown"),
+      model: String(model?.id ?? "unknown"),
+      api: typeof model?.api === "string" ? model.api : undefined,
+      thinkingLevel: s.thinkingLevel,
+      modelMaxTokens: model?.maxTokens,
+      contextWindow: model?.contextWindow,
+      systemPrompt: s.systemPrompt,
+      tools: s.state.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      })),
+      messageCount,
+    });
+  }
+
   /** Run an observability hook; never throws (see `#safe`). */
   observe<T>(fn: () => T): T | undefined {
     return this.#safe(fn);
@@ -579,5 +617,6 @@ function tracerFor(options: SessionRunnerOptions): TurnTracer {
     versions: { pi: PI_VERSION, hub: HUB_VERSION },
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(options.newId === undefined ? {} : { newId: options.newId }),
+    ...(options.redact === undefined ? {} : { redact: options.redact }),
   });
 }
