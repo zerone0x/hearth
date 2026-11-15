@@ -285,11 +285,11 @@ describe("ToolRpcClient through a real hub and box-agent", () => {
     const root = workspace();
     const dir = mkdtempSync(join(tmpdir(), "hearth-toolrpc-hub-"));
     dirs.push(dir);
-    const hub = startHub({ dbPath: join(dir, "hub.db"), port: 0, log: () => {} });
+    const hub = startHub({ dbPath: join(dir, "hub.db"), port: 0, boxPort: 0, log: () => {} });
     hubs.push(hub);
     const { token } = await hub.issueJoinToken("box_tools", "ses_tools");
     const agent = new BoxAgent({
-      hubUrl: hub.boxSocketUrl,
+      hubUrl: hub.listenForBoxes("127.0.0.1"),
       boxId: "box_tools",
       joinToken: token,
       log: () => {},

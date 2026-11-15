@@ -18,7 +18,9 @@ import { BOX_ENV, startHub } from "./server";
 const CONNECT_DEADLINE_MS = 15_000;
 
 const dir = mkdtempSync(join(tmpdir(), "hearth-demo-"));
-const hub = startHub({ port: 0, dbPath: join(dir, "hub.db") });
+const hub = startHub({ port: 0, boxPort: 0, dbPath: join(dir, "hub.db") });
+// The box is a local process here, so its listener is on loopback too.
+const boxSocketUrl = hub.listenForBoxes("127.0.0.1");
 let box: Bun.Subprocess | undefined;
 let code = 0;
 try {
@@ -31,7 +33,7 @@ try {
   box = Bun.spawn([process.execPath, join(import.meta.dir, "../../box-agent/src/main.ts")], {
     env: {
       ...process.env,
-      [BOX_ENV.hubUrl]: hub.boxSocketUrl,
+      [BOX_ENV.hubUrl]: boxSocketUrl,
       [BOX_ENV.boxId]: "box_demo",
       [BOX_ENV.joinToken]: token,
     },

@@ -30,12 +30,11 @@ HEARTH_DATA_DIR=/tmp/hearth-data bun run --filter @hearth/hub start
 curl -s -X POST http://127.0.0.1:8787/v1/boxes/<boxId>/echo -d '{"message":"hi"}'
 ```
 
-Today this can only answer `409` with `box.not-connected`. A standalone hub
-has no way yet to get a box connected to it: it listens on loopback only, so a
-box on its own bridge network cannot reach it, and nothing in `main.ts` starts
-or watches boxes. Those are follow-ups: #27 (a listener boxes can reach) and
-#28 (box supervision). Until they land, the echo round trip runs in the two
-setups below, where the test starts the box itself.
+Today this can only answer `409` with `box.not-connected`. The hub has the
+Docker box provider wired in and listens for each box on its network's gateway
+(decision 0012), but nothing in the API starts a box until the session manager
+lands (#28). The echo round trip runs in the two setups below, where the test
+starts the box itself.
 
 ### With Docker and the real box image
 
@@ -46,10 +45,64 @@ HEARTH_DOCKER_TESTS=1 HEARTH_BOX_AGENT_IMAGE=hearth-box:ci \
   bun test apps/hub/src/box/echo.docker.test.ts
 ```
 
-The test starts a hub, creates the box with `DockerBoxProvider` (its own
-bridge network, no published ports), passes the hub URL and join token in the
-box's boot environment, waits for the box's own box-agent to dial in, and
-checks the echo round trip. CI runs it in the `box-provider` job.
+The test starts a hub on its production defaults (API on loopback, box
+listener on the box network's gateway, decision 0012), starts the box with
+`hub.startBox` (its own bridge network, no published ports, the box
+listener's URL and a join token in its boot environment), waits for the box's
+own box-agent to dial in, checks the echo round trip, and probes the box's
+egress. It needs `HEARTH_TEST_LAN_URL` (an HTTP server on a private address)
+and `HEARTH_TEST_EGRESS=open` unless `sudo scripts/box-firewall.sh apply` ran. CI runs it in the `box-provider` job.
+
+### The box firewall (required before the hub starts boxes)
+
+The hub refuses `startBox` with `box.egress-unfiltered` until
+`scripts/box-firewall.sh apply` has run since the last boot (decision 0012).
+The script writes `/run/hearth/box-egress.applied` once every rule is in
+place; `/run` is cleared on reboot, like the rules. `/healthz` reports
+`boxEgress` (`filtered`, `unfiltered` or `unrestricted`), and the hub logs a
+`WARNING` line at startup when it is not `filtered`.
+
+```sh
+sudo scripts/box-firewall.sh apply
+```
+
+If the host's DNS resolver is on a private address (a home router), the rules
+keep boxes from reaching it. `apply` detects this and prints a warning. Whether
+DNS in boxes actually breaks depends on where Docker sends box DNS queries
+from (the CI runner's private resolver keeps working), so check with
+`docker exec <box container> getent hosts github.com`. If names do not
+resolve, apply with the line the warning prints, for example:
+
+```sh
+sudo HEARTH_BOX_EGRESS_ALLOW="192.168.1.1/32" scripts/box-firewall.sh apply
+```
+
+The rules and the marker are gone after a reboot, and a firewalld reload drops
+the rules. Re-apply at boot with a systemd unit (adjust the path):
+
+```ini
+# /etc/systemd/system/hearth-box-firewall.service
+[Unit]
+Description=Hearth box egress firewall
+After=docker.service firewalld.service
+Wants=docker.service
+ReloadPropagatedFrom=firewalld.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=HEARTH_BOX_PORT=8788
+ExecStart=/opt/hearth/scripts/box-firewall.sh apply
+ExecReload=/opt/hearth/scripts/box-firewall.sh apply
+ExecStop=/opt/hearth/scripts/box-firewall.sh remove
+
+[Install]
+WantedBy=multi-user.target docker.service
+```
+
+To run boxes without the firewall on purpose (a disposable VM, for example),
+start the hub with `HEARTH_BOX_EGRESS=unrestricted`: boxes then reach the host,
+the LAN and cloud metadata, and the hub says so at every start.
 
 ### The reliability tests
 

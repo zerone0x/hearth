@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOCAL_PRINCIPAL } from "@hearth/core";
 import { BoxAgent } from "../../../box-agent/src/connection";
-import { type Hub, startHub } from "../server";
+import { startHub } from "../server";
 import type { AppliedDelivery } from "./connections";
 
 const AGENT_MAIN = join(import.meta.dir, "../../../box-agent/src/main.ts");
@@ -27,6 +27,8 @@ interface Child {
 }
 
 const children: Child[] = [];
+/** A hub with one box listener on loopback: boxes in these tests are local processes. */
+type Hub = ReturnType<typeof startHub> & { readonly boxSocketUrl: string };
 const hubs: Hub[] = [];
 const dirs: string[] = [];
 
@@ -46,12 +48,20 @@ function hub(
   dbPath: string,
   options: {
     port?: number;
+    boxPort?: number;
     onApplied?: (a: AppliedDelivery) => void;
     echoDeadlineMs?: number;
     log?: (line: string) => void;
   } = {},
 ) {
-  const started = startHub({ dbPath, port: options.port ?? 0, log: () => {}, ...options });
+  const hub = startHub({
+    dbPath,
+    port: options.port ?? 0,
+    boxPort: options.boxPort ?? 0,
+    log: () => {},
+    ...options,
+  });
+  const started: Hub = Object.assign(hub, { boxSocketUrl: hub.listenForBoxes("127.0.0.1") });
   hubs.push(started);
   return started;
 }
@@ -324,7 +334,7 @@ describe("at-least-once across a hub restart", () => {
         if (applied.length === KILL_AFTER) killed = first.stop();
       },
     });
-    const port = Number(first.url.port);
+    const boxPort = Number(new URL(first.boxSocketUrl).port);
     const { token } = await first.issueJoinToken("box_stream", "ses_stream");
     const agent = spawn(STREAM_AGENT, {
       ...agentEnv(first, "box_stream", token),
@@ -337,10 +347,10 @@ describe("at-least-once across a hub restart", () => {
     await killed;
     expect(applied.length).toBe(KILL_AFTER);
 
-    // Restart on the same port and database; the box reconnects with its
+    // Restart on the same box port and database; the box reconnects with its
     // per-box credential (the join token is spent) and redelivers.
     const restarted: AppliedDelivery[] = [];
-    const second = hub(dbPath, { port, onApplied: (a) => restarted.push(a) });
+    const second = hub(dbPath, { boxPort, onApplied: (a) => restarted.push(a) });
     await agent.waitForLine((l) => l.includes('"all-acked"'));
 
     const page = await second.events.read({ workspaceId: "ws_default" }, "ses_stream", 0, 1000);

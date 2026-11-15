@@ -10,6 +10,11 @@
  *
  *   HEARTH_BOX_AGENT_IMAGE  defaults to `hearth-box:ci`.
  *   HEARTH_DOCKER_SOCKET    optional, defaults to /var/run/docker.sock.
+ *   HEARTH_BOX_PORT         the box listener port the firewall allows (8788).
+ *
+ * The hub runs on its production defaults (decision 0012): the API on
+ * loopback, the box listener on the box network's gateway, and the box started
+ * by `hub.startBox`, which needs the box firewall's marker (CI applies it).
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
@@ -17,7 +22,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BoxSpec, LOCAL_PRINCIPAL } from "@hearth/core";
-import { type Hub, startHub } from "../server";
+import { DEFAULT_BOX_PORT, type Hub, parsePort, startHub } from "../server";
 import { DEFAULT_DOCKER_API_VERSION, DEFAULT_DOCKER_SOCKET } from "./docker/config";
 import { DockerEngine } from "./docker/engine";
 import { DockerBoxProvider } from "./docker/provider";
@@ -26,6 +31,7 @@ import { ToolRpcClient } from "./tool-rpc";
 const enabled = process.env["HEARTH_DOCKER_TESTS"] === "1";
 const image = process.env["HEARTH_BOX_AGENT_IMAGE"] || "hearth-box:ci";
 const socketPath = process.env["HEARTH_DOCKER_SOCKET"] || DEFAULT_DOCKER_SOCKET;
+const boxPort = parsePort(process.env["HEARTH_BOX_PORT"], DEFAULT_BOX_PORT);
 const instance = `hearthtools${process.pid}${Math.floor(Math.random() * 1e6)}`;
 const CONNECT_DEADLINE_MS = 120_000;
 
@@ -39,20 +45,6 @@ const provider = new DockerBoxProvider({
     stopGraceMs: 2_000,
   },
 });
-
-async function gatewayOf(network: string): Promise<string> {
-  const res = await engine.request({
-    method: "GET",
-    path: `/networks/${network}`,
-    ok: [200],
-    timeoutMs: 10_000,
-    endpoint: "network.inspect",
-  });
-  const config = (res.body as { IPAM: { Config: { Gateway?: string }[] | null } }).IPAM.Config;
-  const gateway = config?.find((c) => c.Gateway !== undefined && !c.Gateway.includes(":"))?.Gateway;
-  if (gateway === undefined) throw new Error(`network ${network} has no IPv4 gateway`);
-  return gateway;
-}
 
 async function logsOf(containerId: string | undefined): Promise<string> {
   if (containerId === undefined) return "(no container)";
@@ -82,21 +74,14 @@ describe.skipIf(!enabled)("tool RPC through DockerBoxProvider and the box image"
 
   test("write, read, grep and exec in /workspace of a real box", async () => {
     dir = mkdtempSync(join(tmpdir(), "hearth-tools-docker-"));
-    hub = startHub({ hostname: "0.0.0.0", port: 0, dbPath: join(dir, "hub.db") });
+    hub = startHub({ port: 0, boxPort, provider, dbPath: join(dir, "hub.db") });
     const spec: BoxSpec = {
       boxId: "tools",
       workspaceId: "ws_default",
       sessionId: "se_tools",
       image,
     };
-    await provider.create(spec);
-    const gateway = await gatewayOf(provider.objectName(spec.boxId));
-    const info = await hub.launchBox(
-      LOCAL_PRINCIPAL,
-      provider,
-      spec,
-      `ws://${gateway}:${hub.url.port}/v1/box/socket`,
-    );
+    const info = await hub.startBox(LOCAL_PRINCIPAL, spec);
     try {
       await hub.boxes.waitForBox(spec.boxId, CONNECT_DEADLINE_MS);
     } catch (error) {

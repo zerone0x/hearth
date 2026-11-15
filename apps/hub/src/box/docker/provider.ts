@@ -5,7 +5,9 @@
  * Per box it owns, all named `<instance>-box-<boxId>` and labeled `dev.hearth.*`:
  *
  * - a bridge network of its own (egress allowed, nothing published, no
- *   inter-container traffic), so boxes cannot reach each other;
+ *   inter-container traffic, IPv4 only), so boxes cannot reach each other. Its
+ *   Linux bridge is named `hbx…` (`bridgeName`), which is what the host
+ *   firewall of decision 0012 matches to keep boxes off the host and the LAN;
  * - two named volumes, one for `/workspace` and one (`…-home`) for `/home/hearth`;
  * - while running, one container built fresh by every `start`.
  */
@@ -67,6 +69,31 @@ export const PROVIDER_ENV_KEYS = [
   "HEARTH_CHROMIUM_SANDBOX",
 ] as const;
 
+/**
+ * Prefix of every box network's Linux bridge. `scripts/box-firewall.sh` matches
+ * `hbx+` (decision 0012), so the rules cover boxes created after they were
+ * installed without any per-box change.
+ */
+export const BOX_BRIDGE_PREFIX = "hbx";
+
+/**
+ * The Linux bridge name of a box network: the prefix and 12 hex digits of the
+ * network name's SHA-256, 15 characters, the kernel's limit for an interface name.
+ */
+export function bridgeName(networkName: string): string {
+  const hash = new Bun.CryptoHasher("sha256").update(networkName).digest("hex");
+  return `${BOX_BRIDGE_PREFIX}${hash.slice(0, 12)}`;
+}
+
+/**
+ * Kernel settings for every box: no IPv6 at all, so IPv6 ULA and link-local
+ * addresses are out of reach without IPv6 firewall rules (decision 0012).
+ */
+export const BOX_SYSCTLS: Readonly<Record<string, string>> = {
+  "net.ipv6.conf.all.disable_ipv6": "1",
+  "net.ipv6.conf.default.disable_ipv6": "1",
+};
+
 const IMAGE_REF = /^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -93,6 +120,7 @@ interface VolumeJson {
 interface NetworkJson {
   readonly Id: string;
   readonly Labels?: Record<string, string> | null;
+  readonly IPAM?: { readonly Config?: readonly { readonly Gateway?: string }[] | null };
 }
 
 function fail(
@@ -166,6 +194,27 @@ export class DockerBoxProvider implements BoxProvider {
 
   homeVolumeName(boxId: BoxId): string {
     return `${this.objectName(boxId)}-home`;
+  }
+
+  /**
+   * The gateway of the box's network: the host's address on it, where the hub
+   * binds the box's listener (decision 0012). IPv4 only, like the network.
+   */
+  async hubAddress(boxId: BoxId): Promise<string> {
+    this.#validateId(boxId);
+    const name = this.objectName(boxId);
+    const network = await this.#get<NetworkJson>(`/networks/${name}`, "network.inspect");
+    if (network === undefined) {
+      throw fail(`network ${name} does not exist`, "box", "retry-cold", "box.network-missing");
+    }
+    this.#checkOwned(boxId, network.Labels, `network ${name}`);
+    const gateway = network.IPAM?.Config?.find(
+      (c) => typeof c.Gateway === "string" && /^\d{1,3}(\.\d{1,3}){3}$/.test(c.Gateway),
+    )?.Gateway;
+    if (gateway === undefined) {
+      throw fail(`network ${name} has no IPv4 gateway`, "hub", "give-up", "box.network-invalid");
+    }
+    return gateway;
   }
 
   async create(spec: BoxSpec): Promise<BoxInfo> {
@@ -504,6 +553,7 @@ export class DockerBoxProvider implements BoxProvider {
         MemorySwap: memory,
         PidsLimit: pids,
         ShmSize: this.config.shmBytes,
+        Sysctls: { ...BOX_SYSCTLS },
         ...(disk === undefined ? {} : { StorageOpt: { size: String(disk) } }),
         CapDrop: ["ALL"],
         SecurityOpt: ["no-new-privileges:true"],
@@ -531,8 +581,12 @@ export class DockerBoxProvider implements BoxProvider {
         Driver: "bridge",
         Internal: false,
         Attachable: false,
+        EnableIPv6: false,
         Labels: this.#labels(spec, {}),
-        Options: { "com.docker.network.bridge.enable_icc": "false" },
+        Options: {
+          "com.docker.network.bridge.enable_icc": "false",
+          "com.docker.network.bridge.name": bridgeName(name),
+        },
       },
       // 409: a same-named network appeared since the inspect.
       ok: [201, 409],
