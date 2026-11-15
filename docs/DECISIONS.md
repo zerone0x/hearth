@@ -890,6 +890,9 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   `first run: set the owner password with setup token ...` at start.
   `POST /v1/auth/setup {setupToken, password}` sets the password and signs in;
   after that it answers `409 auth.already-set-up` and the token is gone. The
+  store writes the password with an atomic insert-if-absent (`INSERT ... ON
+  CONFLICT DO NOTHING`), so of two setups racing with the token, exactly one
+  stores its password and signs in; the other gets the 409. The
   token keeps a fresh install that is already behind a public reverse proxy
   from being claimed by whoever reaches it first: only someone who can read the
   hub's output can set the password. A token in the log is a secret in the
@@ -900,7 +903,13 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   (19 MiB, 2 passes, parallelism 1: the OWASP Password Storage Cheat Sheet's
   first argon2id configuration), stored as the PHC string, so raising the
   parameters later still verifies old hashes. Passwords are 12 to 1024
-  characters; the upper bound caps the KDF input.
+  characters; the upper bound caps the KDF input. A longer password is
+  refused before the KDF runs, at setup (`400`) and at login (`401`).
+- **Unicode NFC.** Setup and login normalize the password to NFC
+  (`normalizePassword`) before the KDF, after the length check. The same
+  password can arrive composed ("é", U+00E9) or decomposed ("e" + U+0301)
+  depending on the keyboard and OS; both must sign in. NFC, not NFKC: it
+  changes no character the owner typed into a different one.
 - **Server-side sessions.** Migration 4 adds `owner_password` and
   `login_session` (`session` is the agent session of PRD §5). A session id is
   `hls_` + 256 random bits; only its SHA-256 is stored, so the database never
@@ -927,7 +936,7 @@ storage is `SqliteLoginStore` in `apps/hub/src/store/` (boundary rule).
   the login can keep the owner out by guessing, and the owner then waits out
   the window. The limit is in memory, so a hub restart resets it.
 - **Timing.** The password comparison is argon2's own (`Bun.password.verify`);
-  every admitted attempt runs it, whatever the input. The setup token is
+  every admitted attempt within the length cap runs it, whatever the input. The setup token is
   compared with `secretsEqual`: SHA-256 of both sides, then `timingSafeEqual`
   on the 32-byte digests, so neither content nor length shows in the time.
 - **Session guard.** A middleware in `createApp` runs after the request guard

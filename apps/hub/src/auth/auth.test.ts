@@ -4,8 +4,8 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { type JsonValue, LOCAL_PRINCIPAL, type Principal } from "@hearth/core";
 import { type AppOptions, createApp } from "../app";
 import type { BoxConnections } from "../box/connections";
