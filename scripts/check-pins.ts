@@ -5,7 +5,7 @@ import { checkPins, type Manifest } from "./pins";
 const root = join(import.meta.dir, "..");
 
 const manifests: Manifest[] = [];
-for (const pattern of ["package.json", "apps/*/package.json", "packages/*/package.json"]) {
+for (const pattern of ["package.json", "apps/*/package.json", "packages/*/package.json", "spikes/*/package.json"]) {
   for await (const path of new Glob(pattern).scan({ cwd: root })) {
     manifests.push({ path, json: await Bun.file(join(root, path)).json() });
   }
