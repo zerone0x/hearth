@@ -7,9 +7,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+  closeSync,
+  constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -539,13 +542,23 @@ describe("hardening", () => {
     symlinkSync(h.outside, join(h.root, "link"));
     mkdirSync(join(h.root, "sub"));
     symlinkSync(h.outside, join(h.root, "sub", "deep"));
+    symlinkSync(join(h.outside, "secret.txt"), join(h.root, "filelink"));
     writeFileSync(join(h.root, "mine.txt"), "x");
     for (const pattern of ["link/*", "link/secret*", "sub/deep/*.txt", "./link/*"]) {
       const error = await h.fail("tool.glob", { ...c, pattern, cwd: ".", ignore: [], limit: 10 });
       expect({ pattern, code: error.code }).toEqual({ pattern, code: "tool.path-escape" });
     }
-    // The symlinked directory is matched by a wildcard, not named: its files are dropped.
-    for (const pattern of ["*/secret.txt", "{link,sub}/*", "*/*/*.txt", "**/secret.txt"]) {
+    // Matches whose realpath is outside are dropped: a symlinked directory
+    // matched by a wildcard, and a symlinked file named in full, which Bun's
+    // glob returns as is.
+    for (const pattern of [
+      "*/secret.txt",
+      "{link,sub}/*",
+      "*/*/*.txt",
+      "**/secret.txt",
+      "filelink",
+      "{filelink,x}",
+    ]) {
       const found = await h.ok("tool.glob", { ...c, pattern, cwd: ".", ignore: [], limit: 10 });
       expect({ pattern, paths: found.paths }).toEqual({ pattern, paths: [] });
     }
@@ -628,6 +641,14 @@ describe("hardening", () => {
     expect(h.executor.running).toBe(0);
     // The only slot is free again.
     expect(await h.ok("tool.stat", { ...c, path: "fifo" })).toMatchObject({ isFile: false });
+    // With a reader on the other end, a write still does not go into the FIFO.
+    const reader = openSync(join(h.root, "fifo"), constants.O_RDWR | constants.O_NONBLOCK);
+    try {
+      const error = await h.fail("tool.writeFile", { ...c, path: "fifo", content: "x" });
+      expect(error.code).toBe("tool.not-regular-file");
+    } finally {
+      closeSync(reader);
+    }
   });
 
   test("every file method has its own budget, and a cancel ends it", async () => {
@@ -664,5 +685,24 @@ describe("hardening", () => {
       expect(result.fullOutputPath).toBeNull();
       expect(readdirSync(h.outside)).toEqual(["secret.txt"]);
     }
+    // A symlink planted at the spill file's own (predictable) name is not followed.
+    const h = harness();
+    mkdirSync(join(h.root, ".hearth/exec"), { recursive: true });
+    symlinkSync(
+      join(h.outside, "planted.log"),
+      join(h.root, ".hearth/exec/call_1-rpc_planted.log"),
+    );
+    const frame = await h.send(
+      "tool.exec",
+      {
+        ...c,
+        command: `head -c ${MAX_TOOL_OUTPUT_BYTES * 2} /dev/zero | tr '\\0' b`,
+        cwd: ".",
+        timeoutMs: 10_000,
+      },
+      "rpc_planted",
+    );
+    expect(frame.ok && frame.result).toMatchObject({ outcome: "exited", fullOutputPath: null });
+    expect(readdirSync(h.outside)).toEqual(["secret.txt"]);
   });
 });
