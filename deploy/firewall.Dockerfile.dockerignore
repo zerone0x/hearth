@@ -1,0 +1,4 @@
+# The firewall image needs only the script and its entrypoint.
+*
+!scripts/box-firewall.sh
+!deploy/firewall-entrypoint.sh

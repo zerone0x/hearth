@@ -1,0 +1,106 @@
+# Hearth prototype install (PRD §11.1, decision 0020). Follow docs/install.md:
+#
+#   cd deploy && docker compose up -d --build --wait
+#
+# Three services:
+# - box-image: builds the image the hub starts one box container per session
+#   from (hearth-box:local). It is never a running service: its container exits
+#   at once.
+# - box-firewall: a one-shot that applies the box egress firewall on the host
+#   (scripts/box-firewall.sh, decision 0012) and writes the marker the hub
+#   checks before it starts a box. Privileged on the host's network: it runs in
+#   the host's network namespace with NET_ADMIN.
+# - hub: the hub and the web UI, on the host's network so it can bind each box
+#   network's gateway (decision 0012). Its UI/API listens on the host's
+#   loopback, 127.0.0.1:8787 by default; publish it with a reverse proxy.
+#
+# SECURITY: the hub mounts the Docker socket. Whoever controls the hub process
+# controls the Docker daemon, which is root on this host. That is how the hub
+# creates box containers, networks and volumes (decision 0007); keep the hub's
+# API behind its login (decision 0014) and on loopback or behind TLS.
+#
+# Settings come from deploy/.env (copy hearth.env.example); the model key from
+# the file deploy/secrets/model_key, mounted at /run/secrets/model_key.
+
+name: hearth
+
+services:
+  box-image:
+    image: hearth-box:local
+    build:
+      context: ..
+      dockerfile: apps/box-agent/Dockerfile
+      args:
+        # Must match the pi pin in apps/box-agent/package.json (`bun run pins`).
+        PI_VERSION: "1.5.2"
+    # Only this build-only container skips the image's entrypoint. The hub
+    # creates session boxes through the Engine API with the image's own
+    # ENTRYPOINT (decision 0018: join token file, tini), never this override.
+    entrypoint: ["/bin/true"]
+    command: []
+    network_mode: none
+    restart: "no"
+
+  box-firewall:
+    image: hearth-box-firewall:local
+    build:
+      context: ..
+      dockerfile: deploy/firewall.Dockerfile
+    command: ["apply"]
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      HEARTH_BOX_PORT: ${HEARTH_BOX_PORT:-8788}
+      HEARTH_BOX_EGRESS_ALLOW: ${HEARTH_BOX_EGRESS_ALLOW:-}
+      HEARTH_IPTABLES: ${HEARTH_IPTABLES:-}
+    volumes:
+      # The marker lives in the host's /run (tmpfs): gone after a reboot, like
+      # the rules. The hub reads the same directory.
+      - /run/hearth:/run/hearth
+    restart: "no"
+
+  hub:
+    image: hearth-hub:local
+    build:
+      context: ..
+      dockerfile: deploy/hub.Dockerfile
+    network_mode: host
+    # Root in the container: see SECURITY above (decision 0020).
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    depends_on:
+      box-image:
+        condition: service_completed_successfully
+      box-firewall:
+        condition: service_completed_successfully
+    environment:
+      HEARTH_HOST: ${HEARTH_HOST:-127.0.0.1}
+      HEARTH_PORT: ${HEARTH_PORT:-8787}
+      HEARTH_BOX_PORT: ${HEARTH_BOX_PORT:-8788}
+      HEARTH_PUBLIC_ORIGIN: ${HEARTH_PUBLIC_ORIGIN:-}
+      HEARTH_MODEL_PROVIDER: ${HEARTH_MODEL_PROVIDER:-}
+      HEARTH_MODEL: ${HEARTH_MODEL:-}
+      HEARTH_MODEL_KEY_REF: file:/run/secrets/model_key
+      HEARTH_MODELS_FILE: ${HEARTH_MODELS_FILE:-}
+      HEARTH_IDLE_MINUTES: ${HEARTH_IDLE_MINUTES:-}
+      HEARTH_BOX_EGRESS: ${HEARTH_BOX_EGRESS:-}
+      HEARTH_BOX_INSTANCE: ${HEARTH_BOX_INSTANCE:-hearth}
+      HEARTH_BOX_IMAGE: hearth-box:local
+      HEARTH_BOX_PULL: never
+    secrets:
+      - model_key
+    volumes:
+      - hearth-data:/data
+      # Root-equivalent: see SECURITY above.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/hearth:/run/hearth:ro
+      - ./config:/etc/hearth:ro
+
+secrets:
+  model_key:
+    file: ./secrets/model_key
+
+volumes:
+  hearth-data:

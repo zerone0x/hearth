@@ -134,3 +134,48 @@ export function checkPins(manifests: readonly Manifest[], lockfile: string | und
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 }
+
+/** A non-manifest file that can hard-code a pi version (compose file, Dockerfile). */
+export interface PinnedFile {
+  readonly path: string;
+  readonly text: string;
+}
+
+/** `PI_VERSION: "1.5.2"`, `PI_VERSION=1.5.2`, `ARG PI_VERSION=1.5.2`; not `${PI_VERSION}` or `$(...)`. */
+const LITERAL_PI_VERSION = /\bPI_VERSION\s*[:=]\s*["']?([^"'\s$}]+)/g;
+/** `@earendil-works/pi-coding-agent@1.5.2` in an install command. */
+const PACKAGE_AT_VERSION = new RegExp(
+  `(${escapeRegExp(PI_SCOPE_PREFIX)}[a-z0-9-]+)@([0-9][^"'\\s]*)`,
+  "g",
+);
+
+/**
+ * Checks hard-coded pi versions outside the package manifests against the pin.
+ * `required` lists files that must carry a literal `PI_VERSION` (the compose
+ * file's box build arg), so deleting it is reported too.
+ */
+export function checkFilePins(
+  files: readonly PinnedFile[],
+  version: string | undefined,
+  required: readonly string[] = [],
+): string[] {
+  const errors: string[] = [];
+  for (const path of required) {
+    const file = files.find((f) => f.path === path);
+    if (file === undefined) {
+      errors.push(`${path}: file is missing; it must pin PI_VERSION`);
+    } else if (![...file.text.matchAll(LITERAL_PI_VERSION)].length) {
+      errors.push(`${path}: no literal PI_VERSION; it must pin the pi version`);
+    }
+  }
+  if (version === undefined) return errors;
+  for (const { path, text } of files) {
+    for (const [, found] of text.matchAll(LITERAL_PI_VERSION)) {
+      if (found !== version) errors.push(`${path}: PI_VERSION is ${found}, expected ${version}`);
+    }
+    for (const [, name, found] of text.matchAll(PACKAGE_AT_VERSION)) {
+      if (found !== version) errors.push(`${path}: ${name}@${found}, expected ${version}`);
+    }
+  }
+  return errors;
+}

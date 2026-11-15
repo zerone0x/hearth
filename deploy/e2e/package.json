@@ -1,0 +1,14 @@
+{
+  "name": "@hearth/compose-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The prototype exit e2e (PRD \u00a711.1) against a hub installed with deploy/compose.yaml (decision 0020).",
+  "scripts": {
+    "e2e:install": "bun prototype.ts install",
+    "e2e:upgrade": "bun prototype.ts upgrade"
+  },
+  "devDependencies": {
+    "playwright": "1.65.1"
+  }
+}

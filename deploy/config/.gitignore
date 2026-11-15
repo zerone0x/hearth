@@ -1,0 +1,3 @@
+# Owner config mounted read-only into the hub at /etc/hearth (docs/install.md).
+*
+!.gitignore
