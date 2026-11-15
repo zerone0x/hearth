@@ -1,0 +1,9 @@
+# The build context is the repo root; the image only needs manifests and sources.
+**/node_modules
+.git
+**/*.test.ts
+**/.env
+**/.env.*
+**/*.sqlite
+**/*.sqlite-*
+docs
