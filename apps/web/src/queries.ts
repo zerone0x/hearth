@@ -16,7 +16,11 @@ export const keys = {
   sessions: ["sessions"] as const,
   session: (id: string) => ["session", id] as const,
   events: (id: string) => ["events", id] as const,
+  desktopLock: (id: string) => ["desktop-lock", id] as const,
 };
+
+/** How often an open desktop re-reads its lock: a lease can lapse or be taken meanwhile. */
+export const POLL_DESKTOP_LOCK_MS = 3000;
 
 const SIGNED_OUT: AuthStatus = { setupRequired: false, authenticated: false };
 

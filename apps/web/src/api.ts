@@ -30,6 +30,15 @@ export interface EventPage {
   readonly hasMore: boolean;
 }
 
+/** The desktop lock of a session (decision 0033): who may type on its desktop. */
+export interface DesktopLock {
+  readonly held: boolean;
+  /** The signed-in user holds it. */
+  readonly mine: boolean;
+  readonly holder: { readonly kind: string; readonly principalId: string } | null;
+  readonly expiresAt: number | null;
+}
+
 export interface AuthStatus {
   readonly setupRequired: boolean;
   readonly authenticated: boolean;
@@ -104,6 +113,17 @@ export const api = {
     call<unknown>("POST", `/v1/sessions/${id(sessionId)}/messages`, { text }),
   interrupt: (sessionId: string) =>
     call<{ interrupted: boolean }>("POST", `/v1/sessions/${id(sessionId)}/interrupt`),
+  desktopLock: async (sessionId: string) =>
+    (await call<{ lock: DesktopLock }>("GET", `/v1/sessions/${id(sessionId)}/desktop/lock`)).lock,
+  takeOver: async (sessionId: string) =>
+    (await call<{ lock: DesktopLock }>("POST", `/v1/sessions/${id(sessionId)}/desktop/lock`)).lock,
+  releaseDesktop: async (sessionId: string) =>
+    (
+      await call<{ lock: DesktopLock }>(
+        "POST",
+        `/v1/sessions/${id(sessionId)}/desktop/lock/release`,
+      )
+    ).lock,
   events: (sessionId: string, after: number, limit = 500) =>
     call<EventPage>("GET", `/v1/sessions/${id(sessionId)}/events?after=${after}&limit=${limit}`),
 };

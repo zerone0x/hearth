@@ -1,15 +1,18 @@
 /**
- * View-only filter for the browser → box half of an RFB stream (RFC 6143;
- * decision 0016). M1 shows the desktop and takes no input: the desktop lock
- * that decides who may type is M2 (PRD §8.3).
+ * Input filter for the browser → box half of an RFB stream (RFC 6143;
+ * decisions 0016, 0033). Input passes only while the viewer's principal holds
+ * the session's desktop lock (PRD §8.3): the filter asks its `allowInput`
+ * gate at each `KeyEvent` and `PointerEvent`, so a lock that is released or
+ * lapses stops input at the next message.
  *
  * The filter parses the client's byte stream and passes on only what a
  * viewer needs: the handshake (protocol version 3.7 or 3.8, security type
  * None, `ClientInit` forced to shared), `SetPixelFormat`, `SetEncodings`
  * (without the pseudo-encodings that would make the server push unrequested
- * updates or expect client answers) and `FramebufferUpdateRequest`. Input
- * (`KeyEvent`, `PointerEvent`, `ClientCutText`, `SetDesktopSize`, QEMU key
- * events) and the messages tied to stripped extensions are dropped. Anything
+ * updates or expect client answers) and `FramebufferUpdateRequest`, plus
+ * `KeyEvent` and `PointerEvent` while the gate allows them. The rest of the
+ * input (`ClientCutText`, `SetDesktopSize`, QEMU key events) and the messages
+ * tied to stripped extensions are always dropped. Anything
  * it cannot parse ends the stream: without a length it cannot find the next
  * message boundary, so passing bytes on would let input through.
  */
@@ -47,13 +50,27 @@ export class RfbViolation extends Error {}
 
 type Phase = "version" | "security" | "client-init" | "messages" | "skip";
 
+/** Never allows input: a view-only viewer. */
+const VIEW_ONLY = () => false;
+
 /** One direction's parser state. Feed it chunks in order; it returns the bytes to forward. */
-export class ViewOnlyFilter {
+export class RfbInputFilter {
   #phase: Phase = "version";
   #buffer = new Uint8Array(0);
   #skip = 0;
+  readonly #allowInput: () => boolean;
   /** Messages dropped so far (input the viewer tried to send). */
   dropped = 0;
+  /** Key and pointer messages passed so far (while the gate allowed them). */
+  passed = 0;
+
+  /**
+   * `allowInput` is asked once per `KeyEvent` or `PointerEvent`, when the
+   * message is complete; true passes it to the box. The default never does.
+   */
+  constructor(allowInput: () => boolean = VIEW_ONLY) {
+    this.#allowInput = allowInput;
+  }
 
   /**
    * Consumes `chunk` and returns the bytes the box may see, possibly empty.
@@ -175,6 +192,14 @@ export class ViewOnlyFilter {
         return message.slice();
       case RFB_CLIENT.setEncodings:
         return stripEncodings(message);
+      case RFB_CLIENT.keyEvent:
+      case RFB_CLIENT.pointerEvent:
+        if (this.#allowInput()) {
+          this.passed += 1;
+          return message.slice();
+        }
+        this.dropped += 1;
+        return undefined;
       case RFB_CLIENT.clientCutText: {
         // Signed: a negative length is the extended clipboard format, |length| bytes.
         const length = Math.abs(new DataView(message.buffer, message.byteOffset).getInt32(4));
