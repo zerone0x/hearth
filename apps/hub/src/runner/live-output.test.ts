@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { LiveToolOutput, type ToolOutputPayload } from "./live-output";
-import { redactSecrets } from "./runner";
+import { redactSecrets, secretStart } from "./runner";
 
 const SECRET = "sk-live-0123456789abcdef";
 const redact = (text: string) => redactSecrets(text, [SECRET]);
+/** The runner's redactor for `secrets`, as `SessionRunners` builds it. */
+const redactor = (secrets: string[]) => ({
+  redact: (text: string) => redactSecrets(text, secrets),
+  secretStart: (text: string) => secretStart(text, secrets),
+});
 const bytes = (text: string) => new TextEncoder().encode(text);
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -40,12 +45,36 @@ function live(
   const out = new LiveToolOutput({
     toolCallId: "call_1",
     redact,
+    secretStart: (text) => secretStart(text, [SECRET]),
     append: s.append,
     log: (line) => logs.push(line),
     intervalMs: 5,
     ...extra,
   });
   return { out, logs };
+}
+
+/** A secret of `length` characters no 8-character run of which repeats or meets filler text. */
+function pseudoSecret(length: number, seed: number): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWZ0123456789";
+  let state = seed * 2654435761;
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    state = (state * 1103515245 + 12345) % 2 ** 31;
+    out += alphabet[state % alphabet.length];
+  }
+  return out;
+}
+
+/** The first 8-character piece of `secret` that `text` shows, if any. */
+function shownPart(text: string, secret: string): string | undefined {
+  const pieces = new Set<string>();
+  for (let i = 0; i + 8 <= secret.length; i += 1) pieces.add(secret.slice(i, i + 8));
+  for (let i = 0; i + 8 <= text.length; i += 1) {
+    const piece = text.slice(i, i + 8);
+    if (pieces.has(piece)) return piece;
+  }
+  return undefined;
 }
 
 describe("LiveToolOutput", () => {
@@ -189,5 +218,136 @@ describe("LiveToolOutput", () => {
     await wait(30);
     expect(s.calls).toBe(1);
     expect(logs.join("\n")).toContain("live output of call_1 stopped: disk full");
+  });
+
+  test("a 2000-char secret on a 4000-char line, split across chunks, never shows in part", async () => {
+    const secret = pseudoSecret(2000, 1);
+    const s = sink();
+    const { out } = live(s, redactor([secret]));
+    out.write(bytes(`${"x".repeat(4000)}${secret.slice(0, 1500)}`));
+    await wait(30);
+    out.write(bytes(`${secret.slice(1500)}\n`));
+    await wait(30);
+    out.close();
+    expect(s.text()).toBe(`${"x".repeat(4000)}[redacted]\n`);
+    expect(shownPart(s.text(), secret)).toBeUndefined();
+  });
+
+  test("a PEM split at a line break between chunks never shows a line of it", async () => {
+    const pem = [
+      "-----BEGIN PRIVATE KEY-----",
+      "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7",
+      "q9Zr0d4x2Y1kLmN8pQrStUvWxYz0a1b2c3d4e5f6g7h8i9j0kLmN",
+      "-----END PRIVATE KEY-----",
+    ].join("\n");
+    const firstLineEnd = pem.indexOf("\n") + 1;
+    for (const cut of [firstLineEnd, pem.indexOf("\n", firstLineEnd) + 1]) {
+      const s = sink();
+      const { out } = live(s, redactor([pem]));
+      out.write(bytes(`head\n${pem.slice(0, cut)}`));
+      await wait(30);
+      // Only the line before the key goes; its first lines wait for the rest.
+      expect(s.text()).toBe("head\n");
+      out.write(bytes(`${pem.slice(cut)}\ntail\n`));
+      await wait(30);
+      out.close();
+      expect(s.text()).toBe("head\n[redacted]\ntail\n");
+      expect(s.text()).not.toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  test("every split offset of a 64-char and a 1500-char secret, on short and long lines", async () => {
+    const cases = [
+      { secret: pseudoSecret(64, 2), pre: "a\nb ", long: {} },
+      // A hold shorter than the secret: only the secret-start rule keeps it whole.
+      {
+        secret: pseudoSecret(64, 3),
+        pre: "x".repeat(200),
+        long: { longLineChars: 100, holdChars: 40 },
+      },
+      { secret: pseudoSecret(1500, 4), pre: "a\nb ", long: {} },
+      { secret: pseudoSecret(1500, 5), pre: "x".repeat(4000), long: {} },
+    ];
+    for (const { secret, pre, long } of cases) {
+      // One stream per offset, all at once, so the test stays fast.
+      const runs = [];
+      for (let cut = 1; cut < secret.length; cut += 1) {
+        const s = sink();
+        runs.push({ cut, s, out: live(s, { ...redactor([secret]), intervalMs: 1, ...long }).out });
+      }
+      for (const r of runs) r.out.write(bytes(`${pre}${secret.slice(0, r.cut)}`));
+      await wait(20);
+      for (const r of runs) r.out.write(bytes(`${secret.slice(r.cut)} end\n`));
+      await wait(40);
+      for (const r of runs) {
+        r.out.close();
+        const shown = shownPart(r.s.text(), secret);
+        if (shown !== undefined) throw new Error(`cut ${r.cut} of ${secret.length} shows ${shown}`);
+        expect(r.s.text()).toBe(`${pre}[redacted] end\n`);
+      }
+    }
+  }, 30_000);
+
+  test("a JSON-escaped secret on a long line is held back from its first character", async () => {
+    const secret = `pa"ss\\word-${pseudoSecret(40, 6)}`;
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    for (let cut = 1; cut < escaped.length; cut += 1) {
+      const s = sink();
+      const { out } = live(s, { ...redactor([secret]), longLineChars: 20, holdChars: 4 });
+      out.write(bytes(`{"k":"${"y".repeat(60)}${escaped.slice(0, cut)}`));
+      await wait(15);
+      expect(s.text()).not.toContain("pa\\");
+      out.write(bytes(`${escaped.slice(cut)}"}\n`));
+      await wait(15);
+      out.close();
+      expect(s.text()).toBe(`{"k":"${"y".repeat(60)}[redacted]"}\n`);
+    }
+  });
+
+  test("a carriage return ends a line: progress output shows while it runs", async () => {
+    const s = sink();
+    const { out } = live(s);
+    out.write(bytes("10%\r20%\r30"));
+    await wait(30);
+    expect(s.text()).toBe("10%\r20%\r");
+  });
+
+  test("a line that is not long waits whole for its break", async () => {
+    const s = sink();
+    const { out } = live(s);
+    // 2000 chars: past the hold, short of a long line.
+    out.write(bytes(`a\n${"y".repeat(2000)}`));
+    await wait(30);
+    expect(s.text()).toBe("a\n");
+  });
+
+  test("write says when it takes no more, so the box can be told to stop", async () => {
+    const s = sink();
+    const { out } = live(s, { maxBytes: 8 });
+    expect(out.write(bytes("1234\n"))).toBe(true);
+    expect(out.write(bytes("5678\n"))).toBe(false);
+    expect(out.write(bytes("more\n"))).toBe(false);
+    const closed = live(sink()).out;
+    expect(closed.write(bytes("a\n"))).toBe(true);
+    closed.close();
+    expect(closed.write(bytes("b\n"))).toBe(false);
+  });
+});
+
+describe("secretStart", () => {
+  test("finds the longest tail that is a proper prefix of a secret, raw or JSON-escaped", () => {
+    expect(secretStart("abc sk-li", [SECRET])).toBe(4);
+    expect(secretStart("abc s", [SECRET])).toBe(4);
+    expect(secretStart("abc sk-x", [SECRET])).toBe(8);
+    expect(secretStart("", [SECRET])).toBe(0);
+    // A whole secret at the end is the redactor's job, not a tail.
+    expect(secretStart(`abc ${SECRET}`, [SECRET])).toBe(4 + SECRET.length);
+    // Repeats inside the secret: the longest matching tail wins.
+    expect(secretStart("xaaa", ["aaaab"])).toBe(1);
+    expect(secretStart('k "pa\\"s', ['pa"ss'])).toBe(3);
+    expect(secretStart("k pa", ['pa"ss', "zzz"])).toBe(2);
+    expect(secretStart("k pa", [""])).toBe(4);
+    // A longer secret that starts with a shorter one holds the shorter back.
+    expect(secretStart("k abc", ["abc", "abcdef"])).toBe(2);
   });
 });

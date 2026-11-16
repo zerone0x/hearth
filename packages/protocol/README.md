@@ -249,7 +249,8 @@ new.
   (64 KiB) per command.
 - **Backpressure.** When its hub socket is backed up the box drops waiting
   bytes instead of queuing them. A hub `stream.close` on the id stops the
-  stream; the command runs on.
+  stream; the command runs on. The hub sends one (`cancelled`) once it takes
+  no more of the command's output (its cap, or a failed store).
 - **Compatibility.** A 1.3 box drops the unknown param and answers once. A
   1.3 hub never sends it.
 

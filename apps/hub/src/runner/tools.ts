@@ -85,7 +85,8 @@ export interface HearthToolsOptions {
 
 /** Where a running command's streamed output goes (`LiveToolOutput`). */
 export interface LiveOutputSink {
-  write(chunk: Uint8Array): void;
+  /** False once it wants no more output (capped or stopped): the box is told to stop. */
+  write(chunk: Uint8Array): boolean;
   close(): void;
 }
 

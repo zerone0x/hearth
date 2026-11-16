@@ -6,12 +6,15 @@
  * events are a preview the web drops once the result is in.
  *
  * - **Redacted with the runner's redactor**, the one every stored payload and
- *   tool result goes through. A secret can arrive split across two chunks, so
+ *   tool result goes through. A secret can arrive split across chunks, so
  *   text is only emitted up to a line break (or, for a long line, up to
- *   `holdChars` before its end), and only where redacting the emitted part
- *   alone gives the same text as redacting it with what follows. The held
- *   back tail waits for the next chunk; whatever is held back when the call
- *   ends is never emitted (the result has it).
+ *   `holdChars` before its end), never past the start of a tail that could
+ *   begin a secret (`secretStart`: a proper prefix of one, raw or
+ *   JSON-escaped, however long the secret and whatever line breaks it holds),
+ *   and only where redacting the emitted part alone gives the same text as
+ *   redacting it with what follows. The held back tail waits for the next
+ *   chunk; whatever is held back when the call ends is never emitted (the
+ *   result has it).
  * - **Capped** at `maxBytes` of output per call; then one last event says so.
  * - **Rate limited and coalesced**: at most one append every `intervalMs`,
  *   and never two at once. Output that arrives while an append is in flight
@@ -45,6 +48,11 @@ export interface ToolOutputPayload {
 export interface LiveToolOutputOptions {
   readonly toolCallId: string;
   readonly redact: (text: string) => string;
+  /**
+   * Where the tail of `text` that could be the start of a secret begins
+   * (`text.length` when none): nothing from there on is emitted yet.
+   */
+  readonly secretStart: (text: string) => number;
   readonly append: (payload: ToolOutputPayload) => Promise<unknown>;
   readonly log?: (line: string) => void;
   readonly maxBytes?: number;
@@ -77,15 +85,19 @@ export class LiveToolOutput {
     return this.#seq;
   }
 
-  /** Output bytes from the box. Never blocks and never throws. */
-  write(chunk: Uint8Array): void {
-    if (this.#closed || this.#capped) return;
+  /**
+   * Output bytes from the box. Never blocks and never throws. Returns false
+   * once it takes no more (capped or closed), so the stream can be closed.
+   */
+  write(chunk: Uint8Array): boolean {
+    if (this.#closed || this.#capped) return false;
     const room = this.#max - this.#bytes;
     const part = chunk.length > room ? chunk.subarray(0, room) : chunk;
     this.#bytes += part.length;
     if (part.length > 0) this.#raw += this.#decoder.decode(part, { stream: true });
     if (this.#bytes >= this.#max) this.#capped = true;
     this.#schedule();
+    return !this.#capped;
   }
 
   /** The call ended: no more events, and what is held back is dropped. */
@@ -144,8 +156,9 @@ export class LiveToolOutput {
 
   /**
    * How much of `#raw` can be emitted now: up to the last line break, or for
-   * a long line up to `holdChars` before its end, and only where the head
-   * redacts the same alone as with the rest after it.
+   * a long line up to `holdChars` before its end; moved back to before any
+   * tail that could start a secret; and only where the head redacts the same
+   * alone as with the rest after it.
    */
   #safeCut(): number {
     const raw = this.#raw;
@@ -159,11 +172,22 @@ export class LiveToolOutput {
       at = lastBreak(raw, at - 1);
     }
     const whole = this.#o.redact(raw);
-    for (const cut of candidates) {
+    for (const candidate of candidates) {
+      const cut = this.#beforeSecret(raw, candidate);
       if (cut <= 0) continue;
       if (whole.startsWith(this.#o.redact(raw.slice(0, cut)))) return cut;
     }
     return 0;
+  }
+
+  /** `cut`, moved back until no tail of `raw.slice(0, cut)` could start a secret. */
+  #beforeSecret(raw: string, cut: number): number {
+    let at = cut;
+    for (;;) {
+      const start = noSplitPair(raw, this.#o.secretStart(raw.slice(0, at)));
+      if (start >= at) return at;
+      at = start;
+    }
   }
 }
 
@@ -186,6 +210,7 @@ export interface LiveOutputRunner {
   readonly scope: WorkspaceScope;
   readonly sessionId: SessionId;
   readonly redact?: (text: string) => string;
+  readonly secretStart?: (text: string) => number;
   readonly log?: (line: string) => void;
 }
 
@@ -198,6 +223,7 @@ export function liveToolOutput(
   return new LiveToolOutput({
     toolCallId,
     redact: runner.redact ?? ((text) => text),
+    secretStart: runner.secretStart ?? ((text) => text.length),
     append: (payload) => {
       const turn = turnId();
       return runner.events.append(runner.scope, runner.sessionId, {

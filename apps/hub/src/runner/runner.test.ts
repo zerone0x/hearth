@@ -1218,6 +1218,38 @@ describe("model key redaction (review of #63)", () => {
     }
   });
 
+  test("live output holds back the first lines of a multi-line key until it is whole", async () => {
+    const PEM_KEY = "-----BEGIN KEY-----\nQUJDREVGR0hJSktMTU5PUA\n-----END KEY-----";
+    const pemKeyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(PEM_KEY) };
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs, h.rpc, pemKeyed);
+    const [first, ...rest] = PEM_KEY.split("\n");
+    h.faux.setResponses([
+      call(
+        "bash",
+        {
+          command: `printf 'head\\n${first}\\n'; sleep 0.8; printf '${rest.join("\\n")}\\ntail\\n'`,
+        },
+        "c_pem",
+      ),
+      fauxAssistantMessage("ok"),
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    await (await runners.runner("se_a")).settled();
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.length).toBeGreaterThan(0);
+    // The key's first line went out with nothing else: it waited for the rest.
+    expect((outputs[0] as StoredEvent).payload).toEqual({
+      toolCallId: "c_pem",
+      seq: 0,
+      text: "head\n",
+    });
+    const shown = outputs.map((o) => (o.payload as { text: string }).text).join("");
+    expect(shown).not.toContain("BEGIN KEY");
+    expect(shown).not.toContain("QUJDREVGR0hJSktMTU5PUA");
+  }, 20_000);
+
   // A key with characters JSON escapes (`"` and `\`): the escaped form differs
   // from the raw one, so each redaction site must replace both.
   const TRICKY = 'sk-"a\\b-9f8e7d6c';

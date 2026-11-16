@@ -45,7 +45,8 @@ import type { BoxConnections } from "./connections";
 export type CallParams<M extends ToolMethod> = Omit<ToolParams[M], "callId">;
 
 export interface ToolRpcClientOptions {
-  readonly boxes: Pick<BoxConnections, "listen" | "sendRpc">;
+  readonly boxes: Pick<BoxConnections, "listen" | "sendRpc"> &
+    Partial<Pick<BoxConnections, "sendStream">>;
   /** Overrides `toolDeadlineMs`; tests shorten it. */
   readonly deadlineMs?: <M extends ToolMethod>(method: M, params: ToolParams[M]) => number;
   readonly log?: (line: string) => void;
@@ -121,9 +122,11 @@ export interface BoxToolOperations {
         /**
          * Not in pi's `BashOperations`: the command's output as the box
          * streams it while it runs (decision 0036). Lossy and capped; the
-         * result, through `onData`, stays the answer.
+         * result, through `onData`, stays the answer. Returning `false`
+         * means it wants no more: the hub closes the stream so the box stops
+         * sending it.
          */
-        onOutput?: (chunk: Uint8Array) => void;
+        onOutput?: (chunk: Uint8Array) => boolean | undefined;
       },
     ): Promise<{ exitCode: number | null }>;
   };
@@ -156,12 +159,12 @@ export interface BoxToolOperations {
 }
 
 export class ToolRpcClient {
-  readonly #boxes: Pick<BoxConnections, "listen" | "sendRpc">;
+  readonly #boxes: ToolRpcClientOptions["boxes"];
   readonly #deadlineMs: <M extends ToolMethod>(method: M, params: ToolParams[M]) => number;
   readonly #log: (line: string) => void;
   readonly #pending = new Map<string, Pending>();
   /** Live output streams by `<boxId> <streamId>` (decision 0036). */
-  readonly #streams = new Map<string, (chunk: Uint8Array) => void>();
+  readonly #streams = new Map<string, (chunk: Uint8Array) => boolean | undefined>();
   #nextStream = 0;
   readonly #unlisten: () => void;
 
@@ -400,7 +403,7 @@ export class ToolRpcClient {
   }
 
   /** A live output stream id for one exec on `boxId`, in the range the desktop bridge never uses. */
-  #openStream(boxId: BoxId, onOutput: (chunk: Uint8Array) => void) {
+  #openStream(boxId: BoxId, onOutput: (chunk: Uint8Array) => boolean | undefined) {
     let id: number;
     let key: string;
     do {
@@ -425,10 +428,21 @@ export class ToolRpcClient {
       this.#streams.delete(key);
       return true;
     }
+    let more: boolean | undefined;
     try {
-      onOutput(frame.data);
+      more = onOutput(frame.data);
     } catch (error) {
       this.#log(`tool rpc: live output consumer failed: ${String(error)}`);
+    }
+    if (more === false) {
+      // The consumer stopped listening (its cap, or a failed store): tell the
+      // box to stop streaming this command. The call itself goes on.
+      this.#streams.delete(key);
+      this.#boxes.sendStream?.(boxId, {
+        type: "stream.close",
+        streamId: frame.streamId,
+        reason: "cancelled",
+      });
     }
     return true;
   }

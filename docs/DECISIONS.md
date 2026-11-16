@@ -2844,11 +2844,19 @@ A `bash` call showed nothing until it ended (0011: exec answers once). PRD
   `tool.output` events, `{toolCallId, seq, text, truncated?}` with the turn
   id:
   - **Redacted with the runner's redactor**, the one tool results and every
-    stored payload go through. A secret can arrive split over two chunks, so
+    stored payload go through. A secret can arrive split over chunks, so
     text is emitted only up to a line break, or, for a line over 4 KiB, up to
-    1 KiB before its end, and only where redacting the part alone gives the
-    same text as redacting it with what follows. The held-back tail waits for
-    more output and is dropped when the call ends or hits the cap.
+    1 KiB before its end. That cut then moves back past any tail that could
+    be the start of a secret: a proper prefix of one, raw or JSON-escaped,
+    whatever its length and whatever line breaks it holds (`secretStart` in
+    `runner.ts`, from the same secret list as the redactor; the values never
+    leave it). Last, a cut is taken only where redacting the part alone gives
+    the same text as redacting it with what follows (secrets that overlap).
+    The held-back tail waits for more output and is dropped when the call
+    ends or hits the cap.
+  - **The box is told to stop.** Once the hub takes no more of a call's
+    output (its cap, or a failed append), it sends `stream.close` for that
+    stream, and the box stops streaming the command; the call goes on.
   - **Capped** at 64 KiB per call, then one event with `truncated: true`.
   - **Rate limited, with backpressure:** at most one append per 250 ms per
     call and never two at once. Output that arrives while an append waits on
@@ -2866,8 +2874,13 @@ A `bash` call showed nothing until it ended (0011: exec answers once). PRD
 
 ### Consequences
 
-- A secret that contains a line break can show in part while it is still
-  arriving; the result and every other stored text redact it whole.
+- No part of a registered secret is shown while it is still arriving, at
+  any length and across line breaks. The cost: output that stops at what
+  could be a secret's start (a long line whose last characters are `sk-` when
+  a key starts so, or a line that is a registered PEM's first line) waits for
+  what follows, or shows only in the result. Text that is not a
+  registered secret (one the command makes up) is not redacted here, as in
+  the result.
 - Output with no line break for less than 4 KiB (a prompt, a progress bar
   without `\r`) shows only when the call ends.
 - The trajectory ignores `tool.output`: the tool call's result is its record.
