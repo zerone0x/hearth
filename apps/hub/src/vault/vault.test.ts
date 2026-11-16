@@ -354,14 +354,16 @@ test("vault log lines: component vault, warn when disabled or mid-rotation", () 
 
 test("a key file others can read is used, with a warning at every start", async () => {
   const keyFile = join(dir, "vault_key");
-  writeFileSync(keyFile, `${KEY_A}\n`, { mode: 0o644 });
-  chmodSync(keyFile, 0o644);
-  const shared = await start({ keyRef: `file:${keyFile}` });
-  expect(shared.status).toMatchObject({ state: "enabled" });
-  expect(shared.logs).toContain(
-    `vault: the key file ${keyFile} is readable by others (mode 644); run chmod 600 on it`,
-  );
-  expect(shared.logs.join("\n")).not.toContain(KEY_A);
+  writeFileSync(keyFile, `${KEY_A}\n`);
+  for (const mode of [0o644, 0o640, 0o604]) {
+    chmodSync(keyFile, mode);
+    const shared = await start({ keyRef: `file:${keyFile}` });
+    expect(shared.status).toMatchObject({ state: "enabled" });
+    expect(shared.logs).toContain(
+      `vault: the key file ${keyFile} is readable by others (mode ${mode.toString(8)}); run chmod 600 on it`,
+    );
+    expect(shared.logs.join("\n")).not.toContain(KEY_A);
+  }
   chmodSync(keyFile, 0o600);
   const tight = await start({ keyRef: `file:${keyFile}` });
   expect(tight.status).toMatchObject({ state: "enabled" });
@@ -1614,6 +1616,25 @@ describe("redaction", () => {
     const check = openDatabase(plain);
     expect(new SqliteVaultStore(check).keyRecord()).toBeUndefined();
     check.close();
+  });
+
+  test("a read-only vault on a database with no vault creates nothing", async () => {
+    const db = openDatabase(path);
+    dbs.push(db);
+    const audit = new SqliteAuditSink(db);
+    const status = await new HubVault({
+      store: new SqliteVaultStore(db),
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      readOnly: true,
+      log: () => {},
+      register: () => {},
+    }).open();
+    expect(status).toMatchObject({ state: "disabled", reason: "key-missing" });
+    expect(new SqliteVaultStore(db).keyRecord()).toBeUndefined();
+    expect(auditRows(db, "vault.key.create")).toHaveLength(0);
   });
 
   test("the trajectory CLI exits 1 with no output when it cannot redact", async () => {
