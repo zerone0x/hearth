@@ -511,7 +511,14 @@ describe("snapshot cap", () => {
   test("the spill is a 0600 file under <root>/.hearth/browser, made with its directories", async () => {
     const { tools, page, root } = setup({ maxSnapshotBytes: 10 });
     page.snapshotText = lines(5);
-    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    // A permissive umask, so the file's 0600 is the writer's own, not the umask's.
+    const umask = process.umask(0o022);
+    let snapshot: Awaited<ReturnType<typeof tools.snapshot>>["snapshot"];
+    try {
+      ({ snapshot } = await tools.run("browser.snapshot", { callId: "c" }));
+    } finally {
+      process.umask(umask);
+    }
     const path = join(root, ".hearth/browser/s1.txt");
     expect(snapshot.fullSnapshotPath).toBe(path);
     expect(readFileSync(path, "utf8")).toBe(lines(5).replace(/\[ref=e/g, "[ref=s1e"));
