@@ -339,6 +339,8 @@ describe("secretStart", () => {
     expect(secretStart("abc sk-li", [SECRET])).toBe(4);
     expect(secretStart("abc s", [SECRET])).toBe(4);
     expect(secretStart("abc sk-x", [SECRET])).toBe(8);
+    // A tail that starts like the secret but then differs is not held.
+    expect(secretStart("abc sk-live-0X", [SECRET])).toBe(14);
     expect(secretStart("", [SECRET])).toBe(0);
     // A whole secret at the end is the redactor's job, not a tail.
     expect(secretStart(`abc ${SECRET}`, [SECRET])).toBe(4 + SECRET.length);
