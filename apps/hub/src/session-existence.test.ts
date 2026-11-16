@@ -86,17 +86,19 @@ function fixture() {
   const cookie = `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}`;
   const request = (
     path: string,
-    init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
-  ) =>
-    fetch(new URL(path, hub.url), {
-      method: init.method ?? (init.body === undefined ? "GET" : "POST"),
+    init: { method?: string; body?: unknown; raw?: string; headers?: Record<string, string> } = {},
+  ) => {
+    const text = init.raw ?? (init.body === undefined ? undefined : JSON.stringify(init.body));
+    return fetch(new URL(path, hub.url), {
+      method: init.method ?? (text === undefined ? "GET" : "POST"),
       headers: {
         cookie,
-        ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(text === undefined ? {} : { "content-type": "application/json" }),
         ...init.headers,
       },
-      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+      ...(text === undefined ? {} : { body: text }),
     });
+  };
 
   return {
     hub,
@@ -199,4 +201,54 @@ test("a refused attempt on an existing session keeps its allowed = 0 audit row",
   f.signedIn.principal = OTHER;
   const res = await f.request(`/v1/sessions/${id}`);
   expect(((await res.json()) as { session: { state: string } }).session.state).toBe("idle");
+});
+
+/** Every route with a body, and the action it authorizes (`%` is a session id). */
+const BODY_ROUTES: [string, string][] = [
+  ["/v1/sessions", "session.create"],
+  ["/v1/sessions/%/messages", "session.message"],
+  ["/v1/sessions/%/runner", "session.configure"],
+  ["/v1/sessions/%/labels", "session.label"],
+];
+
+describe("a body is read only after authorize (#32)", () => {
+  test("a body that is not JSON is authorized and audited, then answers 400", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    for (const [template, action] of BODY_ROUTES) {
+      const before = f.auditRows().length;
+      const res = await f.request(template.replace("%", id), { raw: "{not json" });
+      const code = ((await res.json()) as { error: { code: string } }).error.code;
+      expect({ template, status: res.status, code }).toEqual({
+        template,
+        status: 400,
+        code: "request.invalid",
+      });
+      const rows = f.auditRows().slice(before);
+      expect({ template, audited: rows.some((r) => r.action === action) }).toEqual({
+        template,
+        audited: true,
+      });
+    }
+  });
+
+  test("a refused caller gets the same answer whatever the body", async () => {
+    const f = fixture();
+    const live = await f.createSession();
+    f.signedIn.principal = STRANGER;
+    const unknown = unknownLike(live);
+    for (const [template] of BODY_ROUTES.slice(1)) {
+      const answers = new Set<string>();
+      for (const sid of [live, unknown]) {
+        for (const raw of ["{not json", "{}", '{"text":"hi"}']) {
+          const res = await f.request(template.replace("%", sid), { raw });
+          answers.add(`${res.status} ${(await res.text()).replaceAll(sid, "<id>")}`);
+        }
+      }
+      expect({ template, answers: [...answers] }).toEqual({
+        template,
+        answers: [expect.stringMatching(/^403 /)],
+      });
+    }
+  });
 });
