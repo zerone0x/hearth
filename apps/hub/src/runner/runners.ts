@@ -53,7 +53,7 @@ import type { RunnerBox } from "./tools";
 export interface RunnerConfig {
   /** pi provider id, e.g. `anthropic`. */
   readonly provider: string;
-  /** pi model id, e.g. `claude-sonnet-4-5`. */
+  /** pi model id, e.g. `claude-sonnet-5-5`. */
   readonly model: string;
   /** SecretStore reference of the provider key, e.g. `env:ANTHROPIC_API_KEY`. */
   readonly apiKeyRef?: SecretRef;

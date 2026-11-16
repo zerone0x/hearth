@@ -4,9 +4,11 @@ A self-hosted personal agent host. Every session gets its own isolated cloud
 desktop (pi + Chrome), keeps working after you close your laptop, picks up on
 your phone, and turns finished work into lessons.
 
-Status: M1 prototype (PRD §11.1): the hub with its web UI and login, sessions
-whose pi runner works in a Docker box, the box desktop in the browser, and the
-box egress firewall. See the [PRD](docs/PRD.md), the
+Status: M1 prototype done (PRD §11.1): the hub with its web UI and login,
+sessions whose pi runner works in a Docker box, the box desktop in the browser,
+trajectories, and the box egress firewall. Next is M2 Browser & vault. What
+you can do today and after each stage is in
+[PRD §11](docs/PRD.md#11-milestones). See the [PRD](docs/PRD.md), the
 [architecture](docs/ARCHITECTURE.md), the [decision log](docs/DECISIONS.md)
 and the [repo rules](AGENTS.md).
 
