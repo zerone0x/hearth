@@ -300,6 +300,30 @@ async function rawKeys(page: Page, sessionId: string, keys: [number, boolean][])
  * again, even from a client that ignores the UI and sends key events anyway.
  */
 async function takeOver(page: Page, box: string, sessionId: string): Promise<void> {
+  try {
+    await takeOverSteps(page, box, sessionId);
+  } catch (error) {
+    // What the box and the hub saw, for a failed run.
+    await shot(page, "3x-takeover-failed");
+    const run = (...args: string[]) => {
+      const out = Bun.spawnSync(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+      return `${out.stdout.toString()}${out.stderr.toString()}`;
+    };
+    console.log(`e2e: box xvnc.log:\n${run("exec", box, "tail", "-n", "40", "/tmp/xvnc.log")}`);
+    console.log(
+      `e2e: box chromium.log:\n${run("exec", box, "tail", "-n", "20", "/tmp/chromium.log")}`,
+    );
+    const hub = run("ps", "-q", "--filter", "name=hub").trim().split("\n")[0] ?? "";
+    const logs = run("logs", "--tail", "400", hub)
+      .split("\n")
+      .filter((l) => /desktop|lock|vnc|stream/i.test(l))
+      .slice(-60);
+    console.log(`e2e: hub desktop log:\n${logs.join("\n")}`);
+    throw error;
+  }
+}
+
+async function takeOverSteps(page: Page, box: string, sessionId: string): Promise<void> {
   step("5b. take over the desktop and type into the box browser's address bar");
   const desktop = page.getByRole("region", { name: "Desktop" });
   const canvas = desktop.locator("canvas");

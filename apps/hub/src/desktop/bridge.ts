@@ -240,12 +240,18 @@ export class DesktopBridge {
       return;
     }
     let forward: Uint8Array;
+    const passed = viewer.filter.passed;
     try {
       forward = viewer.filter.push(data);
     } catch (error) {
       if (!(error instanceof RfbViolation)) throw error;
       this.#close(viewer, DESKTOP_CLOSE.protocol, error.message);
       return;
+    }
+    if (passed === 0 && viewer.filter.passed > 0) {
+      this.#log(
+        `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} passes input (desktop lock held)`,
+      );
     }
     if (forward.byteLength === 0) return;
     viewer.held.push(forward);
@@ -375,7 +381,7 @@ export class DesktopBridge {
       });
     }
     this.#log(
-      `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} closed: ${reason}`,
+      `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} closed: ${reason} (input passed ${viewer.filter.passed}, dropped ${viewer.filter.dropped})`,
     );
     if (!this.#watching(viewer.ticket.sessionId, viewer.ticket.principal.id)) {
       void this.#options.locks?.viewerLeft(viewer.ticket.sessionId, viewer.ticket.principal.id);
