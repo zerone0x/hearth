@@ -339,6 +339,8 @@ describe("secretStart", () => {
     expect(secretStart("abc sk-li", [SECRET])).toBe(4);
     expect(secretStart("abc s", [SECRET])).toBe(4);
     expect(secretStart("abc sk-x", [SECRET])).toBe(8);
+    // The first candidate start is not a prefix; a later one is.
+    expect(secretStart("k sXsk-l", [SECRET])).toBe(4);
     // A tail that starts like the secret but then differs is not held.
     expect(secretStart("abc sk-live-0X", [SECRET])).toBe(14);
     expect(secretStart("", [SECRET])).toBe(0);
