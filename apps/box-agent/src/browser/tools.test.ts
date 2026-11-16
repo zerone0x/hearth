@@ -902,4 +902,26 @@ describe("review rework 1", () => {
     const result = await tools.run("browser.back", { callId: "c" });
     expect(result).toMatchObject({ ok: false, outcome: "timeout", status: null });
   });
+
+  test("navigate, back and wait report only the dialogs of their own call", async () => {
+    const { tools, page } = setup();
+    page.dialog("alert", "old");
+    const nav = await tools.run("browser.navigate", { callId: "c", url: "http://x/" });
+    expect(nav.dialogs).toEqual([]);
+    page.dialog("alert", "old");
+    const back = await tools.run("browser.back", { callId: "c" });
+    expect(back.dialogs).toEqual([]);
+    page.dialog("alert", "old");
+    const wait = await tools.run("browser.wait", { callId: "c", urlIncludes: "/", timeoutMs: 0 });
+    expect(wait.dialogs).toEqual([]);
+  });
+
+  test("an action whose closing snapshot fails still answers, with snapshot null", async () => {
+    const { tools, page } = setup();
+    page.failSnapshot = new DriverError("failed", "the page is gone");
+    const result = await tools.run("browser.press", { callId: "c", key: "Enter" });
+    expect(result.outcome).toBe("done");
+    expect(result.snapshot).toBeNull();
+  });
 });
+
