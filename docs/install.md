@@ -69,7 +69,7 @@ sed -i "s/^HEARTH_VERSION=.*/HEARTH_VERSION=${version}/" .env
 ```
 
 Edit `.env`: set `HEARTH_MODEL_PROVIDER` and `HEARTH_MODEL` to the pi provider
-and model you use (`anthropic` and `claude-sonnet-4-5` by default). For an
+and model you use (`anthropic` and `claude-sonnet-5-5` by default). For an
 OpenAI-compatible endpoint, put a pi `models.json` in `deploy/config/` and set
 `HEARTH_MODELS_FILE=/etc/hearth/models.json` (`deploy/config/` is mounted
 read-only at `/etc/hearth`), for example:

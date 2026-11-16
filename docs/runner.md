@@ -20,7 +20,7 @@ export ANTHROPIC_API_KEY=sk-ant-...             # your key
 HEARTH_BOX_IMAGE=hearth-box:dev \
 HEARTH_BOX_EGRESS=unrestricted \
 HEARTH_MODEL_PROVIDER=anthropic \
-HEARTH_MODEL=claude-sonnet-4-5 \
+HEARTH_MODEL=claude-sonnet-5-5 \
 HEARTH_MODEL_KEY_REF=env:ANTHROPIC_API_KEY \
 bun apps/hub/src/main.ts
 ```

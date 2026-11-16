@@ -2390,3 +2390,61 @@ row, against "every API handler calls `authorize` first" (AGENTS.md).
 - A refused caller that sends a bad body now gets 401/403/404/409 instead of
   400; the order of checks no longer depends on the body.
 - New error code `rpc.invalid-params` on the echo endpoint.
+
+## 0030: Stage plan v0.4: milestones by user-visible features; a vault in M2
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #106
+
+### Context
+
+M1 Prototype shipped. The v0.3 stage plan (decision 0009) listed later
+milestones as engineering work ("Hardening & desktop": hibernate polish,
+resource limits, image slimming #15, test debt #25 and #26), which does not say
+what the owner can do after a stage. The owner also wants a place to manage
+credentials: today the model key is a file (`deploy/secrets/model_key`) and the
+model is chosen in `.env`.
+
+### Decision
+
+- **PRD v0.4, §11 re-planned** into M2 Browser & vault, M3 Anywhere,
+  M4 Connections & automation, M5 Retro & router, and v1.0. Each stage lists
+  what you can do after it in user terms and closes on testable exit criteria
+  tied to a scenario (S2 to S5). M1 is marked done with what shipped (§11.1),
+  and §11 opens with how to use Hearth today.
+- **The old M2 is split by what it serves.** Desktop takeover with the lock,
+  live shell output and desktop process supervision (#15 item 1) go to M2,
+  because driving and watching a browser needs them. Base image pinning and
+  slimming (#15 items 2 to 4), hibernate polish to the §6.3 acceptance and
+  global resource limits go to v1.0, next to backup / restore and the
+  10-minute install. The test debt (#25, #26) is already closed.
+- **A vault (PRD §6.10, goal G9) in M2.** It stores model keys, site logins and
+  API tokens encrypted at rest, shows only fingerprints, audits every use
+  first, and lets the agent use a credential without the model seeing it. The
+  model key and model choice move into the settings UI; `env:` / `file:`
+  references stay as a fallback. Research #108 settles the master key, cipher,
+  TOTP and whether values enter the box; the PRD marks those spots
+  TODO(#108). Browser automation details are left to research #107,
+  marked TODO(#107).
+- **Placeholder substitution (#70) moves from M3 to M2**, because the vault's
+  "the model never sees a value" needs it.
+- **The model router moves from P2 to P1 (M5).** It suggests a model per task
+  type from past outcomes and spend; the owner accepts a suggestion before it
+  becomes a default, so nothing switches models silently.
+- **Default model `claude-sonnet-5-5`.** `deploy/hearth.env.example`,
+  `docs/install.md` and `docs/runner.md` used `claude-sonnet-4-5`. The newest
+  Sonnet in pi 1.5.2's registry is `claude-sonnet-5-5`
+  (`@earendil-works/pi-ai` 1.5.2, `dist/providers/data/anthropic.json`, key
+  `chat:claude-sonnet-5-5`, "Claude Sonnet 5.5"; the other Sonnet ids there
+  are `claude-sonnet-4-5`, `claude-sonnet-4-5-20250929`, `claude-sonnet-4-6`
+  and `claude-sonnet-5`).
+
+### Consequences
+
+- M2 is larger than the old M2: browser tools (#93), takeover, the vault and
+  #70. The vault and browser designs wait for #107 and #108.
+- The slim image and the hibernate acceptance now gate v1.0, not M2, so the
+  §6.3 numbers are not measured before v1.0.
+- Code comments that name a milestone (approvals in M3, the desktop lock in
+  M2) stay correct.
