@@ -349,6 +349,16 @@ test("vault log lines: component vault, warn when disabled or mid-rotation", () 
 describe("input checks", () => {
   const bad: [string, unknown][] = [
     ["a body that is not an object", ["x"]],
+    ["a null body", null],
+    ["meta that is an array", { name: "a", kind: "token", meta: [], fields: { value: "v" } }],
+    [
+      "a scope whose session is not a string",
+      { name: "a", kind: "token", scope: { sessionId: 5 }, fields: { value: "v" } },
+    ],
+    [
+      "a scope that is an array",
+      { name: "a", kind: "token", scope: ["ses_1"], fields: { value: "v" } },
+    ],
     ["an unknown field", { name: "a", kind: "token", fields: { value: "v" }, extra: 1 }],
     ["a bad name", { name: "A b", kind: "token", fields: { value: "v" } }],
     ["a bad kind", { name: "a", kind: "password", fields: { value: "v" } }],
@@ -442,10 +452,6 @@ describe("input checks", () => {
       register: () => {},
     });
     expect(vault.currentStatus).toEqual({ state: "starting" });
-    // A use before anyone opened the vault waits for the open, it does not fail.
-    await expect(vault.readForHub("none", undefined, "vault:none")).rejects.toMatchObject({
-      code: "secret.not-found",
-    });
     expect(await vault.status(LOCAL_PRINCIPAL)).toMatchObject({ state: "enabled" });
     expect(vault.currentStatus).toMatchObject({ state: "enabled" });
     await vault.list(LOCAL_PRINCIPAL);
@@ -453,6 +459,19 @@ describe("input checks", () => {
     for (const action of ["vault.status", "secret.list", "secret.uses"]) {
       expect(auditRows(db, action)).toHaveLength(1);
     }
+    // A use before anyone opened the vault waits for the open, it does not fail.
+    const fresh = new HubVault({
+      store: new SqliteVaultStore(db),
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+      register: () => {},
+    });
+    await expect(fresh.readForHub("none", undefined, "vault:none")).rejects.toMatchObject({
+      code: "secret.not-found",
+    });
   });
 
   test("a store that throws at open: the vault is disabled (store-corrupt), not the hub", async () => {
