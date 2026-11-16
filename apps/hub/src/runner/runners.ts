@@ -34,6 +34,7 @@ import {
   type WorkspaceScope,
 } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
+import type { DesktopLockCheck } from "../desktop/lock";
 import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
@@ -93,6 +94,12 @@ export interface SessionRunnersOptions {
   readonly log?: (line: string) => void;
   /** Spans and metrics (decision 0021); exports nothing unless configured. */
   readonly telemetry?: Telemetry;
+  /**
+   * The desktop lock (decision 0033): the browser tools refuse with
+   * `desktop.locked` while a person holds the session's desktop. Unset (tests
+   * without a desktop), nothing is locked.
+   */
+  readonly desktopLocks?: DesktopLockCheck;
 }
 
 export interface RunnerOptionsInput {
@@ -325,6 +332,8 @@ export class SessionRunners {
         await this.#refreshContext(sessionId, lease, boxCwd);
       },
       operations: (boxId, callId, trace) => this.#o.tools.operations(boxId, callId, trace),
+      // The browser tools refuse while the owner holds the desktop (decisions 0033, 0035).
+      assertDesktopUnlocked: () => this.#o.desktopLocks?.assertUnlocked(sessionId),
     };
   }
 

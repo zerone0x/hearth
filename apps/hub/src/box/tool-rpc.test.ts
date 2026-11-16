@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HearthError } from "@hearth/core";
 import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
+import { FakeDriver } from "../../../box-agent/src/browser/fake";
+import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { BoxAgent } from "../../../box-agent/src/connection";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import { type Hub, startHub } from "../server";
@@ -342,6 +344,69 @@ describe("ToolRpcClient through a real hub and box-agent", () => {
     });
     expect(exitCode).toBe(0);
     expect(Buffer.concat(chunks).toString()).toBe(`${root}\nfrom the hub`);
+    client.close();
+  }, 30_000);
+});
+
+describe("browser methods through a real hub and box-agent (protocol 1.3)", () => {
+  async function connect(
+    boxId: string,
+    options: Partial<ConstructorParameters<typeof BoxAgent>[0]>,
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), "hearth-browser-hub-"));
+    dirs.push(dir);
+    const hub = startHub({ dbPath: join(dir, "hub.db"), port: 0, boxPort: 0, log: () => {} });
+    hubs.push(hub);
+    const { token } = await hub.issueJoinToken(boxId, `ses_${boxId}`);
+    const agent = new BoxAgent({
+      hubUrl: hub.listenForBoxes("127.0.0.1"),
+      boxId,
+      joinToken: token,
+      log: () => {},
+      ...options,
+    });
+    agents.push(agent);
+    agent.start();
+    await hub.boxes.waitForBox(boxId, STEP_MS);
+    const client = new ToolRpcClient({ boxes: hub.boxes, log: () => {} });
+    return client;
+  }
+
+  test("a 1.2 box connects, and answers a browser method unknown-method, classified give-up", async () => {
+    const client = await connect("box_old", {
+      version: { major: 1, minor: 2 },
+      tools: { root: workspace() },
+    });
+    const error = await rejection(client.call("box_old", "call_b", "browser.snapshot", {}));
+    expect(error).toMatchObject({ code: "unknown-method", owner: "box", disposition: "give-up" });
+    // Its file tools still work.
+    expect(await client.call("box_old", "call_e", "tool.exists", { path: "." })).toEqual({
+      exists: true,
+    });
+    client.close();
+  }, 30_000);
+
+  test("a 1.3 box with a browser answers: snapshot, then a click by ref, then a stale ref", async () => {
+    const root = workspace();
+    const driver = new FakeDriver();
+    driver.first.snapshotText = '- button "Save" [ref=e2]';
+    driver.first.targets.set("e2", {});
+    const client = await connect("box_new", {
+      tools: { root, browser: new BrowserTools({ driver, root }) },
+    });
+    const snap = await client.call("box_new", "call_s", "browser.snapshot", {});
+    expect(snap.snapshot.text).toBe('- button "Save" [ref=s1e2]');
+    const click = await client.call("box_new", "call_c", "browser.click", {
+      ref: "s1e2",
+      element: "Save",
+    });
+    expect(click).toMatchObject({ ok: true, outcome: "done" });
+    const stale = await client.call("box_new", "call_x", "browser.click", {
+      ref: "s1e2",
+      element: "Save",
+    });
+    expect(stale).toMatchObject({ ok: false, outcome: "stale_ref" });
+    expect(driver.first.actions).toEqual(["click e2 left"]);
     client.close();
   }, 30_000);
 });

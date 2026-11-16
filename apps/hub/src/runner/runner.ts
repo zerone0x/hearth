@@ -41,6 +41,7 @@ import {
 import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
+import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import type { CompiledDenyRule } from "./policy";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
@@ -222,6 +223,8 @@ export class SessionRunner {
           throw error;
         }
       },
+      // The desktop lock check of the browser tools (decision 0035).
+      assertDesktopUnlocked: () => inner.assertDesktopUnlocked?.(),
     };
     try {
       const settingsManager = SettingsManager.inMemory({});
@@ -234,6 +237,8 @@ export class SessionRunner {
             denyList: options.denyList,
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
+            onRefused: (_name, toolCallId, code) =>
+              self?.observe(() => self?.tracer.onRefused(toolCallId, code)),
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),
           }),
         },
@@ -299,7 +304,11 @@ export class SessionRunner {
         resourceLoader: loader,
         sessionManager: pi,
         settingsManager,
-        tools: [...ROUTED_TOOLS, ...(options.codemode === true ? ["codemode"] : [])],
+        tools: [
+          ...ROUTED_TOOLS,
+          ...BROWSER_TOOLS,
+          ...(options.codemode === true ? ["codemode"] : []),
+        ],
       });
       const runner = new SessionRunner(options, session, pi, agentDir, persisted);
       self = runner;

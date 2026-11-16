@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.2** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.3** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -230,6 +230,49 @@ sets it on every tool call to the span of that call, so the box's log lines for
 it carry the same trace id (decision 0021). It is optional: a 1.1 peer drops
 it, and the decoder drops a malformed one instead of refusing the call, since
 tracing never fails a tool call.
+
+## Browser RPC (1.3)
+
+The `browser.*` methods (`src/browser.ts`, decision 0032) drive the box's
+Chromium over CDP on loopback (decision 0026). They are tool methods: same
+`rpc` frames, `callId`, once-per-boot ids, deadlines and error classification
+as above. A 1.2 box answers them `unknown-method`; the hub tells the model the
+box does not have browser tools.
+
+| Method | Params | Result |
+|---|---|---|
+| `browser.navigate` | `url` (http, https, `about:blank`), `tab?`, `expect?`, `expectTimeoutMs?` | action result + `status` |
+| `browser.back`, `browser.forward` | `tab?`, `expect?`, `expectTimeoutMs?` | action result + `status`; `navigation_failed` with no such history entry |
+| `browser.snapshot` | `tab?`, `ref?` (subtree), `depth?` | `tab`, `url`, `title`, `snapshot` |
+| `browser.find` | `text` or `regex`, `tab?`, `max?` | `snapshotId`, `lines`, `matches`, `limitReached` |
+| `browser.click` | `ref`, `element`, `button?`, `double?`, `expect?`, `expectTimeoutMs?` | action result |
+| `browser.type` | `ref`, `element`, `text`, `submit?`, `expect?`, `expectTimeoutMs?` | action result |
+| `browser.select` | `ref`, `element`, `values`, `expect?`, `expectTimeoutMs?` | action result |
+| `browser.press` | `key`, `ref?` and `element?` or `tab?`, `expect?`, `expectTimeoutMs?` | action result |
+| `browser.wait` | `urlIncludes?`, `titleIncludes?`, `textVisible?`, `textGone?` (one at least), `tab?`, `timeoutMs` | action result |
+| `browser.screenshot` | `tab?`, `ref?`, `fullPage?` | `data` (JPEG, base64, ≤ 1 MiB), `mimeType`, `bytes`, `sha256`, `width`, `height` |
+| `browser.tabs` | `action` (`list`, `new`, `select`, `close`), `index?`, `url?` | `tabs` (`index`, `url`, `title`, `active`), `active` |
+
+- **Refs.** A snapshot's refs are `s<generation>` plus Playwright's ref
+  (`s7e12`, `s7f1e3` in a frame). Each snapshot of a tab gets a new
+  generation; a ref that is not of a tab's latest snapshot, or whose tab
+  navigated since, is refused at once.
+- **Action result.** `ok`, `outcome` (`done`, `not_verified`, `stale_ref`,
+  `not_actionable`, `timeout`, `navigation_failed`), `message`, `verified`
+  (`expect` held, did not, or `null` when none was given), `tab`, `url`,
+  `title`, `dialogs` the box dismissed, and the fresh `snapshot` ("snapshot
+  last"). `ok` is false when `expect` did not hold.
+- **Snapshot cap.** `snapshot.text` holds at most `MAX_SNAPSHOT_TEXT_BYTES`
+  (24 KiB), cut at a line end with a marker; the whole snapshot is in the
+  box at `fullSnapshotPath` (under `.hearth/browser/`).
+- **Budget.** `browserBudgetMs(method, params)`: connect, the action or
+  navigation, `expectTimeoutMs` or `timeoutMs`, and the closing snapshot.
+  The hub adds the grace. Acting methods and `browser.tabs` are mutating.
+
+| Code | Owner | Disposition |
+|---|---|---|
+| `browser.unavailable` (no CDP answer, or Chromium gone during the call) | `box` | `give-up` when mutating, `retry` when read-only |
+| `browser.no-tab`, `browser.bad-url`, `browser.stale-ref` (screenshot or subtree), `browser.failed` | `user` | `give-up` |
 
 ## Versioning
 

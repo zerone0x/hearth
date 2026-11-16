@@ -4,7 +4,7 @@ export interface ProtocolVersion {
 }
 
 /** The version this build speaks. A different major is incompatible. */
-export const PROTOCOL_VERSION: ProtocolVersion = { major: 1, minor: 2 };
+export const PROTOCOL_VERSION: ProtocolVersion = { major: 1, minor: 3 };
 
 /**
  * Two peers can talk when their major versions match. Minor versions only add

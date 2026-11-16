@@ -2596,6 +2596,164 @@ deviates.
   deleted, or rolled back together with its version, by someone who can write
   the database (the audit rows record the version used).
 
+## 0032: Browser tools: `browser.*` tool RPCs (protocol 1.3) on playwright-core in box-agent
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #116 (narrows #93); design: `docs/research/browser.md` (#107)
+
+### Context
+
+M2 (PRD §6.2, §11.2) gives the agent the box's Chromium (decision 0026) as a
+tool. Research #107 settled the observation model (an accessibility snapshot
+with refs, screenshots on request), verified actions, the package
+(`playwright-core` with `connectOverCDP`) and the tool shapes. Its spike also
+found two traps: a ref from an older page waited out Playwright's whole action
+timeout, and a covered or disabled target did the same.
+
+### Decision
+
+- **Protocol 1.3: `browser.*` methods are tool methods.** `browser.navigate`,
+  `back`, `forward`, `snapshot`, `find`, `click`, `type`, `select`, `press`, `wait`, `screenshot`
+  and `tabs` (`packages/protocol/src/browser.ts`) join `ToolParams` and
+  `ToolResults`, so they reuse the tool RPC of 0011 unchanged: `rpc` frames,
+  once-per-boot ids, per-call deadlines (`browserBudgetMs` plus the grace),
+  trace context (0021) and error classification. Acting methods and `tabs`
+  are mutating (never re-sent to a new boot, `give-up` when the outcome is
+  unknown); observing ones are `retry`. New codes: `browser.unavailable`
+  (box), `browser.no-tab`, `browser.bad-url`, `browser.stale-ref`,
+  `browser.failed` (user). `browser.unavailable` also covers Chromium going
+  away during a call (killed or restarted: the page's browser is
+  disconnected when the call fails); the next call reconnects. A minor bump: a 1.2 box connects as before and
+  answers a browser method `unknown-method`; the hub's tool turns that into
+  "this box has no browser tools". A box-agent built without browser tools
+  answers the same way.
+- **box-agent: `playwright-core` 1.65.1, pinned exactly.** One lazy
+  `connectOverCDP("http://127.0.0.1:${HEARTH_CDP_PORT}")` connection, dialled
+  for up to `BROWSER_CONNECT_TIMEOUT_MS` while the port is closed (box start,
+  supervisor restart). Its `disconnected` event drops it and the next call
+  reconnects; `close()` only disconnects, the supervisor owns Chromium. No
+  hand-written CDP. The browser code sits behind a CDP-free `BrowserDriver`
+  interface (`apps/box-agent/src/browser/driver.ts`), so the rules below are
+  unit-tested on a fake page model.
+- **Snapshot generations, refs that name their snapshot.** Every snapshot
+  (whole page, subtree, or the one behind `browser.find`) gets a new
+  generation, unique in the process, and its refs are rewritten from
+  Playwright's `e5` / `f1e5` to `s<generation>e5`. A tab keeps only its latest
+  generation and its main-frame navigation count at that time. A ref whose
+  generation is not some open tab's latest, or whose tab navigated since, is
+  refused at once with the outcome `stale_ref`, before Playwright sees it.
+  Encoding the generation in the ref, not only remembering the last ref set,
+  is needed because Playwright reuses ref strings across snapshots: `e5` of an
+  older snapshot can name a different element in the newer one.
+- **Fail closed before acting.** Before dispatch the target is inspected: gone
+  is `stale_ref`; hidden, disabled, not editable (`type`) or covered at its
+  centre by another element (`click`, a hit test in the element's own root)
+  is `not_actionable`. Nothing is dispatched, so these return in milliseconds
+  instead of after the 10 s action timeout.
+- **Verified actions, typed outcomes, snapshot last.** Acting calls take an
+  optional `expect` (`urlIncludes`, `titleIncludes`, `textVisible`,
+  `textGone`), polled every 100 ms for `expectTimeoutMs` (default 3 s, at most
+  30 s). The result is `{ ok, outcome, message, verified, tab, url, title,
+  dialogs, snapshot }` with `outcome` one of `done`, `not_verified`,
+  `stale_ref`, `not_actionable`, `timeout`, `navigation_failed`; `ok` is
+  false when `expect` did not hold. Every acting result carries the tab's
+  fresh snapshot, so refs from before the action are stale afterwards.
+  Changes from the research table: `navigation_blocked` is named
+  `navigation_failed`, since the box cannot tell its firewall from other
+  network errors; JavaScript dialogs are dismissed (an `alert` accepted) and
+  listed in `dialogs` instead of being an outcome.
+- **Snapshot cap.** Snapshot text in a result is at most
+  `MAX_SNAPSHOT_TEXT_BYTES` (24 KiB), cut at a line end with a marker; the
+  whole snapshot (up to 4 MiB) is written to
+  `/workspace/.hearth/browser/s<generation>.txt` for `read`. The box writes
+  that file on its own, so it goes through `openPlainFile` like the exec
+  spill (0011): a symlinked `.hearth` or `browser` directory is refused, the
+  file is opened `O_NOFOLLOW | O_NONBLOCK` (a FIFO there fails at once
+  instead of blocking the serial call queue) and created 0600. A refused
+  spill returns the cut snapshot with no path. `browser.find` returns only
+  matching lines (default 20, at most 200); an invalid `regex` is
+  `tool.bad-params`.
+- **Back and forward.** `browser.back` and `browser.forward` move one entry
+  in the tab's history. They are navigations: mutating, navigate's budget,
+  every ref of the tab stale afterwards, the new page's snapshot in the
+  result, `expect` checked. With no such entry the outcome is
+  `navigation_failed` and nothing happens.
+- **One call at a time per box.** Browser calls run in arrival order; a call
+  whose budget ran out while queued never starts. The runner registers the
+  tools as `sequential`.
+- **Navigation scope.** `browser.navigate` and `tabs new` open `http`,
+  `https` and `about:blank` only (`browser.bad-url` otherwise). This is not a
+  boundary: any box command can drive CDP (0026); egress is the host firewall
+  (0012).
+- **Hub runner: `browser_*` pi custom tools** (`apps/hub/src/runner/browser-tools.ts`),
+  registered by the `hearth-tools` extension and active in every session.
+  Each call takes a box lease and calls `browser.*` through the tool RPC.
+  Text results are a JSON header line and the snapshot inside a
+  `<page-content>` block marked as untrusted page content. A page cannot
+  leave the block: every `<page-content` or `</page-content` in page text
+  (snapshot lines, find lines, and the title, URL and dialog text in the
+  header), in any case and spacing, has its `<` written `&lt;`. An acting result
+  that is not ok fails the tool call with the same text, so the trajectory
+  counts `stale_ref` and `not_verified`. `browser_screenshot` returns the JPEG
+  (quality 70, then 50, then 30; a full page falls back to the viewport; at
+  most 1 MiB) as a pi image content part, with its sha256, size and
+  dimensions in the text part; the trajectory step records the image count
+  (0021). Storing the bytes by hash is #117.
+
+### Consequences
+
+- Not in this change: `browser_fill` with vault refs and redaction of filled
+  values (#118), the screenshot mask (#118), the eval tasks B1-B6 (#119),
+  approvals on `element` (M3), coordinate clicks, `browser_evaluate`.
+- Until #117 the screenshot is kept only inside the `pi.tool_execution_end`
+  event of the call, as base64, and only while that event fits
+  `MAX_RUNNER_EVENT_BYTES` (1 MiB). A JPEG over about 768 KiB makes the
+  event larger, and the event is then stored truncated (its first 4 KiB and
+  its size): the image is not kept.
+- The agent works in the same browser the owner sees. The desktop lock
+  (0033) does not gate the browser tools yet; wiring `assertUnlocked` into
+  them is #126.
+- `playwright-core` follows Playwright's tested Chromium, while the box runs
+  Debian's. The Docker e2e (`browser.docker.test.ts`, `box-provider` job)
+  runs the tools against the real image, so a drift shows up in CI.
+
+### Proof
+
+- `packages/protocol/src/browser.test.ts`: methods, params and results, ref
+  parsing, budgets, classification, and a 1.2 peer being compatible.
+- `apps/box-agent/src/browser/tools.test.ts` (fake page model): generations,
+  stale refs refused before dispatch (older snapshot, after an action, after
+  a navigation, closed tab, foreign shape), the five pre-dispatch refusals,
+  verification, the snapshot cap at exactly the limit and one byte over,
+  find, screenshots, tabs, back and forward, error codes and call ordering.
+  The spill uses the real writer on a temp root: a 0600 file in a new
+  `.hearth/browser`, the 4 MiB cap, and no spill (nothing written outside,
+  no hang) through a symlinked `.hearth`, `.hearth/browser` or file, or a
+  FIFO at the path.
+- `apps/box-agent/src/browser/playwright.test.ts`: the same tools on
+  `playwright-core` against a real headless Chromium over CDP (CI `web-e2e`
+  job): type, select and click verified, disabled and covered targets refused
+  fast, a stale ref after navigation and after the page navigates by itself,
+  dialogs settled and reported, back and forward, a refused connection as
+  `navigation_failed`, an element screenshot, Chromium killed mid-call as
+  `browser.unavailable`, and a reconnect after the browser restarts; without a browser, `browser.unavailable` after the dial
+  timeout.
+- `apps/hub/src/box/tool-rpc.test.ts`: a real hub and box-agent; a 1.2
+  box-agent answers `unknown-method`, a 1.3 one answers snapshot, click and a
+  stale ref.
+- `apps/hub/src/runner/browser-tools.test.ts` and
+  `browser-tools.chromium.test.ts` (real Chromium): one `<page-content>`
+  block per result even when the page writes `</page-content> SYSTEM: ...`;
+  the dialogs header; find wrapping; every tool `sequential`.
+- `apps/hub/src/runner/runner.test.ts`: the faux model reads a ref off a
+  snapshot and clicks it; image results; failed outcomes as tool errors; the
+  older-box message.
+- `apps/hub/src/runner/browser.docker.test.ts` (CI `box-provider` job): the
+  real box image, a fixture page served inside the box, type, select and a
+  verified click by ref, a screenshot, and the submitted values in the box
+  server's log.
+
 ## 0033: Desktop takeover: a hub-side lock lease per session gates the RFB input filter
 
 - Date: 2026-11-16
@@ -2729,3 +2887,68 @@ before `fetch` runs, with no JSON envelope.
 ### Consequences
 
 A client that streams a body without a length is refused with 411.
+
+## 0035: Browser tools refuse at once while the owner holds the desktop lock
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #126
+- Wires 0033 (the lock) into 0032 (the browser tools); PRD §8.3, §11.2.
+
+### Context
+
+0033 gave the hub a desktop lock and a check for the agent's tools
+(`assertUnlocked`), and 0032 gave the agent `browser_*` tools on the box's
+Chromium. Neither wired one into the other, so the agent could still click and
+type in the browser the owner had taken over. PRD §11.2 says the agent's
+browser and desktop input tools answer "user is in control" while the owner
+holds the lock. The choice left open: refuse at once, or wait for the lock
+with a short bound.
+
+### Decision
+
+- **Every `browser_*` tool checks the lock first**, before it takes a box
+  lease: a refused call neither starts nor wakes the box and sends nothing to
+  it. The runners get the hub's `DesktopLocks` (`SessionRunnersOptions.desktopLocks`,
+  set by `startHub`) and each session's `RunnerBox.assertDesktopUnlocked`
+  calls `assertUnlocked(sessionId)`.
+- **All twelve tools refuse, the read-only ones too** (`browser_snapshot`,
+  `browser_find`, `browser_screenshot`, `browser_tabs` list). One rule is
+  easier for the model to follow than a list, a snapshot or tab switch drives
+  the same page the owner is using, and the owner's page while they work on
+  it is theirs. This narrows the "read-only tools may keep working" note of
+  docs/runner.md.
+- **Refuse at once, no wait.** The tool call fails with
+  `DESKTOP_LOCKED_MESSAGE`: `desktop.locked: user is in control.` and that
+  nothing was sent, wait and try again later, or ask the user. The model can
+  retry, tell the owner or do other work; a hidden wait would hold the turn
+  (and its box lease) for up to the 60 s lease while the owner may be gone
+  for longer, and PRD §8.3's paused turn clocks for an agent waiting on the
+  lock do not exist yet.
+- **The trajectory records the refusal.** The tool call's `runner.step` has
+  `outcome: "desktop-locked"` (a new value next to 0021's `ok`, `error`,
+  `aborted`, `timeout`, `denied`, `outcome-unknown`; added values do not bump
+  the schema), `refused_code: "desktop.locked"`, no box and no RPCs, and the
+  summary counts it under `tool_failures_by_class["desktop-locked"]`.
+- Any other error of the check is not a refusal: it is rethrown as is.
+
+### Alternatives rejected
+
+- Wait for the release with a bound of a few seconds: a person who took over
+  rarely gives the desktop back that fast, so it mostly adds latency before
+  the same refusal, while holding a lease.
+- Refuse only the acting tools: see above; it can be revisited when the agent
+  can hold the lock itself (PRD §8.3 queue).
+
+### Consequences
+
+- While the owner holds the desktop the agent cannot even look at the page;
+  it has to ask or wait.
+- The check runs once, before the box lease. A call already past it (a cold
+  box wake can take seconds) still reaches the page if the owner takes over
+  meanwhile: the owner may see one last agent action after Take over. A second
+  check after the wake is a follow-up (#133).
+- Proof: unit tests of the check in every tool (`browser-tools.test.ts`), the
+  real `startHub` wiring and trajectory step (`browser-lock.test.ts`), and a
+  compose-e2e step: Take over, an agent `browser_tabs` call is refused with
+  `desktop.locked`, Release, the same call works in the box's Chromium.

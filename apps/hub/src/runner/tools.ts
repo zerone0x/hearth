@@ -14,6 +14,9 @@
  *   hub's `rg`.
  * - `tool_call` rewrites `~` to the box workspace and applies the deny-list;
  *   `tool_result` rewrites hub temp paths (policy.ts).
+ * - The `browser_*` tools (browser-tools.ts, decision 0032) go to the box the
+ *   same way, as `browser.*` methods of the tool RPC, and refuse while the
+ *   owner holds the desktop lock (decision 0035).
  */
 
 import {
@@ -29,6 +32,7 @@ import {
 import type { BoxId } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { BoxLease } from "../session/manager";
+import { registerBrowserTools } from "./browser-tools";
 import {
   type CompiledDenyRule,
   denied,
@@ -52,6 +56,12 @@ export interface RunnerBox {
    * and the call fails.
    */
   prepare?(lease: BoxLease): Promise<void>;
+  /**
+   * Throws `desktop.locked` while a person holds this session's desktop lock
+   * (`DesktopLocks.assertUnlocked`, decision 0033). The browser tools call it
+   * before anything else; unset, nothing is locked.
+   */
+  assertDesktopUnlocked?(): void;
 }
 
 export interface HearthToolsOptions {
@@ -63,6 +73,8 @@ export interface HearthToolsOptions {
   readonly hubTempDir?: string;
   /** Called after a call was blocked, for the event log. */
   readonly onDenied?: (toolName: string, toolCallId: string, reason: string) => void;
+  /** Called after a browser tool was refused for the desktop lock, for the trajectory. */
+  readonly onRefused?: (toolName: string, toolCallId: string, code: string) => void;
 }
 
 const GREP_DEFAULT_LIMIT = 100;
@@ -197,6 +209,8 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
           return { content: [{ type: "text", text }], details: undefined };
         }),
     });
+
+    registerBrowserTools(pi, box, options.onRefused);
 
     pi.on("tool_call", (event) => {
       if (PATH_TOOLS.has(event.toolName)) {
