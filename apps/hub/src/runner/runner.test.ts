@@ -124,6 +124,8 @@ class FakeBoxes {
   executor: ToolExecutor;
   /** The box's browser (a fake page model); without one the box is a 1.2 box. */
   browser: BrowserTools | undefined;
+  /** Stream frames the hub sent the box. */
+  readonly streamsClosed: Array<{ streamId: number; reason: string | undefined }> = [];
 
   constructor(
     readonly root: string,
@@ -151,6 +153,13 @@ class FakeBoxes {
   listen(listener: BoxConnectionListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** The hub closed a stream: as box-agent's connection does, stop that live output. */
+  sendStream(_boxId: string, frame: { type: string; streamId: number; reason?: string }): boolean {
+    this.streamsClosed.push({ streamId: frame.streamId, reason: frame.reason });
+    if (frame.type === "stream.close") this.executor.closeStream(frame.streamId);
+    return true;
   }
 
   sendRpc(_boxId: string, frame: RpcFrame): string | undefined {
@@ -1121,6 +1130,32 @@ describe("live bash output (decision 0036)", () => {
     // The result is the answer, redacted as before.
     const result = toolResults(runner.messages).find((r) => r.id === "c_live");
     expect(result?.text).toContain("second");
+  }, 20_000);
+});
+
+describe("live bash output: the cap", () => {
+  test("output past the cap closes the stream on the box; the call and its result go on", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "go", [
+      call(
+        "bash",
+        { command: "head -c 70000 /dev/zero | tr '\\0' a; sleep 0.5; echo; echo end" },
+        "c_cap",
+      ),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.at(-1)?.payload).toMatchObject({ toolCallId: "c_cap", truncated: true });
+    const stream = (h.boxes.sent.find((f) => f.method === "tool.exec")?.params ?? {}) as {
+      outputStream?: number;
+    };
+    expect(stream.outputStream).toBeDefined();
+    expect(h.boxes.streamsClosed).toEqual([
+      { streamId: stream.outputStream as number, reason: "cancelled" },
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_cap");
+    expect(result?.text).toContain("end");
   }, 20_000);
 });
 

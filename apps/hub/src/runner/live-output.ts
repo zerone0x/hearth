@@ -180,14 +180,13 @@ export class LiveToolOutput {
     return 0;
   }
 
-  /** `cut`, moved back until no tail of `raw.slice(0, cut)` could start a secret. */
+  /**
+   * `cut`, moved back to where the longest tail of `raw.slice(0, cut)` that
+   * could start a secret begins. No secret then spans the cut: its first part
+   * would be such a tail.
+   */
   #beforeSecret(raw: string, cut: number): number {
-    let at = cut;
-    for (;;) {
-      const start = noSplitPair(raw, this.#o.secretStart(raw.slice(0, at)));
-      if (start >= at) return at;
-      at = start;
-    }
+    return Math.min(cut, this.#o.secretStart(raw.slice(0, cut)));
   }
 }
 
