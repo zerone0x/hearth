@@ -186,6 +186,7 @@ describe("input checks", () => {
       ["token", { hosts: ["ok.example", "bad host"] }],
       ["token", { hosts: ["-bad.example"] }],
       ["model-key", { use: "hub" }],
+      ["model-key", []],
     ];
     for (const [kind, policy] of bad) {
       expect(() => canonicalPolicy(kind, policy)).toThrow(invalid);
@@ -198,6 +199,7 @@ describe("input checks", () => {
     });
     const bad: [Parameters<typeof checkEntryFields>[0], unknown][] = [
       ["token", "x"],
+      ["token", null],
       ["token", { value: "v", other: "w" }],
       ["login", { username: "u" }],
       ["token", { value: " " }],
