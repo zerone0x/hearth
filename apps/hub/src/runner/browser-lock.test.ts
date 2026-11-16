@@ -81,7 +81,10 @@ async function fixture(): Promise<{ hub: Hub; faux: FauxProviderHandle; leases: 
 
 type Result = { role: string; toolCallId?: string; isError?: boolean; content?: unknown };
 
-function resultText(messages: readonly unknown[], id: string): { isError?: boolean; text: string } {
+function resultText(
+  messages: readonly unknown[],
+  id: string,
+): { isError: boolean | undefined; text: string } {
   const m = (messages as Result[]).find((r) => r.role === "toolResult" && r.toolCallId === id);
   const parts = (m?.content ?? []) as Array<{ text?: string }>;
   return { isError: m?.isError, text: parts.map((p) => p.text ?? "").join("") };

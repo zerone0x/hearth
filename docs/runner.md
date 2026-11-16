@@ -75,8 +75,9 @@ desktop's Chromium over CDP, so the owner watches them on the live desktop. Resu
 whose refs (`s3e12`) are valid until the next snapshot or action; an acting
 call with `expect` is checked by the box, and one that is not `done` fails
 the tool call. Screenshots reach the model as image results. A box image
-older than protocol 1.3 answers that it has no browser tools. They do not
-check the desktop lock below yet; that is #126.
+older than protocol 1.3 answers that it has no browser tools. While the owner
+holds the desktop lock they refuse at once with `desktop.locked` (below,
+decision 0035).
 
 ## Desktop lock: agent desktop and browser tools (decision 0033)
 
@@ -90,12 +91,16 @@ check as `hub.desktopLocks` (`apps/hub/src/desktop/lock.ts`):
 | `assertUnlocked(sessionId)` | throws `HearthError` code `desktop.locked`, message `user is in control` (owner `user`, disposition `retry`) while it is held |
 | `holder(sessionId)` | `{ kind, principalId }` or `undefined` |
 
-A tool that drives the box desktop or browser (the `browser_*` tools of #116)
-calls `assertUnlocked` before it sends anything to the box and returns the
-error to the model as its result, so the model reads "user is in control" and
-can wait or ask. Read-only tools (a screenshot) may keep working. Releasing
+Every `browser_*` tool, the read-only ones included, calls `assertUnlocked`
+through `RunnerBox.assertDesktopUnlocked` before it takes a box lease, so a
+refused call neither wakes the box nor sends it anything (decision 0035). It
+does not wait: the tool call fails at once with `DESKTOP_LOCKED_MESSAGE`
+(`desktop.locked: user is in control.`, then wait and try again, or ask the
+user), and the model decides what to do. The trajectory step of the call has
+`outcome: "desktop-locked"` and `refused_code: "desktop.locked"`. Releasing
 the lock, closing the tab and a lapsed lease all free it at once; the next
-call succeeds.
+call succeeds. `startHub` hands its `DesktopLocks` to the runners; runners
+made without one (tests) are never locked.
 
 ## Tests
 

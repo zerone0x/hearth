@@ -408,6 +408,91 @@ async function takeOverSteps(page: Page, box: string, sessionId: string): Promis
   check(urls.includes(held), `the box browser left ${held}: ${urls.join(", ")}`);
 }
 
+/** The `tool_call` trajectory step of `toolCallId` (decision 0021), read over the events API. */
+async function toolStep(
+  page: Page,
+  sessionId: string,
+  toolCallId: string,
+): Promise<Record<string, unknown> | undefined> {
+  const res = await page.request.get(
+    new URL(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/events?after=0&limit=1000`,
+      BASE,
+    ).toString(),
+    { headers: { origin: BASE.origin } },
+  );
+  check(res.ok(), `reading events answered ${res.status()}`);
+  const { events } = (await res.json()) as {
+    events: { type: string; payload: Record<string, unknown> }[];
+  };
+  return events.find(
+    (e) =>
+      e.type === "runner.step" &&
+      e.payload["kind"] === "tool_call" &&
+      e.payload["tool_call_id"] === toolCallId,
+  )?.payload;
+}
+
+/**
+ * #126 (decision 0035): while the owner holds the desktop, an agent
+ * `browser_*` call is refused with `desktop.locked` and the trajectory says
+ * so; after Release the same tool runs in the box's Chromium again.
+ */
+async function browserToolUnderLock(page: Page, sessionId: string): Promise<void> {
+  step("5e. a browser tool refuses while the desktop is taken over, and works after Release");
+  await page.getByRole("button", { name: "Take over" }).click();
+  await page.getByRole("button", { name: "Release" }).waitFor();
+  await script([
+    {
+      toolCalls: [{ id: "call_tabs_locked", name: "browser_tabs", arguments: { action: "list" } }],
+    },
+    { text: "The user is in control of the desktop; I will wait." },
+  ]);
+  await page.getByLabel("Message").fill("List the browser tabs");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page
+    .getByText("The user is in control of the desktop; I will wait.")
+    .waitFor({ timeout: TURN_MS });
+  const locked = await toolStep(page, sessionId, "call_tabs_locked");
+  check(locked !== undefined, "no trajectory step for the locked browser_tabs call");
+  check(
+    locked?.["outcome"] === "desktop-locked" && locked?.["refused_code"] === "desktop.locked",
+    `the locked browser_tabs call was not refused with desktop.locked: ${JSON.stringify(locked)}`,
+  );
+  check(
+    String((locked?.["result"] as { text?: unknown } | undefined)?.text).includes(
+      "user is in control",
+    ),
+    `the model was not told the user is in control: ${JSON.stringify(locked?.["result"])}`,
+  );
+  check(
+    JSON.stringify(locked?.["rpcs"]) === "[]",
+    `the locked call reached the box: ${JSON.stringify(locked?.["rpcs"])}`,
+  );
+  await shot(page, "3c-browser-tool-locked");
+
+  await page.getByRole("button", { name: "Release" }).click();
+  await page.getByRole("button", { name: "Take over" }).waitFor();
+  await script([
+    { toolCalls: [{ id: "call_tabs_free", name: "browser_tabs", arguments: { action: "list" } }] },
+    { text: "Listed the browser tabs." },
+  ]);
+  await page.getByLabel("Message").fill("List the browser tabs again");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByText("Listed the browser tabs.").waitFor({ timeout: TURN_MS });
+  const free = await toolStep(page, sessionId, "call_tabs_free");
+  check(
+    free?.["outcome"] === "ok",
+    `browser_tabs did not work after Release: ${JSON.stringify(free)}`,
+  );
+  check(
+    (free?.["rpcs"] as { method?: string }[] | undefined)?.some(
+      (r) => r.method === "browser.tabs",
+    ) === true,
+    `browser_tabs after Release made no browser.tabs rpc: ${JSON.stringify(free?.["rpcs"])}`,
+  );
+}
+
 async function install(browser: Browser): Promise<void> {
   const setupToken = process.env["HEARTH_SETUP_TOKEN"];
   check(setupToken !== undefined && setupToken !== "", "HEARTH_SETUP_TOKEN is required");
@@ -562,6 +647,7 @@ async function install(browser: Browser): Promise<void> {
   check(problem === null, `the desktop is not drawn: ${problem}`);
 
   await takeOver(page, box, sessionId);
+  await browserToolUnderLock(page, sessionId);
 
   step("6. closing and reopening the page continues the session");
   await page.close();
