@@ -106,7 +106,9 @@ const BUN_MAX_BODY_BYTES = 0xffff_ffff;
  */
 function bodyLimitRefusal(req: Request, limit: number): Response | undefined {
   if (req.headers.has("transfer-encoding")) {
-    return closing(refusal(411, "request.length-required", "a request body needs a Content-Length"));
+    return closing(
+      refusal(411, "request.length-required", "a request body needs a Content-Length"),
+    );
   }
   const declared = req.headers.get("content-length");
   if (declared === null) return undefined;
