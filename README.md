@@ -114,7 +114,7 @@ Inside the box (set by the hub or the box image, not by the owner):
 | `HEARTH_SESSION_ID` | set by the hub | `apps/box-agent/image/entrypoint.sh` | the session shown on the desktop's start page |
 | `HEARTH_CHROMIUM_SANDBOX` | `off` from the hub | `apps/box-agent/image/entrypoint.sh` | `off` launches Chromium with `--no-sandbox` (0026) |
 | `HEARTH_WORKSPACE` | `/workspace` | `apps/box-agent/src/main.ts` | workspace root, for box-agent outside the image |
-| `HEARTH_DISPLAY` | `:1` | `apps/box-agent/src/main.ts`, `apps/box-agent/image/entrypoint.sh` | X display of the desktop |
+| `HEARTH_DISPLAY` | `:1` | `apps/box-agent/src/main.ts`, `apps/box-agent/image/entrypoint.sh` | X display of the desktop; the default comes from the image and its entrypoint, not from `main.ts` |
 | `HEARTH_VNC_PORT` | `5901` | `apps/box-agent/src/main.ts`, `apps/box-agent/image/entrypoint.sh` | Xvnc port, loopback only (0016) |
 | `HEARTH_SCREEN` | `1280x800` | `apps/box-agent/image/entrypoint.sh` | desktop size |
 | `HEARTH_CDP_PORT` | `9222` | `apps/box-agent/image/entrypoint.sh` | Chromium DevTools port, loopback only (0026) |

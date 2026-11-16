@@ -5,7 +5,14 @@
  *   row of the README's configuration table, the row names a file that really
  *   mentions it, and no `HEARTH_*` row names a variable the repo no longer has;
  * - every row of the "Invariants and tests" table in docs/ARCHITECTURE.md
- *   names a test file that exists and a test name that is in it.
+ *   names a test file that exists and a test name that is declared in it as
+ *   `test("<name>"` or `it("<name>"`, exactly, not as a substring.
+ *
+ * Both checks read source text, so they cannot evaluate code. The rule for a
+ * name built at run time (a template literal, a concatenation, a loop over
+ * cases): a built name must be spelled out in a comment of the file that
+ * builds it. The README row and the invariants row then name the spelled-out
+ * variable or test, and the check finds it in that comment.
  */
 
 /** A `HEARTH_*` or `OTEL_*` variable name; a template prefix such as `OTEL_..._${signal}` is not one. */
@@ -18,12 +25,13 @@ export interface SourceFile {
 
 /**
  * Whether a tracked file is shipped code whose variables the README must list:
- * the apps, packages, scripts and deploy files, but not tests, test data, the
+ * the apps, packages, scripts and deploy files and the root `.json` files
+ * (`package.json` scripts read variables too), but not `bun.lock`, tests, test data, the
  * e2e harnesses (their variables are documented in their own headers) or docs.
  */
 export function isShippedCode(path: string): boolean {
-  if (!/^(apps|packages|scripts|deploy)\//.test(path)) return false;
-  if (/\.(md|lock|json)$/.test(path)) return false;
+  if (!/^(apps|packages|scripts|deploy)\/|^[^/]+\.json$/.test(path)) return false;
+  if (/\.(md|lock)$/.test(path) || /(^|\/)bun\.lock$/.test(path)) return false;
   if (/\.test\.tsx?$/.test(path) || /\.dom\.tsx$/.test(path)) return false;
   if (/(^|\/)(testdata|e2e)\//.test(path)) return false;
   return true;
@@ -158,6 +166,12 @@ export function invariantRefs(architecture: string): InvariantRef[] {
   return refs;
 }
 
+/** Whether the source declares a test named exactly `name`: `test("name"` or `it("name"` that starts a line, so a name in a comment or a string does not count. */
+export function declaresTest(text: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^[ \\t]*(?:test|it)\\(\\s*(["'\`])${escaped}\\1`, "m").test(text);
+}
+
 /** Each reference whose file is missing or does not contain the test name. */
 export function invariantDrift(
   refs: readonly InvariantRef[],
@@ -172,7 +186,7 @@ export function invariantDrift(
     }
     const text = read(ref.file);
     if (text === undefined) errors.push(`invariant "${ref.promise}": no file ${ref.file}`);
-    else if (!text.includes(ref.test)) {
+    else if (!declaresTest(text, ref.test)) {
       errors.push(`invariant "${ref.promise}": ${ref.file} has no test "${ref.test}"`);
     }
   }

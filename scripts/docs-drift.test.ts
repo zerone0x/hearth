@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   configDrift,
   configVars,
+  declaresTest,
   invariantDrift,
   invariantRefs,
   isShippedCode,
@@ -63,7 +64,19 @@ describe("README configuration table", () => {
     expect(isShippedCode("apps/box-agent/src/testdata/stream-agent.ts")).toBe(false);
     expect(isShippedCode("deploy/e2e/prototype.ts")).toBe(false);
     expect(isShippedCode("docs/install.md")).toBe(false);
+    expect(isShippedCode("bun.lock")).toBe(false);
+    expect(isShippedCode("apps/hub/bun.lock")).toBe(false);
     expect(isShippedCode(".github/workflows/ci.yml")).toBe(false);
+  });
+
+  test("shipped code includes .json files, root and nested", () => {
+    expect(isShippedCode("package.json")).toBe(true);
+    expect(isShippedCode("apps/hub/package.json")).toBe(true);
+    expect(isShippedCode("apps/hub/src/testdata/x.json")).toBe(false);
+    const json = [{ path: "package.json", text: '{"scripts":{"x":"HEARTH_J=1 bun x"}}' }];
+    expect(configDrift(readmeConfigRows(README), json, json)).toContain(
+      "HEARTH_J (package.json) is not in the README configuration table",
+    );
   });
 
   test("a variable the code reads and the table lacks is drift", () => {
@@ -136,6 +149,32 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
       'invariant "One": x.test.ts has no test "second"',
       'invariant "One": no file y.test.ts',
       'invariant "Two" names no test',
+    ]);
+  });
+
+  test("a test name must be declared exactly, not as a substring or in a comment", () => {
+    const text = [
+      'test("first thing happens", () => {});',
+      '// test("second") was renamed',
+      "it('third', () => {});",
+      'const label = "fourth";',
+    ].join("\n");
+    expect(declaresTest(text, "first thing happens")).toBe(true);
+    expect(declaresTest(text, "first")).toBe(false);
+    expect(declaresTest(text, "thing happens")).toBe(false);
+    expect(declaresTest(text, "fourth")).toBe(false);
+    expect(declaresTest(text, "second")).toBe(false);
+    expect(declaresTest(`/*\n * test("block")\n */`, "block")).toBe(false);
+    expect(
+      declaresTest('  describe("g", () => {\n    test("indented", fn);\n  });', "indented"),
+    ).toBe(true);
+    expect(declaresTest('test("a.b (c)", fn)', "a.b (c)")).toBe(true);
+    expect(declaresTest('test("axb (c)", fn)', "a.b (c)")).toBe(false);
+    expect(declaresTest("it('third', fn)", "third")).toBe(true);
+    const files = { "x.test.ts": text };
+    const refs = [{ promise: "P", file: "x.test.ts", test: "first" }];
+    expect(invariantDrift(refs, (path) => files[path as "x.test.ts"])).toEqual([
+      'invariant "P": x.test.ts has no test "first"',
     ]);
   });
 
