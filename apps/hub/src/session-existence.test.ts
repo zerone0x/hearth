@@ -137,6 +137,9 @@ const ROUTES: [string, string, unknown?][] = [
   ["GET", "/v1/sessions/%/runner"],
   ["GET", "/v1/sessions/%/events"],
   ["GET", "/v1/sessions/%/desktop", undefined],
+  ["GET", "/v1/sessions/%/desktop/lock"],
+  ["POST", "/v1/sessions/%/desktop/lock", {}],
+  ["POST", "/v1/sessions/%/desktop/lock/release", {}],
 ];
 
 /** Another id of the same shape as `id`, that no session has. */
