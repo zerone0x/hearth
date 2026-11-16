@@ -1,0 +1,174 @@
+connectOverCDP: 281 ms
+
+# snapshot 1 (299 chars, 114 ms) http://127.0.0.1:PORT/login.html
+- generic [active] [ref=e1]:
+  - heading "Sign in" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - text: Username
+      - textbox "Username" [ref=e5]
+    - generic [ref=e6]:
+      - text: Password
+      - textbox "Password" [ref=e7]
+    - button "Sign in" [ref=e8]
+  - alert
+screenshot 1280x800: jpeg q60 8770 B, png 8158 B
+
+fill username: {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/login.html",
+  title: "Sign in - Fixture",
+  ms: 83,
+}
+fill password: {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/login.html",
+  title: "Sign in - Fixture",
+  ms: 20,
+}
+click Sign in, expect /profile.html: {
+  ok: false,
+  verified: false,
+  url: "http://127.0.0.1:PORT/login.html",
+  title: "Sign in - Fixture",
+  ms: 3146,
+}
+
+# snapshot 2 after failed sign-in (350 chars)
+- generic [ref=e1]:
+  - heading "Sign in" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - text: Username
+      - textbox "Username" [ref=e5]: alice
+    - generic [ref=e6]:
+      - text: Password
+      - textbox "Password" [ref=e7]: wrong
+    - button "Sign in" [active] [ref=e8]
+  - alert [ref=e9]: Wrong username or password
+
+fillSecret username: {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/login.html",
+  title: "Sign in - Fixture",
+  ms: 11,
+}
+fillSecret password: {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/login.html",
+  title: "Sign in - Fixture",
+  ms: 20,
+}
+snapshot after secret fill contains the password: true; contains the username: true
+click Sign in, expect /profile.html + 'Welcome, alice': {
+  ok: true,
+  verified: true,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 140,
+}
+
+stale ref click: {
+  ok: false,
+  verified: null,
+  error: "click: Timeout 3000ms exceeded.",
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 3004,
+}
+
+# snapshot 3 (708 chars, 14 ms) http://127.0.0.1:PORT/profile.html
+- generic [active] [ref=f1e1]:
+  - navigation [ref=f1e2]:
+    - link "Sign out" [ref=f1e3] [cursor=pointer]:
+      - /url: /login.html
+  - heading "Welcome, alice" [level=1] [ref=f1e4]
+  - generic [ref=f1e5]:
+    - generic [ref=f1e6]:
+      - text: Full name
+      - textbox "Full name" [ref=f1e7]
+    - generic [ref=f1e8]:
+      - text: Email
+      - textbox "Email" [ref=f1e9]
+    - generic [ref=f1e10]:
+      - text: Plan
+      - combobox "Plan" [ref=f1e11]:
+        - option "Free" [selected]
+        - option "Pro"
+        - option "Team"
+    - generic [ref=f1e12]:
+      - checkbox "I agree to the terms" [ref=f1e13]
+      - text: I agree to the terms
+    - button "Save profile" [ref=f1e14]
+  - status
+fill f1e7 -> {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 11,
+}
+fill f1e9 -> {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 13,
+}
+select f1e11 -> {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 19,
+}
+click f1e14 -> {
+  ok: false,
+  verified: false,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 3087,
+}
+check terms -> {
+  ok: true,
+  verified: null,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 37,
+}
+click Save again, expect 'Saved: Alice Example <alice@example.test> on Pro' -> {
+  ok: true,
+  verified: true,
+  url: "http://127.0.0.1:PORT/profile.html",
+  title: "Profile - Fixture",
+  ms: 365,
+}
+
+# final snapshot (817 chars)
+- generic [ref=f1e1]:
+  - navigation [ref=f1e2]:
+    - link "Sign out" [ref=f1e3] [cursor=pointer]:
+      - /url: /login.html
+  - heading "Welcome, alice" [level=1] [ref=f1e4]
+  - generic [ref=f1e5]:
+    - generic [ref=f1e6]:
+      - text: Full name
+      - textbox "Full name" [ref=f1e7]: Alice Example
+    - generic [ref=f1e8]:
+      - text: Email
+      - textbox "Email" [ref=f1e9]: alice@example.test
+    - generic [ref=f1e10]:
+      - text: Plan
+      - combobox "Plan" [ref=f1e11]:
+        - option "Free"
+        - option "Pro" [selected]
+        - option "Team"
+    - generic [ref=f1e12]:
+      - checkbox "I agree to the terms" [checked] [ref=f1e13]
+      - text: I agree to the terms
+    - button "Save profile" [active] [ref=f1e14]
+  - status [ref=f1e15]: "Saved: Alice Example <alice@example.test> on Pro"

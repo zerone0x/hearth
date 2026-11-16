@@ -1,0 +1,13 @@
+{
+  "name": "@hearth/spike-browser",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway spike (issue #107): drive Chromium over CDP from Bun with playwright-core: snapshot, act by ref, verify. Not for merge. Findings: docs/research/browser.md.",
+  "scripts": {
+    "spike": "bun src/spike.ts"
+  },
+  "dependencies": {
+    "playwright-core": "1.65.1"
+  }
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Profile - Fixture</title></head>
+<body>
+  <nav><a href="/login.html">Sign out</a></nav>
+  <h1 id="hello"></h1>
+  <form id="profile">
+    <label>Full name <input name="name"></label>
+    <label>Email <input name="email" type="email"></label>
+    <label>Plan
+      <select name="plan"><option>Free</option><option>Pro</option><option>Team</option></select>
+    </label>
+    <label><input name="agree" type="checkbox"> I agree to the terms</label>
+    <button type="submit">Save profile</button>
+  </form>
+  <p role="status" id="status"></p>
+  <script>
+    const user = sessionStorage.getItem("user");
+    if (!user) location.href = "/login.html";
+    document.getElementById("hello").textContent = "Welcome, " + user;
+    document.getElementById("profile").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      if (!f.get("agree")) { document.getElementById("status").textContent = "Please accept the terms"; return; }
+      setTimeout(() => {
+        document.getElementById("status").textContent =
+          "Saved: " + f.get("name") + " <" + f.get("email") + "> on " + f.get("plan");
+      }, 300);
+    });
+  </script>
+</body>
+</html>
