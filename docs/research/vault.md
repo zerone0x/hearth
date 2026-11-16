@@ -51,7 +51,9 @@ code written for this note; they are not committed.
   no new dependency, no hand-rolled primitives. Each row is bound to its id,
   name and version through AAD.
 - **The master key is a 32-byte key file**, a compose secret next to today's
-  `model_key` (`deploy/secrets/vault_key`). The hub reads it through the
+  `model_key` (`deploy/secrets/vault_key`). The install step generates it
+  automatically (random bytes, mode 0600); the owner never types, pastes or
+  edits it, and backs it up apart from the volume. The hub reads it through the
   SecretStore (`HEARTH_VAULT_KEY_REF=file:/run/secrets/vault_key`). It wraps one
   data key; the database alone, or a backup of the volume, decrypts nothing.
   No owner password in the key path: triggers and Telegram (M3, M4) must run
@@ -197,10 +199,27 @@ None of these survives a live hub compromise: the hub must hold the DEK to use
 secrets. The key file is the simplest option that keeps a stolen database or
 backup useless.
 
-**Generating the key.** `docs/install.md` gains one line next to the model key:
-`(umask 077 && head -c 32 /dev/urandom > secrets/vault_key)`. The hub never
-generates a key into the data volume, because a key stored next to the
-database protects nothing.
+**Generating the key: automatic, never edited by the owner.** PRD §13 says
+that from M2 "no credential is kept in `.env` or a file the owner edits". The
+vault key is how that holds: every credential the owner types (model keys,
+logins, tokens) goes into the vault through the Settings page, and the one file
+left is a random key that the owner never types, pastes or edits.
+- `docs/install.md` gains a tagged step, run by the install and by every
+  upgrade, before `install:up`:
+
+  ```sh install:vault-key
+  [ -e secrets/vault_key ] || (umask 077 && head -c 32 /dev/urandom > secrets/vault_key)
+  ```
+
+  It creates the file with mode 0600 on the first run and never overwrites an
+  existing one, because overwriting the key loses the vault. Running it twice is
+  safe.
+- The hub does not generate it. The compose secret is a read-only mount, and the
+  only place the hub can write is the data volume; a key stored next to the
+  database protects nothing.
+- The owner's only duty is to back the file up **apart** from the volume
+  (install.md's backup section says so). If it is missing anyway, the hub still
+  starts, with the vault disabled (next paragraph).
 
 **A missing or wrong key file: the hub starts with the vault disabled.** This
 is the one behaviour for every case, including an old compose file that has no
@@ -766,7 +785,8 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 1. **Compose and install.md.**
    - Add `vault_key` as a compose secret (`./secrets/vault_key`) and
      `HEARTH_VAULT_KEY_REF: file:/run/secrets/vault_key`.
-   - The upgrade steps of `docs/install.md` gain the one-line key generation.
+   - The install and upgrade steps of `docs/install.md` run the automatic,
+     idempotent `install:vault-key` step (see "Generating the key").
      `install:purge` also removes `secrets/vault_key` (`docs/install.md:237`).
 2. **First start with a vault** and no `setting.model` row: if
    `HEARTH_MODEL_KEY_REF` resolves, the hub imports it. It creates entry
@@ -809,7 +829,9 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 >   kind, version, session scope and a hash of the policy: bound origins, `use`,
 >   `hosts`, `allow_any_field`) under one data key. The data key is stored only
 >   wrapped with AES-KW. No other crypto, no hand-written primitives.
-> - **Vault key.** 32 random bytes in `deploy/secrets/vault_key`, a compose
+> - **Vault key.** 32 random bytes in `deploy/secrets/vault_key`, generated
+>   automatically by the install and upgrade step (mode 0600, never overwritten,
+>   never typed or edited by the owner, backed up apart from the volume), a compose
 >   secret read through the SecretStore (`HEARTH_VAULT_KEY_REF`). HKDF-SHA256
 >   derives three subkeys from it: the wrapping key, the `kek_check` key and the
 >   fingerprint key. It is never generated into the data volume. If it is
