@@ -16,10 +16,10 @@ import {
   displayRef,
   parseVaultRefBody,
   redactRef,
-  type SecretRef,
-  type SecretResolver,
   SecretError,
   type SecretErrorCode,
+  type SecretRef,
+  type SecretResolver,
 } from "./secrets";
 
 /** Length of the master key in bytes (AES-256). */
@@ -72,7 +72,11 @@ export type VaultPolicy = LoginPolicy | TokenPolicy | Record<string, never>;
 export const MAX_VAULT_FIELD_CHARS = 16_384;
 
 function invalid(message: string): HearthError {
-  return new HearthError(message, { owner: "user", disposition: "give-up", code: "request.invalid" });
+  return new HearthError(message, {
+    owner: "user",
+    disposition: "give-up",
+    code: "request.invalid",
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,7 +111,8 @@ function canonicalOrigin(raw: string): string {
   return url.origin;
 }
 
-const HOST_NAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+const HOST_NAME =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 
 /**
  * The canonical JSON of an entry's policy: known keys only, sorted keys,

@@ -99,7 +99,9 @@ export class SqliteVaultStore implements VaultEntryBackend {
           rotated_at: number | null;
         },
         []
-      >("SELECT wrapped_dek, kek_check, provider, created_at, rotated_at FROM vault_key WHERE id = 1")
+      >(
+        "SELECT wrapped_dek, kek_check, provider, created_at, rotated_at FROM vault_key WHERE id = 1",
+      )
       .get();
     if (row === null) return undefined;
     return {

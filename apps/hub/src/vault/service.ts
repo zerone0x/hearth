@@ -24,8 +24,8 @@ import {
   type AuditRecord,
   type AuditSink,
   type Authorizer,
-  checkEntryFields,
   canonicalPolicy,
+  checkEntryFields,
   DEFAULT_WORKSPACE_ID,
   type EntryBinding,
   type EpochMs,
@@ -38,15 +38,15 @@ import {
   parseMasterKey,
   parseSecretRef,
   parseVaultRefBody,
+  type SealedEntry,
   SecretError,
   type SecretErrorCode,
   type SecretRef,
   type SecretStore,
   SecretValue,
-  type SealedEntry,
+  type SessionId,
   SYSTEM_PRINCIPAL,
   sealEntry,
-  type SessionId,
   VAULT_DISPLAY_HEX,
   VAULT_FIELDS,
   VAULT_KINDS,
@@ -419,7 +419,7 @@ export class HubVault implements VaultReader {
    * fingerprints come from the master key, so they do not change.
    */
   async rotateDataKey(principal: Principal): Promise<{ entries: number }> {
-    await this.#authorize(principal, "vault.rotate-data-key", "vault");
+    await this.#authorize(principal, "vault.data-key.rotate", "vault");
     return this.#serial(async () => {
       const state = await this.#enabled();
       const dek = await generateDataKey();
