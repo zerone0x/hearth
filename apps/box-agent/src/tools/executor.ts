@@ -31,6 +31,8 @@ import {
   type RpcFrame,
   type RpcResultFrame,
   SEARCH_TIMEOUT_MS,
+  type StreamCloseFrame,
+  type StreamDataFrame,
   type ToolMethod,
   type ToolParams,
   type ToolResults,
@@ -38,6 +40,7 @@ import {
 } from "@hearth/protocol";
 import type { BrowserTools } from "../browser/tools";
 import { ToolCallError, toToolError } from "./errors";
+import { LiveOutputSender } from "./live-output";
 import { openPlainFile, Workspace } from "./paths";
 import { runProcess } from "./process";
 
@@ -70,6 +73,13 @@ export interface ToolExecutorOptions {
   readonly fileTimeoutMs?: number;
   /** Sends a frame to the hub if connected; a lost answer is re-sent on the hub's re-send. */
   readonly send: (frame: RpcResultFrame) => void;
+  /**
+   * Sends a live output frame (decision 0036) if connected. Without it a
+   * `tool.exec` that names an `outputStream` answers once, like a 1.3 box.
+   */
+  readonly sendStream?: (frame: StreamDataFrame | StreamCloseFrame) => void;
+  /** Bytes queued on the hub socket; live output is dropped above a high water mark. */
+  readonly backlog?: () => number;
   readonly log?: (line: string) => void;
   /**
    * Structured log of every tool call (decision 0021): one JSON line per call
@@ -117,6 +127,7 @@ export class ToolExecutor {
   readonly #env: Readonly<Record<string, string>>;
   readonly #calls = new Map<string, CallState>();
   readonly #expired = new Set<string>();
+  readonly #live = new Map<number, LiveOutputSender>();
   #running = 0;
   #cachedBytes = 0;
 
@@ -200,6 +211,18 @@ export class ToolExecutor {
         this.#finish(frame.id, this.#errorFrame(frame.id, e));
       },
     );
+  }
+
+  /**
+   * The hub closed a stream. Returns true when it was a live output stream:
+   * the command keeps running, its output is just no longer streamed.
+   */
+  closeStream(streamId: number): boolean {
+    const sender = this.#live.get(streamId);
+    if (sender === undefined) return false;
+    sender.stop();
+    this.#live.delete(streamId);
+    return true;
   }
 
   /** Cancel every running call (agent shutdown). */
@@ -626,6 +649,37 @@ export class ToolExecutor {
     const realRoot = await this.workspace.realRoot();
     const name = spillName(p.callId, rpcId);
     const spillRelative = posix.join(EXEC_SPILL_DIR, name);
+    const sendStream = this.#options.sendStream;
+    const live =
+      p.outputStream === undefined || sendStream === undefined || this.#live.has(p.outputStream)
+        ? undefined
+        : new LiveOutputSender({
+            streamId: p.outputStream,
+            send: sendStream,
+            backlog: this.#options.backlog ?? (() => 0),
+          });
+    if (live !== undefined) this.#live.set(live.streamId, live);
+    try {
+      return await this.#exec(p, real, lexical, realRoot, name, spillRelative, signal, live);
+    } finally {
+      // Before the result goes out, so the hub has the whole stream first.
+      if (live !== undefined) {
+        live.end();
+        this.#live.delete(live.streamId);
+      }
+    }
+  }
+
+  async #exec(
+    p: ToolParams["tool.exec"],
+    real: string,
+    lexical: string,
+    realRoot: string,
+    name: string,
+    spillRelative: string,
+    signal: AbortSignal,
+    live: LiveOutputSender | undefined,
+  ): Promise<ToolResults["tool.exec"]> {
     const run = await runProcess({
       argv: [this.#options.shell ?? "/bin/bash", "-c", p.command],
       cwd: real,
@@ -639,6 +693,7 @@ export class ToolExecutor {
         // Never through a symlinked `.hearth` or `exec`: no spill rather than a write outside.
         open: () => openPlainFile(realRoot, EXEC_SPILL_DIR.split("/"), name),
       },
+      ...(live === undefined ? {} : { onOutput: (chunk: Buffer) => live.write(chunk) }),
     });
     const fullOutputPath =
       run.spillPath === null ? null : posix.join(this.workspace.root, spillRelative);

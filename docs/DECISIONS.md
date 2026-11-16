@@ -2805,3 +2805,83 @@ with a short bound.
   real `startHub` wiring and trajectory step (`browser-lock.test.ts`), and a
   compose-e2e step: Take over, an agent `browser_tabs` call is refused with
   `desktop.locked`, Release, the same call works in the box's Chromium.
+
+## 0036: Live shell output: `tool.exec` names a stream (protocol 1.4), the hub stores redacted `tool.output` events
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #121
+
+### Context
+
+A `bash` call showed nothing until it ended (0011: exec answers once). PRD
+§8.2.1 left live output for a protocol minor bump after the prototype.
+
+### Decision
+
+- **Existing stream frames, one new param (protocol 1.4).** The hub adds
+  `outputStream` to `tool.exec`; the box sends the merged stdout and stderr as
+  `stream.data` on that id while the command runs, then `stream.close`
+  (`done`), both before the `rpc.result`. No new frame type and no
+  `stream.open` (the `rpc` opens it). A 1.3 box drops the param and answers
+  once. A new `stream.open` kind was not chosen: it changes the codec for no
+  gain, and the call already names everything the stream needs.
+- **Stream ids.** Live output ids are even (the hub picks them, 0002) with the
+  top bit set (2^31 and up); the desktop bridge's ids now wrap below 2^31, so
+  the two never meet on one box. The decoder refuses any other id.
+- **The result stays the answer.** The stream is lossy (fire-and-forget,
+  dropped under backpressure, capped). pi's `onData` still gets the result
+  once, so the tool result, the trajectory and the spill file (0011) are
+  unchanged. The web drops a call's live output when its result arrives.
+- **Box side.** `LiveOutputSender` coalesces reads (one frame per 100 ms, or
+  at once at 16 KiB), caps a command at 64 KiB, and drops waiting bytes
+  when the hub socket's backlog is over 256 KiB, so a slow hub never makes
+  box-agent buffer. A hub `stream.close` stops the stream; the command runs
+  on.
+- **Hub side.** `ToolRpcClient` routes the stream's frames (that box, that id,
+  while the call runs) to a callback, synchronously, in frame order.
+  `LiveToolOutput` (`apps/hub/src/runner/live-output.ts`) turns the bytes into
+  `tool.output` events, `{toolCallId, seq, text, truncated?}` with the turn
+  id:
+  - **Redacted with the runner's redactor**, the one tool results and every
+    stored payload go through. A secret can arrive split over chunks, so
+    text is emitted only up to a line break, or, for a line over 4 KiB, up to
+    1 KiB before its end. That cut then moves back past any tail that could
+    be the start of a secret: a proper prefix of one, raw or JSON-escaped,
+    whatever its length and whatever line breaks it holds (`secretStart` in
+    `runner.ts`, from the same secret list as the redactor; the values never
+    leave it). Last, a cut is taken only where redacting the part alone gives
+    the same text as redacting it with what follows (secrets that overlap).
+    The held-back tail waits for more output and is dropped when the call
+    ends or hits the cap.
+  - **The box is told to stop.** Once the hub takes no more of a call's
+    output (its cap, or a failed append), it sends `stream.close` for that
+    stream, and the box stops streaming the command; the call goes on.
+  - **Capped** at 64 KiB per call, then one event with `truncated: true`.
+  - **Rate limited, with backpressure:** at most one append per 250 ms per
+    call and never two at once. Output that arrives while an append waits on
+    the store joins the next event, so a slow store makes events fewer and
+    larger; the box connection's frame handling never waits on the store.
+    A failed append stops that call's live output and is logged; the call
+    and the runner go on.
+- **Web.** `hearthPi.ts` keeps live output per running call (the last 64 KiB)
+  and drops it at `tool_execution_end` or `agent_end`; a chunk for a call
+  that has ended is ignored. The tool card shows it in a `role="log"` block
+  named `Live output of <tool>` outside its collapsed details, while the call
+  runs. The trigger keeps its name (`Tool call bash: running`, then
+  `done`). Plain React and Tailwind; no inline styles or scripts, so the CSP
+  (0017) is unchanged.
+
+### Consequences
+
+- No part of a registered secret is shown while it is still arriving, at
+  any length and across line breaks. The cost: output that stops at what
+  could be a secret's start (a long line whose last characters are `sk-` when
+  a key starts so, or a line that is a registered PEM's first line) waits for
+  what follows, or shows only in the result. Text that is not a
+  registered secret (one the command makes up) is not redacted here, as in
+  the result.
+- Output with no line break for less than 4 KiB (a prompt, a progress bar
+  without `\r`) shows only when the call ends.
+- The trajectory ignores `tool.output`: the tool call's result is its record.
+- Each running call adds at most four events a second to the session log.

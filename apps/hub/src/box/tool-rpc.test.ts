@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HearthError } from "@hearth/core";
-import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
+import type { RpcFrame, RpcResultFrame, StreamCloseFrame } from "@hearth/protocol";
 import { FakeDriver } from "../../../box-agent/src/browser/fake";
 import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { BoxAgent } from "../../../box-agent/src/connection";
@@ -44,6 +44,8 @@ function workspace(): string {
 class FakeBoxes {
   readonly listeners = new Set<BoxConnectionListener>();
   readonly sent: RpcFrame[] = [];
+  /** Stream frames the hub sent the box (`sendStream`). */
+  readonly streamFrames: Array<{ boxId: string; frame: StreamCloseFrame | { type: string } }> = [];
   connected = true;
   bootId = "boot_1";
   /** When true, answers are lost on the way back (a cut connection). */
@@ -74,6 +76,11 @@ class FakeBoxes {
     this.sent.push(frame);
     queueMicrotask(() => this.executor.handle(frame));
     return this.bootId;
+  }
+
+  sendStream(boxId: string, frame: StreamCloseFrame | { type: string }): boolean {
+    this.streamFrames.push({ boxId, frame });
+    return this.connected;
   }
 
   reconnect(newBoot: boolean): void {
@@ -346,6 +353,181 @@ describe("ToolRpcClient through a real hub and box-agent", () => {
     expect(Buffer.concat(chunks).toString()).toBe(`${root}\nfrom the hub`);
     client.close();
   }, 30_000);
+});
+
+describe("live exec output through a real hub and box-agent (protocol 1.4)", () => {
+  test("a sleep+echo command's first line reaches onOutput before the call ends", async () => {
+    const root = workspace();
+    const dir = mkdtempSync(join(tmpdir(), "hearth-toolrpc-live-"));
+    dirs.push(dir);
+    const hub = startHub({ dbPath: join(dir, "hub.db"), port: 0, boxPort: 0, log: () => {} });
+    hubs.push(hub);
+    const { token } = await hub.issueJoinToken("box_live", "ses_live");
+    const agent = new BoxAgent({
+      hubUrl: hub.listenForBoxes("127.0.0.1"),
+      boxId: "box_live",
+      joinToken: token,
+      log: () => {},
+      tools: { root },
+    });
+    agents.push(agent);
+    agent.start();
+    await hub.boxes.waitForBox("box_live", STEP_MS);
+    const client = new ToolRpcClient({ boxes: hub.boxes, log: () => {} });
+    const ops = client.operations("box_live", "call_live");
+    const live: string[] = [];
+    const final: Buffer[] = [];
+    let ended = false;
+    let firstBeforeEnd: boolean | undefined;
+    const run = ops.bash
+      .exec("echo first; sleep 1; echo second", root, {
+        onData: (data) => final.push(data),
+        timeout: 10,
+        onOutput: (chunk) => {
+          live.push(Buffer.from(chunk).toString("utf8"));
+          firstBeforeEnd ??= !ended;
+        },
+      })
+      .finally(() => {
+        ended = true;
+      });
+    expect(client.liveStreams).toBe(1);
+    const { exitCode } = await run;
+    expect(exitCode).toBe(0);
+    expect(firstBeforeEnd).toBe(true);
+    expect(live.join("")).toBe("first\nsecond\n");
+    // The result is still the whole answer, through onData once.
+    expect(final.map(String)).toEqual(["first\nsecond\n"]);
+    expect(client.liveStreams).toBe(0);
+    // The next exec gets a new stream id the box takes too (even, in range).
+    const again: string[] = [];
+    const second = await ops.bash.exec("echo again", root, {
+      onData: () => {},
+      timeout: 10,
+      onOutput: (chunk) => {
+        again.push(Buffer.from(chunk).toString("utf8"));
+        return true;
+      },
+    });
+    expect(second.exitCode).toBe(0);
+    expect(again.join("")).toBe("again\n");
+    // A consumer that stops listening closes the stream: the box sends no more.
+    const capped: string[] = [];
+    const final3: Buffer[] = [];
+    const third = await ops.bash.exec("echo one; sleep 0.5; echo two", root, {
+      onData: (data) => final3.push(data),
+      timeout: 10,
+      onOutput: (chunk) => {
+        capped.push(Buffer.from(chunk).toString("utf8"));
+        return false;
+      },
+    });
+    expect(third.exitCode).toBe(0);
+    expect(capped).toEqual(["one\n"]);
+    expect(final3.map(String)).toEqual(["one\ntwo\n"]);
+    expect(client.liveStreams).toBe(0);
+    client.close();
+  }, 30_000);
+});
+
+describe("live exec output: stream routing", () => {
+  test("only the call's own stream on its own box reaches onOutput, and only while it runs", async () => {
+    const boxes = new FakeBoxes(workspace());
+    const client = new ToolRpcClient({ boxes, log: () => {} });
+    const got: string[] = [];
+    const run = client.operations("box_1", "call_r").bash.exec("sleep 0.2", ".", {
+      onData: () => {},
+      onOutput: (chunk) => {
+        got.push(Buffer.from(chunk).toString());
+        return true;
+      },
+    });
+    const sent = boxes.sent[0]?.params as { outputStream?: number };
+    const id = sent.outputStream as number;
+    expect(id).toBeGreaterThanOrEqual(2 ** 31);
+    expect(id % 2).toBe(0);
+    const data = (streamId: number, text: string) => ({
+      type: "stream.data" as const,
+      streamId,
+      seq: 0,
+      data: new TextEncoder().encode(text),
+    });
+    const claim = (boxId: string, frame: ReturnType<typeof data>) =>
+      [...boxes.listeners].some((l) => l.stream?.(boxId, frame) === true);
+    expect(claim("box_1", data(id, "mine"))).toBe(true);
+    expect(claim("box_2", data(id, "other box"))).toBe(false);
+    expect(claim("box_1", data(id + 2, "other stream"))).toBe(false);
+    await run;
+    expect(claim("box_1", data(id, "late"))).toBe(false);
+    expect(got).toEqual(["mine"]);
+    // The box's stream.close ends the routing at once, before the result.
+    const run2 = client.operations("box_1", "call_c").bash.exec("sleep 0.2", ".", {
+      onData: () => {},
+      onOutput: (chunk) => {
+        got.push(Buffer.from(chunk).toString());
+        return true;
+      },
+    });
+    const id2 = (boxes.sent.at(-1)?.params as { outputStream: number } | undefined)
+      ?.outputStream as number;
+    expect(id2).not.toBe(id);
+    expect(id2 % 2).toBe(0);
+    expect(client.liveStreams).toBe(1);
+    const close = { type: "stream.close" as const, streamId: id2, reason: "done" as const };
+    expect([...boxes.listeners].some((l) => l.stream?.("box_1", close) === true)).toBe(true);
+    expect(client.liveStreams).toBe(0);
+    expect(claim("box_1", data(id2, "after close"))).toBe(false);
+    await run2;
+    expect(got).toEqual(["mine"]);
+    expect(boxes.streamFrames).toEqual([]);
+    // Without onOutput no stream is asked for.
+    await client.operations("box_1", "call_s").bash.exec("true", ".", { onData: () => {} });
+    expect(
+      (boxes.sent.at(-1)?.params as { outputStream?: number } | undefined)?.outputStream,
+    ).toBeUndefined();
+    client.close();
+  });
+});
+
+describe("live exec output: the consumer stops listening", () => {
+  test("onOutput returning false closes the stream on the box; the call goes on", async () => {
+    const boxes = new FakeBoxes(workspace());
+    const logs: string[] = [];
+    const client = new ToolRpcClient({ boxes, log: (line) => logs.push(line) });
+    const got: string[] = [];
+    const run = client.operations("box_1", "call_k").bash.exec("sleep 0.2; echo done", ".", {
+      onData: () => {},
+      onOutput: (chunk) => {
+        got.push(Buffer.from(chunk).toString());
+        return got.length < 2;
+      },
+    });
+    const id = (boxes.sent[0]?.params as { outputStream: number } | undefined)
+      ?.outputStream as number;
+    const data = (text: string) => ({
+      type: "stream.data" as const,
+      streamId: id,
+      seq: 0,
+      data: new TextEncoder().encode(text),
+    });
+    const claim = (frame: ReturnType<typeof data>) =>
+      [...boxes.listeners].some((l) => l.stream?.("box_1", frame) === true);
+    expect(claim(data("a"))).toBe(true);
+    expect(boxes.streamFrames).toEqual([]);
+    expect(client.liveStreams).toBe(1);
+    // The second chunk hits the consumer's cap: it says no more.
+    expect(claim(data("b"))).toBe(true);
+    expect(boxes.streamFrames).toEqual([
+      { boxId: "box_1", frame: { type: "stream.close", streamId: id, reason: "cancelled" } },
+    ]);
+    expect(client.liveStreams).toBe(0);
+    expect(claim(data("c"))).toBe(false);
+    const { exitCode } = await run;
+    expect(exitCode).toBe(0);
+    expect(got).toEqual(["a", "b"]);
+    expect(boxes.streamFrames).toHaveLength(1);
+    client.close();
+  });
 });
 
 describe("browser methods through a real hub and box-agent (protocol 1.3)", () => {

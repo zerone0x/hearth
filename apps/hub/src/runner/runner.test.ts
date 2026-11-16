@@ -85,6 +85,7 @@ class MemoryEvents implements EventStore {
       seq,
       ts: Date.now(),
       type: event.type,
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
       payload: event.payload,
     });
     this.all.set(sessionId, list);
@@ -123,6 +124,8 @@ class FakeBoxes {
   executor: ToolExecutor;
   /** The box's browser (a fake page model); without one the box is a 1.2 box. */
   browser: BrowserTools | undefined;
+  /** Stream frames the hub sent the box. */
+  readonly streamsClosed: Array<{ streamId: number; reason: string | undefined }> = [];
 
   constructor(
     readonly root: string,
@@ -140,12 +143,23 @@ class FakeBoxes {
       send: (frame: RpcResultFrame) => {
         for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
       },
+      // Live output (decision 0036), in the same order as the answers.
+      sendStream: (frame) => {
+        for (const l of this.listeners) if (l.stream?.("box_1", frame)) return;
+      },
     });
   }
 
   listen(listener: BoxConnectionListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** The hub closed a stream: as box-agent's connection does, stop that live output. */
+  sendStream(_boxId: string, frame: { type: string; streamId: number; reason?: string }): boolean {
+    this.streamsClosed.push({ streamId: frame.streamId, reason: frame.reason });
+    if (frame.type === "stream.close") this.executor.closeStream(frame.streamId);
+    return true;
   }
 
   sendRpc(_boxId: string, frame: RpcFrame): string | undefined {
@@ -1090,6 +1104,61 @@ describe("hub restart mid-tool (review of #63)", () => {
   });
 });
 
+describe("live bash output (decision 0036)", () => {
+  test("a running command's output is stored as redacted tool.output events before its result", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo 'key=faux-key-not-a-secret'; sleep 1; echo second" }, "c_live"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const types = h.events.types("se_a");
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.length).toBeGreaterThan(0);
+    const first = outputs[0] as StoredEvent;
+    expect(first.payload).toEqual({ toolCallId: "c_live", seq: 0, text: "key=[redacted]\n" });
+    expect(first.turnId).toBeDefined();
+    // Live output came while the call ran, before its end event.
+    expect(first.seq).toBeLessThan(types.indexOf("pi.tool_execution_end") + 1);
+    expect(JSON.stringify(outputs)).not.toContain("faux-key-not-a-secret");
+    // The call's end closes its live output: nothing is stored after its end
+    // event, also once a chunk that arrived just before the result would be due.
+    await Bun.sleep(600);
+    outputs.splice(0, outputs.length, ...h.events.of("se_a", "tool.output"));
+    const endSeq = h.events.of("se_a", "pi.tool_execution_end")[0]?.seq ?? 0;
+    for (const o of outputs) expect(o.seq).toBeLessThan(endSeq);
+    // The result is the answer, redacted as before.
+    const result = toolResults(runner.messages).find((r) => r.id === "c_live");
+    expect(result?.text).toContain("second");
+  }, 20_000);
+});
+
+describe("live bash output: the cap", () => {
+  test("output past the cap closes the stream on the box; the call and its result go on", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "go", [
+      call(
+        "bash",
+        { command: "head -c 70000 /dev/zero | tr '\\0' a; sleep 0.5; echo; echo end" },
+        "c_cap",
+      ),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.at(-1)?.payload).toMatchObject({ toolCallId: "c_cap", truncated: true });
+    const stream = (h.boxes.sent.find((f) => f.method === "tool.exec")?.params ?? {}) as {
+      outputStream?: number;
+    };
+    expect(stream.outputStream).toBeDefined();
+    expect(h.boxes.streamsClosed).toEqual([
+      { streamId: stream.outputStream as number, reason: "cancelled" },
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_cap");
+    expect(result?.text).toContain("end");
+  }, 20_000);
+});
+
 describe("model key redaction (review of #63)", () => {
   const KEY = "sk-ant-PLANTED-9f8e7d6c5b4a";
   const keyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(KEY) };
@@ -1183,6 +1252,38 @@ describe("model key redaction (review of #63)", () => {
       prompt.mockRestore();
     }
   });
+
+  test("live output holds back the first lines of a multi-line key until it is whole", async () => {
+    const PEM_KEY = "-----BEGIN KEY-----\nQUJDREVGR0hJSktMTU5PUA\n-----END KEY-----";
+    const pemKeyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(PEM_KEY) };
+    const h = await harness();
+    const logs: string[] = [];
+    const runners = await keyedRunners(h, logs, h.rpc, pemKeyed);
+    const [first, ...rest] = PEM_KEY.split("\n");
+    h.faux.setResponses([
+      call(
+        "bash",
+        {
+          command: `printf 'head\\n${first}\\n'; sleep 0.8; printf '${rest.join("\\n")}\\ntail\\n'`,
+        },
+        "c_pem",
+      ),
+      fauxAssistantMessage("ok"),
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    await (await runners.runner("se_a")).settled();
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.length).toBeGreaterThan(0);
+    // The key's first line went out with nothing else: it waited for the rest.
+    expect((outputs[0] as StoredEvent).payload).toEqual({
+      toolCallId: "c_pem",
+      seq: 0,
+      text: "head\n",
+    });
+    const shown = outputs.map((o) => (o.payload as { text: string }).text).join("");
+    expect(shown).not.toContain("BEGIN KEY");
+    expect(shown).not.toContain("QUJDREVGR0hJSktMTU5PUA");
+  }, 20_000);
 
   // A key with characters JSON escapes (`"` and `\`): the escaped form differs
   // from the raw one, so each redaction site must replace both.
