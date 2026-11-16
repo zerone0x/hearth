@@ -210,6 +210,8 @@ interface ToolState {
   boxId: string | undefined;
   boxWaitMs: number;
   denied: string | undefined;
+  /** The code the call was refused with before dispatch (`desktop.locked`). */
+  refused: string | undefined;
 }
 
 interface Turn {
@@ -295,8 +297,10 @@ export function toolOutcome(
   text: string,
   rpcs: readonly RpcRecord[],
   denied: string | undefined,
+  refused?: string,
 ): string {
   if (denied !== undefined) return "denied";
+  if (refused === "desktop.locked") return "desktop-locked";
   if (rpcs.some((r) => r.error_code === "tool.outcome-unknown")) return "outcome-unknown";
   if (rpcs.some((r) => r.error_code === "tool.deadline" || r.error_code === "timed-out"))
     return "timeout";
@@ -606,6 +610,7 @@ export class TurnTracer {
       boxId: undefined,
       boxWaitMs: 0,
       denied: undefined,
+      refused: undefined,
     });
   }
 
@@ -622,6 +627,15 @@ export class TurnTracer {
   onDenied(toolCallId: string, reason: string): void {
     const tool = this.#tools.get(toolCallId);
     if (tool !== undefined) tool.denied = reason;
+  }
+
+  /**
+   * The tool refused the call before it reached the box, with `code`: today
+   * only the browser tools, while the owner holds the desktop lock (decision 0035).
+   */
+  onRefused(toolCallId: string, code: string): void {
+    const tool = this.#tools.get(toolCallId);
+    if (tool !== undefined) tool.refused = code;
   }
 
   /** The RPC hooks for one pi tool call: a client span per RPC, its `traceparent` on the frame. */
@@ -681,7 +695,13 @@ export class TurnTracer {
     this.#tools.delete(toolCallId);
     const now = this.#clock.mono();
     const capped = capResult(result, this.#redact);
-    const outcome = toolOutcome(isError, String(capped["text"]), tool.rpcs, tool.denied);
+    const outcome = toolOutcome(
+      isError,
+      String(capped["text"]),
+      tool.rpcs,
+      tool.denied,
+      tool.refused,
+    );
     const exec = [...tool.rpcs].reverse().find((r) => r.method === "tool.exec");
     turn.step++;
     turn.toolCalls++;
@@ -720,6 +740,7 @@ export class TurnTracer {
         is_error: isError,
         outcome,
         ...(tool.denied === undefined ? {} : { denied_reason: tool.denied }),
+        ...(tool.refused === undefined ? {} : { refused_code: tool.refused }),
         exit_code: exec?.exit_code ?? null,
         box_id: tool.boxId ?? null,
         box_wait_ms: round(tool.boxWaitMs),

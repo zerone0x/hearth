@@ -16,6 +16,10 @@
  *   bytes are not stored by hash yet (#117).
  * - **An older box** answers `unknown-method`; the tool says the box has no
  *   browser tools instead of a bare code.
+ * - **The desktop lock** (decisions 0033, 0035): while the owner holds the
+ *   session's desktop, every browser tool refuses at once with
+ *   `desktop.locked`, before it takes a box lease or sends anything to the
+ *   box. The model reads that the user is in control and can wait or ask.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -52,6 +56,14 @@ export const BROWSER_TOOLS = [
 ] as const;
 
 export type BrowserToolName = (typeof BROWSER_TOOLS)[number];
+
+/** The code of a call refused because the owner holds the desktop lock (decision 0033). */
+export const DESKTOP_LOCKED = "desktop.locked";
+
+/** What the model reads when a browser tool is refused for the desktop lock (decision 0035). */
+export const DESKTOP_LOCKED_MESSAGE =
+  "desktop.locked: user is in control. The user has taken over the desktop, so nothing was " +
+  "sent to the browser. Wait and try again later, or ask the user to hand the desktop back.";
 
 /** What the model reads when the box runs a box-agent older than protocol 1.3. */
 export const NO_BROWSER_IN_BOX =
@@ -340,8 +352,42 @@ export function browserContent<M extends BrowserMethod>(
   }
 }
 
-/** Registers the browser tools on pi; every call takes a lease and goes to the box. */
-export function registerBrowserTools(pi: ExtensionAPI, box: RunnerBox): void {
+/**
+ * Called when a browser tool was refused before dispatch, with the refusal's
+ * code (`desktop.locked`), so the trajectory records it.
+ */
+export type OnRefused = (toolName: string, toolCallId: string, code: string) => void;
+
+/**
+ * Throws `DESKTOP_LOCKED_MESSAGE` while the session's desktop lock is held,
+ * after telling `onRefused`; any other error of the check is rethrown as is.
+ */
+function assertDesktopFree(
+  box: RunnerBox,
+  name: BrowserToolName,
+  id: string,
+  onRefused: OnRefused | undefined,
+): void {
+  try {
+    box.assertDesktopUnlocked?.();
+  } catch (error) {
+    if (error instanceof HearthError && error.code === DESKTOP_LOCKED) {
+      onRefused?.(name, id, DESKTOP_LOCKED);
+      throw new Error(DESKTOP_LOCKED_MESSAGE);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Registers the browser tools on pi. Every call first checks the desktop
+ * lock, then takes a lease and goes to the box.
+ */
+export function registerBrowserTools(
+  pi: ExtensionAPI,
+  box: RunnerBox,
+  onRefused?: OnRefused,
+): void {
   for (const name of BROWSER_TOOLS) {
     const spec = SPECS[name];
     pi.registerTool({
@@ -352,6 +398,8 @@ export function registerBrowserTools(pi: ExtensionAPI, box: RunnerBox): void {
       // One page, one pointer: browser calls of one turn run in order.
       executionMode: "sequential",
       execute: async (id, params, signal) => {
+        // Before the lease: a refused call neither starts nor wakes the box.
+        assertDesktopFree(box, name, id, onRefused);
         const lease = await box.ensureBox(id);
         try {
           await box.prepare?.(lease);
