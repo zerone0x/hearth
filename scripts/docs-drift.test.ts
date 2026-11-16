@@ -131,6 +131,7 @@ const ARCH = `# A
 | --- | --- | --- |
 | One | 0001 | \`x.test.ts\` "first"; "second"<br>\`y.test.ts\` "third" |
 | Two | 0002 | nothing named |
+| Three | 0003 | \`z.ts\` (a script check)<br>\`x.test.ts\` "first" |
 `;
 
 describe("docs/ARCHITECTURE.md invariants table", () => {
@@ -140,6 +141,8 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
       { promise: "One", file: "x.test.ts", test: "second" },
       { promise: "One", file: "y.test.ts", test: "third" },
       { promise: "Two", file: "", test: "" },
+      { promise: "Three", file: "z.ts", test: "" },
+      { promise: "Three", file: "x.test.ts", test: "first" },
     ]);
   });
 
@@ -149,7 +152,12 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
       'invariant "One": x.test.ts has no test "second"',
       'invariant "One": no file y.test.ts',
       'invariant "Two" names no test',
+      'invariant "Three": no file z.ts',
     ]);
+    files["z.ts"] = "check();";
+    expect(invariantDrift(invariantRefs(ARCH), (path) => files[path])).not.toContain(
+      'invariant "Three": no file z.ts',
+    );
   });
 
   test("a test name must be declared exactly, not as a substring or in a comment", () => {
@@ -171,11 +179,38 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
     expect(declaresTest('test("a.b (c)", fn)', "a.b (c)")).toBe(true);
     expect(declaresTest('test("axb (c)", fn)', "a.b (c)")).toBe(false);
     expect(declaresTest("it('third', fn)", "third")).toBe(true);
+    expect(declaresTest('test(\n  "on the next line",\n  fn)', "on the next line")).toBe(true);
+    expect(declaresTest("test('root\\'s box', fn)", "root's box")).toBe(true);
     const files = { "x.test.ts": text };
     const refs = [{ promise: "P", file: "x.test.ts", test: "first" }];
     expect(invariantDrift(refs, (path) => files[path as "x.test.ts"])).toEqual([
       'invariant "P": x.test.ts has no test "first"',
     ]);
+  });
+
+  test("a modifier, a describe and a template literal declare a name too", () => {
+    expect(declaresTest('test.skipIf(me === 0)("skipped as root", fn)', "skipped as root")).toBe(
+      true,
+    );
+    expect(
+      declaresTest('test.skipIf(Bun.which("rg") === null)(\n  "needs rg",\n  fn)', "needs rg"),
+    ).toBe(true);
+    expect(declaresTest('test.each([1, 2])(\n  "seed %p", fn)', "seed %p")).toBe(true);
+    expect(declaresTest('test.only("focused", fn)', "focused")).toBe(true);
+    expect(declaresTest('describe("a group", () => {})', "a group")).toBe(true);
+    expect(declaresTest('xtest("not a test", fn)', "not a test")).toBe(false);
+
+    const built = "  test(`${path}: every directive holds`, fn)";
+    expect(declaresTest(built, "/: every directive holds")).toBe(true);
+    expect(declaresTest(built, "/index.html: every directive holds")).toBe(true);
+    expect(declaresTest(built, ": every directive holds")).toBe(false);
+    expect(declaresTest(built, "every directive holds")).toBe(false);
+    expect(declaresTest(built, "/: every directive holds, mostly")).toBe(false);
+    expect(declaresTest(built, "/: every directive")).toBe(false);
+    expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 (x) 2")).toBe(true);
+    expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 yxy 2")).toBe(false);
+    expect(declaresTest("test(`plain`, fn)", "plain")).toBe(true);
+    expect(declaresTest("// test(`${p}: in a comment`, fn)", "/: in a comment")).toBe(false);
   });
 
   test("no table is drift", () => {

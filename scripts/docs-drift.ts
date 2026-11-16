@@ -5,14 +5,19 @@
  *   row of the README's configuration table, the row names a file that really
  *   mentions it, and no `HEARTH_*` row names a variable the repo no longer has;
  * - every row of the "Invariants and tests" table in docs/ARCHITECTURE.md
- *   names a test file that exists and a test name that is declared in it as
- *   `test("<name>"` or `it("<name>"`, exactly, not as a substring.
+ *   names a file that exists, and each test name the row cites after a file is
+ *   declared in it: `test(`, `it(` or `describe(` (also with a modifier such as
+ *   `test.skipIf(…)(` or `test.each(…)(`) at the start of a line, with the
+ *   whole name as its first argument, so a substring, a comment or a string
+ *   elsewhere does not count.
  *
- * Both checks read source text, so they cannot evaluate code. The rule for a
- * name built at run time (a template literal, a concatenation, a loop over
- * cases): a built name must be spelled out in a comment of the file that
- * builds it. The README row and the invariants row then name the spelled-out
- * variable or test, and the check finds it in that comment.
+ * Both checks read source text, so they cannot evaluate code. A test name
+ * built from a template literal matches with each `${…}` standing for any
+ * non-empty text: the table cites the name the runner prints, such as
+ * "/: every directive …" for `${path}: every directive …`. A name built any
+ * other way (a concatenation, a variable) is not found; rename the test to a
+ * literal or a template literal. A name spelled out in a comment is not found
+ * either, by design.
  */
 
 /** A `HEARTH_*` or `OTEL_*` variable name; a template prefix such as `OTEL_..._${signal}` is not one. */
@@ -26,12 +31,12 @@ export interface SourceFile {
 /**
  * Whether a tracked file is shipped code whose variables the README must list:
  * the apps, packages, scripts and deploy files and the root `.json` files
- * (`package.json` scripts read variables too), but not `bun.lock`, tests, test data, the
+ * (`package.json` scripts read variables too), but not lockfiles, tests, test data, the
  * e2e harnesses (their variables are documented in their own headers) or docs.
  */
 export function isShippedCode(path: string): boolean {
   if (!/^(apps|packages|scripts|deploy)\/|^[^/]+\.json$/.test(path)) return false;
-  if (/\.(md|lock)$/.test(path) || /(^|\/)bun\.lock$/.test(path)) return false;
+  if (/\.(md|lock)$/.test(path)) return false;
   if (/\.test\.tsx?$/.test(path) || /\.dom\.tsx$/.test(path)) return false;
   if (/(^|\/)(testdata|e2e)\//.test(path)) return false;
   return true;
@@ -142,8 +147,9 @@ export interface InvariantRef {
 
 /**
  * The test references of the `## Invariants and tests` table: in its last
- * cell, each `` `path` `` followed by one or more `"test name"`s. A row with
- * none is returned with an empty file, so the check reports it.
+ * cell, each `` `path` `` followed by zero or more `"test name"`s. A path with
+ * no name is returned with an empty test, so the check still finds the file.
+ * A row with no path is returned with an empty file, so the check reports it.
  */
 export function invariantRefs(architecture: string): InvariantRef[] {
   const refs: InvariantRef[] = [];
@@ -153,26 +159,57 @@ export function invariantRefs(architecture: string): InvariantRef[] {
     const promise = row[0] ?? "";
     const guard = row[row.length - 1] ?? "";
     let file = "";
-    let found = false;
+    let named = false;
+    const fileOnly = () => {
+      if (file !== "" && !named) refs.push({ promise, file, test: "" });
+    };
     for (const m of guard.matchAll(/`([^`]+)`|"([^"]+)"/g)) {
-      if (m[1] !== undefined) file = m[1];
-      else if (file !== "") {
+      if (m[1] !== undefined) {
+        fileOnly();
+        file = m[1];
+        named = false;
+      } else if (file !== "") {
         refs.push({ promise, file, test: m[2] as string });
-        found = true;
+        named = true;
       }
     }
-    if (!found) refs.push({ promise, file: "", test: "" });
+    fileOnly();
+    if (file === "") refs.push({ promise, file: "", test: "" });
   }
   return refs;
 }
 
-/** Whether the source declares a test named exactly `name`: `test("name"` or `it("name"` that starts a line, so a name in a comment or a string does not count. */
-export function declaresTest(text: string, name: string): boolean {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^[ \\t]*(?:test|it)\\(\\s*(["'\`])${escaped}\\1`, "m").test(text);
+/**
+ * A test declaration that starts a line: `test`, `it` or `describe`, any
+ * modifiers (`.skipIf(…)`, `.each(…)`, `.only`), then `(` and a quoted first
+ * argument, which may be on the next line. Group 1 is the quote, group 2 the
+ * name as written.
+ */
+const DECLARATION =
+  /^[ \t]*(?:test|it|describe)(?:\.\w+(?:\((?:[^()]|\([^()]*\))*\))?)*\(\s*(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/gm;
+
+/** `\'` read as `'`: the name the runner prints, not the source spelling. */
+const unescaped = (written: string) => written.replace(/\\([\s\S])/g, "$1");
+
+/** Whether a declared name, as written, is `name`: a template literal's `${…}` matches any non-empty text. */
+function namesMatch(quote: string, written: string, name: string): boolean {
+  if (quote !== "`" || !written.includes("${")) return unescaped(written) === name;
+  const pattern = written
+    .split(/\$\{[^}]*\}/)
+    .map((part) => unescaped(part).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".+");
+  return new RegExp(`^${pattern}$`, "s").test(name);
 }
 
-/** Each reference whose file is missing or does not contain the test name. */
+/** Whether the source declares a test or group named `name` (see DECLARATION): a name in a comment or a string does not count. */
+export function declaresTest(text: string, name: string): boolean {
+  for (const m of text.matchAll(DECLARATION)) {
+    if (namesMatch(m[1] as string, m[2] as string, name)) return true;
+  }
+  return false;
+}
+
+/** Each reference whose file is missing or does not declare the test name. */
 export function invariantDrift(
   refs: readonly InvariantRef[],
   read: (path: string) => string | undefined,
@@ -186,7 +223,7 @@ export function invariantDrift(
     }
     const text = read(ref.file);
     if (text === undefined) errors.push(`invariant "${ref.promise}": no file ${ref.file}`);
-    else if (!declaresTest(text, ref.test)) {
+    else if (ref.test !== "" && !declaresTest(text, ref.test)) {
       errors.push(`invariant "${ref.promise}": ${ref.file} has no test "${ref.test}"`);
     }
   }
