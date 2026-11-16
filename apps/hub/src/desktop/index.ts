@@ -1,4 +1,4 @@
-/** The desktop stream: browser ↔ hub ↔ box VNC (PRD §8.2, §8.3, §11.1 item 4; decision 0016). */
+/** The desktop stream and its lock: browser ↔ hub ↔ box VNC (PRD §8.2, §8.3, §11.1 item 4, §11.2; decisions 0016, 0033). */
 
 export {
   closeReason,
@@ -16,11 +16,31 @@ export {
   type ViewerTicket,
 } from "./bridge";
 export {
+  DESKTOP_LOCK_EVENT,
+  DESKTOP_LOCK_TTL_MS,
+  type DesktopLockCheck,
+  type DesktopLockEnd,
+  type DesktopLockHolder,
+  type DesktopLockHolderKind,
+  DesktopLocks,
+  type DesktopLocksOptions,
+  type DesktopLockView,
+  USER_IN_CONTROL,
+} from "./lock";
+export {
   MAX_CUT_TEXT_BYTES,
   MAX_ENCODINGS,
   RFB_CLIENT,
+  RfbInputFilter,
   RfbViolation,
   STRIPPED_ENCODINGS,
-  ViewOnlyFilter,
 } from "./rfb";
-export { DESKTOP_PATH, type DesktopSocketData, mountDesktopRoute, type Upgrader } from "./routes";
+export {
+  DESKTOP_LOCK_PATH,
+  DESKTOP_PATH,
+  DESKTOP_RELEASE_PATH,
+  type DesktopSocketData,
+  mountDesktopLockRoutes,
+  mountDesktopRoute,
+  type Upgrader,
+} from "./routes";

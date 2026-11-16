@@ -2560,3 +2560,137 @@ deviates.
   values over-redact; usernames are redacted like passwords; a row can still be
   deleted, or rolled back together with its version, by someone who can write
   the database (the audit rows record the version used).
+
+## 0033: Desktop takeover: a hub-side lock lease per session gates the RFB input filter
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #120
+- Builds on 0016 (the view-only filter); PRD §8.3, §11.2.
+
+### Context
+
+M1 showed the box desktop view-only: the hub's RFB filter dropped every key
+and pointer message (0016). M2 lets the owner take the desktop over (PRD
+§11.2): the desktop view accepts their mouse and keyboard while they hold the
+desktop lock, and the agent's desktop and browser input tools answer "user is
+in control" until they release it. PRD §8.3 leaves open where the lock lives,
+how long a lease lasts and what releases it.
+
+### Decision
+
+- **The lock is hub state, one per session, in memory** (`apps/hub/src/desktop/lock.ts`).
+  A holder is `{ kind, principalId }`; kinds are `person`, `agent` and
+  `automation` (PRD §8.3), and only `person` acquires it today. First come,
+  first served: a lock someone else holds is refused with `desktop.locked`
+  (409). A hub restart drops every lock, which is the safe side: input stops.
+- **A lease of 60 s (`DESKTOP_LOCK_TTL_MS`), renewed by interacting.** Each key
+  or pointer message the relay passes for the holder renews it; taking a lock
+  one already holds renews it too. A lease nobody renews is treated as free
+  the moment it lapses (every check compares the clock, so it never counts as
+  held past `expiresAt`), and a timer records the expiry. The box is not told
+  about the lock: the hub filters input before the box sees it, so there is
+  no box-side grant to expire early (§8.3's "the box stops trusting its grant"
+  applies once a box-side grant exists).
+- **The filter asks the lock per message.** `RfbInputFilter` (renamed from
+  `ViewOnlyFilter`) takes an `allowInput` gate; the bridge passes
+  `locks.allowsInput(sessionId, viewer principal)`. At each complete
+  `KeyEvent` and `PointerEvent` the gate decides; anything else of 0016's drop
+  list (`ClientCutText`, `SetDesktopSize`, QEMU key events, continuous
+  updates, fences) stays dropped whoever holds the lock. A release or lapse
+  stops input at the next message. Every viewer of the holder's principal
+  passes input; viewers of other principals stay view-only.
+- **What releases it:** `POST /v1/sessions/:id/desktop/lock/release`; the
+  holder's last open viewer of the session closing (the tab closed, the box
+  went to sleep, the login was revoked), checked when any viewer closes; and
+  the lease lapsing.
+- **API**, behind the login and request guards like every route:
+  `GET /v1/sessions/:id/desktop/lock` (`desktop.view`),
+  `POST /v1/sessions/:id/desktop/lock` (take over, `desktop.control`) and
+  `POST /v1/sessions/:id/desktop/lock/release` (`desktop.control`). Each
+  answers `{ ok, lock: { held, mine, holder, expiresAt } }`. Each authorizes
+  against the session's workspace (0022) before it reads anything, so an
+  unknown id and another workspace's id get the same answer (#85, #90, #94);
+  the request body is never read. An archived or failed session cannot be
+  taken over (409 `session.unavailable`).
+- **Recorded before it acts.** `authorize` writes the audit row of each API
+  call. Every lock change is also a `desktop.lock` event in the session's log
+  (`action`: `acquired`, `released`, `viewer-left`, `expired`; the holder),
+  appended before the lock changes; an acquire whose event cannot be written
+  grants nothing (PRD §10). Implicit releases (viewer left, expiry) are not
+  API calls and are not authorized; their event records them.
+- **The agent's check.** `hub.desktopLocks.isDesktopLocked(sessionId)` and
+  `assertUnlocked(sessionId)` (throws `desktop.locked`, message
+  `user is in control`) are the API the runner's desktop and browser tools
+  call before they act (docs/runner.md). No such tool exists on main yet;
+  #116 (or a follow-up) wires the refusal into the `browser_*` tools.
+- **Web UI.** Over the open desktop the panel shows a control bar with a
+  badge, a line of status and a **Take over** or **Release** button (shadcn
+  `Button`, `Badge`). noVNC stays `viewOnly` unless the lock is the user's;
+  the bar re-reads the lock every 3 s, so a lapsed lease turns the view back
+  to view-only. The bar sits outside the `Desktop` region, which keeps its
+  stable names (`Open desktop`, `Wake`, `Reconnect`).
+
+### Consequences
+
+- A person who leaves the desktop untouched for 60 s loses control and must
+  click Take over again; the agent's tools are blocked for at most that long
+  after a tab is abandoned without closing.
+- Keys or buttons held down when the lock ends are not released on the box: the
+  filter drops the matching key-up. Clicking Release with the mouse does not hit
+  this.
+- Clipboard paste into the box (`ClientCutText`) stays dropped; it is a
+  follow-up if needed.
+- The agent cannot hold the lock yet (no queue, no paused turn clocks, PRD
+  §8.3); that comes with the browser tools.
+- Proof: unit tests of the gate (`rfb.test.ts`), the lease and its timer
+  (`lock.test.ts`), the bridge on the real call path (`bridge.test.ts`), the
+  routes' same answers (`session-existence.test.ts`, `principal.test.ts`), the
+  panel in a DOM (`web.dom.tsx`); web-e2e types through noVNC into the fake
+  desktop only while holding the lock; compose-e2e types a URL into the box
+  Chromium's address bar through noVNC, checks the page over CDP and on the
+  canvas, then after Release a hand-written RFB client's key events no longer
+  reach the browser.
+
+## 0034: The public listener caps request bodies at 1 MiB, checked before every guard
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #105
+
+### Context
+
+Request bodies are read only after `authorize` (0029), but a signed-in caller
+could still send a huge JSON body and have it parsed into memory. Bun's own
+`maxRequestBodySize` answers an oversized `Content-Length` with a bare 413
+before `fetch` runs, with no JSON envelope.
+
+### Decision
+
+- The public listener refuses a body whose `Content-Length` is over
+  `maxBodyBytes` (default `DEFAULT_MAX_BODY_BYTES`, 1 MiB; a prompt plus labels
+  is a few KiB) with 413 and the JSON error envelope, code
+  `request.body-too-large`. Bun answers most malformed `Content-Length` values
+  with its own bare 400 before the hub runs; repeated equal headers reach the
+  hub joined by a comma and get the same JSON 413. Every 411/413 carries
+  `connection: close`, so Bun closes the socket instead of draining the
+  declared body.
+- A request with `Transfer-Encoding` (a body of unknown length) gets 411,
+  `request.length-required`. Browsers send a length for the UI's JSON bodies.
+- The check reads headers only and runs first in the public `fetch`, before the
+  request guard (0010), the session guard (0014) and `authorize`. An
+  unauthenticated oversized request therefore gets 413, as a signed-in one
+  does, and the answer reveals nothing the caller did not send. It applies to
+  every public path, `/healthz` included.
+- Bun's `maxRequestBodySize` on the public listener is raised to its maximum
+  so Bun does not answer first. The box listener and the desktop WebSocket are
+  not touched; the limit is an option, not an environment variable.
+
+### Alternatives rejected
+
+- Bun's `maxRequestBodySize` alone: the answer is not the JSON envelope.
+- Counting streamed chunks: more code for a case no client of the hub needs.
+
+### Consequences
+
+A client that streams a body without a length is refused with 411.

@@ -32,7 +32,9 @@ import { ToolRpcClient } from "./box/tool-rpc";
 import {
   DESKTOP_CLOSE,
   DesktopBridge,
+  DesktopLocks,
   type DesktopSocketData,
+  mountDesktopLockRoutes,
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
@@ -87,8 +89,49 @@ function healthzOnPlaceholder(req: Request): Request | undefined {
   return new Request(new URL(target, "http://hub.invalid").href, req);
 }
 
-function refusal(status: 400 | 404 | 421 | 426, code: string, message: string): Response {
+function refusal(
+  status: 400 | 404 | 411 | 413 | 421 | 426,
+  code: string,
+  message: string,
+): Response {
   return Response.json({ ok: false, error: { code, owner: "user", message } }, { status });
+}
+
+/**
+ * Largest request body the public listener accepts, in bytes (issue #105,
+ * decision 0034): a message prompt plus labels is a few KiB, so 1 MiB leaves
+ * ample room and still keeps a signed-in caller from parsing huge JSON.
+ */
+export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+
+/** The largest value Bun accepts for `maxRequestBodySize` (an unsigned 32-bit integer). */
+const BUN_MAX_BODY_BYTES = 0xffff_ffff;
+
+/**
+ * The 413 or 411 answer for a request whose declared body is over `limit`
+ * (or has no declared length), undefined when the request may go on. It reads
+ * headers only, never the body.
+ */
+function bodyLimitRefusal(req: Request, limit: number): Response | undefined {
+  if (req.headers.has("transfer-encoding")) {
+    return closing(
+      refusal(411, "request.length-required", "a request body needs a Content-Length"),
+    );
+  }
+  const declared = req.headers.get("content-length");
+  if (declared === null) return undefined;
+  // Repeated Content-Length headers arrive joined ("10, 10") and are not digits.
+  const length = /^\d+$/.test(declared.trim()) ? Number(declared.trim()) : Number.NaN;
+  if (Number.isNaN(length) || length > limit) {
+    return closing(refusal(413, "request.body-too-large", `the body is over ${limit} bytes`));
+  }
+  return undefined;
+}
+
+/** Ends the connection after a body refusal, so Bun does not drain the declared body. */
+function closing(res: Response): Response {
+  res.headers.set("connection", "close");
+  return res;
 }
 
 export interface HubListenOptions {
@@ -102,6 +145,8 @@ export interface HubListenOptions {
    * and the bound address (docs/DECISIONS.md, 0010).
    */
   readonly publicOrigin?: string;
+  /** Largest request body of the public listener in bytes. Defaults to `DEFAULT_MAX_BODY_BYTES`. */
+  readonly maxBodyBytes?: number;
 }
 
 /**
@@ -166,6 +211,8 @@ export interface HubOptions extends HubListenOptions {
   readonly heartbeat?: BoxConnectionsOptions["heartbeat"];
   /** Image of session boxes (`HEARTH_BOX_IMAGE`). Defaults to `DEFAULT_BOX_IMAGE`. */
   readonly boxImage?: string;
+  /** Lease of the desktop lock (decision 0033). Defaults to `DESKTOP_LOCK_TTL_MS`; tests change it. */
+  readonly desktopLockTtlMs?: number;
   /** Session manager timings and bounds (idle time, relaunch bounds); see `SessionManagerOptions`. */
   readonly sessions?: Partial<
     Pick<
@@ -254,6 +301,7 @@ export function startHub(options: HubOptions) {
     ...(options.heartbeat === undefined ? {} : { heartbeat: options.heartbeat }),
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const boxEgress = options.boxEgress ?? markerEgressCheck();
   // The local login (decision 0014). Until the owner sets a password, the
   // setup token is logged: only whoever reads the hub's output can claim it.
@@ -282,7 +330,17 @@ export function startHub(options: HubOptions) {
     server = Bun.serve<DesktopSocketData>({
       hostname,
       port: options.port ?? DEFAULT_PORT,
+      // Bun answers an oversized Content-Length with a bare 413 before `fetch`
+      // runs. The limit is checked below instead, so the answer is the JSON
+      // envelope; Bun's own cap is raised to its maximum on purpose. Box
+      // listeners and the desktop socket keep their own settings.
+      maxRequestBodySize: BUN_MAX_BODY_BYTES,
       fetch: (req, srv) => {
+        // The body limit (decision 0034) runs first: it reads headers only,
+        // so an oversized request is refused before the request guard (0010),
+        // the session guard and `authorize`, and learns nothing from them.
+        const tooLarge = bodyLimitRefusal(req, maxBodyBytes);
+        if (tooLarge !== undefined) return tooLarge;
         // A Host the HTTP layer cannot turn into a URL (an empty one) makes
         // `req.url` relative and every later `new URL` throw: answer it as the
         // request guard would (decision 0010) instead of a 500 (issue #48).
@@ -505,11 +563,21 @@ export function startHub(options: HubOptions) {
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
   mountVaultRoutes(app, vault);
+  // The desktop lock (decision 0033): who may type on a session's desktop.
+  const desktopLocks = new DesktopLocks({
+    authorizer,
+    sessions,
+    events,
+    ...(options.desktopLockTtlMs === undefined ? {} : { ttlMs: options.desktopLockTtlMs }),
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+  mountDesktopLockRoutes(app, desktopLocks);
   // The desktop stream (decision 0016): behind the login guard, owner only.
   desktop = new DesktopBridge({
     boxes,
     sessions,
     authorizer,
+    locks: desktopLocks,
     ...(options.log === undefined ? {} : { log: options.log }),
   });
   mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
@@ -542,6 +610,12 @@ export function startHub(options: HubOptions) {
     sessions,
     /** The pi runners (decision 0015), when `runner` is configured. */
     runners,
+    /**
+     * The desktop lock (decision 0033). Agent desktop and browser tools call
+     * `desktopLocks.isDesktopLocked(sessionId)` or `assertUnlocked(sessionId)`
+     * before they act (docs/runner.md).
+     */
+    desktopLocks,
     /** The tool RPC client the runners use, when `runner` is configured. */
     toolRpc,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
@@ -609,6 +683,7 @@ export function startHub(options: HubOptions) {
       toolRpc?.close();
       void runners?.close();
       desktop?.shutdown();
+      desktopLocks.shutdown();
       boxes.shutdown();
       stopped = (async () => {
         await sessions.ready.catch(() => undefined);

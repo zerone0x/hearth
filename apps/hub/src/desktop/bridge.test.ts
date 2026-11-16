@@ -17,6 +17,7 @@ import {
 import type { Frame, StreamCloseFrame, StreamDataFrame } from "@hearth/protocol";
 import type { BoxConnectionListener } from "../box/connections";
 import { DESKTOP_CLOSE, DesktopBridge, type ViewerSocket, type ViewerTicket } from "./bridge";
+import { DesktopLocks } from "./lock";
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const HANDSHAKE = Uint8Array.from([...enc("RFB 003.008\n"), 1, 0]);
@@ -76,6 +77,8 @@ function setup(
     limitBytes?: number;
     highWaterBytes?: number;
     reauthIntervalMs?: number;
+    /** Give the bridge a real desktop lock (decision 0033). */
+    locks?: boolean;
   } = {},
 ) {
   const boxes = new FakeBoxes();
@@ -99,10 +102,23 @@ function setup(
       return { sessionId: id, boxId: "box_1", release: () => calls.push(`release ${id}`) };
     },
   };
+  const events: { type: string; payload: unknown }[] = [];
+  const locks = new DesktopLocks({
+    authorizer,
+    sessions: { scope: sessions.scope, get: async (_p, id) => ({ id, state: "idle" }) as never },
+    events: {
+      append: async (_scope, _id, event) => {
+        events.push({ type: event.type, payload: event.payload });
+        return { seq: events.length, duplicate: false };
+      },
+    },
+    log: () => undefined,
+  });
   const bridge = new DesktopBridge({
     boxes,
     sessions,
     authorizer,
+    ...(options.locks === true ? { locks } : {}),
     log: () => undefined,
     ...(options.limitBytes === undefined ? {} : { limitBytes: options.limitBytes }),
     ...(options.highWaterBytes === undefined ? {} : { highWaterBytes: options.highWaterBytes }),
@@ -122,6 +138,8 @@ function setup(
     bridge,
     calls,
     ticket,
+    locks,
+    events,
     signOut() {
       signedIn = undefined;
     },
@@ -327,5 +345,118 @@ describe("DesktopBridge streams", () => {
     const late = new FakeSocket();
     expect(v.bridge.attach(late, v.ticket())).toBeUndefined();
     expect(late.closedWith?.code).toBe(DESKTOP_CLOSE.shutdown);
+  });
+});
+
+describe("DesktopBridge with the desktop lock (decision 0033)", () => {
+  const input = (t: ReturnType<typeof setup>) =>
+    t.boxes
+      .data()
+      .flatMap((f) => [...f.data])
+      .slice(14);
+
+  test("input reaches the box only while the viewer's principal holds the lock", async () => {
+    const t = setup({ locks: true });
+    const { viewer } = t.open();
+    t.bridge.message(viewer, HANDSHAKE);
+    t.bridge.message(viewer, KEY);
+    expect(input(t)).toEqual([]);
+
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.message(viewer, KEY);
+    t.bridge.message(viewer, POINTER);
+    expect(input(t)).toEqual([...KEY, ...POINTER]);
+
+    await t.locks.release(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.message(viewer, Uint8Array.from([...KEY, ...POINTER]));
+    expect(input(t)).toEqual([...KEY, ...POINTER]);
+    expect(viewer.filter.passed).toBe(2);
+    expect(viewer.filter.dropped).toBe(3);
+  });
+
+  test("another principal's lock lets nothing through this viewer", async () => {
+    const t = setup({ locks: true });
+    const { viewer } = t.open();
+    t.bridge.message(viewer, HANDSHAKE);
+    await t.locks.acquire({ ...LOCAL_PRINCIPAL, id: "usr_other" }, "ses_1");
+    t.bridge.message(viewer, KEY);
+    expect(input(t)).toEqual([]);
+  });
+
+  test("closing the holder's last viewer releases the lock; another open viewer keeps it", async () => {
+    const t = setup({ locks: true });
+    const first = t.open();
+    const second = t.open();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.closed(first.viewer);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(true);
+    t.bridge.closed(second.viewer);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
+    expect(t.events.map((e) => (e.payload as { action: string }).action)).toEqual([
+      "acquired",
+      "viewer-left",
+    ]);
+  });
+
+  test("a viewer closed by the hub (box gone) releases the lock too", async () => {
+    const t = setup({ locks: true });
+    t.open();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.boxes.listener?.disconnected?.("box_1", undefined);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
+  });
+
+  test("a viewer of another principal leaving keeps the holder's lock", async () => {
+    const t = setup({ locks: true });
+    const mine = t.open();
+    const other = new FakeSocket();
+    const theirs = t.bridge.attach(other, {
+      ...t.ticket(),
+      principal: { ...LOCAL_PRINCIPAL, id: "usr_other" },
+    });
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.closed(theirs as NonNullable<typeof theirs>);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(true);
+    t.bridge.closed(mine.viewer);
+  });
+
+  test("the holder's other viewer, behind another principal's, keeps the lock", async () => {
+    const t = setup({ locks: true });
+    const other = { ...t.ticket(), principal: { ...LOCAL_PRINCIPAL, id: "usr_other" } };
+    t.bridge.attach(new FakeSocket(), other);
+    const first = t.open();
+    t.open();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.closed(first.viewer);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(true);
+  });
+
+  test("the holder's viewer on a replaced box, behind another box's viewers, keeps the lock", async () => {
+    const t = setup({ locks: true });
+    const other = { ...t.ticket(), principal: { ...LOCAL_PRINCIPAL, id: "usr_other" } };
+    t.bridge.attach(new FakeSocket(), other);
+    const onBox2 = { ...t.ticket(), boxId: "box_2" };
+    const a = t.bridge.attach(new FakeSocket(), onBox2);
+    t.bridge.attach(new FakeSocket(), onBox2);
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.closed(a as NonNullable<typeof a>);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(true);
+  });
+
+  test("the holder's last viewer leaving releases even while another principal watches", async () => {
+    const t = setup({ locks: true });
+    const other = { ...t.ticket(), principal: { ...LOCAL_PRINCIPAL, id: "usr_other" } };
+    t.bridge.attach(new FakeSocket(), other);
+    const mine = t.open();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.bridge.closed(mine.viewer);
+    await Bun.sleep(0);
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
   });
 });

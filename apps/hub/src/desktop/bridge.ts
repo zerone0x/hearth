@@ -3,8 +3,11 @@
  *
  * Each viewer is one browser WebSocket bridged to one hub-opened `vnc` stream
  * (even id, decision 0002) on the session's box connection. RFB from the box
- * goes to the browser as is; RFB from the browser goes through the view-only
- * filter (`rfb.ts`) first.
+ * goes to the browser as is; RFB from the browser goes through the input
+ * filter (`rfb.ts`) first, which passes key and pointer input only while the
+ * viewer's principal holds the session's desktop lock (`lock.ts`, decision
+ * 0033). When a viewer closes and its principal has no other viewer of the
+ * session open, a lock that principal holds is released.
  *
  * Bounds, so a slow browser cannot grow hub memory without limit:
  * - Box → browser: RFB is pull-based, the server sends an update only for a
@@ -31,7 +34,8 @@ import {
 import type { StreamCloseFrame, StreamDataFrame } from "@hearth/protocol";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import type { SessionManager } from "../session";
-import { RfbViolation, ViewOnlyFilter } from "./rfb";
+import type { DesktopLocks } from "./lock";
+import { RfbInputFilter, RfbViolation } from "./rfb";
 
 /** Browser socket queue above which the viewer's requests are held back. */
 export const VIEWER_HIGH_WATER_BYTES = 1024 * 1024;
@@ -82,6 +86,8 @@ export interface DesktopBridgeOptions {
   readonly boxes: Pick<BoxConnections, "listen" | "sendStream">;
   readonly sessions: Pick<SessionManager, "get" | "ensureBox" | "scope">;
   readonly authorizer: Authorizer;
+  /** The desktop lock; without it every viewer is view-only. */
+  readonly locks?: Pick<DesktopLocks, "allowsInput" | "viewerLeft">;
   readonly log?: (line: string) => void;
   readonly highWaterBytes?: number;
   readonly limitBytes?: number;
@@ -93,7 +99,7 @@ export class Viewer {
   readonly ticket: ViewerTicket;
   readonly socket: ViewerSocket;
   readonly streamId: number;
-  readonly filter = new ViewOnlyFilter();
+  readonly filter: RfbInputFilter;
   /** Next `seq` to the box, and the next one expected from it. */
   sendSeq = 0;
   recvSeq = 0;
@@ -103,10 +109,16 @@ export class Viewer {
   reauthTimer: ReturnType<typeof setInterval> | undefined;
   closed = false;
 
-  constructor(ticket: ViewerTicket, socket: ViewerSocket, streamId: number) {
+  constructor(
+    ticket: ViewerTicket,
+    socket: ViewerSocket,
+    streamId: number,
+    allowInput?: () => boolean,
+  ) {
     this.ticket = ticket;
     this.socket = socket;
     this.streamId = streamId;
+    this.filter = new RfbInputFilter(allowInput);
   }
 }
 
@@ -189,7 +201,15 @@ export class DesktopBridge {
       socket.close(DESKTOP_CLOSE.tooMany, "too many viewers of this desktop");
       return undefined;
     }
-    const viewer = new Viewer(ticket, socket, this.#allocate(streams));
+    const locks = this.#options.locks;
+    const viewer = new Viewer(
+      ticket,
+      socket,
+      this.#allocate(streams),
+      locks === undefined
+        ? undefined
+        : () => locks.allowsInput(ticket.sessionId, ticket.principal.id),
+    );
     if (
       !this.#options.boxes.sendStream(ticket.boxId, {
         type: "stream.open",
@@ -220,12 +240,18 @@ export class DesktopBridge {
       return;
     }
     let forward: Uint8Array;
+    const passed = viewer.filter.passed;
     try {
       forward = viewer.filter.push(data);
     } catch (error) {
       if (!(error instanceof RfbViolation)) throw error;
       this.#close(viewer, DESKTOP_CLOSE.protocol, error.message);
       return;
+    }
+    if (passed === 0 && viewer.filter.passed > 0) {
+      this.#log(
+        `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} passes input (desktop lock held)`,
+      );
     }
     if (forward.byteLength === 0) return;
     viewer.held.push(forward);
@@ -312,6 +338,18 @@ export class DesktopBridge {
     return false;
   }
 
+  /** Whether `principalId` still has a viewer of `sessionId` open. */
+  #watching(sessionId: SessionId, principalId: string): boolean {
+    for (const streams of this.#byBox.values()) {
+      for (const viewer of streams.values()) {
+        if (viewer.ticket.sessionId === sessionId && viewer.ticket.principal.id === principalId) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /** Next free even stream id on this box (decision 0002: the hub opens even ids). */
   #allocate(streams: Map<number, Viewer>): number {
     for (;;) {
@@ -343,8 +381,11 @@ export class DesktopBridge {
       });
     }
     this.#log(
-      `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} closed: ${reason}`,
+      `desktop: session ${viewer.ticket.sessionId} stream ${viewer.streamId} closed: ${reason} (input passed ${viewer.filter.passed}, dropped ${viewer.filter.dropped})`,
     );
+    if (!this.#watching(viewer.ticket.sessionId, viewer.ticket.principal.id)) {
+      void this.#options.locks?.viewerLeft(viewer.ticket.sessionId, viewer.ticket.principal.id);
+    }
     if (code === undefined) return;
     try {
       viewer.socket.close(code, closeReason(reason));

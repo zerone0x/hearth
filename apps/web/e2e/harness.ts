@@ -121,6 +121,12 @@ export class LocalBoxProvider implements BoxNetworkProvider {
   }
 }
 
+/** What reached the fake Xvnc: key syms pressed, and pointer events. */
+export interface FakeVncInput {
+  readonly keys: number[];
+  pointers: number;
+}
+
 /** Width and height of the fake desktop. */
 export const FAKE_DESKTOP = { width: 640, height: 400 } as const;
 
@@ -142,13 +148,16 @@ function pixel(x: number, y: number): [number, number, number] {
  * A minimal RFB 3.8 server, security None, raw encoding: the stand-in for
  * Xvnc behind box-agent's relay. Answers non-incremental update requests
  * with the whole picture and holds incremental ones (nothing changes).
+ * Records the key and pointer events that reach it (decision 0033: only
+ * while the viewer holds the desktop lock).
  */
-export function startFakeVnc(): { port: number; stop(): void } {
+export function startFakeVnc(): { port: number; stop(): void; input: FakeVncInput } {
   interface Conn {
     buf: Buffer;
     phase: "version" | "security" | "init" | "normal";
     format: { bpp: number; bigEndian: boolean; shifts: [number, number, number] };
   }
+  const input: FakeVncInput = { keys: [], pointers: 0 };
   const server = Bun.listen<Conn>({
     hostname: "127.0.0.1",
     port: 0,
@@ -208,6 +217,14 @@ export function startFakeVnc(): { port: number; stop(): void } {
               const incremental = c.buf[1] !== 0;
               c.buf = c.buf.subarray(10);
               if (!incremental) socket.write(frame(c.format));
+            } else if (type === 4) {
+              if (c.buf.length < 8) return;
+              if (c.buf[1] !== 0) input.keys.push(c.buf.readUInt32BE(4));
+              c.buf = c.buf.subarray(8);
+            } else if (type === 5) {
+              if (c.buf.length < 6) return;
+              input.pointers += 1;
+              c.buf = c.buf.subarray(6);
             } else {
               socket.end();
               return;
@@ -238,7 +255,7 @@ export function startFakeVnc(): { port: number; stop(): void } {
     }
     return out;
   }
-  return { port: server.port, stop: () => server.stop(true) };
+  return { port: server.port, stop: () => server.stop(true), input };
 }
 
 const noSecrets: SecretStore = {
@@ -254,6 +271,8 @@ export interface E2eHub {
   readonly faux: FauxProviderHandle;
   readonly workspace: string;
   readonly boxes: LocalBoxProvider;
+  /** Key and pointer events that reached the fake desktop. */
+  readonly vncInput: FakeVncInput;
   stop(): Promise<void>;
 }
 
@@ -296,6 +315,7 @@ export async function startE2eHub(webRoot: string): Promise<E2eHub> {
     faux,
     workspace,
     boxes,
+    vncInput: vnc.input,
     async stop() {
       await boxes.stopAll();
       await hub.stop();

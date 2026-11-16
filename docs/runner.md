@@ -65,6 +65,25 @@ an `rm\s+-rf` rule and are known: `rm -fr`, `rm -r -f`, `X=rm; $X -rf`,
 `bash -c "r""m -rf"`, `base64 -d | sh`. Write content is not tested, only the
 path. The box is the boundary; approvals with a human in the loop are M3.
 
+## Desktop lock: agent desktop and browser tools (decision 0033)
+
+While the owner holds a session's desktop lock (the Take over button), the
+agent's desktop and browser input tools must not act. The hub exposes the
+check as `hub.desktopLocks` (`apps/hub/src/desktop/lock.ts`):
+
+| Call | Answer |
+|---|---|
+| `isDesktopLocked(sessionId)` | `true` while someone holds the lock (a lapsed lease counts as free) |
+| `assertUnlocked(sessionId)` | throws `HearthError` code `desktop.locked`, message `user is in control` (owner `user`, disposition `retry`) while it is held |
+| `holder(sessionId)` | `{ kind, principalId }` or `undefined` |
+
+A tool that drives the box desktop or browser (the `browser_*` tools of #116)
+calls `assertUnlocked` before it sends anything to the box and returns the
+error to the model as its result, so the model reads "user is in control" and
+can wait or ask. Read-only tools (a screenshot) may keep working. Releasing
+the lock, closing the tab and a lapsed lease all free it at once; the next
+call succeeds.
+
 ## Tests
 
 ```sh
