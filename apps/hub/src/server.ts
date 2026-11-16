@@ -34,6 +34,7 @@ import {
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
+import { mountBlobRoutes, SessionBlobs } from "./obs/blobs";
 import { mountTrajectoryRoutes, Trajectories } from "./obs/routes";
 import { HUB_VERSION } from "./obs/version";
 import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
@@ -41,6 +42,7 @@ import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "
 import {
   openDatabase,
   SqliteAuditSink,
+  SqliteBlobStore,
   SqliteBoxCredentialStore,
   SqliteEventStore,
   SqliteLoginStore,
@@ -254,6 +256,7 @@ export function startHub(options: HubOptions) {
   const audit = new SqliteAuditSink(db);
   const authorizer = new AllowAllAuthorizer({ audit });
   const events = new SqliteEventStore(db);
+  const blobs = new SqliteBlobStore(db);
   const credentials = new SqliteBoxCredentialStore(db);
   const sessionStore = new SqliteSessionStore(db);
   const boxes = new BoxConnections({
@@ -498,6 +501,8 @@ export function startHub(options: HubOptions) {
       versions: { pi: PI_VERSION, hub: HUB_VERSION },
     }),
   );
+  // Screenshots and other images by hash (decision 0037).
+  mountBlobRoutes(app, new SessionBlobs({ authorizer, blobs, sessions }));
 
   // The desktop lock (decision 0033): who may type on a session's desktop.
   // Made before the runners: their browser tools check it (decision 0035).
@@ -527,6 +532,7 @@ export function startHub(options: HubOptions) {
           ...options.runner,
           authorizer,
           events,
+          blobs,
           sessions: {
             ensureBox: (sessionId) => sessions.ensureBox(sessionId),
             get: (principal, sessionId) => sessions.get(principal, sessionId),

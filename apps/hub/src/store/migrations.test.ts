@@ -51,7 +51,7 @@ describe("migrate", () => {
     old.close();
 
     const db = openDatabase(path, { migrate: false });
-    expect(migrate(db)).toEqual([5]);
+    expect(migrate(db, MIGRATIONS.slice(0, 5))).toEqual([5]);
     expect(MIGRATIONS[4]?.name).toBe("owner password and login sessions");
     expect(versions(db)).toEqual([1, 2, 3, 4, 5]);
     const tables = db
@@ -61,6 +61,22 @@ describe("migrate", () => {
     expect(tables).toEqual(
       expect.arrayContaining(["session_operation", "owner_password", "login_session"]),
     );
+    db.close();
+  });
+
+  test("a database before the blob store upgrades to it, with no blobs (decision 0037)", () => {
+    const path = join(dir, "pre-blob.db");
+    const at = MIGRATIONS.findIndex((m) => m.name === "content-addressed blobs and their sessions");
+    expect(at).toBeGreaterThan(4);
+    const old = openDatabase(path, { migrate: false });
+    migrate(old, MIGRATIONS.slice(0, at));
+    old.close();
+    const db = openDatabase(path, { migrate: false });
+    expect(migrate(db)[0]).toBe(at + 1);
+    const count = (table: string) =>
+      db.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n;
+    expect(count("blob")).toBe(0);
+    expect(count("session_blob")).toBe(0);
     db.close();
   });
 

@@ -214,6 +214,37 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX login_session_by_expiry ON login_session (expires_at);
     `,
   },
+  {
+    // Content-addressed blobs (#117, decision 0037): screenshots and other
+    // image tool results, kept once by the SHA-256 of their bytes instead of
+    // as base64 inside events. `session_blob` says which sessions put a blob,
+    // so a session reads only its own. Both are immutable; no row is deleted
+    // until retention (#83) adds a decision and the code for it.
+    version: 6,
+    name: "content-addressed blobs and their sessions",
+    sql: `
+      CREATE TABLE blob (
+        sha256 TEXT PRIMARY KEY CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK (size >= 0),
+        data BLOB NOT NULL CHECK (length(data) = size),
+        created_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE session_blob (
+        workspace_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL REFERENCES blob (sha256),
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, session_id, sha256)
+      ) STRICT;
+
+      CREATE TRIGGER blob_no_update BEFORE UPDATE ON blob
+      BEGIN SELECT RAISE(ABORT, 'blob is immutable'); END;
+      CREATE TRIGGER session_blob_no_update BEFORE UPDATE ON session_blob
+      BEGIN SELECT RAISE(ABORT, 'session_blob is immutable'); END;
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */
