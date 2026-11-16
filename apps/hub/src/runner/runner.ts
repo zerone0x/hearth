@@ -42,6 +42,7 @@ import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/t
 import { HUB_VERSION } from "../obs/version";
 import type { PinnedExtension } from "./extensions";
 import type { CompiledDenyRule } from "./policy";
+import { BROWSER_TOOLS } from "./browser-tools";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
 
 export const BOX_CWD = "/workspace";
@@ -303,7 +304,11 @@ export class SessionRunner {
         resourceLoader: loader,
         sessionManager: pi,
         settingsManager,
-        tools: [...ROUTED_TOOLS, ...(options.codemode === true ? ["codemode"] : [])],
+        tools: [
+          ...ROUTED_TOOLS,
+          ...BROWSER_TOOLS,
+          ...(options.codemode === true ? ["codemode"] : []),
+        ],
       });
       const runner = new SessionRunner(options, session, pi, agentDir, persisted);
       self = runner;

@@ -289,11 +289,11 @@ describe("protocol version", () => {
     expect(reject).toMatchObject({
       type: "reject",
       reason: "version-mismatch",
-      hubVersion: { major: 1, minor: 2 },
+      hubVersion: { major: 1, minor: 3 },
       boxVersion: { major: 2, minor: 3 },
     });
     expect(reject.message).toContain("2.3");
-    expect(reject.message).toContain("1.2");
+    expect(reject.message).toContain("1.3");
   });
 
   test("a box-agent speaking another major stops with the hub's message", async () => {

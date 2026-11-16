@@ -14,6 +14,8 @@
  *   hub's `rg`.
  * - `tool_call` rewrites `~` to the box workspace and applies the deny-list;
  *   `tool_result` rewrites hub temp paths (policy.ts).
+ * - The `browser_*` tools (browser-tools.ts, decision 0032) go to the box the
+ *   same way, as `browser.*` methods of the tool RPC.
  */
 
 import {
@@ -29,6 +31,7 @@ import {
 import type { BoxId } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { BoxLease } from "../session/manager";
+import { registerBrowserTools } from "./browser-tools";
 import {
   type CompiledDenyRule,
   denied,
@@ -197,6 +200,8 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
           return { content: [{ type: "text", text }], details: undefined };
         }),
     });
+
+    registerBrowserTools(pi, box);
 
     pi.on("tool_call", (event) => {
       if (PATH_TOOLS.has(event.toolName)) {
