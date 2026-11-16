@@ -228,6 +228,8 @@ export class SessionRunner {
           throw error;
         }
       },
+      // The desktop lock check of the browser tools (decision 0035).
+      assertDesktopUnlocked: () => inner.assertDesktopUnlocked?.(),
     };
     try {
       const settingsManager = SettingsManager.inMemory({});
@@ -240,6 +242,8 @@ export class SessionRunner {
             denyList: options.denyList,
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
+            onRefused: (_name, toolCallId, code) =>
+              self?.observe(() => self?.tracer.onRefused(toolCallId, code)),
             liveOutput: (toolCallId) =>
               liveToolOutput(options, toolCallId, () => self?.tracer.turnId),
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),

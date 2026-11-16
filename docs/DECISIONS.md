@@ -2741,6 +2741,71 @@ before `fetch` runs, with no JSON envelope.
 
 A client that streams a body without a length is refused with 411.
 
+## 0035: Browser tools refuse at once while the owner holds the desktop lock
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #126
+- Wires 0033 (the lock) into 0032 (the browser tools); PRD §8.3, §11.2.
+
+### Context
+
+0033 gave the hub a desktop lock and a check for the agent's tools
+(`assertUnlocked`), and 0032 gave the agent `browser_*` tools on the box's
+Chromium. Neither wired one into the other, so the agent could still click and
+type in the browser the owner had taken over. PRD §11.2 says the agent's
+browser and desktop input tools answer "user is in control" while the owner
+holds the lock. The choice left open: refuse at once, or wait for the lock
+with a short bound.
+
+### Decision
+
+- **Every `browser_*` tool checks the lock first**, before it takes a box
+  lease: a refused call neither starts nor wakes the box and sends nothing to
+  it. The runners get the hub's `DesktopLocks` (`SessionRunnersOptions.desktopLocks`,
+  set by `startHub`) and each session's `RunnerBox.assertDesktopUnlocked`
+  calls `assertUnlocked(sessionId)`.
+- **All twelve tools refuse, the read-only ones too** (`browser_snapshot`,
+  `browser_find`, `browser_screenshot`, `browser_tabs` list). One rule is
+  easier for the model to follow than a list, a snapshot or tab switch drives
+  the same page the owner is using, and the owner's page while they work on
+  it is theirs. This narrows the "read-only tools may keep working" note of
+  docs/runner.md.
+- **Refuse at once, no wait.** The tool call fails with
+  `DESKTOP_LOCKED_MESSAGE`: `desktop.locked: user is in control.` and that
+  nothing was sent, wait and try again later, or ask the user. The model can
+  retry, tell the owner or do other work; a hidden wait would hold the turn
+  (and its box lease) for up to the 60 s lease while the owner may be gone
+  for longer, and PRD §8.3's paused turn clocks for an agent waiting on the
+  lock do not exist yet.
+- **The trajectory records the refusal.** The tool call's `runner.step` has
+  `outcome: "desktop-locked"` (a new value next to 0021's `ok`, `error`,
+  `aborted`, `timeout`, `denied`, `outcome-unknown`; added values do not bump
+  the schema), `refused_code: "desktop.locked"`, no box and no RPCs, and the
+  summary counts it under `tool_failures_by_class["desktop-locked"]`.
+- Any other error of the check is not a refusal: it is rethrown as is.
+
+### Alternatives rejected
+
+- Wait for the release with a bound of a few seconds: a person who took over
+  rarely gives the desktop back that fast, so it mostly adds latency before
+  the same refusal, while holding a lease.
+- Refuse only the acting tools: see above; it can be revisited when the agent
+  can hold the lock itself (PRD §8.3 queue).
+
+### Consequences
+
+- While the owner holds the desktop the agent cannot even look at the page;
+  it has to ask or wait.
+- The check runs once, before the box lease. A call already past it (a cold
+  box wake can take seconds) still reaches the page if the owner takes over
+  meanwhile: the owner may see one last agent action after Take over. A second
+  check after the wake is a follow-up (#133).
+- Proof: unit tests of the check in every tool (`browser-tools.test.ts`), the
+  real `startHub` wiring and trajectory step (`browser-lock.test.ts`), and a
+  compose-e2e step: Take over, an agent `browser_tabs` call is refused with
+  `desktop.locked`, Release, the same call works in the box's Chromium.
+
 ## 0036: Live shell output: `tool.exec` names a stream (protocol 1.4), the hub stores redacted `tool.output` events
 
 - Date: 2026-11-16
