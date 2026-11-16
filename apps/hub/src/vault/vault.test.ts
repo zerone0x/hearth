@@ -15,6 +15,7 @@ import {
   type AuditSink,
   createDefaultSecretStore,
   LOCAL_PRINCIPAL,
+  type Principal,
   type SecretError,
   type SecretStore,
   VaultSecretResolver,
@@ -25,6 +26,7 @@ import { lineFields, lineLevel } from "../obs/hub-log";
 import { knownSecrets, redactHub, registerSecret } from "../obs/redaction";
 import { observabilityFromEnv } from "../obs/setup";
 import { Telemetry } from "../obs/telemetry";
+import { RequestBody } from "../request-body";
 import { redactSecrets, SessionRunners } from "../runner";
 import { startHub } from "../server";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
@@ -1103,6 +1105,86 @@ describe("the API never returns a value", () => {
     expect(((await corrupt.json()) as { error: { code: string } }).error.code).toBe(
       "vault.entry-corrupt",
     );
+  });
+
+  test("a foreign principal gets 403 before any body is read, valid or not", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const { id } = await addModelKey(h);
+    const foreign = Object.freeze({
+      id: "pr_foreign",
+      workspaceId: "ws_other",
+      kind: "user",
+      displayName: "foreign",
+    }) as Principal;
+    const app = new Hono<HubEnv>();
+    app.use("*", async (c, next) => {
+      c.set("principal", foreign);
+      await next();
+    });
+    mountVaultRoutes(app, h.vault);
+    const json = { "content-type": "application/json" };
+    // Every route that takes a body, with each kind of body a parser refuses.
+    const routes: [string, string][] = [
+      ["POST", "/v1/secrets"],
+      ["PUT", `/v1/secrets/${id}/value`],
+      ["PUT", "/v1/secrets/sec_unknown/value"],
+    ];
+    const bodies = ["not json {", "", "[]", '{"unknown":1}', '{"fields":{"value":7}}'];
+    for (const [method, url] of routes) {
+      for (const body of bodies) {
+        const res = await app.request(url, { method, body, headers: json });
+        const code = ((await res.json()) as { error: { code: string } }).error.code;
+        expect(`${method} ${url} ${JSON.stringify(body)} ${res.status} ${code}`).toBe(
+          `${method} ${url} ${JSON.stringify(body)} 403 authz.denied`,
+        );
+      }
+    }
+    // The service itself: a denied call never reads its body.
+    let reads = 0;
+    const spy = new RequestBody<unknown>(async () => {
+      reads++;
+      return {};
+    });
+    await expect(h.vault.create(foreign, spy)).rejects.toMatchObject({ code: "authz.denied" });
+    await expect(h.vault.rotate(foreign, id, spy)).rejects.toMatchObject({ code: "authz.denied" });
+    expect(reads).toBe(0);
+    await expect(h.vault.rotate(LOCAL_PRINCIPAL, id, spy)).rejects.toMatchObject({
+      code: "request.invalid",
+    });
+    expect(reads).toBe(1);
+  });
+
+  test("a row in another workspace is not found by id: 404, untouched", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const { id } = await addModelKey(h);
+    h.db.run("INSERT INTO workspace (id, name, created_at) VALUES ('ws_other', 'other', 0)");
+    h.db.run(
+      `INSERT INTO secret SELECT 'sec_foreign', 'ws_other', name, kind, scope_session_id,
+         policy_json, meta_json, iv, ciphertext, version, fingerprint, created_at, updated_at,
+         last_used_at FROM secret WHERE id = ?`,
+      [id],
+    );
+    const store = new SqliteVaultStore(h.db);
+    expect(store.byId("ws_default", "sec_foreign")).toBeUndefined();
+    expect(store.byId("ws_other", "sec_foreign")?.workspaceId).toBe("ws_other");
+    const app = new Hono<HubEnv>();
+    app.use("*", async (c, next) => {
+      c.set("principal", LOCAL_PRINCIPAL);
+      await next();
+    });
+    mountVaultRoutes(app, h.vault);
+    const put = await app.request("/v1/secrets/sec_foreign/value", {
+      method: "PUT",
+      body: JSON.stringify({ fields: { value: "foreign-rotate-value-2c" } }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(put.status).toBe(404);
+    const del = await app.request("/v1/secrets/sec_foreign", { method: "DELETE" });
+    expect(del.status).toBe(404);
+    const row = h.db
+      .query<{ version: number }, []>("SELECT version FROM secret WHERE id = 'sec_foreign'")
+      .get();
+    expect(row?.version).toBe(1);
   });
 
   test("the hub serves the vault routes behind the login and resolves vault: refs", async () => {
