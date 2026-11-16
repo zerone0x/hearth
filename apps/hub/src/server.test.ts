@@ -540,6 +540,19 @@ describe("startHub", () => {
       ),
     );
     expect(foreign.status).toBe(413);
+    // Repeated Content-Length headers (joined by a comma) are refused with the
+    // JSON 413, over the limit or not: they are never taken as a length.
+    for (const length of [limit + 1, 10]) {
+      const answer = await raw(
+        port,
+        `POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\ncookie: ${cookie}\r\ncontent-type: application/json\r\ncontent-length: ${length}\r\ncontent-length: ${length}\r\nconnection: keep-alive\r\n\r\n`,
+      );
+      const twice = parseAnswer(answer);
+      expect({ length, status: twice.status }).toEqual({ length, status: 413 });
+      expect(JSON.parse(twice.body)).toMatchObject({ error: { code: "request.body-too-large" } });
+      // The refusal closes the connection instead of draining the declared body.
+      expect(answer).toMatch(/\r\nconnection: close\r\n/i);
+    }
     // A malformed length and a body of unknown length are refused too.
     const malformed = parseAnswer(
       await raw(

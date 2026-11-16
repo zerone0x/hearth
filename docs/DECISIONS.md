@@ -2467,7 +2467,11 @@ before `fetch` runs, with no JSON envelope.
 - The public listener refuses a body whose `Content-Length` is over
   `maxBodyBytes` (default `DEFAULT_MAX_BODY_BYTES`, 1 MiB; a prompt plus labels
   is a few KiB) with 413 and the JSON error envelope, code
-  `request.body-too-large`. A malformed `Content-Length` gets the same answer.
+  `request.body-too-large`. Bun answers most malformed `Content-Length` values
+  with its own bare 400 before the hub runs; repeated equal headers reach the
+  hub joined by a comma and get the same JSON 413. Every 411/413 carries
+  `connection: close`, so Bun closes the socket instead of draining the
+  declared body.
 - A request with `Transfer-Encoding` (a body of unknown length) gets 411,
   `request.length-required`. Browsers send a length for the UI's JSON bodies.
 - The check reads headers only and runs first in the public `fetch`, before the

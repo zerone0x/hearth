@@ -106,15 +106,22 @@ const BUN_MAX_BODY_BYTES = 0xffff_ffff;
  */
 function bodyLimitRefusal(req: Request, limit: number): Response | undefined {
   if (req.headers.has("transfer-encoding")) {
-    return refusal(411, "request.length-required", "a request body needs a Content-Length");
+    return closing(refusal(411, "request.length-required", "a request body needs a Content-Length"));
   }
   const declared = req.headers.get("content-length");
   if (declared === null) return undefined;
+  // Repeated Content-Length headers arrive joined ("10, 10") and are not digits.
   const length = /^\d+$/.test(declared.trim()) ? Number(declared.trim()) : Number.NaN;
   if (Number.isNaN(length) || length > limit) {
-    return refusal(413, "request.body-too-large", `the body is over ${limit} bytes`);
+    return closing(refusal(413, "request.body-too-large", `the body is over ${limit} bytes`));
   }
   return undefined;
+}
+
+/** Ends the connection after a body refusal, so Bun does not drain the declared body. */
+function closing(res: Response): Response {
+  res.headers.set("connection", "close");
+  return res;
 }
 
 export interface HubListenOptions {
