@@ -367,6 +367,16 @@ describe("scope and kind", () => {
     expect(() => new SqliteVaultStore(h.db).insert({ ...row, id: "sec_other" })).toThrow(
       expect.objectContaining({ code: "secret.name-taken" }),
     );
+    // Any other constraint is rethrown as it is, never swallowed.
+    expect(() =>
+      new SqliteVaultStore(h.db).insert({
+        ...row,
+        id: "sec_third",
+        name: "third",
+        iv: new Uint8Array(11),
+      }),
+    ).toThrow(expect.objectContaining({ code: "SQLITE_CONSTRAINT_CHECK" }));
+    expect(new SqliteVaultStore(h.db).byId("ws_default", "sec_third")).toBeUndefined();
   });
 
   test("a login and a box-env token are not handed to the hub's store", async () => {
@@ -512,7 +522,9 @@ describe("master key rotation through vault_key.next", () => {
   test("rewrap under the next key, new fingerprints, the cutover and both wrong orders", async () => {
     const first = await start({ env: { VAULT_KEY: KEY_A } });
     await addModelKey(first);
+    await addModelKey(first, "second", MODEL_KEY_2);
     const fpA = fingerprintOf(first.db, "model");
+    const fpA2 = fingerprintOf(first.db, "second");
     const checkA = kekCheck(first.db);
 
     const rotating = await start({
@@ -524,12 +536,15 @@ describe("master key rotation through vault_key.next", () => {
     expect(checkB).not.toBe(checkA);
     const fpB = fingerprintOf(rotating.db, "model");
     expect(fpB).not.toBe(fpA);
+    // Every entry's fingerprint is recomputed, not only the first.
+    expect(fingerprintOf(rotating.db, "second")).not.toBe(fpA2);
+    expect(fingerprintOf(rotating.db, "second")).toMatch(/^hmac:[0-9a-f]{12}$/);
     expect((await rotating.secrets.resolve("vault:model")).reveal()).toBe(MODEL_KEY);
     const [rotate] = auditRows(rotating.db, "vault.key.rotate");
     expect(JSON.parse(rotate?.detail_json ?? "{}")).toEqual({
       from_kek_check: checkA.slice(0, 12),
       to_kek_check: checkB.slice(0, 12),
-      entries: 1,
+      entries: 2,
     });
 
     // Restart before the cutover: the old key no longer matches, the next one does.
