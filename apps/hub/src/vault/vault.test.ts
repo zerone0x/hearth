@@ -329,6 +329,133 @@ test("vault log lines: component vault, warn when disabled or mid-rotation", () 
   expect(lineLevel("vault: key rotation failed, still on the current key: x")).toBe("error");
 });
 
+describe("input checks", () => {
+  const bad: [string, unknown][] = [
+    ["a body that is not an object", ["x"]],
+    ["an unknown field", { name: "a", kind: "token", fields: { value: "v" }, extra: 1 }],
+    ["a bad name", { name: "A b", kind: "token", fields: { value: "v" } }],
+    ["a bad kind", { name: "a", kind: "password", fields: { value: "v" } }],
+    ["meta that is not an object", { name: "a", kind: "token", meta: "x", fields: { value: "v" } }],
+    [
+      "an unknown meta field",
+      { name: "a", kind: "token", meta: { note: "x" }, fields: { value: "v" } },
+    ],
+    [
+      "a meta value that is not a string",
+      { name: "a", kind: "token", meta: { label: 1 }, fields: { value: "v" } },
+    ],
+    [
+      "a meta value of 201 characters",
+      { name: "a", kind: "token", meta: { label: "x".repeat(201) }, fields: { value: "v" } },
+    ],
+    [
+      "a scope that is a string",
+      { name: "a", kind: "token", scope: "ses_1", fields: { value: "v" } },
+    ],
+    [
+      "a scope with an empty session",
+      { name: "a", kind: "token", scope: { sessionId: "" }, fields: { value: "v" } },
+    ],
+    [
+      "a scope with another key",
+      { name: "a", kind: "token", scope: { sessionId: "ses_1", x: 1 }, fields: { value: "v" } },
+    ],
+    [
+      "a scope with |",
+      { name: "a", kind: "token", scope: { sessionId: "ses|1" }, fields: { value: "v" } },
+    ],
+    [
+      "a missing field",
+      {
+        name: "a",
+        kind: "login",
+        policy: { origins: ["https://a.example"] },
+        fields: { username: "u" },
+      },
+    ],
+    ["a blank value", { name: "a", kind: "token", fields: { value: "  " } }],
+  ];
+  for (const [what, body] of bad) {
+    test(`create refuses ${what} with request.invalid, writing nothing`, async () => {
+      const h = await start({ env: { VAULT_KEY: KEY_A } });
+      addSession(h.db, "ses_1");
+      const error = await h.vault.create(LOCAL_PRINCIPAL, body).catch((e: unknown) => e);
+      expect(error).toMatchObject({ code: "request.invalid" });
+      expect(await h.vault.list(LOCAL_PRINCIPAL)).toEqual([]);
+    });
+  }
+
+  test("meta of exactly 200 characters is kept, keys sorted; rotate takes only fields", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const label = "x".repeat(200);
+    const { id } = await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "a",
+      kind: "model-key",
+      meta: { provider: "anthropic", label },
+      fields: { value: MODEL_KEY },
+    });
+    const [view] = await h.vault.list(LOCAL_PRINCIPAL);
+    expect(view?.meta).toEqual({ label, provider: "anthropic" });
+    expect(h.db.query("SELECT meta_json AS m FROM secret").get()).toEqual({
+      m: JSON.stringify({ label, provider: "anthropic" }),
+    });
+    for (const body of [{ fields: { value: "v2" }, name: "b" }, "x", { fields: { other: "v" } }]) {
+      expect(
+        await h.vault.rotate(LOCAL_PRINCIPAL, id, body).catch((e: unknown) => e),
+      ).toMatchObject({
+        code: "request.invalid",
+      });
+    }
+    expect(
+      (await errorOf(h.vault.rotate(LOCAL_PRINCIPAL, "sec_none", { fields: { value: "v" } }))).code,
+    ).toBe("secret.not-found");
+  });
+
+  test("status opens the vault on first call and every API call is authorized (audited)", async () => {
+    const db = openDatabase(path);
+    dbs.push(db);
+    const audit = new SqliteAuditSink(db);
+    const vault = new HubVault({
+      store: new SqliteVaultStore(db),
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+      register: () => {},
+    });
+    expect(vault.currentStatus).toEqual({ state: "starting" });
+    expect(await vault.status(LOCAL_PRINCIPAL)).toMatchObject({ state: "enabled" });
+    expect(vault.currentStatus).toMatchObject({ state: "enabled" });
+    await vault.list(LOCAL_PRINCIPAL);
+    await vault.uses(LOCAL_PRINCIPAL, "sec_x");
+    for (const action of ["vault.status", "secret.list", "secret.uses"]) {
+      expect(auditRows(db, action)).toHaveLength(1);
+    }
+  });
+
+  test("a store that throws at open: the vault is disabled (store-corrupt), not the hub", async () => {
+    const db = openDatabase(path);
+    dbs.push(db);
+    const audit = new SqliteAuditSink(db);
+    const store = new SqliteVaultStore(db);
+    store.keyRecord = () => {
+      throw new Error("database disk image is malformed");
+    };
+    const logs: string[] = [];
+    const vault = new HubVault({
+      store,
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      log: (l) => logs.push(l),
+    });
+    expect(await vault.open()).toMatchObject({ state: "disabled", reason: "store-corrupt" });
+    expect(logs.join("\n")).toContain("vault: could not open: database disk image is malformed");
+  });
+});
+
 describe("scope and kind", () => {
   test("a scoped entry is usable only in its session, never through the hub's store", async () => {
     const h = await start({ env: { VAULT_KEY: KEY_A } });
@@ -782,16 +909,42 @@ describe("the API never returns a value", () => {
       ...base,
       authorizer: { authorize: async () => ({ allowed: false, policy: "t", reason: "no" }) },
     });
-    const res = await app(denied).request("/v1/secrets");
-    expect(res.status).toBe(403);
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("authz.denied");
+    const json = { "content-type": "application/json" };
+    const routes: [string, string][] = [
+      ["GET", "/v1/vault/status"],
+      ["GET", "/v1/secrets"],
+      ["POST", "/v1/secrets"],
+      ["PUT", "/v1/secrets/sec_x/value"],
+      ["DELETE", "/v1/secrets/sec_x"],
+      ["GET", "/v1/secrets/sec_x/uses"],
+    ];
+    for (const [method, url] of routes) {
+      const res = await app(denied).request(url, {
+        method,
+        ...(method === "POST" || method === "PUT" ? { body: "{}", headers: json } : {}),
+      });
+      expect(`${method} ${url} ${res.status}`).toBe(`${method} ${url} 403`);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("authz.denied");
+    }
+    // An unclassified error is not answered with its message.
+    const brokenStore = new SqliteVaultStore(db);
+    brokenStore.list = () => {
+      throw new Error("internal detail 7c1e");
+    };
+    const broken = new HubVault({
+      ...base,
+      store: brokenStore,
+      authorizer: new AllowAllAuthorizer({ audit: real }),
+    });
+    const crashed = await app(broken).request("/v1/secrets");
+    expect(crashed.status).toBe(500);
+    expect(await crashed.text()).not.toContain("internal detail 7c1e");
     const disabled = new HubVault({
       ...base,
       keySecrets: createDefaultSecretStore({ env: {} }),
       authorizer: new AllowAllAuthorizer({ audit: real }),
     });
     const body = JSON.stringify({ name: "m", kind: "model-key", fields: { value: "x-value" } });
-    const json = { "content-type": "application/json" };
     expect(
       (await app(disabled).request("/v1/secrets", { method: "POST", body, headers: json })).status,
     ).toBe(409);
@@ -808,6 +961,23 @@ describe("the API never returns a value", () => {
     expect(
       (await app(auditDown).request("/v1/secrets", { method: "POST", body, headers: json })).status,
     ).toBe(503);
+    // A tampered row is a hub-side 500, classified.
+    const ok = new HubVault({ ...base, authorizer: new AllowAllAuthorizer({ audit: real }) });
+    const made = await ok.create(LOCAL_PRINCIPAL, {
+      name: "t",
+      kind: "token",
+      fields: { value: "v-tamper" },
+    });
+    db.run("UPDATE secret SET version = 7");
+    const corrupt = await app(ok).request(`/v1/secrets/${made.id}/value`, {
+      method: "PUT",
+      body: JSON.stringify({ fields: { value: "v2" } }),
+      headers: json,
+    });
+    expect(corrupt.status).toBe(500);
+    expect(((await corrupt.json()) as { error: { code: string } }).error.code).toBe(
+      "vault.entry-corrupt",
+    );
   });
 
   test("the hub serves the vault routes behind the login and resolves vault: refs", async () => {

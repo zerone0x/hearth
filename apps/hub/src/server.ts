@@ -238,7 +238,8 @@ export function startHub(options: HubOptions) {
     keySecrets: options.vault?.keySecrets ?? createDefaultSecretStore(),
     ...(options.vault?.keyRef === undefined ? {} : { keyRef: options.vault.keyRef }),
     ...(options.vault?.nextKeyRef === undefined ? {} : { nextKeyRef: options.vault.nextKeyRef }),
-    ...(options.log === undefined ? {} : { log: options.log }),
+    // Its state goes to the hub's log; a hub without one (tests) stays quiet.
+    log: options.log ?? (() => {}),
   });
   const vaultReady = vault.open();
   /** The hub's SecretStore: `env:`, `file:` and `vault:` (E7). */
