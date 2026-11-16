@@ -299,7 +299,9 @@ describe("startHub", () => {
     dir = undefined;
   });
 
-  function start(options: { hostname?: string; publicOrigin?: string } = {}) {
+  function start(
+    options: { hostname?: string; publicOrigin?: string; maxBodyBytes?: number } = {},
+  ) {
     dir = mkdtempSync(join(tmpdir(), "hearth-server-"));
     server = startHub({ port: 0, dbPath: join(dir, "hub.db"), ...options });
     return server;
@@ -506,6 +508,83 @@ describe("startHub", () => {
     const empty = parseAnswer(await raw(port, requests[0] as string));
     expect(empty.status).toBe(421);
     expect(JSON.parse(empty.body)).toMatchObject({ error: { code: "request.foreign-host" } });
+  });
+
+  test("the public listener caps request bodies with a JSON 413 before every guard (issue #105, decision 0034)", async () => {
+    const limit = 1_000;
+    const hub = start({ maxBodyBytes: limit });
+    const port = Number(hub.url.port);
+    const cookie = signedIn(hub).cookie;
+    const post = (path: string, length: number, extra = "", sent = "") =>
+      raw(
+        port,
+        `POST ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\n${extra}content-length: ${length}\r\nconnection: close\r\n\r\n${sent}`,
+      );
+    // Over the limit: 413 with the JSON envelope, signed in or not, and even
+    // when the request guard would refuse it (foreign Host).
+    for (const extra of ["", `cookie: ${cookie}\r\n`]) {
+      const { status, contentType, body } = parseAnswer(
+        await post("/v1/sessions", limit + 1, extra),
+      );
+      expect({ extra, status }).toEqual({ extra, status: 413 });
+      expect(contentType).toContain("application/json");
+      expect(JSON.parse(body)).toMatchObject({
+        ok: false,
+        error: { code: "request.body-too-large", owner: "user" },
+      });
+    }
+    const foreign = parseAnswer(
+      await raw(
+        port,
+        `POST /v1/sessions HTTP/1.1\r\nHost: evil.example\r\ncontent-length: ${limit + 1}\r\nconnection: close\r\n\r\n`,
+      ),
+    );
+    expect(foreign.status).toBe(413);
+    // A malformed length and a body of unknown length are refused too.
+    const malformed = parseAnswer(
+      await raw(
+        port,
+        "POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: 1e3\r\nconnection: close\r\n\r\n",
+      ),
+    );
+    expect([400, 413]).toContain(malformed.status);
+    const chunked = parseAnswer(
+      await raw(
+        port,
+        `POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n`,
+      ),
+    );
+    expect(chunked.status).toBe(411);
+    expect(JSON.parse(chunked.body)).toMatchObject({ error: { code: "request.length-required" } });
+
+    // At the limit: not refused for size. Signed in, the body reaches the route.
+    const pad = JSON.stringify({ pad: "x".repeat(limit - 10) });
+    expect(pad.length).toBe(limit);
+    const atLimit = parseAnswer(await post("/v1/sessions", limit, `cookie: ${cookie}\r\n`, pad));
+    expect([413, 411]).not.toContain(atLimit.status);
+    const unauth = parseAnswer(await post("/v1/sessions", limit, "", pad));
+    expect(unauth.status).toBe(401);
+
+    // The box listener and the desktop WebSocket are not capped by it: a body
+    // over the limit is not answered with this 413 there.
+    const boxPort = Number(new URL(hub.listenForBoxes("127.0.0.1").replace("ws", "http")).port);
+    const box = parseAnswer(
+      await raw(
+        boxPort,
+        `POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-length: ${limit + 1}\r\nconnection: close\r\n\r\n`,
+      ),
+    );
+    expect(box.status).toBe(404);
+    const ws = new WebSocket(new URL(BOX_SOCKET_PATH, `ws://127.0.0.1:${boxPort}`));
+    const frame = await new Promise<string>((resolve) => {
+      ws.onopen = () => {
+        ws.send("x".repeat(limit * 4));
+        setTimeout(() => resolve(ws.readyState === WebSocket.OPEN ? "open" : "closed"), 300);
+      };
+      ws.onerror = () => resolve("error");
+    });
+    ws.close();
+    expect(frame).not.toBe("error");
   });
 
   test("/healthz answers a Host that is not a valid URL authority, as before issue #48", async () => {

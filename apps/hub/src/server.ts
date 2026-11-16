@@ -81,8 +81,40 @@ function healthzOnPlaceholder(req: Request): Request | undefined {
   return new Request(new URL(target, "http://hub.invalid").href, req);
 }
 
-function refusal(status: 400 | 404 | 421 | 426, code: string, message: string): Response {
+function refusal(
+  status: 400 | 404 | 411 | 413 | 421 | 426,
+  code: string,
+  message: string,
+): Response {
   return Response.json({ ok: false, error: { code, owner: "user", message } }, { status });
+}
+
+/**
+ * Largest request body the public listener accepts, in bytes (issue #105,
+ * decision 0034): a message prompt plus labels is a few KiB, so 1 MiB leaves
+ * ample room and still keeps a signed-in caller from parsing huge JSON.
+ */
+export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+
+/** The largest value Bun accepts for `maxRequestBodySize` (an unsigned 32-bit integer). */
+const BUN_MAX_BODY_BYTES = 0xffff_ffff;
+
+/**
+ * The 413 or 411 answer for a request whose declared body is over `limit`
+ * (or has no declared length), undefined when the request may go on. It reads
+ * headers only, never the body.
+ */
+function bodyLimitRefusal(req: Request, limit: number): Response | undefined {
+  if (req.headers.has("transfer-encoding")) {
+    return refusal(411, "request.length-required", "a request body needs a Content-Length");
+  }
+  const declared = req.headers.get("content-length");
+  if (declared === null) return undefined;
+  const length = /^\d+$/.test(declared.trim()) ? Number(declared.trim()) : Number.NaN;
+  if (Number.isNaN(length) || length > limit) {
+    return refusal(413, "request.body-too-large", `the body is over ${limit} bytes`);
+  }
+  return undefined;
 }
 
 export interface HubListenOptions {
@@ -96,6 +128,8 @@ export interface HubListenOptions {
    * and the bound address (docs/DECISIONS.md, 0010).
    */
   readonly publicOrigin?: string;
+  /** Largest request body of the public listener in bytes. Defaults to `DEFAULT_MAX_BODY_BYTES`. */
+  readonly maxBodyBytes?: number;
 }
 
 /**
@@ -216,6 +250,7 @@ export function startHub(options: HubOptions) {
     ...(options.heartbeat === undefined ? {} : { heartbeat: options.heartbeat }),
   });
   const hostname = options.hostname ?? DEFAULT_HOSTNAME;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const boxEgress = options.boxEgress ?? markerEgressCheck();
   // The local login (decision 0014). Until the owner sets a password, the
   // setup token is logged: only whoever reads the hub's output can claim it.
@@ -244,7 +279,17 @@ export function startHub(options: HubOptions) {
     server = Bun.serve<DesktopSocketData>({
       hostname,
       port: options.port ?? DEFAULT_PORT,
+      // Bun answers an oversized Content-Length with a bare 413 before `fetch`
+      // runs. The limit is checked below instead, so the answer is the JSON
+      // envelope; Bun's own cap is raised to its maximum on purpose. Box
+      // listeners and the desktop socket keep their own settings.
+      maxRequestBodySize: BUN_MAX_BODY_BYTES,
       fetch: (req, srv) => {
+        // The body limit (decision 0034) runs first: it reads headers only,
+        // so an oversized request is refused before the request guard (0010),
+        // the session guard and `authorize`, and learns nothing from them.
+        const tooLarge = bodyLimitRefusal(req, maxBodyBytes);
+        if (tooLarge !== undefined) return tooLarge;
         // A Host the HTTP layer cannot turn into a URL (an empty one) makes
         // `req.url` relative and every later `new URL` throw: answer it as the
         // request guard would (decision 0010) instead of a 500 (issue #48).
