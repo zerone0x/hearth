@@ -1,6 +1,22 @@
 # Hearth PRD
 
-> Status: draft v0.3 · 2026-11-15 · Owner: @zerone0x
+> Status: draft v0.4 · 2026-11-16 · Owner: @zerone0x
+
+**What changed in v0.4** (decision 0030, issue #106): the **stage plan**. M1
+Prototype is done (§11.1). §11 now says, for each milestone, what you can do
+after it and how that is tested: M2 Browser & vault, M3 Anywhere, M4
+Connections & automation, M5 Retro & router, then v1.0. The old M2 "Hardening
+& desktop" is split up: takeover, live shell output and desktop supervision go
+to M2; image slimming, hibernate polish and resource limits go to v1.0. A new
+**Vault** (§6.10) holds model keys, site logins and API tokens, and replaces
+`.env` and the key file for the model key and model choice. Sections touched:
+§4, §6.2, §6.4, §6.8, §6.10, §7, §8.5, §9, §10, §11, §12, §13.
+
+Changelog:
+
+- v0.4 · 2026-11-16 · decision 0030, #106: stage plan by user-visible
+  features; vault (§6.10); M1 marked done.
+- v0.3 · 2026-11-15 · decision 0009, #29: brain/hands split; M1 Prototype.
 
 **What changed in v0.3** (decision 0009, issue #29): the **brain/hands split**.
 The pi agent loop now runs in the hub, in one runner per session; the box is the
@@ -56,6 +72,7 @@ Differentiators:
 - G6: Scheduled and webhook triggers.
 - G7: Automatic retro when a session ends; lessons can be injected into later sessions.
 - G8: Code structure leaves extension points for multi-tenant and multi-node (see §7) without implementing them.
+- G9: Credentials (model keys, site logins, API tokens) are managed in a vault from the web UI, and the model never sees a credential's value (§6.10).
 
 ### Non-goals (explicitly not in v1)
 
@@ -102,7 +119,8 @@ Acceptance: start a 30-minute task from the web, close the browser, open it on a
 The box is the session's **tool executor**. The agent loop does not run in it (§8).
 
 - **P0** Image includes box-agent, Chrome (CDP on loopback only), Xvnc + a lightweight WM, git, common language runtimes. pi is **not** needed in the box any more: box-agent executes tool calls, it does not run an agent. The current image still installs pi (decision 0004); dropping it is part of slimming the image (#15).
-- **P0** box-agent executes the routed tools: read, write and edit files, list and search them, and run shell commands, all inside `/workspace` (§8.2). Later, desktop and browser tools (CDP) run here too.
+- **P0** box-agent executes the routed tools: read, write and edit files, list and search them, and run shell commands, all inside `/workspace` (§8.2). From M2, browser tools run here too.
+- **P0 (M2)** Browser tools over the box's Chromium (CDP on loopback, decision 0026): navigate, read the page, click, type, screenshot, list tabs (#93). The live desktop shows the same Chromium, so the user watches what the agent does. TODO(#107): the observation model (accessibility snapshot with element refs, DOM text, screenshots, or a mix), click by ref or by coordinates, verified actions, the maintained package box-agent uses, and the exact tool names and params.
 - **P0** One container per session; workspace and home on a persistent volume.
 - **P0** **Lazy start.** Creating a session or sending a message does not start a box. The box is started when the first tool call of the session needs it (or the user opens the desktop view), and the tool call waits for it under a named deadline.
 - **P0** Watch the desktop via noVNC in the web UI. A **Take over** button: while the user holds it, the agent's desktop input tools return "user is in control"; releasing hands it back.
@@ -138,6 +156,7 @@ Acceptance: with 50 hibernated sessions, host idle memory differs from zero sess
 Model calls are made by the runner, in the hub. **The box holds no model credentials at all**: no provider key, no virtual key, no subscription token. This supersedes v0.2's "the box gets a virtual key" (decision 0009).
 
 - **P0 (prototype)** Model access through the `direct` gateway with an **API key stored as a SecretStore reference** (`env:` / `file:`, E7). The runner resolves it at use and passes it to pi in memory (`ModelRuntime.setRuntimeApiKey`, see pi's `examples/sdk/09-api-keys-and-oauth.ts`); it is never written to the box, the event log or pi's on-disk auth storage.
+- **P0 (M2)** The model key and the model choice move to the web UI: the key is a vault secret (§6.10) and the provider and model are picked in settings, from the models pi knows plus a `models.json`. No editing `.env` or `deploy/secrets/model_key`. The `env:` / `file:` references stay as a fallback for headless installs; TODO(#108): whether they stay as such or are imported into the vault once.
 - **P1** Default gateway: **Bifrost** (self-hosted, on the internal network only), after the prototype. Provider keys live in Bifrost; the hub creates **one virtual key per session** with a budget, rate limit and an explicit model allowlist (empty means none, never "all"), keeps it hub-side for that session's runner, and revokes it when the session is archived or deleted.
 - **P1** With Bifrost, the runner's pi uses a custom provider pointing at Bifrost with the session's virtual key.
 - **P1** Alternative `direct` gateway: pi's own provider configuration, or an OpenAI- / Anthropic-compatible base URL such as a local magpie gateway (for multiplexing personal subscriptions).
@@ -176,12 +195,42 @@ Model calls are made by the runner, in the hub. **The box holds no model credent
 - **P1** Lessons page: review candidates (accept / edit / discard). Accepted lessons are injected into new sessions by scope (as a pi extension or an `AGENTS.md` fragment).
 - **P2** Weekly report: tasks by type, success rate, spend, most common failure causes.
 - **P2** Import external sessions (local Claude Code / Codex / pi JSONL) into the retro.
-- **P2** Stats by task type × model × outcome; export model-routing suggestions (e.g. magpie routing-group rules).
+- **P1 (M5)** Model router learned from outcomes: stats by task type × model × outcome (with spend from the gateway, §6.4) give a suggested model per task type, with the numbers behind it. The owner accepts a suggestion before it becomes the default for that task type; nothing switches models silently (§6.4, retired models).
+- **P2** Export the routing suggestions to an external gateway (e.g. magpie routing-group rules).
 
 ### 6.9 Memory
 
 - **P1** Sessions can call `memory_search` / `memory_save`, stored in the hub's SQLite (FTS5).
 - **P2** Vector search (local embeddings).
+
+### 6.10 Vault
+
+The vault is where the owner keeps every credential Hearth uses: model provider
+keys, site logins and API tokens for the agent's tools. It is a SecretStore
+backend (E7) that stores values itself, next to the `env:` and `file:`
+resolvers. Research #108 decides the details marked TODO(#108).
+
+- **P0 (M2)** A settings page in the web UI to add, replace (rotate) and delete a secret: a name, a kind (model key, site login, API token) and an optional note. After saving, the UI and API show only a fingerprint and when it was last used; no route returns a value.
+- **P0 (M2)** Model key and model choice in settings (§6.4): pick the provider and model, test the key with a cheap call, and new sessions use it without a hub restart.
+- **P0 (M2)** Values are encrypted at rest with a maintained crypto library; no hand-rolled crypto. TODO(#108): the cipher and library, where the master key lives (key file, environment, derived from the owner password, OS keyring) and how it is rotated.
+- **P0 (M2)** The model never sees a value. The agent names a credential by a placeholder; the hub swaps the value in only in the tool call that leaves for the box and swaps it back out of the result (#70). Values are redacted in events, logs, trajectories and OTLP export (decisions 0015, 0021); a value joins the redaction set as soon as it is saved. TODO(#108, #107): how a site login reaches a login form (the browser tool fills a field from a reference inside the box, or the hub substitutes at the tool RPC), and whether a value enters the box at all.
+- **P0 (M2)** Every use is audited before it happens (E10): which secret (name and fingerprint), which session and tool call. If the audit record cannot be written, the value is not used.
+- **P0 (M2)** A site login is a username and a password for a stated origin; the agent may use it only on that origin. TODO(#108): TOTP codes.
+- **P1** Scope: a secret is global or limited to chosen sessions; a session cannot use a secret outside its scope.
+- **P1** Per-secret approval: using a marked secret asks the owner first (§6.5, M3).
+- **P1** Backup and restore include the vault (v1.0). A restore without the master key gives an unreadable vault and says so, never a silent empty one.
+- **P2** Read from an existing password manager (for example Bitwarden / Vaultwarden or the 1Password CLI) instead of, or next to, the built-in store. TODO(#108): compare, and whether this is P1.
+
+Threat model, short form. The asset is the credential values.
+
+| Threat | Defence | What is left |
+|---|---|---|
+| Prompt injection (a web page or file tells the agent to reveal or send a credential) | The model only has placeholders; a placeholder is restored only in tool calls to the box, and a site login only on its origin | A value typed into a page can be read by that page's scripts |
+| Compromised box (hostile page or code in `/workspace`) | The box holds no vault values at rest and no model credentials (§10); egress firewall (decision 0012) | A value the box uses is visible in the box while it is used. TODO(#108): whether values enter the box |
+| Leak through events, logs, trajectories or export | Redaction at the sink with every vault value known; trajectories never leave the hub unless an exporter is set (§8.5) | Encodings the redactor misses (#70 lists the gaps) |
+| Stolen database file or backup | Values are encrypted; the master key is not stored with them | TODO(#108): where the master key is kept |
+| Hub or host compromise | Out of scope: the running hub can decrypt. pi extensions run with the hub's rights, hence the allowlist policy (#56) | Everything the hub can read |
+| Someone at the UI or API | Login, Origin and Host checks (§10); values are never returned; changes are audited | A signed-in owner session can use secrets, not read them |
 
 ## 7. Extension points (reserved for an enterprise edition)
 
@@ -195,7 +244,7 @@ Principle: **implement only the personal-edition variant now, but design each in
 | E4 | **BoxProvider**: `create / start / stop / destroy / snapshot / attach` | Local Docker; boxes started lazily by the session manager | Remote Docker, Kubernetes, gVisor, cloud VMs |
 | E5 | **Hub↔Box protocol**: box dials out, one multiplexed connection; carries tool calls from the runner to the box | Same host, over a box listener reachable only from box networks (#27) | Cross-host / cross-network (enterprise data plane) |
 | E6 | **EventStore**: append-only log + cursor reads | SQLite | Postgres, object-storage archive |
-| E7 | **SecretStore**: secrets are stored as *references* (`env:`, `file:`) resolved at use, with a short cache; UI shows fingerprints, never values | `env:` / `file:` resolvers | `vault:` / KMS resolvers |
+| E7 | **SecretStore**: secrets are stored as *references* (`env:`, `file:`) resolved at use, with a short cache; UI shows fingerprints, never values | `env:` / `file:` resolvers; the vault's own encrypted store (§6.10, M2) | External password managers, KMS |
 | E8 | **ModelGateway**: issues and revokes per-session credentials, reports usage. Credentials go to the hub-side runner, never to a box | `direct` with an API key from the SecretStore (prototype); then Bifrost (one virtual key per session); magpie as an alternative | Bifrost Enterprise or another gateway; team / org budget layers |
 | E9 | **Channel**: message entry adapters | Web, Telegram | Slack, Teams, Lark, etc. |
 | E10 | **Audit**: every `authorize` decision and admin action is written to the event stream | Written, no UI | Audit log UI, compliance export |
@@ -330,7 +379,7 @@ Stack (can change before implementation):
 ### 8.5 Observability and trajectories
 
 From day one every session produces a complete trajectory (decision 0021).
-Sessions are the data for Retro (§6.8) and the M4 model router, and "no silent
+Sessions are the data for Retro (§6.8) and the M5 model router, and "no silent
 failure" (§8.1) needs evidence.
 
 - **Trajectory.** One per session, schema `hearth.trajectory/2`: turns made of
@@ -381,7 +430,9 @@ trigger_run(id, trigger_id, session_id, fired_at, result)
 lesson(id, workspace_id, scope, text, source_session_id,
        source_seq, state, created_at)
 retro(session_id, workspace_id, labels_json, failures_json, created_at)
-secret(id, workspace_id, name, ciphertext, created_at)
+secret(id, workspace_id, name, kind, scope, ciphertext,
+       fingerprint, created_at, rotated_at, last_used_at)
+      -- the vault (§6.10); cipher and key handling TODO(#108)
 ```
 
 v0.3 changes (decision 0009):
@@ -401,35 +452,59 @@ v0.3 changes (decision 0009):
 - The runner runs pi in the hub process, so pi extensions are code running with the hub's rights. The runner loads only Hearth's own extension (§8.2.1).
 - Desktop takeovers, approvals and settings changes are written to the event stream (E10). **The audit record is written before the action**; if it cannot be written, the action does not happen. The audit table is append-only, enforced in the database (SQLite triggers), not just by convention.
 - Secrets are references resolved at use; a preflight at startup checks every reference resolves. Logs and UI show only fingerprints.
+- Vault values (§6.10) are encrypted at rest, never returned by the API or UI, never shown to the model, and every use is audited first. See §6.10 for the threat model.
 - Telegram: only paired chats are served. A stranger gets one pairing prompt and then silence. Display names in chats are labels, not identity.
 - Every external poller (Telegram, trigger scheduler) runs under a single lease, so a restart or a second hub instance never sends duplicate replies.
 - Retro runs locally or against a model the user configured; no data is sent to third parties by default.
 
 ## 11. Milestones
 
-| Milestone | Scope | Exit criteria |
-|---|---|---|
-| **M0 Skeleton** (done) | Repo layout, empty hub, box image, BoxProvider (Docker), hub↔box connection (#1–#7) | Hub creates a box, box connects, hub can send `echo` |
-| **M1 Prototype** (about 2–3 days of loop time) | See §11.1. Replaces v0.2's "M1 Chat" | See §11.1 |
-| **M2 Hardening & desktop** (1 wk) | Desktop supervision, pinned base image and an image without pi (#15); noVNC takeover and the desktop lock (§8.3); resource limits; hibernate / wake polish up to the §6.3 acceptance; live shell output for tool calls (§8.2.1); low-priority test debt (#25, #26) | S2 works; §6.3 acceptance met |
-| **M3 Gateway & anywhere** (1 wk) | Bifrost with one virtual key per session (§6.4), PWA, Web Push, Telegram, approvals | S3 works; per-session spend visible |
-| **M4 Automation & retro** (1–2 wk) | Cron / webhook triggers, Retro, Lessons, memory | S4 and S5 work |
-| **v1.0** | Docs, one-command install, backup / restore | Fresh VPS to running in 10 minutes |
+Each stage is described by what you can do after it, in user terms, and closed
+by exit criteria that a test or a scripted check can prove. Docker-dependent
+checks run in CI (repo rules).
 
-### 11.1 M1 Prototype
+**How to use it today (after M1).** Hearth is a web UI for a pi agent whose
+tools run in an isolated box with a live desktop, and every session keeps a
+trajectory. Install it with Docker Compose by following
+[docs/install.md](install.md): copy `deploy/hearth.env.example` to
+`deploy/.env`, set `HEARTH_MODEL_PROVIDER` and `HEARTH_MODEL` there (default
+`anthropic` / `claude-sonnet-5-5`), and put the model key in
+`deploy/secrets/model_key`. Then `docker compose up`, set the owner password
+with the one-time setup token from the hub's log, and sign in. You can start a
+session, have the agent edit files and run commands in the box's `/workspace`,
+watch the box's desktop, close the page and come back to the same session, and
+download the session's trajectory (`GET /v1/sessions/:id/trajectory`). Not yet:
+the agent cannot drive the browser, you cannot type into the desktop, keys are
+not managed in the UI, and there is no phone, Telegram or trigger entry point.
+
+| Milestone | What you can do after it | Exit criteria |
+|---|---|---|
+| **M0 Skeleton** (done) | Nothing user-facing: repo layout, empty hub, box image, BoxProvider (Docker), hub↔box connection (#1–#7) | Hub creates a box, box connects, hub can send `echo` |
+| **M1 Prototype** (done) | Chat with a pi agent in the web UI; its tools run in the session's own box; watch the box's desktop; every session has a trajectory. See §11.1 | Met; §11.1 |
+| **M2 Browser & vault** | Have the agent work on websites in the box's Chromium while you watch, take over the desktop, keep keys and logins in a vault the model never reads, see command output live. See §11.2 | S2 works; §11.2 |
+| **M3 Anywhere** | Use several models with per-session budgets and spend, follow and approve work from your phone (PWA, Web Push, Telegram). See §11.3 | S3 works; §11.3 |
+| **M4 Connections & automation** | Connect external accounts through MCP, run sessions on a schedule or from a webhook, let the agent remember across sessions. See §11.4 | S4 works; §11.4 |
+| **M5 Retro & router** | Search past sessions, get lessons from finished work, get a model suggested per task type from past outcomes, keep trajectories for a set period. See §11.5 | S5 works; §11.5 |
+| **v1.0** | Install on a fresh VPS in 10 minutes, back up and restore, run many hibernated sessions cheaply on a slim image. See §11.6 | §11.6 |
+
+### 11.1 M1 Prototype (done)
 
 Goal: a usable prototype on the brain/hands split, before any of the polish.
+Done on 2026-11-16. All exit criteria are met; the `compose-e2e` CI job installs
+by running [docs/install.md](install.md) verbatim and then runs
+`deploy/e2e/prototype.ts` against the result, with a faux model.
 
-Scope, in order:
+What shipped:
 
-1. **Box listener + docker compose install** (#27): a box listener reachable only from box networks, the UI/API on loopback, `DockerBoxProvider` wired into hub startup, and a compose file for the hub. Box egress restricted to the internet and that hub address (#20), done together with #27 as #27 asks.
-2. **Session manager + box supervision** (#28): the session state machine of §5, lazy box start (§6.2), hibernate as "stop the box", and every box exit classified and ending in a relaunch or a visible failure event.
-3. **pi on Bun spike**, then the **hub-side pi runner + tool RPC to the box**: `createAgentSession` in the hub, the routed tools of §8.2.1, the tool RPC methods in `packages/protocol` and their executor in box-agent, the runner's state in the event log (§9).
-4. **Minimal web UI**: session list, a chat stream that shows tool calls, and a noVNC view of the box's desktop.
-5. **Model via an API key through the SecretStore** (`direct` gateway, §6.4). No Bifrost yet.
-6. **Minimal local login and API request checks.** The prototype lets a web page create sessions and have pi run shell commands, so every route except `GET /healthz` sits behind the local login of §10 (password, optional passkey; session cookie `HttpOnly`, `SameSite=Strict`). The API also checks Host, Origin and Content-Type: an allow-listed Host, an Origin that is same-origin or the configured `HEARTH_PUBLIC_ORIGIN`, and a JSON content type (#33).
+- **Install**: Docker Compose install with a host-network hub, a box listener reachable only from box networks, the UI/API on loopback (#27, decision 0012, 0020), and the box egress firewall: internet and the hub only (#20, decisions 0023, 0024).
+- **Sessions**: the session manager with lazy box start, hibernate as "stop the box", and every box exit classified into a relaunch or a visible failure (#28, #42); a heartbeat on the hub↔box connection (#31, decision 0028).
+- **The agent**: the pi runner in the hub on Bun (spike #40), with read, write, edit, bash, ls, find and grep routed to the box over the tool RPC (#41, #43, decision 0011); its state is the event log, and a runner rebuilt after a hub restart continues the conversation (decisions 0015, 0027).
+- **Web UI**: session list, a chat that shows tool calls, and a view-only noVNC desktop (#45, #46), on assistant-ui and shadcn/ui (#77, decision 0019). The desktop runs a supervised Chromium (#92, decision 0026).
+- **Login and request checks**: local owner login with a one-time setup token (#44, decision 0014), every route behind `authorize` as the signed-in principal (#61), Host, Origin and JSON checks (#33, decision 0010).
+- **Model**: the `direct` gateway with the key from the SecretStore (`file:` in the compose install), the model from `.env` (decision 0015).
+- **Trajectories and logs**: a complete trajectory per session, structured logs, trace context on tool calls and optional OTLP export (#80, decision 0021).
 
-Exit criteria:
+Exit criteria (all met):
 
 - A fresh `docker compose up` on a Docker host brings up a working hub.
 - Create a session from the web UI.
@@ -438,7 +513,92 @@ Exit criteria:
 - Closing and reopening the page continues the session.
 - An unauthenticated or cross-origin request cannot create a session or run a command (#33).
 
-After the prototype, still in scope and kept in this PRD: Bifrost (§6.4), Telegram (§6.6), hibernation polish (§6.3), triggers (§6.7) and Retro (§6.8), in M2–M4 above.
+The old M2 "Hardening & desktop" items are placed below: takeover, live shell
+output and desktop process supervision in M2; base image pinning, slimming
+(#15), hibernate polish and resource limits in v1.0. Its test debt (#25, #26)
+is done.
+
+### 11.2 M2 Browser & vault
+
+What you can do after M2:
+
+- **The agent drives a browser.** Ask it to work on a website: in the box's Chromium it opens pages, reads them, clicks, types, takes screenshots and switches tabs (#93, §6.2). You watch it on the live desktop. Browser steps and screenshots (stored by hash) are in the trajectory. TODO(#107): the observation model, click by ref or coordinates, verified actions with a success check, the package in box-agent, and the tool names.
+- **You take over the desktop.** The desktop view accepts your mouse and keyboard while you hold the desktop lock (§8.3); while you hold it, the agent's browser and desktop input tools answer "user is in control", and releasing hands it back.
+- **A vault for credentials** (§6.10). A settings page holds model keys, site logins and API tokens, encrypted at rest; the UI shows fingerprints only. The model key and the model are chosen there, not in `.env` or a file (§6.4). TODO(#108): master key, cipher, TOTP, and whether values enter the box.
+- **The agent signs in without seeing the password.** It names a vault credential by placeholder; the hub substitutes the value only on the way to the box and redacts it everywhere else (#70).
+- **Live command output.** A long `bash` command shows its output in the chat while it runs (§8.2.1; a protocol minor bump).
+- **A dead desktop is visible.** If Xvnc or the window manager dies, the box reports a failure instead of showing a black desktop (#15, item 1).
+
+Exit criteria:
+
+- **S2 works** (CI e2e, Docker): on a local test site served inside the box, the agent signs in with a site login from the vault and fills and submits a multi-field form; the test verifies the submitted values on the server side. The session's trajectory has the browser steps and screenshot hashes.
+- The login's password, and its base64 and hex forms, appear in no event, trajectory line, log line or model request of that run (the test greps all of them and the faux model's request log).
+- While the e2e's person holds the desktop lock, an agent input tool call returns "user is in control"; after release the next one succeeds.
+- A fresh install with no `deploy/secrets/model_key` and no `HEARTH_MODEL` gets its model key and model from the settings page, and a new session answers. The API returns no secret value on any route.
+- Killing Xvnc in a running box ends in a visible box failure event within a named deadline (box smoke test).
+- A `bash` command that prints a line every second for 10 seconds shows its first line in the chat before the command exits.
+
+### 11.3 M3 Anywhere
+
+What you can do after M3:
+
+- **Several models with budgets.** Models go through Bifrost with one virtual key per session, a budget and an explicit model allowlist; you can switch a session's model, and the UI shows per-session spend and tokens (§6.4).
+- **Your phone.** Install the web UI as a PWA and get Web Push when a turn finishes, an approval waits or a session fails; or use Telegram: one session per thread, send messages, get results, `/new`, `/list` (§6.6).
+- **Approvals.** Risky actions (for example `git push`, `rm -rf`, a payment page) stop and wait for you; approve or deny from the web or Telegram with one tap; a timeout denies (§6.5). Bash commands are parsed before the deny-list applies (#69); approval cards follow one lifecycle on every channel (#71).
+
+Exit criteria:
+
+- **S3 works** (CI e2e): with no web client connected, an agent's `git push` creates an approval; the approval reaches the push and Telegram test doubles; approving on one channel runs the push and updates the card on the other; a second approval left alone is denied at its timeout and the turn says so.
+- A session's spend in the UI equals the sum of its rows in Bifrost's request log; a session over its budget is refused with a visible message, not a silent stop.
+- The web UI is installable as a PWA (valid manifest and service worker, checked in the e2e's Chromium) and a Web Push arrives when a turn finishes.
+
+### 11.4 M4 Connections & automation
+
+What you can do after M4:
+
+- **Connections.** Add a remote MCP server (URL plus a vault secret) and the agent can use its tools; tokens stay in the hub and write actions go through approvals (#68, a new extension point E11). Composio is an optional provider, off by default because it keeps tokens on a third-party service. Extensions and MCP servers are loaded only from an allowlist (#56).
+- **Triggers.** Run a prompt on a cron schedule (with a time zone) or from a webhook with a secret, into a fixed or a new session, and see the trigger history (§6.7). A cron trigger can be gated by a check script and has a notify policy (#72).
+- **Memory.** The agent saves and searches notes that outlive a session (`memory_search` / `memory_save`, §6.9).
+
+Exit criteria:
+
+- **S4 works** (CI, with a fake clock): a cron trigger fires once per tick at the set time and time zone; a run whose previous run is still going is recorded as skipped; a webhook with a wrong secret is refused and audited; each run appears in the trigger history with its session and result.
+- A tool call through an MCP connection is authorized, audited and approval-gated for writes; the MCP token never appears in a box, an event or a trajectory.
+- A note saved with `memory_save` in one session is found by `memory_search` in another.
+
+### 11.5 M5 Retro & router
+
+What you can do after M5:
+
+- **Search.** Full-text search across all sessions (§6.1): "how did we fix auth last week?".
+- **Retro and lessons.** A finished session is labelled (task type, outcome), its failure points are found, and 0–3 lessons are proposed; you accept, edit or discard them on a Lessons page, and accepted lessons are given to later sessions as an index the agent can open (#74, §6.8).
+- **A model router.** For each task type, Hearth suggests a model from past outcomes and spend, with the numbers; you accept a suggestion before it becomes the default (§6.8).
+- **Retention.** Trajectories and events older than a set period are removed (#83; needs a decision on the append-only event log, decision 0006).
+
+Exit criteria:
+
+- **S5 works**: a search for a term from an archived session finds it; a session with three identical tool failures gets a retro that names that failure point and proposes a lesson; after the lesson is accepted, a new session's context contains it.
+- With a seeded set of sessions (task type × model × outcome), the router suggests the model with the best outcome per cost for each task type, and nothing changes until it is accepted.
+- With a retention period set, data older than it is gone after the next sweep and newer data is untouched (test on a copy of the database).
+
+### 11.6 v1.0
+
+What you can do at v1.0:
+
+- **Install fast**: a fresh VPS to a working session in 10 minutes (G1), with `hearth doctor` and startup preflight probes that name what is wrong (#73).
+- **Back up and restore**: the database, session volumes and the vault (with its master key handled as #108 decides).
+- **Many idle sessions cost little**: hibernate and wake polished to the §6.3 acceptance.
+- **Slim, pinned image**: base image pinned by digest, only box-agent's dependencies, no pi in the box (#15, items 2–4); a desktop-less variant if §12 question 5 says so.
+- **Global resource limits**: CPU, memory and disk for all boxes together, on top of the per-box limits that exist (`HEARTH_BOX_CPUS`, `HEARTH_BOX_MEMORY_BYTES`, `HEARTH_BOX_PIDS`, `HEARTH_BOX_DISK_BYTES`).
+- **Docs** for install, upgrade, backup and every setting.
+
+Exit criteria:
+
+- Following docs/install.md on a fresh VPS gets to a session that answers in under 10 minutes (timed, once per release).
+- A backup taken on one host and restored on another brings back sessions, files and vault secrets that still work.
+- The §6.3 acceptance holds: with 50 hibernated sessions, host idle memory differs from zero sessions by < 200 MB; the first tool result on a hibernated session comes in < 15 s.
+- The box image has no hub-only dependencies and no pi, its base is pinned by digest, and a box-agent-only change rebuilds only the top layer.
+- A box that exceeds its memory limit is stopped and reported; starting a box beyond the global limit is refused with a visible message.
 
 ## 12. Open questions
 
@@ -452,12 +612,15 @@ After the prototype, still in scope and kept in this PRD: Bifrost (§6.4), Teleg
 8. **pi on Bun in the hub**: does the SDK path the runner uses work on Bun 1.4.4? The M1 spike answers it. If it does not, a fallback is to run each runner in a Node child process of the hub: still hub-side, still no credentials in the box. That fallback would need its own decision.
 9. **Context files and skills**: pi's `DefaultResourceLoader` discovers `AGENTS.md`, skills and prompt templates from the local `cwd`, which on the hub is not the session's repo. Options: a custom `ResourceLoader` (pi `docs/sdk.md`: "Supply a custom ResourceLoader when the host owns resource storage and discovery completely") that reads the repo's context files from the box through the tool RPC, or none in the prototype. Lessons (§6.8) are injected through the same loader.
 10. **Runner isolation in the hub**: all runners share the hub process. One runner using much memory or crashing should not take the others or the hub down. In-process for the prototype; whether runners later move to workers or child processes is open.
+11. **Browser automation** (M2): how the agent observes and acts on pages, and which package box-agent uses. Research #107 answers it; its answers replace the TODO(#107) markers in §6.2 and §11.2.
+12. **Vault details** (M2): the master key, the cipher, TOTP, whether a value ever enters the box, and whether to read from an existing password manager. Research #108 answers it; its answers replace the TODO(#108) markers in §6.4, §6.10, §9 and §11.
 
 ## 13. Success metrics (dogfooding phase)
 
 - Tasks completed through Hearth per week ≥ tasks done with a local agent directly.
 - Unattended background tasks (S1) completion rate ≥ 70%.
 - At least 3 lessons accepted per week, with fewer repeats of the same failure after acceptance.
+- From M2: no credential is kept in `.env` or a file the owner edits, and no credential value shows up in events, trajectories or model requests (checked by searching them for the vault's values).
 
 ## 14. Constraints
 
