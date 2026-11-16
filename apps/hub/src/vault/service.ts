@@ -51,7 +51,6 @@ import {
   VAULT_FIELDS,
   VAULT_KINDS,
   VAULT_NAME,
-  VaultCryptoError,
   type VaultEntryRecord,
   type VaultKeyProvider,
   type VaultKind,
@@ -713,11 +712,8 @@ export class HubVault implements VaultReader {
   async #open_(dek: CryptoKey, row: VaultEntryRecord): Promise<Record<string, string>> {
     try {
       return await openEntry(dek, bindingOf(row), row);
-    } catch (error) {
-      if (error instanceof VaultCryptoError) {
-        throw fail("vault.entry-corrupt", `secret ${row.name} does not decrypt`, "hub");
-      }
-      throw error;
+    } catch {
+      throw fail("vault.entry-corrupt", `secret ${row.name} does not decrypt`, "hub");
     }
   }
 

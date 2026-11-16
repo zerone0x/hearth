@@ -191,6 +191,9 @@ describe("vault key", () => {
       writeFileSync(keyFile, "file-model-key\n");
       const h = await start(options);
       expect(h.status).toMatchObject({ state: "disabled", reason });
+      expect(await h.vault.status(LOCAL_PRINCIPAL)).toEqual(h.status);
+      expect(h.vault.currentStatus).toEqual(h.status);
+      expect(h.logs.join("\n")).toContain(`vault: disabled (${reason}): `);
       expect((await h.secrets.resolve("env:PLAIN")).reveal()).toBe("plain-env-value");
       expect((await h.secrets.resolve(`file:${keyFile}`)).reveal()).toBe("file-model-key");
       const error = await errorOf(h.secrets.resolve("vault:model"));
