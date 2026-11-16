@@ -1112,6 +1112,9 @@ describe("live bash output (decision 0036)", () => {
     // Live output came while the call ran, before its end event.
     expect(first.seq).toBeLessThan(types.indexOf("pi.tool_execution_end") + 1);
     expect(JSON.stringify(outputs)).not.toContain("faux-key-not-a-secret");
+    // The call's end closes its live output: nothing is stored after its end event.
+    const endSeq = h.events.of("se_a", "pi.tool_execution_end")[0]?.seq ?? 0;
+    for (const o of outputs) expect(o.seq).toBeLessThan(endSeq);
     // The result is the answer, redacted as before.
     const result = toolResults(runner.messages).find((r) => r.id === "c_live");
     expect(result?.text).toContain("second");
