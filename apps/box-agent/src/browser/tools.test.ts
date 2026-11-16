@@ -1,7 +1,22 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   type BrowserActionResult,
   MAX_SCREENSHOT_BYTES,
+  MAX_SNAPSHOT_SPILL_BYTES,
   MAX_SNAPSHOT_TEXT_BYTES,
 } from "@hearth/protocol";
 import { ToolCallError } from "../tools/errors";
@@ -15,17 +30,25 @@ const FORM = [
   '  - button "Off" [disabled] [ref=e4]',
 ].join("\n");
 
-function setup(options: { maxSnapshotBytes?: number; tabs?: number } = {}) {
+const roots: string[] = [];
+afterAll(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+});
+
+/** A fresh workspace root on the real filesystem: spills go through the real writer. */
+function tempRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "hearth-browser-ws-"));
+  roots.push(root);
+  return root;
+}
+
+function setup(options: { maxSnapshotBytes?: number; tabs?: number; root?: string } = {}) {
   const driver = new FakeDriver(options.tabs ?? 1);
-  const spilled: Array<{ name: string; text: string }> = [];
+  const root = options.root ?? tempRoot();
   let clock = 0;
   const tools = new BrowserTools({
     driver,
-    root: "/workspace",
-    spill: async (name, text) => {
-      spilled.push({ name, text });
-      return `/workspace/.hearth/browser/${name}`;
-    },
+    root,
     ...(options.maxSnapshotBytes === undefined
       ? {}
       : { maxSnapshotBytes: options.maxSnapshotBytes }),
@@ -41,7 +64,7 @@ function setup(options: { maxSnapshotBytes?: number; tabs?: number } = {}) {
   page.targets.set("e2", {});
   page.targets.set("e3", {});
   page.targets.set("e4", { enabled: false });
-  return { driver, tools, page, spilled, advance: (ms: number) => (clock += ms), now: () => clock };
+  return { driver, tools, page, root, advance: (ms: number) => (clock += ms), now: () => clock };
 }
 
 async function snapshotId(tools: BrowserTools): Promise<string> {
@@ -432,12 +455,12 @@ describe("snapshot cap", () => {
   }
 
   test("a snapshot within the cap is whole", async () => {
-    const { tools, page, spilled } = setup();
+    const { tools, page, root } = setup();
     page.snapshotText = lines(10);
     const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
     expect(snapshot.truncated).toBe(false);
     expect(snapshot.fullSnapshotPath).toBeNull();
-    expect(spilled).toEqual([]);
+    expect(existsSync(join(root, ".hearth"))).toBe(false);
   });
 
   test("exactly the cap is whole; one byte more is cut at a line end and spilled", async () => {
@@ -449,18 +472,19 @@ describe("snapshot cap", () => {
       page.snapshotText = text;
       expect((await tools.run("browser.snapshot", { callId: "c" })).snapshot.truncated).toBe(false);
     }
-    const { tools, page, spilled } = setup({ maxSnapshotBytes: max - 1 });
+    const { tools, page, root } = setup({ maxSnapshotBytes: max - 1 });
     page.snapshotText = text;
     const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.totalBytes).toBe(max);
-    expect(snapshot.fullSnapshotPath).toBe("/workspace/.hearth/browser/s1.txt");
-    expect(spilled).toEqual([{ name: "s1.txt", text: tagged(text) }]);
+    const path = join(root, ".hearth/browser/s1.txt");
+    expect(snapshot.fullSnapshotPath).toBe(path);
+    expect(readFileSync(path, "utf8")).toBe(tagged(text));
     const [head, marker] = snapshot.text.split("\n[hearth: ");
     expect(tagged(text).startsWith(`${head}\n`)).toBe(true);
     expect(head?.endsWith('"row 38" [ref=s1e39]')).toBe(true);
     expect(marker).toContain(`of ${max} bytes`);
-    expect(marker).toContain("/workspace/.hearth/browser/s1.txt");
+    expect(marker).toContain(path);
   });
 
   test("the default cap is MAX_SNAPSHOT_TEXT_BYTES, for acting results too", async () => {
@@ -477,17 +501,87 @@ describe("snapshot cap", () => {
     expect(Buffer.byteLength(head)).toBeGreaterThan(MAX_SNAPSHOT_TEXT_BYTES - 100);
   });
 
-  test("a spill that fails still returns the cut snapshot, without a path", async () => {
-    const driver = new FakeDriver();
-    const tools = new BrowserTools({
-      driver,
-      root: "/workspace",
-      maxSnapshotBytes: 10,
-      spill: async () => {
-        throw new Error("disk full");
-      },
-    });
-    driver.first.snapshotText = lines(5);
+  test("the spill is a 0600 file under <root>/.hearth/browser, made with its directories", async () => {
+    const { tools, page, root } = setup({ maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    const path = join(root, ".hearth/browser/s1.txt");
+    expect(snapshot.fullSnapshotPath).toBe(path);
+    expect(readFileSync(path, "utf8")).toBe(lines(5).replace(/\[ref=e/g, "[ref=s1e"));
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(lstatSync(join(root, ".hearth/browser")).isDirectory()).toBe(true);
+    // Nothing lands in the workspace root itself.
+    expect(readdirSync(root)).toEqual([".hearth"]);
+  });
+
+  test("the spill file keeps at most MAX_SNAPSHOT_SPILL_BYTES, cut at a line end", async () => {
+    const { tools, page, root } = setup();
+    const row = `- listitem "${"x".repeat(1000)}" [ref=e1]`;
+    page.snapshotText = Array.from({ length: 5000 }, () => row).join("\n");
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    expect(snapshot.totalBytes).toBeGreaterThan(MAX_SNAPSHOT_SPILL_BYTES);
+    const spilled = readFileSync(join(root, ".hearth/browser/s1.txt"));
+    expect(spilled.length).toBeLessThanOrEqual(MAX_SNAPSHOT_SPILL_BYTES);
+    expect(spilled.length).toBeGreaterThan(MAX_SNAPSHOT_SPILL_BYTES - 2 * row.length);
+    expect(spilled.toString("utf8").endsWith("[ref=s1e1]")).toBe(true);
+  });
+
+  test("a symlinked .hearth/browser is never followed: no spill, nothing written outside", async () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    mkdirSync(join(root, ".hearth"));
+    symlinkSync(outside, join(root, ".hearth/browser"));
+    const { tools, page } = setup({ root, maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.fullSnapshotPath).toBeNull();
+    expect(snapshot.text).toContain("[hearth: ");
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("a symlinked .hearth is never followed either", async () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    symlinkSync(outside, join(root, ".hearth"));
+    const { tools, page } = setup({ root, maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    expect(snapshot.fullSnapshotPath).toBeNull();
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("a symlink at the spill file itself is not followed", async () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    mkdirSync(join(root, ".hearth/browser"), { recursive: true });
+    symlinkSync(join(outside, "target"), join(root, ".hearth/browser/s1.txt"));
+    const { tools, page } = setup({ root, maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    expect(snapshot.fullSnapshotPath).toBeNull();
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("a FIFO at the spill path fails at once and does not block the next call", async () => {
+    const root = tempRoot();
+    mkdirSync(join(root, ".hearth/browser"), { recursive: true });
+    execFileSync("mkfifo", [join(root, ".hearth/browser/s1.txt")]);
+    const { tools, page } = setup({ root, maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
+    const started = performance.now();
+    const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.fullSnapshotPath).toBeNull();
+    // The queue is free: the next call answers.
+    const list = await tools.run("browser.tabs", { callId: "c", action: "list" });
+    expect(list.tabs).toHaveLength(1);
+    expect(performance.now() - started).toBeLessThan(1_000);
+  }, 5_000);
+
+  test("a workspace root that does not exist means no spill, not a failed call", async () => {
+    const { tools, page } = setup({ root: "/nonexistent/hearth-ws", maxSnapshotBytes: 10 });
+    page.snapshotText = lines(5);
     const { snapshot } = await tools.run("browser.snapshot", { callId: "c" });
     expect(snapshot.truncated).toBe(true);
     expect(snapshot.fullSnapshotPath).toBeNull();

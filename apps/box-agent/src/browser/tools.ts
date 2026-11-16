@@ -21,7 +21,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { closeSync, writeSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { posix } from "node:path";
 import {
   BROWSER_ACTION_TIMEOUT_MS,
@@ -42,6 +43,7 @@ import {
   parseBrowserRef,
 } from "@hearth/protocol";
 import { ToolCallError } from "../tools/errors";
+import { openPlainFile } from "../tools/paths";
 import { type BrowserDriver, DriverError, type DriverTab } from "./driver";
 import { capText, findLines, jpegSize, snapshotCutMarker, tagRefs } from "./snapshot";
 
@@ -58,8 +60,6 @@ export interface BrowserToolsOptions {
   readonly driver: BrowserDriver;
   /** The workspace root; spilled snapshots go under `SNAPSHOT_SPILL_DIR` in it. */
   readonly root: string;
-  /** Writes a spilled snapshot; tests replace it. Returns the box path. */
-  readonly spill?: (name: string, text: string) => Promise<string>;
   readonly maxSnapshotBytes?: number;
   readonly pollMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -228,7 +228,7 @@ export class BrowserTools {
     }
     let path: string | null = null;
     try {
-      path = await this.#spill(`${snapshotId}.txt`, capText(text, MAX_SNAPSHOT_SPILL_BYTES).text);
+      path = await this.#spill(`${snapshotId}.txt`, text);
     } catch {
       path = null;
     }
@@ -256,13 +256,28 @@ export class BrowserTools {
     return generation;
   }
 
+  /**
+   * Writes the whole snapshot, cut to `MAX_SNAPSHOT_SPILL_BYTES`, to
+   * `<root>/.hearth/browser/<name>` and returns that box path. The box writes
+   * it on its own, so it goes through `openPlainFile` as the exec spill does
+   * (decision 0011): no symlinked `.hearth` or `browser` directory is
+   * followed, the file is opened with `O_NOFOLLOW` and `O_NONBLOCK` (a FIFO
+   * there fails at once instead of blocking the call queue) and created 0600.
+   * A refusal throws; the caller returns the cut snapshot without a path.
+   */
   async #spill(name: string, text: string): Promise<string> {
-    if (this.#options.spill !== undefined) return await this.#options.spill(name, text);
-    const dir = posix.join(this.#options.root, SNAPSHOT_SPILL_DIR);
-    await mkdir(dir, { recursive: true });
-    const path = posix.join(dir, name);
-    await writeFile(path, text, { mode: 0o600 });
-    return path;
+    const data = Buffer.from(capText(text, MAX_SNAPSHOT_SPILL_BYTES).text, "utf8");
+    const realRoot = await realpath(this.#options.root);
+    const fd = openPlainFile(realRoot, SNAPSHOT_SPILL_DIR.split("/"), name);
+    try {
+      let written = 0;
+      while (written < data.length) {
+        written += writeSync(fd, data, written, data.length - written);
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return posix.join(this.#options.root, SNAPSHOT_SPILL_DIR, name);
   }
 
   /** The closing snapshot of an action, or null when the page cannot give one now. */
