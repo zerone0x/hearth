@@ -34,14 +34,14 @@ const BINDING: BoxBinding = { workspaceId: DEFAULT_WORKSPACE_ID, boxId: BOX, ses
 
 interface FakeSocket {
   readonly frames: Frame[];
-  readonly closes: { code?: number; reason?: string }[];
+  readonly closes: { code: number | undefined; reason: string | undefined }[];
   send(data: string | Uint8Array): void;
   close(code?: number, reason?: string): void;
 }
 
 function fakeSocket(): FakeSocket {
   const frames: Frame[] = [];
-  const closes: { code?: number; reason?: string }[] = [];
+  const closes: { code: number | undefined; reason: string | undefined }[] = [];
   return {
     frames,
     closes,
