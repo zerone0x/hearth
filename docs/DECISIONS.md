@@ -2797,6 +2797,10 @@ with a short bound.
 
 - While the owner holds the desktop the agent cannot even look at the page;
   it has to ask or wait.
+- The check runs once, before the box lease. A call already past it (a cold
+  box wake can take seconds) still reaches the page if the owner takes over
+  meanwhile: the owner may see one last agent action after Take over. A second
+  check after the wake is a follow-up (#133).
 - Proof: unit tests of the check in every tool (`browser-tools.test.ts`), the
   real `startHub` wiring and trajectory step (`browser-lock.test.ts`), and a
   compose-e2e step: Take over, an agent `browser_tabs` call is refused with
