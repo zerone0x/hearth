@@ -34,6 +34,7 @@ import {
   type EventStore,
   HearthError,
   type JsonValue,
+  redactValues,
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
@@ -100,16 +101,11 @@ export const REDACTED = "[redacted]";
 /**
  * `text` with every secret replaced, raw and as it appears inside a JSON
  * string. Provider errors can echo the key (`invalid x-api-key sk-...`).
+ * Overlapping secrets (a password that contains the username) are replaced
+ * as one span, whatever their order (`redactValues`).
  */
 export function redactSecrets(text: string, secrets: Iterable<string>): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (secret.length === 0) continue;
-    out = out.split(secret).join(REDACTED);
-    const escaped = JSON.stringify(secret).slice(1, -1);
-    if (escaped !== secret) out = out.split(escaped).join(REDACTED);
-  }
-  return out;
+  return redactValues(text, secrets, REDACTED);
 }
 
 /** The text a rebuilt runner gives a tool call that a hub restart cut off. */

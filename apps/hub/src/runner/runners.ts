@@ -148,7 +148,9 @@ export class SessionRunners {
    * value saved, used or found at open (decision 0031).
    */
   redact(text: string): string {
-    return redactSecrets(redactSecrets(text, this.#secretValues), knownSecrets());
+    // One pass over both sets: a value in one that overlaps a value in the other
+    // is replaced as one span, not cut by whichever pass ran first.
+    return redactSecrets(text, [...this.#secretValues, ...knownSecrets()]);
   }
 
   #log(line: string): void {

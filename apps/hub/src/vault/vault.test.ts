@@ -22,10 +22,10 @@ import {
 import { Hono } from "hono";
 import { type HubEnv, SESSION_COOKIE } from "../auth";
 import { lineFields, lineLevel } from "../obs/hub-log";
-import { redactHub } from "../obs/redaction";
+import { knownSecrets, redactHub, registerSecret } from "../obs/redaction";
 import { observabilityFromEnv } from "../obs/setup";
 import { Telemetry } from "../obs/telemetry";
-import { SessionRunners } from "../runner";
+import { redactSecrets, SessionRunners } from "../runner";
 import { startHub } from "../server";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
 import { dumpTrajectory } from "../trajectory-cli";
@@ -1184,6 +1184,104 @@ describe("redaction", () => {
       config: { provider: "faux", model: "m" },
     } as unknown as ConstructorParameters<typeof SessionRunners>[0]);
     expect(runners.redact(`{"text":"${value}"}`)).not.toContain(value);
+  });
+
+  test("overlapping values leave no tail on any sink, in either order of registration", async () => {
+    // Every sink the hub has: log lines, span attributes and status, the
+    // runner's stored events, and the trajectory export.
+    const sinks = async (text: string): Promise<Record<string, string>> => {
+      const lines: string[] = [];
+      observabilityFromEnv({}, (line) => lines.push(line)).logger.info(`saw ${text}`);
+      const exported: string[] = [];
+      const telemetry = new Telemetry({
+        redact: redactHub,
+        spanExporter: {
+          export: (spans, done) => {
+            exported.push(JSON.stringify(spans.map((s) => [s.attributes, s.status])));
+            done({ code: 0 });
+          },
+          shutdown: () => Promise.resolve(),
+          forceFlush: () => Promise.resolve(),
+        },
+      });
+      telemetry.endSpan(
+        telemetry.startSpan("tool", { arg: text }),
+        {},
+        { type: "x", message: text },
+      );
+      await telemetry.shutdown();
+      const runners = new SessionRunners({
+        config: { provider: "faux", model: "m" },
+      } as unknown as ConstructorParameters<typeof SessionRunners>[0]);
+      const known = [...knownSecrets()];
+      return {
+        log: lines.join("\n"),
+        span: exported.join(""),
+        runner: runners.redact(JSON.stringify({ text })),
+        "runner-forward": redactSecrets(text, known),
+        "runner-reverse": redactSecrets(text, known.reverse()),
+      };
+    };
+    for (const [i, order] of (["username-first", "password-first"] as const).entries()) {
+      const username = `ovl-admin-${i}`;
+      const password = `${username}-Zq9!SuffixLeak${i}`;
+      const token = `zzpart${i}x`;
+      const modelKey = `${token}-MODELTAILSECRET${i}`;
+      // The process-wide registry keeps insertion order: register the login in
+      // this round's order before the vault adds the rest at open.
+      if (order === "username-first") {
+        registerSecret(username);
+        registerSecret(password);
+      } else {
+        registerSecret(password);
+        registerSecret(username);
+      }
+      const h = await start({ env: { VAULT_KEY: KEY_A } });
+      const login = {
+        name: `login-${i}`,
+        kind: "login",
+        policy: { origins: ["https://example.com"] },
+        fields: order === "username-first" ? { username, password } : { password, username },
+      };
+      const tokenEntry = { name: "", kind: "token", fields: { value: token } };
+      const modelEntry = { name: "", kind: "model-key", fields: { value: modelKey } };
+      // The vault registers at open in name order: the shorter value first in
+      // round 0, the longer one first in round 1.
+      const [first, second] =
+        i === 0
+          ? [
+              { ...tokenEntry, name: `a-tok-${i}` },
+              { ...modelEntry, name: `b-model-${i}` },
+            ]
+          : [
+              { ...modelEntry, name: `a-model-${i}` },
+              { ...tokenEntry, name: `b-tok-${i}` },
+            ];
+      for (const entry of [login, first, second]) await h.vault.create(LOCAL_PRINCIPAL, entry);
+      const text = `u=${username} pw=${password} tok=${token} key=${modelKey} "q":"${password}"`;
+      const sessionId = `se_overlap_${i}`;
+      await new SqliteEventStore(h.db).append({ workspaceId: "ws_default" }, sessionId, {
+        type: "message.user",
+        payload: { text },
+      });
+      // The CLI opens the vault with the hub's registry: every value joins it.
+      const out = await dumpTrajectory(path, sessionId, {
+        secrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+        vaultKeyRef: "env:VAULT_KEY",
+        warn: () => {},
+      });
+      const all = { trajectory: out, ...(await sinks(text)) };
+      for (const [sink, value] of Object.entries(all)) {
+        for (const tail of [`SuffixLeak${i}`, `MODELTAILSECRET${i}`, "Zq9!", username, token]) {
+          expect(`${order} ${sink}: ${value.includes(tail) ? `leaks ${tail}` : "ok"}`).toBe(
+            `${order} ${sink}: ok`,
+          );
+        }
+      }
+      expect(redactHub(text)).toBe(
+        'u=[redacted] pw=[redacted] tok=[redacted] key=[redacted] "q":"[redacted]"',
+      );
+    }
   });
 
   test("at open, every stored value joins the redaction set; a corrupt row does not stop it", async () => {
