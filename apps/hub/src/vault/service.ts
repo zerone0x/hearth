@@ -20,6 +20,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import {
   type AuditRecord,
   type AuditSink,
@@ -161,6 +162,11 @@ export interface HubVaultOptions {
   readonly now?: () => EpochMs;
   /** Adds a value to the sink-side redaction set. Default `registerSecret` (decision 0021). */
   readonly register?: (value: string) => void;
+  /**
+   * Open only: never create the data key and never rotate to the next key
+   * (the trajectory CLI). With the next key matching, it still opens.
+   */
+  readonly readOnly?: boolean;
 }
 
 type Loaded =
@@ -598,6 +604,9 @@ export class HubVault implements VaultReader {
       this.#log(`vault: the next key is not used: ${loaded.detail}`);
     }
     let record = this.#o.store.keyRecord();
+    if (record === undefined && this.#o.readOnly === true) {
+      return this.#disable("key-missing", "this database has no vault yet");
+    }
     if (record === undefined) {
       if (!current.ok) return this.#disable(current.reason, current.detail);
       const dek = await generateDataKey();
@@ -648,7 +657,12 @@ export class HubVault implements VaultReader {
     } catch {
       return this.#disable("store-corrupt", "the data key does not unwrap under a matching key");
     }
-    if (via === "current" && next !== undefined && next.kekCheck !== active.kekCheck) {
+    if (
+      this.#o.readOnly !== true &&
+      via === "current" &&
+      next !== undefined &&
+      next.kekCheck !== active.kekCheck
+    ) {
       try {
         await this.#rotateMaster(active, next, dek);
         active = next;
@@ -717,7 +731,29 @@ export class HubVault implements VaultReader {
       };
     }
     this.#register(text.trim());
+    this.#warnIfShared(ref);
     return { ok: true, keys: await MasterKeyProvider.fromBytes(bytes) };
+  }
+
+  /**
+   * A key file others can read is used (refusing it would lock the owner out
+   * of a working vault, and some Docker hosts show every mounted file as 0777),
+   * but the hub says so at every start.
+   */
+  #warnIfShared(ref: SecretRef): void {
+    const parsed = parseSecretRef(ref);
+    if (parsed.scheme !== "file") return;
+    let mode: number;
+    try {
+      mode = statSync(parsed.body).mode & 0o777;
+    } catch {
+      return;
+    }
+    if ((mode & 0o077) !== 0) {
+      this.#log(
+        `vault: the key file ${parsed.body} is readable by others (mode ${mode.toString(8)}); run chmod 600 on it`,
+      );
+    }
   }
 
   #disable(

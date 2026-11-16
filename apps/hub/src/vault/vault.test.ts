@@ -6,7 +6,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,7 +30,7 @@ import { RequestBody } from "../request-body";
 import { redactSecrets, SessionRunners } from "../runner";
 import { startHub } from "../server";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
-import { dumpTrajectory } from "../trajectory-cli";
+import { dumpTrajectory, UnredactedDumpError } from "../trajectory-cli";
 import { HubVault, mountVaultRoutes, type VaultStatus } from ".";
 
 const KEY_A = Buffer.alloc(32, 0xa1).toString("base64");
@@ -347,6 +347,25 @@ test("vault log lines: component vault, warn when disabled or mid-rotation", () 
   expect(lineLevel("vault: disabled (key-missing): x")).toBe("warn");
   expect(lineLevel("vault: running on vault_key.next, the rotation is committed")).toBe("warn");
   expect(lineLevel("vault: key rotation failed, still on the current key: x")).toBe("error");
+  expect(
+    lineLevel("vault: the key file /k is readable by others (mode 644); run chmod 600 on it"),
+  ).toBe("warn");
+});
+
+test("a key file others can read is used, with a warning at every start", async () => {
+  const keyFile = join(dir, "vault_key");
+  writeFileSync(keyFile, `${KEY_A}\n`, { mode: 0o644 });
+  chmodSync(keyFile, 0o644);
+  const shared = await start({ keyRef: `file:${keyFile}` });
+  expect(shared.status).toMatchObject({ state: "enabled" });
+  expect(shared.logs).toContain(
+    `vault: the key file ${keyFile} is readable by others (mode 644); run chmod 600 on it`,
+  );
+  expect(shared.logs.join("\n")).not.toContain(KEY_A);
+  chmodSync(keyFile, 0o600);
+  const tight = await start({ keyRef: `file:${keyFile}` });
+  expect(tight.status).toMatchObject({ state: "enabled" });
+  expect(tight.logs.join("\n")).not.toContain("readable by others");
 });
 
 describe("input checks", () => {
@@ -1553,19 +1572,103 @@ describe("redaction", () => {
     expect(out).not.toContain(value);
   });
 
-  test("the trajectory CLI warns when the vault does not open", async () => {
+  test("the trajectory CLI refuses to dump when the vault does not open, unless told to", async () => {
     await start({ env: { VAULT_KEY: KEY_A } });
-    const dump = async (key: string) => {
+    const dump = async (
+      env: Record<string, string>,
+      unredactedOk = false,
+      db = path,
+    ): Promise<{ text?: string; error?: unknown; warnings: string[] }> => {
       const warnings: string[] = [];
-      await dumpTrajectory(path, "se_none", {
-        secrets: createDefaultSecretStore({ env: { VAULT_KEY: key } }),
-        vaultKeyRef: "env:VAULT_KEY",
-        warn: (m) => warnings.push(m),
-      });
-      return warnings;
+      try {
+        const text = await dumpTrajectory(db, "se_none", {
+          secrets: createDefaultSecretStore({ env }),
+          ...(env["VAULT_KEY"] === undefined ? {} : { vaultKeyRef: "env:VAULT_KEY" }),
+          unredactedOk,
+          warn: (m) => warnings.push(m),
+        });
+        return { text, warnings };
+      } catch (error) {
+        return { error, warnings };
+      }
     };
-    expect(await dump(KEY_B)).toEqual(["vault values are not redacted: the vault is disabled"]);
-    expect(await dump(KEY_A)).toEqual([]);
+    for (const env of [{ VAULT_KEY: KEY_B }, {}]) {
+      const refused = await dump(env);
+      expect(refused.error).toBeInstanceOf(UnredactedDumpError);
+      expect(String((refused.error as Error).message)).toContain("--unredacted-ok");
+      expect(String((refused.error as Error).message)).not.toContain(KEY_B);
+      expect(refused.warnings).toEqual([]);
+    }
+    const forced = await dump({ VAULT_KEY: KEY_B }, true);
+    expect(forced.warnings).toEqual([
+      "vault values are not redacted: the vault is disabled (key-mismatch)",
+    ]);
+    expect(forced.text).toBeString();
+    expect(await dump({ VAULT_KEY: KEY_A })).toMatchObject({ warnings: [] });
+    // A database with no vault has nothing to redact: no key needed, nothing created.
+    const plain = join(dir, "plain.db");
+    openDatabase(plain).close();
+    const noVault = await dump({}, false, plain);
+    expect(noVault).toMatchObject({ warnings: [] });
+    expect(noVault.text).toBeString();
+    const check = openDatabase(plain);
+    expect(new SqliteVaultStore(check).keyRecord()).toBeUndefined();
+    check.close();
+  });
+
+  test("the trajectory CLI exits 1 with no output when it cannot redact", async () => {
+    await start({ env: { VAULT_KEY: KEY_A } });
+    const cli = join(import.meta.dir, "..", "trajectory-cli.ts");
+    const run = (args: string[], env: Record<string, string>) =>
+      Bun.spawnSync([process.execPath, cli, "--db", path, ...args], {
+        env: { PATH: process.env["PATH"] ?? "", ...env },
+      });
+    const refused = run(["se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_B });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stdout.toString()).toBe("");
+    expect(refused.stderr.toString()).toContain("refusing to dump");
+    const forced = run(["--unredacted-ok", "se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_B });
+    expect(forced.exitCode).toBe(0);
+    const ok = run(["se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_A });
+    expect(ok.exitCode).toBe(0);
+  });
+
+  test("the trajectory CLI opens a vault mid-rotation through the next key, and never rotates", async () => {
+    const value = "vault-trajectory-rotation-3e1d-plain";
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    await h.vault.create(LOCAL_PRINCIPAL, { name: "rot", kind: "token", fields: { value } });
+    await new SqliteEventStore(h.db).append({ workspaceId: "ws_default" }, "se_rot", {
+      type: "message.user",
+      payload: { text: `rotating ${value} now` },
+    });
+    const checkA = kekCheck(h.db);
+    const KEY_C = Buffer.alloc(32, 0xc3).toString("base64");
+    // Read-only: a current key that matches and a different next key rotate nothing.
+    const env = { VAULT_KEY: KEY_A, VAULT_KEY_NEXT: KEY_C };
+    expect(
+      await dumpTrajectory(path, "se_rot", {
+        secrets: createDefaultSecretStore({ env }),
+        vaultKeyRef: "env:VAULT_KEY",
+        vaultNextKeyRef: "env:VAULT_KEY_NEXT",
+        warn: () => {},
+      }),
+    ).not.toContain(value);
+    expect(kekCheck(h.db)).toBe(checkA);
+    expect(auditRows(h.db, "vault.key.rotate")).toHaveLength(0);
+    // The hub rotated to KEY_C; the cutover has not happened yet.
+    await start({ env, nextKeyRef: "env:VAULT_KEY_NEXT" });
+    expect(kekCheck(h.db)).not.toBe(checkA);
+    const dump = (next: boolean) =>
+      dumpTrajectory(path, "se_rot", {
+        secrets: createDefaultSecretStore({ env }),
+        vaultKeyRef: "env:VAULT_KEY",
+        ...(next ? { vaultNextKeyRef: "env:VAULT_KEY_NEXT" } : {}),
+        warn: () => {},
+      });
+    await expect(dump(false)).rejects.toBeInstanceOf(UnredactedDumpError);
+    const out = await dump(true);
+    expect(out).toContain("rotating [redacted] now");
+    expect(out).not.toContain(value);
   });
 
   test("a resolved value joins the redaction set at use", async () => {

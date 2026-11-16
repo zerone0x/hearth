@@ -2490,6 +2490,12 @@ deviates.
   mismatch nothing is written, so restoring the right file recovers the vault.
   The hub logs `vault: enabled` or `vault: disabled (<reason>)` (component
   `vault`, the latter at warn).
+- **A key file others can read is used, with a warning.** At every start the
+  hub stats a `file:` key and logs (warn) `vault: the key file <path> is
+  readable by others (mode …); run chmod 600 on it` when group or other bits
+  are set. It does not refuse: that would lock the owner out of a working vault
+  over a mode, and some Docker hosts report every bind-mounted file as 0777.
+  `install:vault-key` writes it 0600 (`umask 077`).
 - **Rotation.** `HEARTH_VAULT_KEY_NEXT_REF`. At open, if the current key matches
   and a valid next key is present, the data key is rewrapped under the next key
   and `kek_check` and every fingerprint are rewritten in one transaction,
@@ -2502,7 +2508,14 @@ deviates.
   Through the hub's SecretStore only global `model-key` and `use: hub` `token`
   entries resolve; `HubVault.use(ref, {sessionId, tool, toolCallId, origin, kinds})`
   is the hook for session tools (`browser_fill`, #118), and it also allows
-  entries scoped to that session. Each use decrypts first (so the scope and
+  entries scoped to that session. A login is handed out only when the page
+  origin the box reported (scheme, host and port of an `http(s)` URL, as
+  `URL.origin` prints it) is one of its policy's origins; no origin, another
+  one or a non-`http(s)` URL is `vault.origin-mismatch`. `use` returns the
+  value with the entry's name, kind, field and policy (origins and
+  `allow_any_field`, or a token's `use` and hosts), read from the row whose AAD
+  just verified, so #118 enforces them without a second, unauthenticated read.
+  Each use decrypts first (so the scope and
   policy it checks are authentic), then writes `secret.use` (name, field,
   fingerprint, version, consumer, session, tool, tool call, origin); if that
   record cannot be written the value is not returned (`vault.audit-failed`).
@@ -2510,13 +2523,27 @@ deviates.
 - **No read-back.** `GET /v1/vault/status`, `GET /v1/secrets`,
   `POST /v1/secrets`, `PUT /v1/secrets/:id/value`, `DELETE /v1/secrets/:id`,
   `GET /v1/secrets/:id/uses`. Each authorizes first and reads its body after.
+  A denied caller never has its body parsed: a foreign principal gets the same
+  403 for a valid, an invalid and an unparseable body.
   `fields` is write-only; answers carry fingerprints and metadata. Create,
   rotate and delete write a `secret.*` record with the detail (name, kind,
   fingerprints, version, never a value) before they act.
 - **Redaction.** Every value joins the hub's registry (0021) when it is saved,
   when it is used, and at open for every stored entry; the runner's redactor
   (0015) now also applies the registry, so events, logs, trajectories (the API
-  and the CLI, which opens the vault read-only) and span attributes drop it.
+  and the CLI) and span attributes drop it. Values are replaced as spans, not
+  one after another (`redactValues`): every occurrence of every value, raw and
+  JSON-escaped, is found in the original text and each run of overlapping
+  matches becomes one `[redacted]`. Replacing in registration order left the
+  tail of a password that contains its login's username, or of a model key
+  that starts with a token's value.
+- **The trajectory CLI fails closed.** It opens the vault read-only (never
+  creating the data key or rotating) with `HEARTH_VAULT_KEY_REF` and
+  `HEARTH_VAULT_KEY_NEXT_REF`, so it also works after a rotation committed and
+  before the cutover. If the database has a vault that does not open, it
+  refuses to dump (exit 1) because the vault's values could not be redacted;
+  `--unredacted-ok` dumps anyway with a warning. A database with no vault needs
+  no key.
 - **Extension points.** `VaultKeyProvider` (the key file now; OpenBao transit
   later) and `VaultEntryBackend` (SQLite now; OpenBao KV v2 later) in
   `packages/core`.
@@ -2556,6 +2583,14 @@ deviates.
 - A hub compromise reveals everything, as before.
 - Every `vault:` resolve costs one decrypt and one audit row; the runner
   resolves its model key once per runtime, so this is not on a hot path.
+- **Rotating or deleting a `vault:` model key takes effect when the model
+  runtime restarts**, because the runner resolved the key once: today that is a
+  hub restart; #115 adds a reload with the model settings. Until then the old
+  key stays in use (and in the redaction set) for new turns.
+- The key derivation is pinned by known-answer vectors (`kek_check`, a
+  fingerprint and a wrapped data key for a fixed master key, computed outside
+  the code): a change of an HKDF info string, the salt or the wrap would make
+  every existing vault unreadable and fails the tests first.
 - **Known gaps:** redaction misses encodings it does not know (#70); short
   values over-redact; usernames are redacted like passwords; a row can still be
   deleted, or rolled back together with its version, by someone who can write

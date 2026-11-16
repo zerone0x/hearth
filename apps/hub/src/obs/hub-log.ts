@@ -35,8 +35,10 @@ const COMPONENTS: ReadonlyArray<readonly [RegExp, string]> = [
 /** The level a hub line is logged at. */
 export function lineLevel(line: string): LogLevel {
   if (/^WARNING\b/.test(line)) return "warn";
-  // The vault (decision 0031): disabled, mid-rotation or an unused next key.
-  if (/^vault: (disabled|running on|key rotated|the next key)/.test(line)) return "warn";
+  // The vault (decision 0031): disabled, mid-rotation, an unused next key or a shared key file.
+  if (/^vault: (disabled|running on|key rotated|the next key|the key file)/.test(line)) {
+    return "warn";
+  }
   if (ERROR_WORDS.test(line)) return "error";
   if (WARN_WORDS.test(line)) return "warn";
   return "info";
