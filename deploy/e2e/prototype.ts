@@ -309,6 +309,9 @@ async function takeOver(page: Page, box: string, sessionId: string): Promise<voi
       const out = Bun.spawnSync(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
       return `${out.stdout.toString()}${out.stderr.toString()}`;
     };
+    console.log(
+      `e2e: active window: ${run("exec", "-e", "DISPLAY=:1", box, "xprop", "-root", "_NET_ACTIVE_WINDOW")}`,
+    );
     console.log(`e2e: box xvnc.log:\n${run("exec", box, "tail", "-n", "40", "/tmp/xvnc.log")}`);
     console.log(
       `e2e: box chromium.log:\n${run("exec", box, "tail", "-n", "20", "/tmp/chromium.log")}`,
@@ -345,6 +348,8 @@ async function takeOverSteps(page: Page, box: string, sessionId: string): Promis
   await canvas.click();
   await page.keyboard.press("Control+L");
   await page.keyboard.type(typed, { delay: 30 });
+  await page.waitForTimeout(1_000);
+  await shot(page, "3a-typed");
   await page.keyboard.press("Delete");
   await page.keyboard.press("Enter");
   let urls = await waitForBoxUrl(box, typed, 20_000);

@@ -309,6 +309,8 @@ describe("DesktopLocks: one change at a time, logs, shutdown", () => {
     await first;
     // The release is now writing its record; a take-over by someone else waits for it.
     const third = g.locks.acquire(who("usr_b"), "ses_1");
+    // Let the take-over reach its turn while the release is still writing.
+    await Bun.sleep(5);
     await g.next();
     await second;
     await g.next();
