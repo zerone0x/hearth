@@ -25,7 +25,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Browser, type BrowserContext, chromium, type Page } from "playwright";
+import { type Browser, type BrowserContext, chromium, type Locator, type Page } from "playwright";
 import { desktopProblem, desktopStats } from "./desktop-pixels";
 import type { FauxReply, FauxRequest } from "./faux-model";
 
@@ -133,10 +133,279 @@ async function expandTool(page: Page, tool: string, target: string): Promise<voi
   else await page.getByRole("group").filter({ hasText: target }).getByText(target).click();
 }
 
+/** Every CSP violation a page of the run reports (decision 0017); the run fails on any. */
+const cspViolations: string[] = [];
+
 async function newContext(browser: Browser): Promise<BrowserContext> {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   context.setDefaultTimeout(STEP_MS);
+  // Fail closed on CSP: a listener installed before any page script sees
+  // every blocked load or eval, even one the page code catches.
+  await context.exposeBinding("__hearthCspViolation", (_source, report: string) => {
+    cspViolations.push(report);
+  });
+  await context.addInitScript({
+    content: `document.addEventListener("securitypolicyviolation", (event) => {
+      void globalThis.__hearthCspViolation(
+        event.effectiveDirective + " blocked " + (event.blockedURI || "(inline)") +
+          " on " + event.documentURI,
+      );
+    });`,
+  });
   return context;
+}
+
+/** Pixels of the noVNC canvas, sampled every 8 px, as flat RGB. */
+async function sampleCanvas(canvas: Locator): Promise<number[]> {
+  return await canvas.evaluate((c) => {
+    const el = c as unknown as {
+      width: number;
+      height: number;
+      getContext(kind: "2d"): {
+        getImageData(x: number, y: number, w: number, h: number): { data: ArrayLike<number> };
+      } | null;
+    };
+    const data = el.getContext("2d")?.getImageData(0, 0, el.width, el.height).data;
+    const out: number[] = [];
+    if (data === undefined) return out;
+    for (let y = 4; y < el.height; y += 8) {
+      for (let x = 4; x < el.width; x += 8) {
+        const at = (y * el.width + x) * 4;
+        out.push(data[at] ?? 0, data[at + 1] ?? 0, data[at + 2] ?? 0);
+      }
+    }
+    return out;
+  });
+}
+
+/** The URLs of the pages open in the box's Chromium, read over its CDP port inside the box. */
+function boxBrowserUrls(box: string): string[] {
+  const script =
+    'const r = await fetch("http://127.0.0.1:9222/json/list");' +
+    'console.log(JSON.stringify((await r.json()).filter((t) => t.type === "page").map((t) => t.url)));';
+  return JSON.parse(docker("exec", box, "bun", "-e", script)) as string[];
+}
+
+/** Waits until the box's Chromium shows `url`, or returns what it shows. */
+async function waitForBoxUrl(box: string, url: string, ms: number): Promise<string[]> {
+  let urls: string[] = [];
+  for (const end = Date.now() + ms; Date.now() < end; ) {
+    urls = boxBrowserUrls(box);
+    if (urls.includes(url)) return urls;
+    await Bun.sleep(500);
+  }
+  return urls;
+}
+
+const KEY = { control: 0xffe3, delete: 0xffff, enter: 0xff0d, l: 0x6c } as const;
+
+/** RFB key events that focus Chromium's address bar, type `url` and open it. */
+function addressBarKeys(url: string): [number, boolean][] {
+  const keys: [number, boolean][] = [
+    [KEY.control, true],
+    [KEY.l, true],
+    [KEY.l, false],
+    [KEY.control, false],
+  ];
+  // Printable ASCII keysyms are the characters' own codes.
+  for (const ch of url) keys.push([ch.charCodeAt(0), true], [ch.charCodeAt(0), false]);
+  // Delete drops an inline autocompletion; Enter opens the typed URL.
+  keys.push([KEY.delete, true], [KEY.delete, false], [KEY.enter, true], [KEY.enter, false]);
+  return keys;
+}
+
+/**
+ * A second, hand-written RFB client on the desktop WebSocket, in the signed-in
+ * page: it ignores the UI's view-only switch and sends `keys` regardless, so
+ * only the hub's filter decides whether they reach the box.
+ */
+async function rawKeys(page: Page, sessionId: string, keys: [number, boolean][]): Promise<string> {
+  const url = new URL(`/v1/sessions/${encodeURIComponent(sessionId)}/desktop`, BASE);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return await page.evaluate(
+    async ({ url, keys }) => {
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      const buf: number[] = [];
+      let stage = 0;
+      return await new Promise<string>((resolve) => {
+        const timer = setTimeout(() => {
+          ws.close();
+          resolve(`timed out at stage ${stage}`);
+        }, 20_000);
+        ws.onclose = (event) => {
+          clearTimeout(timer);
+          resolve(`closed ${event.code} at stage ${stage}`);
+        };
+        ws.onmessage = (event) => {
+          buf.push(...new Uint8Array(event.data as ArrayBuffer));
+          for (;;) {
+            if (stage === 0 && buf.length >= 12) {
+              buf.splice(0, 12);
+              ws.send(new TextEncoder().encode("RFB 003.008\n"));
+              stage = 1;
+            } else if (stage === 1 && buf.length >= 1 && buf.length >= 1 + (buf[0] ?? 0)) {
+              buf.splice(0, 1 + (buf[0] ?? 0));
+              ws.send(Uint8Array.of(1)); // security None
+              stage = 2;
+            } else if (stage === 2 && buf.length >= 4) {
+              buf.splice(0, 4);
+              ws.send(Uint8Array.of(1)); // ClientInit, shared
+              stage = 3;
+            } else if (stage === 3 && buf.length >= 24) {
+              const n =
+                (((buf[20] ?? 0) << 24) |
+                  ((buf[21] ?? 0) << 16) |
+                  ((buf[22] ?? 0) << 8) |
+                  (buf[23] ?? 0)) >>>
+                0;
+              if (buf.length < 24 + n) return;
+              buf.splice(0, 24 + n);
+              stage = 4;
+              // One message per key, paced like a typist: a burst can reach the
+              // page before Ctrl+L has moved the focus to the address bar.
+              const send = async () => {
+                for (const [i, [sym, down]] of keys.entries()) {
+                  ws.send(
+                    Uint8Array.of(
+                      4,
+                      down ? 1 : 0,
+                      0,
+                      0,
+                      (sym >>> 24) & 255,
+                      (sym >>> 16) & 255,
+                      (sym >>> 8) & 255,
+                      sym & 255,
+                    ),
+                  );
+                  await new Promise((r) => setTimeout(r, i === 3 ? 500 : 30));
+                }
+                await new Promise((r) => setTimeout(r, 2_000));
+                clearTimeout(timer);
+                ws.onclose = null;
+                ws.close();
+                resolve("sent");
+              };
+              void send();
+            } else {
+              return;
+            }
+          }
+        };
+      });
+    },
+    { url: url.toString(), keys },
+  );
+}
+
+/**
+ * M2 takeover (#120, decision 0033): Take over, type into the box Chromium's
+ * address bar through noVNC, see the page change (its URL over CDP, and the
+ * start page's accent gone from the canvas), then Release; input is dropped
+ * again, even from a client that ignores the UI and sends key events anyway.
+ */
+async function takeOver(page: Page, box: string, sessionId: string): Promise<void> {
+  try {
+    await takeOverSteps(page, box, sessionId);
+  } catch (error) {
+    // What the box and the hub saw, for a failed run.
+    await shot(page, "3x-takeover-failed");
+    const run = (...args: string[]) => {
+      const out = Bun.spawnSync(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+      return `${out.stdout.toString()}${out.stderr.toString()}`;
+    };
+    console.log(
+      `e2e: active window: ${run("exec", "-e", "DISPLAY=:1", box, "xprop", "-root", "_NET_ACTIVE_WINDOW")}`,
+    );
+    console.log(`e2e: box xvnc.log:\n${run("exec", box, "tail", "-n", "40", "/tmp/xvnc.log")}`);
+    console.log(
+      `e2e: box chromium.log:\n${run("exec", box, "tail", "-n", "20", "/tmp/chromium.log")}`,
+    );
+    const hub = run("ps", "-q", "--filter", "name=hub").trim().split("\n")[0] ?? "";
+    const logs = run("logs", "--tail", "400", hub)
+      .split("\n")
+      .filter((l) => /desktop|lock|vnc|stream/i.test(l))
+      .slice(-60);
+    console.log(`e2e: hub desktop log:\n${logs.join("\n")}`);
+    throw error;
+  }
+}
+
+/**
+ * Ctrl+L with a lowercase l: Playwright's "Control+L" sends the key "L", noVNC
+ * turns that into the keysym for capital L, and Xvnc adds Shift to type it, so
+ * Chromium sees Ctrl+Shift+L and the address bar never takes focus (#120).
+ */
+const FOCUS_ADDRESS_BAR = "Control+l";
+
+async function takeOverSteps(page: Page, box: string, sessionId: string): Promise<void> {
+  step("5b. take over the desktop and type into the box browser's address bar");
+  const desktop = page.getByRole("region", { name: "Desktop" });
+  const canvas = desktop.locator("canvas");
+  const start = boxBrowserUrls(box);
+  check(
+    start.some((u) => u.startsWith("file:///usr/share/hearth/start.html")),
+    `the box browser is not on its start page: ${start.join(", ")}`,
+  );
+  // View-only first: typing through noVNC reaches nothing.
+  await canvas.click();
+  await page.keyboard.press(FOCUS_ADDRESS_BAR);
+  await page.keyboard.type("file:///etc/\n");
+  await page.waitForTimeout(2_000);
+  check(!boxBrowserUrls(box).includes("file:///etc/"), "view-only typing reached the box browser");
+
+  await page.getByRole("button", { name: "Take over" }).click();
+  await page.getByRole("button", { name: "Release" }).waitFor();
+  const typed = "file:///workspace/";
+  await canvas.click();
+  await page.keyboard.press(FOCUS_ADDRESS_BAR);
+  // The omnibox takes focus a moment after Ctrl+L; a key sent before that is
+  // lost (a CI run dropped the first "f"). A person types slower than this.
+  await page.waitForTimeout(500);
+  await page.keyboard.type(typed, { delay: 30 });
+  await page.waitForTimeout(1_000);
+  await shot(page, "3a-typed");
+  await page.keyboard.press("Delete");
+  await page.keyboard.press("Enter");
+  let urls = await waitForBoxUrl(box, typed, 20_000);
+  check(urls.includes(typed), `the typed URL did not open in the box browser: ${urls.join(", ")}`);
+  // The page changed on the desktop too: the start page's accent band is gone.
+  let accent = 1;
+  for (let i = 0; i < 20 && accent >= 0.005; i++) {
+    if (i > 0) await page.waitForTimeout(500);
+    accent = desktopStats(await sampleCanvas(canvas)).accentShare;
+  }
+  await shot(page, "3b-desktop-taken-over");
+  check(accent < 0.005, `the desktop still shows the start page (accent ${accent})`);
+
+  step("5c. a raw RFB client of the same login types too while the lock is held");
+  const held = "file:///tmp/";
+  const sent = await rawKeys(page, sessionId, addressBarKeys(held));
+  check(sent === "sent", `the raw RFB client did not get to send: ${sent}`);
+  urls = await waitForBoxUrl(box, held, 20_000);
+  check(urls.includes(held), `the raw client's keys did not reach the box: ${urls.join(", ")}`);
+
+  step("5d. release: input is dropped again");
+  await page.getByRole("button", { name: "Release" }).click();
+  await page.getByRole("button", { name: "Take over" }).waitFor();
+  const lock = await page.request.get(
+    new URL(`/v1/sessions/${encodeURIComponent(sessionId)}/desktop/lock`, BASE).toString(),
+    { headers: { origin: BASE.origin } },
+  );
+  check(lock.ok(), `reading the desktop lock answered ${lock.status()}`);
+  check(
+    ((await lock.json()) as { lock: { held: boolean } }).lock.held === false,
+    "the lock is still held after Release",
+  );
+  const dropped = "file:///usr/";
+  const after = await rawKeys(page, sessionId, addressBarKeys(dropped));
+  check(after === "sent", `the raw RFB client did not get to send: ${after}`);
+  await canvas.click();
+  await page.keyboard.press(FOCUS_ADDRESS_BAR);
+  await page.keyboard.type(`${dropped}\n`);
+  urls = await waitForBoxUrl(box, dropped, 5_000);
+  check(!urls.includes(dropped), `input reached the box after Release: ${urls.join(", ")}`);
+  check(urls.includes(held), `the box browser left ${held}: ${urls.join(", ")}`);
 }
 
 async function install(browser: Browser): Promise<void> {
@@ -287,29 +556,12 @@ async function install(browser: Browser): Promise<void> {
   let problem: string | null = "not sampled yet";
   for (let i = 0; i < 60 && problem !== null; i++) {
     if (i > 0) await page.waitForTimeout(1000);
-    const rgb = await canvas.evaluate((c) => {
-      const el = c as unknown as {
-        width: number;
-        height: number;
-        getContext(kind: "2d"): {
-          getImageData(x: number, y: number, w: number, h: number): { data: ArrayLike<number> };
-        } | null;
-      };
-      const data = el.getContext("2d")?.getImageData(0, 0, el.width, el.height).data;
-      const out: number[] = [];
-      if (data === undefined) return out;
-      for (let y = 4; y < el.height; y += 8) {
-        for (let x = 4; x < el.width; x += 8) {
-          const at = (y * el.width + x) * 4;
-          out.push(data[at] ?? 0, data[at + 1] ?? 0, data[at + 2] ?? 0);
-        }
-      }
-      return out;
-    });
-    problem = desktopProblem(desktopStats(rgb));
+    problem = desktopProblem(desktopStats(await sampleCanvas(canvas)));
   }
   await shot(page, "3-desktop");
   check(problem === null, `the desktop is not drawn: ${problem}`);
+
+  await takeOver(page, box, sessionId);
 
   step("6. closing and reopening the page continues the session");
   await page.close();
@@ -330,6 +582,7 @@ async function install(browser: Browser): Promise<void> {
 
   writeFileSync(STATE, JSON.stringify({ sessionUrl, sessionId } satisfies State));
   await context.close();
+  check(cspViolations.length === 0, `CSP violations: ${cspViolations.join("; ")}`);
 }
 
 /**
@@ -464,6 +717,7 @@ async function upgrade(browser: Browser): Promise<void> {
   await page.getByText("Still here after the upgrade.").waitFor({ timeout: TURN_MS });
   await shot(page, "5-after-upgrade");
   await context.close();
+  check(cspViolations.length === 0, `CSP violations: ${cspViolations.join("; ")}`);
 }
 
 const phase = process.argv[2];

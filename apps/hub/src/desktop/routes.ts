@@ -11,8 +11,13 @@ import type { Context, Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { type AuthService, type HubEnv, SESSION_COOKIE } from "../auth";
 import type { DesktopBridge, Viewer, ViewerTicket } from "./bridge";
+import type { DesktopLocks } from "./lock";
 
 export const DESKTOP_PATH = "/v1/sessions/:id/desktop";
+/** The desktop lock (decision 0033): `GET` reads it, `POST` takes it over. */
+export const DESKTOP_LOCK_PATH = "/v1/sessions/:id/desktop/lock";
+/** `POST` hands the desktop lock back. */
+export const DESKTOP_RELEASE_PATH = "/v1/sessions/:id/desktop/lock/release";
 
 /** Per-socket data of a desktop WebSocket on the public listener. */
 export interface DesktopSocketData {
@@ -32,6 +37,7 @@ function statusFor(error: HearthError): 403 | 404 | 409 | 503 | 500 {
     case "session.not-found":
       return 404;
     case "session.unavailable":
+    case "desktop.locked":
       return 409;
     case "box.no-provider":
     case "box.connect-deadline":
@@ -82,4 +88,28 @@ export function mountDesktopRoute(
     // Bun answers the upgrade itself; this response is not sent.
     return new Response(null, { status: 101 });
   });
+}
+
+/**
+ * Mounts the desktop lock routes (decision 0033), behind the same guards.
+ * Each authorizes first (`desktop.view` to read, `desktop.control` to take
+ * over or release) against the session's workspace; the request body, if
+ * any, is never read.
+ */
+export function mountDesktopLockRoutes(app: Hono<HubEnv>, locks: DesktopLocks): void {
+  const answer = async (
+    c: Context<HubEnv>,
+    run: (principal: Principal, sessionId: string) => Promise<unknown>,
+  ) => {
+    try {
+      const lock = await run(c.get("principal"), c.req.param("id") ?? "");
+      return c.json({ ok: true, lock }, 200);
+    } catch (error) {
+      if (!(error instanceof HearthError)) throw error;
+      return fail(c, statusFor(error), error.code, error.message);
+    }
+  };
+  app.get(DESKTOP_LOCK_PATH, (c) => answer(c, (p, id) => locks.state(p, id)));
+  app.post(DESKTOP_LOCK_PATH, (c) => answer(c, (p, id) => locks.acquire(p, id)));
+  app.post(DESKTOP_RELEASE_PATH, (c) => answer(c, (p, id) => locks.release(p, id)));
 }

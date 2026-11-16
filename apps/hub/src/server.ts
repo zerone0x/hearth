@@ -28,7 +28,9 @@ import { ToolRpcClient } from "./box/tool-rpc";
 import {
   DESKTOP_CLOSE,
   DesktopBridge,
+  DesktopLocks,
   type DesktopSocketData,
+  mountDesktopLockRoutes,
   mountDesktopRoute,
   type Upgrader,
 } from "./desktop";
@@ -186,6 +188,8 @@ export interface HubOptions extends HubListenOptions {
   readonly heartbeat?: BoxConnectionsOptions["heartbeat"];
   /** Image of session boxes (`HEARTH_BOX_IMAGE`). Defaults to `DEFAULT_BOX_IMAGE`. */
   readonly boxImage?: string;
+  /** Lease of the desktop lock (decision 0033). Defaults to `DESKTOP_LOCK_TTL_MS`; tests change it. */
+  readonly desktopLockTtlMs?: number;
   /** Session manager timings and bounds (idle time, relaunch bounds); see `SessionManagerOptions`. */
   readonly sessions?: Partial<
     Pick<
@@ -519,11 +523,21 @@ export function startHub(options: HubOptions) {
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
+  // The desktop lock (decision 0033): who may type on a session's desktop.
+  const desktopLocks = new DesktopLocks({
+    authorizer,
+    sessions,
+    events,
+    ...(options.desktopLockTtlMs === undefined ? {} : { ttlMs: options.desktopLockTtlMs }),
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+  mountDesktopLockRoutes(app, desktopLocks);
   // The desktop stream (decision 0016): behind the login guard, owner only.
   desktop = new DesktopBridge({
     boxes,
     sessions,
     authorizer,
+    locks: desktopLocks,
     ...(options.log === undefined ? {} : { log: options.log }),
   });
   mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
@@ -551,6 +565,12 @@ export function startHub(options: HubOptions) {
     sessions,
     /** The pi runners (decision 0015), when `runner` is configured. */
     runners,
+    /**
+     * The desktop lock (decision 0033). Agent desktop and browser tools call
+     * `desktopLocks.isDesktopLocked(sessionId)` or `assertUnlocked(sessionId)`
+     * before they act (docs/runner.md).
+     */
+    desktopLocks,
     /** The tool RPC client the runners use, when `runner` is configured. */
     toolRpc,
     /** Mint a one-time join token for `boxId`, bound to `sessionId`. */
@@ -618,6 +638,7 @@ export function startHub(options: HubOptions) {
       toolRpc?.close();
       void runners?.close();
       desktop?.shutdown();
+      desktopLocks.shutdown();
       boxes.shutdown();
       stopped = (async () => {
         await sessions.ready.catch(() => undefined);

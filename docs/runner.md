@@ -70,12 +70,32 @@ path. The box is the boundary; approvals with a human in the loop are M3.
 Every session also has the `browser_*` tools: `browser_navigate`,
 `browser_back`, `browser_forward`, `browser_snapshot`, `browser_find`,
 `browser_click`, `browser_type`, `browser_select`, `browser_press`,
-`browser_wait`, `browser_screenshot` and `browser_tabs`. They drive the box desktop's Chromium over CDP, so the owner
-watches them on the live desktop. Results carry an accessibility snapshot
+`browser_wait`, `browser_screenshot` and `browser_tabs`. They drive the box
+desktop's Chromium over CDP, so the owner watches them on the live desktop. Results carry an accessibility snapshot
 whose refs (`s3e12`) are valid until the next snapshot or action; an acting
 call with `expect` is checked by the box, and one that is not `done` fails
 the tool call. Screenshots reach the model as image results. A box image
-older than protocol 1.3 answers that it has no browser tools.
+older than protocol 1.3 answers that it has no browser tools. They do not
+check the desktop lock below yet; that is #126.
+
+## Desktop lock: agent desktop and browser tools (decision 0033)
+
+While the owner holds a session's desktop lock (the Take over button), the
+agent's desktop and browser input tools must not act. The hub exposes the
+check as `hub.desktopLocks` (`apps/hub/src/desktop/lock.ts`):
+
+| Call | Answer |
+|---|---|
+| `isDesktopLocked(sessionId)` | `true` while someone holds the lock (a lapsed lease counts as free) |
+| `assertUnlocked(sessionId)` | throws `HearthError` code `desktop.locked`, message `user is in control` (owner `user`, disposition `retry`) while it is held |
+| `holder(sessionId)` | `{ kind, principalId }` or `undefined` |
+
+A tool that drives the box desktop or browser (the `browser_*` tools of #116)
+calls `assertUnlocked` before it sends anything to the box and returns the
+error to the model as its result, so the model reads "user is in control" and
+can wait or ask. Read-only tools (a screenshot) may keep working. Releasing
+the lock, closing the tab and a lapsed lease all free it at once; the next
+call succeeds.
 
 ## Tests
 

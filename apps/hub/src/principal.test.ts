@@ -338,6 +338,80 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     expect(f.eventCount(id, "trajectory.label")).toBe(0);
   });
 
+  test("desktop lock routes: read, take over, release (decision 0033)", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const workspace = f.sessionWorkspace(id);
+    const from = mark(f);
+    const read = await f.request(`/v1/sessions/${id}/desktop/lock`);
+    expect(read.status).toBe(200);
+    expect(((await read.json()) as { lock: { held: boolean } }).lock.held).toBe(false);
+    const taken = await f.request(`/v1/sessions/${id}/desktop/lock`, { body: {} });
+    expect(taken.status).toBe(200);
+    expect(((await taken.json()) as { lock: unknown }).lock).toMatchObject({
+      held: true,
+      mine: true,
+      holder: { kind: "person", principalId: OTHER.id },
+    });
+    expect(f.hub.desktopLocks.isDesktopLocked(id)).toBe(true);
+    const released = await f.request(`/v1/sessions/${id}/desktop/lock/release`, { body: {} });
+    expect(released.status).toBe(200);
+    expect(f.hub.desktopLocks.isDesktopLocked(id)).toBe(false);
+    expectOther(f, from, ["desktop.view", "desktop.control", "session.read"]);
+    expect(f.auditRows().slice(from.rows)).toEqual(
+      ["desktop.view", "session.read", "desktop.control", "session.read"]
+        .concat(["desktop.control", "session.read"])
+        .map((action) => ({
+          principal_id: OTHER.id,
+          action,
+          resource_workspace_id: workspace,
+          allowed: 1,
+        })),
+    );
+    expect(f.eventCount(id, "desktop.lock")).toBe(2);
+  });
+
+  test("desktop lock routes: checked against the session's workspace; refused, nothing recorded", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const workspace = f.sessionWorkspace(id);
+    f.signedIn.principal = STRANGER;
+    const from = mark(f);
+    expect((await f.request(`/v1/sessions/${id}/desktop/lock`, { body: {} })).status).toBe(403);
+    expect((await f.request(`/v1/sessions/${id}/desktop/lock/release`, { body: {} })).status).toBe(
+      403,
+    );
+    expect(f.auditRows().slice(from.rows)).toEqual(
+      ["desktop.control", "desktop.control"].map((action) => ({
+        principal_id: STRANGER.id,
+        action,
+        resource_workspace_id: workspace,
+        allowed: 0,
+      })),
+    );
+    expect(f.eventCount(id, "desktop.lock")).toBe(0);
+    expect(f.hub.desktopLocks.isDesktopLocked(id)).toBe(false);
+  });
+
+  test("desktop lock routes: a lock someone else holds is 409 desktop.locked", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    expect((await f.request(`/v1/sessions/${id}/desktop/lock`, { body: {} })).status).toBe(200);
+    f.signedIn.principal = { ...OTHER, id: "usr_third" };
+    const refused = await f.request(`/v1/sessions/${id}/desktop/lock`, { body: {} });
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe(
+      "desktop.locked",
+    );
+    const archived = await f.createSession();
+    expect((await f.request(`/v1/sessions/${archived}/archive`, { body: {} })).status).toBe(200);
+    const late = await f.request(`/v1/sessions/${archived}/desktop/lock`, { body: {} });
+    expect(late.status).toBe(409);
+    expect(((await late.json()) as { error: { code: string } }).error.code).toBe(
+      "session.unavailable",
+    );
+  });
+
   test("box echo", async () => {
     const f = fixture();
     const from = mark(f);

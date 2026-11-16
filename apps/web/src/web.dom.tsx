@@ -172,6 +172,7 @@ describe("desktop panel in a DOM", () => {
   /** A stand-in for noVNC's RFB and the WebSocket, counting what gets opened. */
   function fakes() {
     const opened = { sockets: 0, clients: 0 };
+    const clients: FakeRfb[] = [];
     class FakeSocket extends EventTarget {
       constructor() {
         super();
@@ -182,9 +183,14 @@ describe("desktop panel in a DOM", () => {
       viewOnly = false;
       scaleViewport = false;
       resizeSession = false;
+      focused = 0;
       constructor() {
         super();
         opened.clients += 1;
+        clients.push(this);
+      }
+      focus() {
+        this.focused += 1;
       }
       disconnect() {}
     }
@@ -203,7 +209,13 @@ describe("desktop panel in a DOM", () => {
       globalThis.WebSocket = realSocket;
       loadNoVnc.load = realLoad;
     };
-    return { opened, release: (ok = true) => release(ok), loads: () => loads, restore };
+    return {
+      opened,
+      clients,
+      release: (ok = true) => release(ok),
+      loads: () => loads,
+      restore,
+    };
   }
 
   test("noVNC loads on Open desktop, not before", async () => {
@@ -242,6 +254,91 @@ describe("desktop panel in a DOM", () => {
       expect(screen.getByText("The desktop viewer did not load.")).toBeTruthy();
       expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy();
       expect(f.opened.sockets).toBe(0);
+    } finally {
+      f.restore();
+    }
+  });
+
+  test("Take over sends input through noVNC; Release makes it view-only again", async () => {
+    const f = fakes();
+    let lock = { held: false, mine: false, holder: null as unknown, expiresAt: null as unknown };
+    const mineLock = {
+      held: true,
+      mine: true,
+      holder: { kind: "person", principalId: "usr_owner" },
+      expiresAt: 1,
+    };
+    const free = { held: false, mine: false, holder: null, expiresAt: null };
+    const calls = hub((method, path) => {
+      if (path !== "/v1/sessions/se_1/desktop/lock" && !path.endsWith("/lock/release")) {
+        return undefined;
+      }
+      if (method === "POST" && path.endsWith("/release")) lock = free;
+      else if (method === "POST") lock = mineLock;
+      return ok({ lock });
+    });
+    try {
+      render(
+        <QueryClientProvider client={createQueryClient()}>
+          <DesktopPanel sessionId="se_1" />
+        </QueryClientProvider>,
+      );
+      // No lock calls before the desktop is open.
+      fireEvent.click(screen.getByRole("button", { name: "Open desktop" }));
+      await act(async () => f.release());
+      expect(calls.some((c) => c.path.includes("/desktop/lock"))).toBe(false);
+      const client = f.clients[0] as (typeof f.clients)[number];
+      expect(client.viewOnly).toBe(true);
+      await act(async () => client.dispatchEvent(new Event("connect")));
+      const take = await screen.findByRole("button", { name: "Take over" });
+      await waitFor(() => expect((take as HTMLButtonElement).disabled).toBe(false));
+      expect(client.viewOnly).toBe(true);
+
+      fireEvent.click(take);
+      await screen.findByRole("button", { name: "Release" });
+      expect(
+        calls.some((c) => c.method === "POST" && c.path === "/v1/sessions/se_1/desktop/lock"),
+      ).toBe(true);
+      await waitFor(() => expect(client.viewOnly).toBe(false));
+      expect(client.focused).toBe(1);
+      expect(screen.getByText(/You are in control/)).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: "Release" }));
+      await screen.findByRole("button", { name: "Take over" });
+      await waitFor(() => expect(client.viewOnly).toBe(true));
+    } finally {
+      f.restore();
+    }
+  });
+
+  test("a lock someone else holds disables Take over and says so", async () => {
+    const f = fakes();
+    hub((_method, path) =>
+      path === "/v1/sessions/se_1/desktop/lock"
+        ? ok({
+            lock: {
+              held: true,
+              mine: false,
+              holder: { kind: "person", principalId: "usr_x" },
+              expiresAt: 1,
+            },
+          })
+        : undefined,
+    );
+    try {
+      render(
+        <QueryClientProvider client={createQueryClient()}>
+          <DesktopPanel sessionId="se_1" />
+        </QueryClientProvider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Open desktop" }));
+      await act(async () => f.release());
+      const client = f.clients[0] as (typeof f.clients)[number];
+      await act(async () => client.dispatchEvent(new Event("connect")));
+      await screen.findByText("Someone else is in control.");
+      const take = screen.getByRole("button", { name: "Take over" }) as HTMLButtonElement;
+      expect(take.disabled).toBe(true);
+      expect(client.viewOnly).toBe(true);
     } finally {
       f.restore();
     }
