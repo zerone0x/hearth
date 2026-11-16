@@ -5,8 +5,12 @@ import {
   type BoxProvider,
   type BoxSpec,
   DEFAULT_WORKSPACE_ID,
+  createDefaultSecretStore,
   HearthError,
   type Principal,
+  type SecretRef,
+  type SecretStore,
+  VaultSecretResolver,
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
 import { AuthService } from "./auth";
@@ -43,7 +47,9 @@ import {
   SqliteEventStore,
   SqliteLoginStore,
   SqliteSessionStore,
+  SqliteVaultStore,
 } from "./store";
+import { HubVault, mountVaultRoutes } from "./vault";
 
 /** `req.url` as a URL, or undefined when it is not absolute (an empty or malformed Host). */
 function parseUrl(req: Request): URL | undefined {
@@ -134,7 +140,24 @@ export interface HubOptions extends HubListenOptions {
    * The hub-side pi runner (#43, decision 0015): model, key reference,
    * deny-list, extension allowlist. Without it the message routes are not served.
    */
-  readonly runner?: Omit<SessionRunnersOptions, "authorizer" | "events" | "sessions" | "tools">;
+  readonly runner?: Omit<
+    SessionRunnersOptions,
+    "authorizer" | "events" | "sessions" | "tools" | "secrets"
+  > & {
+    /** The runner's SecretStore. Default: the hub's own (`env:`, `file:`, `vault:`). */
+    readonly secrets?: SecretStore;
+  };
+  /**
+   * The vault (decision 0031): the key references and the store that resolves
+   * them (`env:` / `file:` only). Without a key reference the vault is
+   * disabled (`key-missing`); the hub runs on.
+   */
+  readonly vault?: {
+    readonly keyRef?: SecretRef;
+    readonly nextKeyRef?: SecretRef;
+    /** Resolves the key references. Default `createDefaultSecretStore()`. */
+    readonly keySecrets?: SecretStore;
+  };
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
@@ -206,6 +229,20 @@ export function startHub(options: HubOptions) {
   const events = new SqliteEventStore(db);
   const credentials = new SqliteBoxCredentialStore(db);
   const sessionStore = new SqliteSessionStore(db);
+  // The vault (decision 0031): opened in the background; a `vault:` resolve
+  // waits for it. A missing or wrong key disables it and nothing else.
+  const vault = new HubVault({
+    store: new SqliteVaultStore(db),
+    authorizer,
+    audit,
+    keySecrets: options.vault?.keySecrets ?? createDefaultSecretStore(),
+    ...(options.vault?.keyRef === undefined ? {} : { keyRef: options.vault.keyRef }),
+    ...(options.vault?.nextKeyRef === undefined ? {} : { nextKeyRef: options.vault.nextKeyRef }),
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+  const vaultReady = vault.open();
+  /** The hub's SecretStore: `env:`, `file:` and `vault:` (E7). */
+  const secrets = createDefaultSecretStore({ resolvers: [new VaultSecretResolver(vault)] });
   const boxes = new BoxConnections({
     authorizer,
     events,
@@ -454,6 +491,7 @@ export function startHub(options: HubOptions) {
       ? undefined
       : new SessionRunners({
           ...options.runner,
+          secrets: options.runner.secrets ?? secrets,
           authorizer,
           events,
           sessions: {
@@ -465,6 +503,7 @@ export function startHub(options: HubOptions) {
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
+  mountVaultRoutes(app, vault);
   // The desktop stream (decision 0016): behind the login guard, owner only.
   desktop = new DesktopBridge({
     boxes,
@@ -493,6 +532,11 @@ export function startHub(options: HubOptions) {
     boxes,
     /** The local login: owner password and login sessions (decision 0014). */
     auth,
+    /** The vault (decision 0031) and its first open. */
+    vault,
+    vaultReady,
+    /** The hub's SecretStore: `env:`, `file:` and `vault:`. */
+    secrets,
     /** The session manager: sessions, lazy box start, hibernate, supervision (decision 0013). */
     sessions,
     /** The pi runners (decision 0015), when `runner` is configured. */

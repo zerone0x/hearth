@@ -116,9 +116,27 @@ export async function registerStartupSecrets(
   runnerConfig: Pick<RunnerConfig, "apiKeyRef"> | undefined,
   log: { warn(message: string): void },
 ): Promise<void> {
-  if (runnerConfig?.apiKeyRef !== undefined) {
+  // A `vault:` key is registered by the vault itself when it opens (decision 0031).
+  if (runnerConfig?.apiKeyRef !== undefined && !runnerConfig.apiKeyRef.startsWith("vault:")) {
     await registerKnownSecrets(secrets, [runnerConfig.apiKeyRef], (m) => log.warn(m));
   }
+}
+
+/**
+ * The vault's key references (decision 0031): `HEARTH_VAULT_KEY_REF`, the key
+ * file written by `install:vault-key`, and `HEARTH_VAULT_KEY_NEXT_REF`, the
+ * key to rotate to. Both are SecretStore references (`file:` or `env:`).
+ */
+export function vaultConfigFromEnv(env: Readonly<Record<string, string | undefined>>): {
+  keyRef?: string;
+  nextKeyRef?: string;
+} {
+  const keyRef = env["HEARTH_VAULT_KEY_REF"];
+  const nextKeyRef = env["HEARTH_VAULT_KEY_NEXT_REF"];
+  return {
+    ...(keyRef ? { keyRef } : {}),
+    ...(nextKeyRef ? { nextKeyRef } : {}),
+  };
 }
 
 if (import.meta.main) {
@@ -145,10 +163,11 @@ if (import.meta.main) {
       : {
           runner: {
             config: runnerConfig,
-            secrets,
             telemetry: obs.telemetry,
           },
         }),
+    // The vault's key is read through the env:/file: store (decision 0031).
+    vault: { ...vaultConfigFromEnv(process.env), keySecrets: secrets },
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
     port: parsePort(process.env["HEARTH_PORT"]),
     // Box listeners bind each box network's gateway on this port (0012).
@@ -168,6 +187,8 @@ if (import.meta.main) {
     hub_version: HUB_VERSION,
   });
   log.info(webRoot === undefined ? "web UI: not built" : `web UI: ${webRoot}`);
+  // The vault logs its own state ("vault: enabled" or "vault: disabled (reason)").
+  void hub.vaultReady;
   if (provider !== undefined) {
     // Boxes still running from before a restart get their listeners back. A
     // daemon that is down is not fatal: the hub serves the API and keeps

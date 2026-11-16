@@ -19,6 +19,11 @@ export function registerSecret(value: string): void {
   if (value.length > 0) known.add(value);
 }
 
+/** The registered values, for redactors that work on their own set (the runner's). */
+export function knownSecrets(): Iterable<string> {
+  return known;
+}
+
 /** `text` with every registered secret and every credential shape redacted. */
 export function redactHub(text: string): string {
   return redactLine(text, known);

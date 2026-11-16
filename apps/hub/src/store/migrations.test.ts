@@ -51,7 +51,7 @@ describe("migrate", () => {
     old.close();
 
     const db = openDatabase(path, { migrate: false });
-    expect(migrate(db)).toEqual([5]);
+    expect(migrate(db, MIGRATIONS.slice(0, 5))).toEqual([5]);
     expect(MIGRATIONS[4]?.name).toBe("owner password and login sessions");
     expect(versions(db)).toEqual([1, 2, 3, 4, 5]);
     const tables = db
@@ -61,6 +61,21 @@ describe("migrate", () => {
     expect(tables).toEqual(
       expect.arrayContaining(["session_operation", "owner_password", "login_session"]),
     );
+    db.close();
+  });
+
+  test("a database at the login (5) upgrades to the vault (6) with no key row and no secrets", () => {
+    const path = join(dir, "hub5.db");
+    const old = openDatabase(path, { migrate: false });
+    migrate(old, MIGRATIONS.slice(0, 5));
+    old.close();
+    const db = openDatabase(path, { migrate: false });
+    expect(migrate(db)).toEqual([6]);
+    expect(MIGRATIONS[5]?.name).toBe("vault: wrapped data key and encrypted secrets");
+    const count = (table: string) =>
+      db.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n;
+    expect(count("vault_key")).toBe(0);
+    expect(count("secret")).toBe(0);
     db.close();
   });
 

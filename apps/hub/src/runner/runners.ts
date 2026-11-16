@@ -34,7 +34,7 @@ import {
   type WorkspaceScope,
 } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
-import { registerSecret } from "../obs/redaction";
+import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
@@ -142,9 +142,13 @@ export class SessionRunners {
     this.#extensions = selection.loaded;
   }
 
-  /** `text` with every secret the runners use replaced (decision 0015). */
+  /**
+   * `text` with every secret the runners use replaced (decision 0015), and
+   * every value in the hub's registry (decision 0021), which holds each vault
+   * value saved, used or found at open (decision 0031).
+   */
   redact(text: string): string {
-    return redactSecrets(text, this.#secretValues);
+    return redactSecrets(redactSecrets(text, this.#secretValues), knownSecrets());
   }
 
   #log(line: string): void {
