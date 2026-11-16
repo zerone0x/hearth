@@ -862,6 +862,22 @@ describe("data key rotation", () => {
     expect((await again.secrets.resolve("vault:two")).reveal()).toBe(MODEL_KEY_2);
   });
 
+  test("creates racing data key rotations are serialized: every entry still decrypts", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const work: Promise<unknown>[] = [];
+    for (let i = 0; i < 6; i++) {
+      work.push(h.vault.rotateDataKey(LOCAL_PRINCIPAL));
+      work.push(addModelKey(h, `race-${i}`, `race-value-${i}-0e9d`));
+    }
+    await Promise.all(work);
+    for (let i = 0; i < 6; i++) {
+      expect((await h.secrets.resolve(`vault:race-${i}`)).reveal()).toBe(`race-value-${i}-0e9d`);
+    }
+    // A failed write does not stall the ones after it.
+    await expect(addModelKey(h, "race-0")).rejects.toMatchObject({ code: "secret.name-taken" });
+    expect(await addModelKey(h, "after-failure")).toMatchObject({ version: 1 });
+  });
+
   test("a crash in the middle of a data key rotation keeps the old data key and ciphertexts", async () => {
     const h = await start({
       env: { VAULT_KEY: KEY_A },

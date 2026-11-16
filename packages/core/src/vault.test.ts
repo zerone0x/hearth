@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { createDefaultSecretStore, displayRef, parseVaultRefBody, SecretError } from "./secrets";
 import {
   canonicalPolicy,
+  checkEntryFields,
   type EntryBinding,
   entryAad,
   generateDataKey,
+  MAX_VAULT_FIELD_CHARS,
   MasterKeyProvider,
   openEntry,
   parseMasterKey,
@@ -164,7 +166,66 @@ describe("master key text", () => {
     expect(parseMasterKey(Buffer.alloc(33, 1).toString("base64"))).toBeUndefined();
     expect(parseMasterKey("not a key")).toBeUndefined();
     expect(parseMasterKey("")).toBeUndefined();
+    // 43 base64 characters decode to 32 bytes, but a character outside base64 is refused.
+    expect(parseMasterKey(`${"A".repeat(43)}!`)).toBeUndefined();
     expect(parseMasterKey(Buffer.alloc(32, 200).toString("latin1"))).toBeUndefined();
+  });
+});
+
+const invalid = expect.objectContaining({ code: "request.invalid" });
+
+describe("input checks", () => {
+  test("policy: every malformed shape is request.invalid", () => {
+    const bad: [Parameters<typeof canonicalPolicy>[0], unknown][] = [
+      ["login", "x"],
+      ["login", { origins: "https://a.example" }],
+      ["login", { origins: [1] }],
+      ["login", { origins: ["not a url"] }],
+      ["login", { origins: ["https://a.example"], allow_any_field: "yes" }],
+      ["token", { use: "hub", extra: true }],
+      ["token", { hosts: ["ok.example", "bad host"] }],
+      ["token", { hosts: ["-bad.example"] }],
+      ["model-key", { use: "hub" }],
+    ];
+    for (const [kind, policy] of bad) {
+      expect(() => canonicalPolicy(kind, policy)).toThrow(invalid);
+    }
+  });
+
+  test("fields: exactly the kind's fields, non-blank, at most the cap", () => {
+    expect(checkEntryFields("token", { value: "x".repeat(MAX_VAULT_FIELD_CHARS) })).toEqual({
+      value: "x".repeat(MAX_VAULT_FIELD_CHARS),
+    });
+    const bad: [Parameters<typeof checkEntryFields>[0], unknown][] = [
+      ["token", "x"],
+      ["token", { value: "v", other: "w" }],
+      ["login", { username: "u" }],
+      ["token", { value: " " }],
+      ["token", { value: 1 }],
+      ["token", { value: "x".repeat(MAX_VAULT_FIELD_CHARS + 1) }],
+    ];
+    for (const [kind, fields] of bad) {
+      expect(() => checkEntryFields(kind, fields)).toThrow(invalid);
+    }
+  });
+
+  test("a version below 1 or not an integer is not bound", async () => {
+    await expect(entryAad({ ...login, version: 0 })).rejects.toThrow("positive integer");
+    await expect(entryAad({ ...login, version: 1.5 })).rejects.toThrow("positive integer");
+  });
+
+  test("a master key of the wrong length is refused", async () => {
+    await expect(MasterKeyProvider.fromBytes(new Uint8Array(16))).rejects.toThrow("32 bytes");
+  });
+
+  test("a decrypted payload that is not string fields is corrupt", async () => {
+    const dek = await generateDataKey();
+    for (const payload of [["x"], { value: 1 }]) {
+      const sealed = await sealEntry(dek, login, payload as unknown as Record<string, string>);
+      const error = await openEntry(dek, login, sealed).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(VaultCryptoError);
+      expect((error as Error).name).toBe("VaultCryptoError");
+    }
   });
 });
 
