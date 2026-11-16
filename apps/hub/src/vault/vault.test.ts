@@ -961,6 +961,13 @@ describe("master key rotation through vault_key.next", () => {
     });
     expect(missing.status).toMatchObject({ state: "disabled", reason: "key-missing" });
     expect(kekCheck(missing.db)).toBe(checkA);
+    // A copy of the current key as the next one is no rotation.
+    const same = await start({
+      env: { VAULT_KEY: KEY_A, VAULT_KEY_NEXT: KEY_A },
+      nextKeyRef: "env:VAULT_KEY_NEXT",
+    });
+    expect(same.status).toMatchObject({ state: "enabled", key: "current" });
+    expect(auditRows(same.db, "vault.key.rotate")).toHaveLength(0);
   });
 
   test("an entry that does not decrypt keeps its fingerprint; the rotation goes on", async () => {
