@@ -180,9 +180,10 @@ export class BrowserTools {
         message: `${ref} is not a ref from a snapshot (refs look like s3e12); take a snapshot`,
       };
     }
+    // `#latest` holds only each tab's latest generation: an older one is not in it.
     const tab = this.#latest.get(parsed.generation)?.deref();
     const state = tab === undefined ? undefined : this.#state.get(tab);
-    if (tab === undefined || state === undefined || state.generation !== parsed.generation) {
+    if (tab === undefined || state === undefined) {
       return {
         kind: "stale",
         message:
