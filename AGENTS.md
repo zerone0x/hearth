@@ -69,6 +69,9 @@ there is no build step between workspaces. The one build is `apps/web`
   run that did not happen as a pass.
 - Tests that need Docker run only when `HEARTH_DOCKER_TESTS=1` is set. A PR lists
   them as "not run" when Docker was not available.
+- Some words are forbidden anywhere in the repo and are stored only as SHA-256 hashes in
+  `scripts/forbidden-terms.json`; `bun run forbidden` (part of `bun run check`) names the
+  file and line of a hit, never the word. Never add a plain term.
 - Run long commands under a timeout. Tests must be hermetic: temporary
   directories, port 0, and no reliance on the user's home or dotfiles.
 

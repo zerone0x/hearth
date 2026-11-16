@@ -10,12 +10,13 @@
     "deploy/e2e"
   ],
   "scripts": {
-    "check": "bun run typecheck && bun run lint && bun run format:check && bun run pins && bun run test",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run pins && bun run forbidden && bun run test",
     "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json",
     "lint": "biome check --formatter-enabled=false .",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "pins": "bun scripts/check-pins.ts",
+    "forbidden": "bun scripts/check-forbidden.ts",
     "test": "bun test && bun run test:dom",
     "test:dom": "bun test ./apps/web/src/web.dom.tsx",
     "dev:hub": "bun run --filter @hearth/hub dev",
