@@ -1,6 +1,9 @@
 import { HearthError } from "@hearth/core";
+import { BROWSER_CONNECT_TIMEOUT_MS } from "@hearth/protocol";
 import { describeBoxAgent } from "./agent";
 import { EXIT_CONFIG, hardenOrExit, takeJoinToken } from "./boot";
+import { PlaywrightDriver } from "./browser/playwright";
+import { BrowserTools } from "./browser/tools";
 import { BoxAgent } from "./connection";
 import { DEFAULT_EXEC_ENV } from "./tools/executor";
 import { DEFAULT_VNC_PORT } from "./vnc";
@@ -18,6 +21,9 @@ const DEFAULT_WORKSPACE = "/workspace";
 const DISPLAY_VAR = "HEARTH_DISPLAY";
 /** The port Xvnc listens on in the box (loopback only), as the image's entrypoint uses it. */
 const VNC_PORT_VAR = "HEARTH_VNC_PORT";
+/** The port of the desktop Chromium's CDP endpoint on loopback (decision 0026). */
+const CDP_PORT_VAR = "HEARTH_CDP_PORT";
+const DEFAULT_CDP_PORT = 9222;
 
 const info = describeBoxAgent();
 const banner = `hearth box-agent (protocol ${info.protocol}, pi ${info.pi})`;
@@ -55,15 +61,31 @@ async function main(): Promise<number> {
     console.error(`${banner}: ${VNC_PORT_VAR} must be a port number`);
     return EXIT_CONFIG;
   }
+  const cdpPort = Number(process.env[CDP_PORT_VAR] || DEFAULT_CDP_PORT);
+  if (!Number.isInteger(cdpPort) || cdpPort < 1 || cdpPort > 65535) {
+    console.error(`${banner}: ${CDP_PORT_VAR} must be a port number`);
+    return EXIT_CONFIG;
+  }
+  const root = process.env[WORKSPACE_VAR] || DEFAULT_WORKSPACE;
+  // The browser tools (decision 0032): one lazy CDP connection to the desktop's Chromium.
+  const browser = new BrowserTools({
+    root,
+    driver: new PlaywrightDriver({
+      endpoint: `http://127.0.0.1:${cdpPort}`,
+      connectTimeoutMs: BROWSER_CONNECT_TIMEOUT_MS,
+      log: (line) => console.error(line),
+    }),
+  });
   const agent = new BoxAgent({
     hubUrl,
     boxId,
     joinToken,
     tools: {
-      root: process.env[WORKSPACE_VAR] || DEFAULT_WORKSPACE,
+      root,
       // Commands get the box's own minimal environment, never this process's,
       // which holds the join token (PRD §8.2.1).
       env: { ...DEFAULT_EXEC_ENV, ...(display ? { DISPLAY: display } : {}) },
+      browser,
     },
     vnc: { port: vncPort },
   });

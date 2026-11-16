@@ -23,6 +23,7 @@
 import { randomUUID } from "node:crypto";
 import { type BoxId, HearthError } from "@hearth/core";
 import {
+  type BrowserMethod,
   classifyToolError,
   DEFAULT_EXEC_TIMEOUT_MS,
   decodeToolResult,
@@ -134,6 +135,14 @@ export interface BoxToolOperations {
     isDirectory(absolutePath: string): Promise<boolean>;
     /** Not in pi's `GrepOperations`: the runner's grep `execute()` calls it. */
     search(params: CallParams<"tool.grep">): Promise<ToolResults["tool.grep"]>;
+  };
+  /** The browser methods (protocol 1.3, decision 0032); the runner's `browser_*` tools call them. */
+  readonly browser: {
+    call<M extends BrowserMethod>(
+      method: M,
+      params: CallParams<M>,
+      signal?: AbortSignal,
+    ): Promise<ToolResults[M]>;
   };
 }
 
@@ -353,6 +362,7 @@ export class ToolRpcClient {
         isDirectory: async (path) => (await call("tool.stat", { path })).isDirectory,
         search: (params) => call("tool.grep", params),
       },
+      browser: { call: (method, params, signal) => call(method, params, signal) },
     };
   }
 

@@ -54,6 +54,13 @@ jobs:
         run: timeout 300 bun x playwright install --with-deps --only-shell chromium
       - name: Build the web UI
         run: timeout 300 bun run build:web
+      # Browser tools on playwright-core against Playwright's headless shell over
+      # CDP (#116, decision 0032): refs, refusals, verification, reconnect.
+      - name: Browser tools on a real Chromium over CDP
+        run: |
+          shell="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell | head -1)"
+          test -x "$shell"
+          HEARTH_CHROMIUM="$shell" timeout 300 bun test apps/box-agent/src/browser/playwright.test.ts apps/hub/src/runner/browser-tools.chromium.test.ts
       - name: Web e2e (setup, login, session, tool card, desktop, reload, asleep, mobile)
         env:
           HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/web-e2e
@@ -162,6 +169,15 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/runner/runner.docker.test.ts
+      # Browser tools (#116, decision 0032): on the faux model the agent opens a
+      # page served inside the box in the box's Chromium (CDP, decision 0026),
+      # types, selects and clicks by ref with a verified expectation, takes a
+      # screenshot, and the box's server log shows the submitted values.
+      - name: Browser tools in a Docker box under the firewall (M2, #116)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+        run: timeout 600 bun test apps/hub/src/runner/browser.docker.test.ts
       # Desktop stream (#45; decision 0016): the real Xvnc banner through the hub.
       - name: Desktop stream reads the real Xvnc banner through the hub, egress filtered
         env:

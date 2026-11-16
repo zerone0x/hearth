@@ -65,6 +65,19 @@ an `rm\s+-rf` rule and are known: `rm -fr`, `rm -r -f`, `X=rm; $X -rf`,
 `bash -c "r""m -rf"`, `base64 -d | sh`. Write content is not tested, only the
 path. The box is the boundary; approvals with a human in the loop are M3.
 
+## Browser tools (decision 0032)
+
+Every session also has the `browser_*` tools: `browser_navigate`,
+`browser_back`, `browser_forward`, `browser_snapshot`, `browser_find`,
+`browser_click`, `browser_type`, `browser_select`, `browser_press`,
+`browser_wait`, `browser_screenshot` and `browser_tabs`. They drive the box
+desktop's Chromium over CDP, so the owner watches them on the live desktop. Results carry an accessibility snapshot
+whose refs (`s3e12`) are valid until the next snapshot or action; an acting
+call with `expect` is checked by the box, and one that is not `done` fails
+the tool call. Screenshots reach the model as image results. A box image
+older than protocol 1.3 answers that it has no browser tools. They do not
+check the desktop lock below yet; that is #126.
+
 ## Desktop lock: agent desktop and browser tools (decision 0033)
 
 While the owner holds a session's desktop lock (the Take over button), the

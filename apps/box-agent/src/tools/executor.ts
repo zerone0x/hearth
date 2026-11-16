@@ -13,9 +13,13 @@ import { access, constants, mkdir, open, readdir, realpath, stat } from "node:fs
 import { posix } from "node:path";
 import type { Logger } from "@hearth/core";
 import {
+  type BrowserMethod,
+  type BrowserParams,
+  browserBudgetMs,
   decodeToolParams,
   EXEC_SPILL_DIR,
   FILE_TIMEOUT_MS,
+  isBrowserMethod,
   isToolMethod,
   type JsonValue,
   MAX_CONCURRENT_TOOL_CALLS,
@@ -32,6 +36,7 @@ import {
   type ToolResults,
   truncationMarker,
 } from "@hearth/protocol";
+import type { BrowserTools } from "../browser/tools";
 import { ToolCallError, toToolError } from "./errors";
 import { openPlainFile, Workspace } from "./paths";
 import { runProcess } from "./process";
@@ -72,6 +77,12 @@ export interface ToolExecutorOptions {
    * Without one, calls are not logged.
    */
   readonly logger?: Logger;
+  /**
+   * The browser tools (protocol 1.3, decision 0032). Without them the
+   * `browser.*` methods are not handled, so the box answers them
+   * `unknown-method` like a 1.2 box.
+   */
+  readonly browser?: BrowserTools;
 }
 
 type CallState =
@@ -122,12 +133,13 @@ export class ToolExecutor {
 
   /** True for the methods this executor answers. */
   handles(method: string): boolean {
+    if (isBrowserMethod(method)) return this.#options.browser !== undefined;
     return isToolMethod(method);
   }
 
   /** Handle one tool `rpc`. The answer goes out through `send`, now or later. */
   handle(frame: RpcFrame): void {
-    if (!isToolMethod(frame.method)) {
+    if (!this.handles(frame.method) || !isToolMethod(frame.method)) {
       this.#reply(frame.id, new ToolCallError("tool.bad-params", `no method ${frame.method}`));
       return;
     }
@@ -226,7 +238,12 @@ export class ToolExecutor {
         log.info("tool call done", {
           ok: true,
           duration_ms,
-          ...(typeof exit.outcome === "string" ? { exec_outcome: exit.outcome } : {}),
+          ...(typeof exit.outcome === "string"
+            ? {
+                [frame.method.startsWith("browser.") ? "browser_outcome" : "exec_outcome"]:
+                  exit.outcome,
+              }
+            : {}),
           ...(exit.exitCode === undefined ? {} : { exit_code: exit.exitCode }),
         });
       } else {
@@ -266,6 +283,9 @@ export class ToolExecutor {
     rpcId: string,
     signal: AbortSignal,
   ): Promise<JsonValue> {
+    if (isBrowserMethod(method)) {
+      return await this.#browserCall(method, params as BrowserParams[typeof method], signal);
+    }
     switch (method) {
       case "tool.glob":
         return await this.glob(params as ToolParams["tool.glob"], signal);
@@ -279,12 +299,38 @@ export class ToolExecutor {
   }
 
   /**
+   * A browser call under its own budget (`browserBudgetMs`), counted from
+   * when it arrived, so a call queued behind another still answers before
+   * the hub's deadline.
+   */
+  async #browserCall<M extends BrowserMethod>(
+    method: M,
+    params: BrowserParams[M],
+    signal: AbortSignal,
+  ): Promise<JsonValue> {
+    const browser = this.#options.browser as BrowserTools;
+    const budget = browserBudgetMs(method, params);
+    const deadline = Date.now() + budget;
+    return (await this.#withFileBudget(
+      method,
+      signal,
+      () => browser.run(method, params, { signal, deadline }),
+      budget,
+    )) as unknown as JsonValue;
+  }
+
+  /**
    * Runs a file method under its own budget (`FILE_TIMEOUT_MS`) and the call's
    * cancel. An I/O the kernel keeps blocked cannot be interrupted, but the call
    * is answered and its slot freed.
    */
-  async #withFileBudget<T>(method: string, signal: AbortSignal, run: () => Promise<T>): Promise<T> {
-    const budget = this.#options.fileTimeoutMs ?? FILE_TIMEOUT_MS;
+  async #withFileBudget<T>(
+    method: string,
+    signal: AbortSignal,
+    run: () => Promise<T>,
+    budgetMs?: number,
+  ): Promise<T> {
+    const budget = budgetMs ?? this.#options.fileTimeoutMs ?? FILE_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     const stopped = new Promise<never>((_, reject) => {
@@ -305,7 +351,10 @@ export class ToolExecutor {
   }
 
   async #file(
-    method: Exclude<ToolMethod, "tool.cancel" | "tool.glob" | "tool.grep" | "tool.exec">,
+    method: Exclude<
+      ToolMethod,
+      BrowserMethod | "tool.cancel" | "tool.glob" | "tool.grep" | "tool.exec"
+    >,
     params: ToolParams[ToolMethod],
   ): Promise<JsonValue> {
     switch (method) {

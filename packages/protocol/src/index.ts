@@ -5,6 +5,7 @@
  * a hub-local path or address. See README.md for the frame list.
  */
 
+export * from "./browser";
 export {
   type DecodeError,
   type DecodeErrorCode,
