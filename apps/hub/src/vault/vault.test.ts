@@ -757,6 +757,59 @@ describe("the API never returns a value", () => {
     }
   });
 
+  test("refusals map to their status: denied 403, disabled 409, audit down 503", async () => {
+    const app = (vault: HubVault) => {
+      const a = new Hono<HubEnv>();
+      a.use("*", async (c, next) => {
+        c.set("principal", LOCAL_PRINCIPAL);
+        await next();
+      });
+      mountVaultRoutes(a, vault);
+      return a;
+    };
+    const db = openDatabase(path);
+    dbs.push(db);
+    const real = new SqliteAuditSink(db);
+    const base = {
+      store: new SqliteVaultStore(db),
+      audit: real,
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+      register: () => {},
+    };
+    const denied = new HubVault({
+      ...base,
+      authorizer: { authorize: async () => ({ allowed: false, policy: "t", reason: "no" }) },
+    });
+    const res = await app(denied).request("/v1/secrets");
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("authz.denied");
+    const disabled = new HubVault({
+      ...base,
+      keySecrets: createDefaultSecretStore({ env: {} }),
+      authorizer: new AllowAllAuthorizer({ audit: real }),
+    });
+    const body = JSON.stringify({ name: "m", kind: "model-key", fields: { value: "x-value" } });
+    const json = { "content-type": "application/json" };
+    expect(
+      (await app(disabled).request("/v1/secrets", { method: "POST", body, headers: json })).status,
+    ).toBe(409);
+    // The data key exists, so only the create's own record fails below.
+    await new HubVault({ ...base, authorizer: new AllowAllAuthorizer({ audit: real }) }).open();
+    const auditDown = new HubVault({
+      ...base,
+      audit: {
+        write: (r: AuditRecord) =>
+          r.detail === undefined ? real.write(r) : Promise.reject(new Error("disk full")),
+      },
+      authorizer: new AllowAllAuthorizer({ audit: real }),
+    });
+    expect(
+      (await app(auditDown).request("/v1/secrets", { method: "POST", body, headers: json })).status,
+    ).toBe(503);
+  });
+
   test("the hub serves the vault routes behind the login and resolves vault: refs", async () => {
     const hub = startHub({
       port: 0,
@@ -866,6 +919,21 @@ describe("redaction", () => {
     });
     expect(out).toContain("the token is [redacted] ok");
     expect(out).not.toContain(value);
+  });
+
+  test("the trajectory CLI warns when the vault does not open", async () => {
+    await start({ env: { VAULT_KEY: KEY_A } });
+    const dump = async (key: string) => {
+      const warnings: string[] = [];
+      await dumpTrajectory(path, "se_none", {
+        secrets: createDefaultSecretStore({ env: { VAULT_KEY: key } }),
+        vaultKeyRef: "env:VAULT_KEY",
+        warn: (m) => warnings.push(m),
+      });
+      return warnings;
+    };
+    expect(await dump(KEY_B)).toEqual(["vault values are not redacted: the vault is disabled"]);
+    expect(await dump(KEY_A)).toEqual([]);
   });
 
   test("a resolved value joins the redaction set at use", async () => {
