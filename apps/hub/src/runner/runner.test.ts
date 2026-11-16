@@ -885,7 +885,7 @@ describe("HTTP routes behind the login", () => {
     }
   });
 
-  test("message bodies are validated before anything runs", async () => {
+  test("message bodies are validated after authorize, before anything runs (#32)", async () => {
     const { h, calls, request } = await routed();
     for (const body of [{}, { text: 1 }, { text: "x", extra: true }, ["x"], "x", null]) {
       const res = await request("/v1/sessions/se_a/messages", { method: "POST", body });
@@ -896,7 +896,8 @@ describe("HTTP routes behind the login", () => {
       body: { text: "x" },
     });
     expect(unknown.status).toBe(404);
-    expect(calls.map((c) => c.action)).toEqual(["session.message"]);
+    // Each bad body was authorized (and audited) before it was read.
+    expect(calls.map((c) => c.action)).toEqual(Array(7).fill("session.message"));
     expect(h.events.types("se_a")).toEqual([]);
   });
 });

@@ -20,6 +20,7 @@ import {
   UNRESTRICTED_EGRESS,
 } from "./box/egress";
 import { HUB_VERSION } from "./obs/version";
+import { bodyOf, type RequestBody } from "./request-body";
 import { BOX_ENV, type BoxNetworkProvider, parsePort, parsePublicOrigin, startHub } from "./server";
 import { openDatabase, SqliteLoginStore } from "./store";
 
@@ -93,7 +94,8 @@ interface Requester {
 function guardedApp(options?: AppOptions): { app: Requester; calls: JsonValue[] } {
   const calls: JsonValue[] = [];
   const boxes = {
-    echo: async (_principal: unknown, _boxId: string, params: JsonValue) => {
+    echo: async (_principal: unknown, _boxId: string, body: JsonValue | RequestBody<JsonValue>) => {
+      const params = await bodyOf(body);
       calls.push(params);
       return params;
     },

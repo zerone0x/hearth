@@ -2347,3 +2347,46 @@ frozen or paused box, a host that sleeps, a lost route) left the box-agent
   (`tool.outcome-unknown`) under its own trace id. Passing the active turn
   down to `BoxConnections` is left for when a turn-scoped box record is
   needed.
+
+## 0029: Request bodies are read after `authorize`; unencodable params and hub-side handshake failures are classified
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #32
+
+### Context
+
+Three hub paths gave an unclassified answer (PRD §8.1 principles 2 and 6).
+Echo params the protocol cannot carry (JSON deeper than `MAX_JSON_DEPTH`)
+made `encodeFrame` throw a `RangeError` inside `BoxConnections.rpc`: a plain
+500, and a pending entry and its timer left until the deadline. The tool RPC
+client had the same path and threw synchronously. A credential store or
+policy that threw during `hello` (`SQLITE_BUSY`, a disk error) sent nothing;
+the box waited and the hub later closed with 4004 "no hello". And every route
+with a body (echo, `POST /v1/sessions`, messages, runner options, labels)
+parsed it before `authorize`, so a body that is not JSON got 400 with no audit
+row, against "every API handler calls `authorize` first" (AGENTS.md).
+
+### Decision
+
+- **Bodies are read after `authorize`.** A route hands its service a
+  `RequestBody` (`apps/hub/src/request-body.ts`), which the service reads
+  after `authorize` and after its visibility or existence check. A body that
+  is not JSON is audited like any other request and answers `400
+  request.invalid` (`request.invalid-json` on echo) only to a caller who may
+  act. A caller who may not gets the same answer as with a valid body: the
+  same-answer rule of 0022 and #94 holds for the body too.
+- **Unencodable rpc params are the caller's error.** `rpc` and `sendRpc`
+  encode the frame before anything is registered or sent; an `EncodeError`
+  becomes `rpc.invalid-params` (owner `user`, `give-up`), which the echo route
+  answers with 400. The tool RPC client turns it into `tool.bad-params` and
+  rejects, never throws. Nothing stays pending.
+- **A hub-side failure during `hello` is `reject` `internal`.** Any throw from
+  the credential store or the authorizer during the handshake sends `reject`
+  `internal` (which box-agent retries) and closes with 4001, never silence.
+
+### Consequences
+
+- A refused caller that sends a bad body now gets 401/403/404/409 instead of
+  400; the order of checks no longer depends on the body.
+- New error code `rpc.invalid-params` on the echo endpoint.

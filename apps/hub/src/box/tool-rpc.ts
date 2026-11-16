@@ -217,7 +217,15 @@ export class ToolRpcClient {
     frame: RpcFrame,
     options: CallOptions,
   ): Promise<ToolResults[M]> {
-    const bootId = this.#boxes.sendRpc(boxId, frame);
+    let bootId: string | undefined;
+    try {
+      bootId = this.#boxes.sendRpc(boxId, frame);
+    } catch (error) {
+      // Params the protocol cannot carry (`rpc.invalid-params`, #32): the hub
+      // built a bad call. Nothing was sent, so nothing is pending.
+      if (!(error instanceof HearthError)) throw error;
+      return Promise.reject(toolError(method, "tool.bad-params", `${method}: ${error.message}`));
+    }
     if (bootId === undefined) {
       // Nothing was sent, so retrying is safe for any method.
       return Promise.reject(

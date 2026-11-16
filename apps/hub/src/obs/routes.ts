@@ -22,6 +22,7 @@ import {
 } from "@hearth/core";
 import type { Context, Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { bodyOf, jsonBody, type RequestBody } from "../request-body";
 import { redactHub } from "./redaction";
 import { buildTrajectory, LABEL_OUTCOMES, type TrajectoryRecord, toJsonl } from "./trajectory";
 
@@ -73,8 +74,14 @@ export class Trajectories {
     return buildTrajectory(events, { sessionId, versions: this.#o.versions, redact: redactHub });
   }
 
-  async label(principal: Principal, sessionId: SessionId, input: unknown): Promise<void> {
+  async label(
+    principal: Principal,
+    sessionId: SessionId,
+    body: unknown | RequestBody<unknown>,
+  ): Promise<void> {
     await this.#authorize(principal, "session.label", sessionId);
+    // A `RequestBody` is read only now, after `authorize` (#32).
+    const input = await bodyOf(body);
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
       throw invalid("expected a JSON object");
     }
@@ -170,12 +177,7 @@ export function mountTrajectoryRoutes(app: Hono<HubEnv>, trajectories: Trajector
   });
   app.post("/v1/sessions/:id/labels", async (c) => {
     try {
-      let input: unknown;
-      try {
-        input = await c.req.json();
-      } catch {
-        throw invalid("the body is not JSON");
-      }
+      const input = jsonBody(c.req, "request.invalid");
       await trajectories.label(c.get("principal"), c.req.param("id"), input);
       return c.json({ ok: true }, 200);
     } catch (error) {
