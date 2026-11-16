@@ -2448,3 +2448,46 @@ model is chosen in `.env`.
   §6.3 numbers are not measured before v1.0.
 - Code comments that name a milestone (approvals in M3, the desktop lock in
   M2) stay correct.
+
+## 0034: The public listener caps request bodies at 1 MiB, checked before every guard
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #105
+
+### Context
+
+Request bodies are read only after `authorize` (0029), but a signed-in caller
+could still send a huge JSON body and have it parsed into memory. Bun's own
+`maxRequestBodySize` answers an oversized `Content-Length` with a bare 413
+before `fetch` runs, with no JSON envelope.
+
+### Decision
+
+- The public listener refuses a body whose `Content-Length` is over
+  `maxBodyBytes` (default `DEFAULT_MAX_BODY_BYTES`, 1 MiB; a prompt plus labels
+  is a few KiB) with 413 and the JSON error envelope, code
+  `request.body-too-large`. Bun answers most malformed `Content-Length` values
+  with its own bare 400 before the hub runs; repeated equal headers reach the
+  hub joined by a comma and get the same JSON 413. Every 411/413 carries
+  `connection: close`, so Bun closes the socket instead of draining the
+  declared body.
+- A request with `Transfer-Encoding` (a body of unknown length) gets 411,
+  `request.length-required`. Browsers send a length for the UI's JSON bodies.
+- The check reads headers only and runs first in the public `fetch`, before the
+  request guard (0010), the session guard (0014) and `authorize`. An
+  unauthenticated oversized request therefore gets 413, as a signed-in one
+  does, and the answer reveals nothing the caller did not send. It applies to
+  every public path, `/healthz` included.
+- Bun's `maxRequestBodySize` on the public listener is raised to its maximum
+  so Bun does not answer first. The box listener and the desktop WebSocket are
+  not touched; the limit is an option, not an environment variable.
+
+### Alternatives rejected
+
+- Bun's `maxRequestBodySize` alone: the answer is not the JSON envelope.
+- Counting streamed chunks: more code for a case no client of the hub needs.
+
+### Consequences
+
+A client that streams a body without a length is refused with 411.
