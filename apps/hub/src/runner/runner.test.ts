@@ -85,6 +85,7 @@ class MemoryEvents implements EventStore {
       seq,
       ts: Date.now(),
       type: event.type,
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
       payload: event.payload,
     });
     this.all.set(sessionId, list);
@@ -139,6 +140,10 @@ class FakeBoxes {
       ...(this.browser === undefined ? {} : { browser: this.browser }),
       send: (frame: RpcResultFrame) => {
         for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
+      },
+      // Live output (decision 0036), in the same order as the answers.
+      sendStream: (frame) => {
+        for (const l of this.listeners) if (l.stream?.("box_1", frame)) return;
       },
     });
   }
@@ -1088,6 +1093,29 @@ describe("hub restart mid-tool (review of #63)", () => {
     expect(toolResults(third.messages)).toHaveLength(1);
     expect(h.events.of("se_a", "runner.outcome-unknown")).toHaveLength(1);
   });
+});
+
+describe("live bash output (decision 0036)", () => {
+  test("a running command's output is stored as redacted tool.output events before its result", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo 'key=faux-key-not-a-secret'; sleep 1; echo second" }, "c_live"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const types = h.events.types("se_a");
+    const outputs = h.events.of("se_a", "tool.output");
+    expect(outputs.length).toBeGreaterThan(0);
+    const first = outputs[0] as StoredEvent;
+    expect(first.payload).toEqual({ toolCallId: "c_live", seq: 0, text: "key=[redacted]\n" });
+    expect(first.turnId).toBeDefined();
+    // Live output came while the call ran, before its end event.
+    expect(first.seq).toBeLessThan(types.indexOf("pi.tool_execution_end") + 1);
+    expect(JSON.stringify(outputs)).not.toContain("faux-key-not-a-secret");
+    // The result is the answer, redacted as before.
+    const result = toolResults(runner.messages).find((r) => r.id === "c_live");
+    expect(result?.text).toContain("second");
+  }, 20_000);
 });
 
 describe("model key redaction (review of #63)", () => {

@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.3** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.4** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -169,7 +169,7 @@ and limits are in `src/tools.ts`: `decodeToolParams`, `decodeToolResult`,
 | `tool.readdir` | `LsOperations.readdir` | `path` | `entries`, `omitted` |
 | `tool.glob` | `FindOperations.glob` | `pattern`, `cwd`, `ignore`, `limit` | `paths` (relative to `cwd`), `limitReached` |
 | `tool.grep` | the grep tool's `execute()`, run as `rg` in the box | `pattern`, `path`, `glob?`, `ignoreCase`, `literal`, `context`, `limit` | `output`, `matches`, `limitReached`, `truncatedBytes` |
-| `tool.exec` | `BashOperations.exec` | `command`, `cwd`, `timeoutMs` | `outcome` (`exited`, `timed-out`, `cancelled`), `exitCode`, `output`, `truncatedBytes`, `fullOutputPath` |
+| `tool.exec` | `BashOperations.exec` | `command`, `cwd`, `timeoutMs`, `outputStream?` (1.4, [live output](#live-exec-output-14)) | `outcome` (`exited`, `timed-out`, `cancelled`), `exitCode`, `output`, `truncatedBytes`, `fullOutputPath` |
 | `tool.cancel` | pi's abort signal | `target` (the `rpc` id) | `found` |
 
 Rules:
@@ -230,6 +230,28 @@ sets it on every tool call to the span of that call, so the box's log lines for
 it carry the same trace id (decision 0021). It is optional: a 1.1 peer drops
 it, and the decoder drops a malformed one instead of refusing the call, since
 tracing never fails a tool call.
+
+## Live exec output (1.4)
+
+Decision 0036. A `tool.exec` may name `outputStream`, an even stream id with
+the top bit set (`isLiveOutputStreamId`: `LIVE_OUTPUT_STREAM_BASE` = 2^31 and
+up; the desktop bridge's ids stay below). The box then sends the command's
+output, stdout and stderr merged in arrival order, as `stream.data` frames on
+that id while it runs, and one `stream.close` (`done`) before the
+`rpc.result`. No `stream.open` is sent: the `rpc` opens it. No frame type is
+new.
+
+- **A preview, not the answer.** The frames are fire-and-forget and lossy;
+  the `rpc.result` still carries the output as before.
+- **Coalesced and capped.** The box sends at most one frame per
+  `LIVE_OUTPUT_INTERVAL_MS` (100 ms), or one early once
+  `LIVE_OUTPUT_CHUNK_BYTES` (16 KiB) wait, and at most `MAX_LIVE_OUTPUT_BYTES`
+  (64 KiB) per command.
+- **Backpressure.** When its hub socket is backed up the box drops waiting
+  bytes instead of queuing them. A hub `stream.close` on the id stops the
+  stream; the command runs on.
+- **Compatibility.** A 1.3 box drops the unknown param and answers once. A
+  1.3 hub never sends it.
 
 ## Browser RPC (1.3)
 

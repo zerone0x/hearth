@@ -168,6 +168,68 @@ describe("tool card in a DOM", () => {
   });
 });
 
+describe("live tool output in a DOM", () => {
+  test("a running sleep+echo command shows its output before it finishes, then its result", async () => {
+    let seq = 0;
+    const ev = (type: string, payload: unknown) => ({ seq: ++seq, ts: 0, type, payload });
+    const command = "echo first; sleep 30; echo second";
+    const call = { type: "toolCall", id: "b1", name: "bash", arguments: { command } };
+    const step = { role: "assistant", content: [call], stopReason: "toolUse", timestamp: 1 };
+    const running = [
+      ev("message.user", { text: "run it" }),
+      ev("pi.agent_start", {}),
+      ev("pi.message_start", { message: { role: "user", content: "run it", timestamp: 1 } }),
+      ev("pi.message_start", { message: step }),
+      ev("pi.message_end", { message: step }),
+      ev("pi.tool_execution_start", { toolCallId: "b1", toolName: "bash", args: { command } }),
+      ev("tool.output", { toolCallId: "b1", seq: 0, text: "first\n" }),
+    ];
+    const result = {
+      role: "toolResult",
+      toolCallId: "b1",
+      toolName: "bash",
+      content: [{ type: "text", text: "first\nsecond\n" }],
+      isError: false,
+      timestamp: 2,
+    };
+    const finished = [
+      // A chunk whose append raced the end: dropped, the result is the answer.
+      ev("pi.tool_execution_end", { toolCallId: "b1", toolName: "bash", result, isError: false }),
+      ev("tool.output", { toolCallId: "b1", seq: 1, text: "late\n" }),
+      ev("pi.message_start", { message: result }),
+      ev("pi.message_end", { message: result }),
+      ev("pi.agent_end", {}),
+    ];
+    // The command is still running until the test lets it finish.
+    let done = false;
+    hub((_method, path) => {
+      const match = /\/v1\/sessions\/se_1\/events\?after=(\d+)/.exec(path);
+      if (match === null) return undefined;
+      const after = Number(match[1]);
+      const events = [...running, ...(done ? finished : [])].filter((e) => e.seq > after);
+      const cursor = events.at(-1)?.seq ?? after;
+      return ok({ events, cursor, hasMore: false });
+    });
+    renderApp("#/s/se_1");
+    const trigger = await screen.findByRole("button", { name: "Tool call bash: running" });
+    const log = await screen.findByRole("log", { name: "Live output of bash" });
+    expect(log.textContent).toBe("first\n");
+    // Still running: the card's name is unchanged and there is no result yet.
+    expect(trigger.getAttribute("aria-label")).toBe("Tool call bash: running");
+    expect(document.querySelector('[data-slot="tool-fallback-result"]')).toBeNull();
+    done = true;
+    await screen.findByRole("button", { name: "Tool call bash: done" }, { timeout: 5000 });
+    expect(screen.queryByRole("log", { name: "Live output of bash" })).toBeNull();
+    expect(screen.queryByText(/late/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Tool call bash: done" }));
+    await waitFor(() =>
+      expect(document.querySelector('[data-slot="tool-fallback-result"]')?.textContent).toContain(
+        "first\nsecond",
+      ),
+    );
+  });
+});
+
 describe("desktop panel in a DOM", () => {
   /** A stand-in for noVNC's RFB and the WebSocket, counting what gets opened. */
   function fakes() {

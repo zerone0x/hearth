@@ -348,6 +348,90 @@ describe("ToolRpcClient through a real hub and box-agent", () => {
   }, 30_000);
 });
 
+describe("live exec output through a real hub and box-agent (protocol 1.4)", () => {
+  test("a sleep+echo command's first line reaches onOutput before the call ends", async () => {
+    const root = workspace();
+    const dir = mkdtempSync(join(tmpdir(), "hearth-toolrpc-live-"));
+    dirs.push(dir);
+    const hub = startHub({ dbPath: join(dir, "hub.db"), port: 0, boxPort: 0, log: () => {} });
+    hubs.push(hub);
+    const { token } = await hub.issueJoinToken("box_live", "ses_live");
+    const agent = new BoxAgent({
+      hubUrl: hub.listenForBoxes("127.0.0.1"),
+      boxId: "box_live",
+      joinToken: token,
+      log: () => {},
+      tools: { root },
+    });
+    agents.push(agent);
+    agent.start();
+    await hub.boxes.waitForBox("box_live", STEP_MS);
+    const client = new ToolRpcClient({ boxes: hub.boxes, log: () => {} });
+    const ops = client.operations("box_live", "call_live");
+    const live: string[] = [];
+    const final: Buffer[] = [];
+    let ended = false;
+    let firstBeforeEnd: boolean | undefined;
+    const run = ops.bash
+      .exec("echo first; sleep 1; echo second", root, {
+        onData: (data) => final.push(data),
+        timeout: 10,
+        onOutput: (chunk) => {
+          live.push(Buffer.from(chunk).toString("utf8"));
+          firstBeforeEnd ??= !ended;
+        },
+      })
+      .finally(() => {
+        ended = true;
+      });
+    expect(client.liveStreams).toBe(1);
+    const { exitCode } = await run;
+    expect(exitCode).toBe(0);
+    expect(firstBeforeEnd).toBe(true);
+    expect(live.join("")).toBe("first\nsecond\n");
+    // The result is still the whole answer, through onData once.
+    expect(final.map(String)).toEqual(["first\nsecond\n"]);
+    expect(client.liveStreams).toBe(0);
+    client.close();
+  }, 30_000);
+});
+
+describe("live exec output: stream routing", () => {
+  test("only the call's own stream on its own box reaches onOutput, and only while it runs", async () => {
+    const boxes = new FakeBoxes(workspace());
+    const client = new ToolRpcClient({ boxes, log: () => {} });
+    const got: string[] = [];
+    const run = client.operations("box_1", "call_r").bash.exec("sleep 0.2", ".", {
+      onData: () => {},
+      onOutput: (chunk) => got.push(Buffer.from(chunk).toString()),
+    });
+    const sent = boxes.sent[0]?.params as { outputStream?: number };
+    const id = sent.outputStream as number;
+    expect(id).toBeGreaterThanOrEqual(2 ** 31);
+    expect(id % 2).toBe(0);
+    const data = (streamId: number, text: string) => ({
+      type: "stream.data" as const,
+      streamId,
+      seq: 0,
+      data: new TextEncoder().encode(text),
+    });
+    const claim = (boxId: string, frame: ReturnType<typeof data>) =>
+      [...boxes.listeners].some((l) => l.stream?.(boxId, frame) === true);
+    expect(claim("box_1", data(id, "mine"))).toBe(true);
+    expect(claim("box_2", data(id, "other box"))).toBe(false);
+    expect(claim("box_1", data(id + 2, "other stream"))).toBe(false);
+    await run;
+    expect(claim("box_1", data(id, "late"))).toBe(false);
+    expect(got).toEqual(["mine"]);
+    // Without onOutput no stream is asked for.
+    await client.operations("box_1", "call_s").bash.exec("true", ".", { onData: () => {} });
+    expect(
+      (boxes.sent.at(-1)?.params as { outputStream?: number } | undefined)?.outputStream,
+    ).toBeUndefined();
+    client.close();
+  });
+});
+
 describe("browser methods through a real hub and box-agent (protocol 1.3)", () => {
   async function connect(
     boxId: string,
