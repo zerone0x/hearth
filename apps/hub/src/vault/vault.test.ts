@@ -20,7 +20,7 @@ import {
   VaultSecretResolver,
 } from "@hearth/core";
 import { Hono } from "hono";
-import type { HubEnv } from "../auth";
+import { type HubEnv, SESSION_COOKIE } from "../auth";
 import { lineFields, lineLevel } from "../obs/hub-log";
 import { redactHub } from "../obs/redaction";
 import { observabilityFromEnv } from "../obs/setup";
@@ -348,6 +348,25 @@ describe("scope and kind", () => {
       (await errorOf(h.vault.use("vault:scoped", { ...ctx("ses_2"), kinds: ["token"] }))).code,
     ).toBe("vault.scope-mismatch");
     expect((await errorOf(h.secrets.resolve("vault:scoped"))).code).toBe("vault.scope-mismatch");
+  });
+
+  test("a scope naming no session is refused; a taken name is refused by the store too", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const error = await h.vault
+      .create(LOCAL_PRINCIPAL, {
+        name: "scoped",
+        kind: "token",
+        scope: { sessionId: "ses_missing" },
+        fields: { value: TOKEN },
+      })
+      .catch((e: unknown) => e as { code: string });
+    expect(error).toMatchObject({ code: "request.invalid" });
+    await addModelKey(h);
+    const [row] = new SqliteVaultStore(h.db).list("ws_default");
+    if (row === undefined) throw new Error("one row expected");
+    expect(() => new SqliteVaultStore(h.db).insert({ ...row, id: "sec_other" })).toThrow(
+      expect.objectContaining({ code: "secret.name-taken" }),
+    );
   });
 
   test("a login and a box-env token are not handed to the hub's store", async () => {
@@ -737,6 +756,10 @@ describe("the API never returns a value", () => {
       expect(await hub.vaultReady).toMatchObject({ state: "enabled" });
       const res = await fetch(new URL("/v1/secrets", hub.url));
       expect(res.status).toBe(401);
+      const cookie = `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}`;
+      const signed = await fetch(new URL("/v1/vault/status", hub.url), { headers: { cookie } });
+      expect(signed.status).toBe(200);
+      expect(await signed.json()).toMatchObject({ ok: true, state: "enabled" });
       await hub.vault.create(LOCAL_PRINCIPAL, {
         name: "model",
         kind: "model-key",
