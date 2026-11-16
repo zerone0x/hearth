@@ -12,7 +12,7 @@ Outside sources, all public, read on 2026-11-16:
 
 | Source | Version or commit | License | State on 2026-11-16 |
 |---|---|---|---|
-| `openbao/openbao` (GitHub API, release tarball, `CHANGELOG.md`) | release `v2.7.2` (2026-10-26, binary commit `9e0a0d3c`), `main` at `92de51f7` (2026-11-12) | MPL-2.0 | active: last push 2026-11-12, 499 contributors, two maintained lines (2.7.x and 2.6.x) patched on the same day |
+| `openbao/openbao` (GitHub API, release tarball, `CHANGELOG.md`) | release `v2.7.2` (2026-10-26, binary commit `9e0a0d3c`), `main` at `92de51f7` (2026-11-12) | MPL-2.0 | active: last push 2026-11-12, 373 contributors (GitHub contributors API, non-anonymous), two maintained lines (2.7.x and 2.6.x) patched on the same day |
 | OpenBao docs, static seal (`openbao.org/docs/configuration/seal/static/`) | "Version 2.7.x" | | |
 | Bun WebCrypto (`crypto.subtle`) | Bun 1.4.4 (Hearth's pin) | MIT (Bun) | built in, no dependency |
 | `libsodium-wrappers` (npm) | `0.8.4`, 550 kB unpacked | ISC | last publish 2026-04-19 |
@@ -21,6 +21,7 @@ Outside sources, all public, read on 2026-11-16:
 | Bitwarden CLI help page (`bitwarden.com/help/cli/`) | | | |
 | `@1password/sdk` (npm) | `0.5.0`, README | MIT (SDK; the 1Password service is proprietary and paid) | active |
 | `@playwright/mcp` (npm tarball README) | `0.0.85` | Apache-2.0 | active |
+| `playwright-core` (npm, `types/types.d.ts`) | `1.65.1` (Hearth's pin in `apps/web/package.json` and `deploy/e2e/package.json`) | Apache-2.0 | active |
 | `node-vault` (npm) | `0.13.0` | MIT | last publish 2026-10-11 |
 
 **Read only from documentation, not verified by running:** the Bitwarden CLI
@@ -67,14 +68,18 @@ code written for this note; they are not committed.
   unauthenticated local HTTP API over the whole vault, and the hub runs on the
   host network (DECISIONS 0020). Offer them later as optional read-only
   resolvers (`bw:`, `op:`) if the owner asks.
-- **The model never sees a value.** It names a reference. The hub resolves it at
-  the tool RPC boundary and sends the value only in the one RPC that uses it.
-  It also redacts the value (and its encodings, #70) from every result, event,
-  log and trajectory. Site logins are filled by a `browser_fill` tool
-  (coordinated with #107), and only on the origins the entry is bound to.
-  Model keys and hub-side tokens never enter a box. A site password must enter
-  the box, because the browser lives there. That gap is named in the threat
-  model.
+- **The model names a reference, not a value.** The hub resolves it at the
+  tool RPC boundary and sends the value only in the one RPC that uses it. It
+  redacts the value (and its encodings, #70) from every later text result,
+  event, log and trajectory of the session. Site logins are filled by the
+  `browser_fill` tool of #107 (PR #112), only into password, username or
+  one-time-code fields, and only on the origins the entry is bound to. String
+  redaction cannot reach a screenshot, so box-agent masks every element it
+  filled with a secret in every later screenshot of that tab. A value the site
+  echoes elsewhere on the page can still reach the model as pixels; that
+  residual is named in the threat model. Model keys and hub-side tokens never
+  enter a box. A site password must enter the box, because the browser lives
+  there.
 - **A settings page replaces the `.env` model lines and `deploy/secrets/model_key`.**
   The page has a model card and a secrets table. You can add, rotate and delete
   secrets, see fingerprints and their uses, but never read a value back. The
@@ -157,14 +162,26 @@ that concern with 192-bit nonces. It is the alternative if we ever want it, at
 the cost of a 550 kB WASM dependency. Both are maintained; neither is hand-rolled.
 Choose WebCrypto: no new dependency.
 
-**Envelope.**
+**Envelope and subkeys.**
+- The 32-byte key file is the **master key** `M`. It is never used directly.
+  Three subkeys are derived from it with HKDF-SHA256 (WebCrypto `deriveKey` /
+  `deriveBits`), one per purpose, so no key serves two purposes:
+  - `KEK` = HKDF(M, info `"hearth-vault/v1 kek"`), an AES-KW key that wraps the
+    data key;
+  - `CK` = HKDF(M, info `"hearth-vault/v1 kek-check"`), an HMAC key for
+    `kek_check`;
+  - `FK` = HKDF(M, info `"hearth-vault/v1 fingerprint"`), an HMAC key for the
+    keyed fingerprints.
 - One random 256-bit **data key** (DEK) encrypts every entry. It is stored only
-  wrapped (AES-KW, RFC 3394) by the **master key** (KEK).
-- Rotating the KEK rewraps one row. Rotating the DEK re-encrypts every entry in
-  one transaction; that is cheap at this scale.
-- The KEK is never in the database. A `kek_check` (a keyed MAC of a constant)
-  lets the hub tell "wrong key file" from "corrupt database" at startup and
-  refuse loudly.
+  wrapped (AES-KW, RFC 3394) by `KEK`.
+- `kek_check` = HMAC-SHA256(CK, `"hearth-vault/v1 kek-check"`). It lets the hub
+  tell "wrong key file" from "corrupt database" at startup without trying an
+  unwrap.
+- **Rotating the DEK** re-encrypts every entry under a new DEK in one
+  transaction (cheap at this scale). Fingerprints do not change, because `FK`
+  comes from `M`, not from the DEK.
+- **Rotating the master key** rewraps one row and recomputes `kek_check` and
+  every fingerprint, in one transaction (procedure below).
 
 **Where the master key lives (options).**
 
@@ -181,14 +198,55 @@ secrets. The key file is the simplest option that keeps a stolen database or
 backup useless.
 
 **Generating the key.** `docs/install.md` gains one line next to the model key:
-`(umask 077 && head -c 32 /dev/urandom > secrets/vault_key)`. If the file is
-missing, the hub refuses to start. It never generates one into the data
-volume, because a key stored next to the database protects nothing.
+`(umask 077 && head -c 32 /dev/urandom > secrets/vault_key)`. The hub never
+generates a key into the data volume, because a key stored next to the
+database protects nothing.
+
+**A missing or wrong key file: the hub starts with the vault disabled.** This
+is the one behaviour for every case, including an old compose file that has no
+`vault_key` secret at all:
+- The hub starts. Login, sessions and every `env:` / `file:` ref keep working,
+  so today's `model_key` file and `HEARTH_MODEL*` env config run as before.
+- Every `vault:` resolve fails with `vault.disabled` and a reason:
+  `key-missing` (no key ref, or the file is absent), `key-mismatch` (the file's
+  `kek_check` does not match; the page shows the first 12 hex digits of the
+  expected and the found `kek_check`) or `key-invalid` (not 32 bytes).
+- The Settings page shows a destructive Alert with that reason and the fix
+  ("add deploy/secrets/vault_key", "restore the key file that matches this
+  database"). Adding and rotating secrets is disabled until it is fixed.
+- If the model key ref is already a `vault:` ref, model calls fail with the
+  same reason, and the session view says so.
+- On `key-mismatch` the hub never creates a new `vault_key` row and never
+  rewrites anything, so restoring the right file recovers the vault.
+- A first start with a valid key file and no `vault_key` row creates the DEK.
+
+**Rotating the master key (key file).**
+1. The owner writes the new key next to the old one:
+   `(umask 077 && head -c 32 /dev/urandom > secrets/vault_key.next)`, mounted as
+   a second compose secret with `HEARTH_VAULT_KEY_NEXT_REF=file:/run/secrets/vault_key_next`.
+2. On the next start (or `POST /v1/vault/rotate-key` from Settings, after the
+   owner password) the hub checks `kek_check` against the current key, unwraps
+   the DEK, then in **one transaction** rewraps it under the new `KEK`, writes
+   the new `kek_check`, recomputes every fingerprint with the new `FK` (it holds
+   the DEK, so it can decrypt each entry), sets `rotated_at`, and audits
+   `vault.key.rotate` with the old and new key fingerprints.
+3. **Cutover:** the owner moves `vault_key.next` over `vault_key`, drops the
+   `next` ref and restarts. The hub logs `vault key rotation complete`.
+4. **Crash safety:** at start the hub tries the current key first and then the
+   next key. If only the next key matches, the rewrap already committed, and the
+   hub runs on the next key with a warning to finish the cutover. If neither
+   matches, the vault is disabled (`key-mismatch`). Each step can be run twice.
+5. Backups taken before the rotation need the **old** key. Keep the old key
+   with those backups until they expire, then destroy it.
+- Audit rows keep the fingerprint of the time they were written. After a master
+  key rotation, the `vault.key.rotate` row is the link between old and new
+  fingerprints.
 
 **Backup and restore.**
 - A backup is the volume plus the key file, **kept apart**.
 - To restore, put both back. With the volume alone every entry is lost, and the
-  UI says so (`vault.key-mismatch` at startup, with the key's fingerprint).
+  UI says so (vault disabled, `key-missing` or `key-mismatch`, with the key's
+  fingerprint).
 - `bun run --filter @hearth/hub vault export` can write an encrypted export
   (entries re-encrypted under a passphrase-derived key: argon2id plus
   AES-GCM, both from maintained code) for moving between hosts. That is a
@@ -202,7 +260,7 @@ kind can add fields without a migration.
 | Kind | Encrypted fields | Plain metadata | Used by | Enters a box |
 |---|---|---|---|---|
 | `model-key` | `value` | `provider` | the runner (hub) | never |
-| `login` | `username`, `password`, `totp_seed?` | `origins[]` (exact origins the login may be filled on), `label` | `browser_fill` | the fields filled, for one RPC |
+| `login` | `username`, `password`, `totp_seed?` | `origins[]` (exact origins the login may be filled on), `allow_any_field` (default false), `label` | `browser_fill` | the fields filled, for one RPC |
 | `token` | `value` | `label`, `use: hub \| box-env`, `hosts[]?` | hub-side tools; box commands only when `use: box-env` | only when `box-env` |
 
 - **References:** `vault:<name>` (the default field: `value`, or `password` for
@@ -222,41 +280,102 @@ resolution point is the one #70 proposes for placeholders, inside the routed
 tool's `execute` before `ToolRpcClient.call`. The event log, the trajectory
 and the UI keep the reference, never the value.
 
-**Site login (with #107).** Proposed tool, in whatever shape the browser
-research settles on for element refs:
+**Site login (with #107, PR #112).** The tool is #112's `browser_fill`, a
+`browser.*` RPC method in protocol 1.3. It takes only a secret; plain text goes
+through `browser_type`.
 
 ```ts
 browser_fill({
-  ref: "e42",                      // element ref from the latest snapshot (#107)
-  secret: "vault:github#password", // or text: "..." for plain text, never both
+  ref: "e42",                      // element ref from the latest snapshot (#112)
+  element: "Password field",       // short description for approvals and the live desktop
+  secret: "vault:github#password", // a vault ref; a literal value is refused
   submit?: boolean,
+  expect?: { ... },                // #112's post-condition
 })
-// result: { ok: true, ref: "e42", origin: "https://github.com", filled: "vault:github#password" }
+// result: #112's { ok, outcome, url, title, verified } + fresh snapshot;
+// the value is never echoed, the snapshot shows the field as [secret]
 ```
 
 The hub side does this, in order:
-1. Parse the ref. Look up the entry. Check its scope (global, or this session).
-2. Write the audit record `secret.use` (action, entry id, session, tool call
-   id, target origin claimed by the box's last snapshot). No record, no use
-   (PRD §10).
-3. Resolve the field and send `{ ref, value, expectOrigins: entry.origins }` in
-   the one tool RPC.
+1. Parse the ref. Look up the entry. Check its scope (global, or this session)
+   and its kind (`login`).
+2. **Origin check in the hub.** Take the page URL that the box reported for
+   that tab in its latest result (the snapshot that produced `ref`). If its
+   origin is not in the entry's `origins`, refuse with `browser.origin-mismatch`
+   and send nothing. The value never leaves the hub for a page that is already
+   on the wrong origin.
+3. Write the audit record `secret.use` (action, entry id, session, tool call
+   id, the reported origin). No record, no use (PRD §10).
+4. Resolve the field and send `{ ref, value, expectOrigins: entry.origins,
+   allowAnyField: entry.allow_any_field, field }` in the one tool RPC.
 
-Box-agent then fills it:
-1. It checks that the **frame** owning the element has an origin in
-   `expectOrigins`. If not, it refuses with `browser.origin-mismatch` and fills
-   nothing. This is the anti-phishing check that password managers do, and the
-   main defense against a prompt injection that says "type your bank password
-   here".
-2. It fills with the browser library's fill call: Playwright's `locator.fill`,
-   or CDP `Input.insertText` if #107 picks a lower layer.
-3. It drops the value and returns no field content.
+Box-agent then fills it, all on the same page object:
+1. It resolves `ref` to one element handle and reads that element's owner
+   frame (`elementHandle.ownerFrame()`).
+2. **Origin check in the box, immediately before the fill.** The owner frame's
+   URL must have an origin in `expectOrigins`. If not, it refuses with
+   `browser.origin-mismatch` and fills nothing. This is the anti-phishing check
+   that password managers do, and the main defense against a prompt injection
+   that says "type your bank password here".
+3. **Field check.** The element must fit the field, unless `allowAnyField`:
+   - `#password`: an `<input type="password">`, or an input whose
+     `autocomplete` is `current-password` or `new-password`;
+   - `#username`: an `<input>` of type `text` or `email` whose `autocomplete`
+     is `username` or `email`, or that is the text input of the same `<form>` as
+     a password input;
+   - `#totp`: an input with `autocomplete="one-time-code"`, or a text or number
+     input of at most 10 characters (`maxlength`) in a form with no password
+     input. The code expires in 30 s, so this rule is looser.
+   Anything else (a search box, a comment field, a `contenteditable`, a page
+   that echoes the input) is refused with `browser.field-mismatch`. The owner
+   sets `allow_any_field` per entry for a site with odd markup; the UI warns
+   that the value may then be shown on the page.
+4. It fills through that same handle (`elementHandle.fill`, or CDP
+   `Input.insertText` if #112 picks a lower layer). If the page navigated
+   between the check and the fill, the handle is detached and the fill fails.
+5. It records the element in the tab's **filled set** (a Playwright
+   `Locator` for the element, plus the value, kept in box-agent's memory only
+   for the redaction and masking below). It returns no field content.
 
-Before the result reaches pi, the hub redacts it. The resolved value joins the
-runner's per-session redaction set (`runners.ts:146-148`) and the hub registry
-(`redaction.ts:18`), and it is redacted by placeholders with encodings once #70
-lands. A later `browser_snapshot`, page text or screenshot OCR can then not
-hand it back in plain form.
+The two checks narrow the race between "the page is on the right origin" and
+"the value is typed" to the time between step 2 and step 4 in the box. They do
+not close it: a same-document change (a script that swaps the form's action or
+moves focus) in that window is not detected. And the origin check trusts the
+origin, not the content: script injected into a bound origin (XSS) or user
+content hosted on it (a profile page, an uploaded HTML file on the same
+origin) passes both checks. Both are residuals in the threat model.
+
+**What reaches the model afterwards.** The value is in the box and on the
+page, so every later observation of that tab is filtered, for the rest of the
+session (not only until navigation; #112 uses the same rule):
+- **Text.** Box-agent replaces every secret value it filled on that tab with
+  `[secret]` in all later snapshot, find and error texts of the session
+  (#112, "Credentials"). The resolved value also joins the runner's per-session
+  redaction set (`runners.ts:146-148`) and the hub registry (`redaction.ts:18`),
+  and placeholders with encodings once #70 lands. That covers text results,
+  events, logs and trajectories.
+- **Screenshots.** Hub redaction rewrites strings only, and a screenshot reaches
+  the model as an image part (#112, "Screenshots"). A password field shows dots,
+  but a username field, a token pasted into a text input, a show-password
+  toggle that flips the input to `type="text"`, or a site that echoes the input
+  shows the value in pixels. So box-agent passes the tab's filled set to every
+  screenshot as Playwright's `mask` option:
+  `page.screenshot({ mask: filledLocators, maskColor: "#000" })`. `mask` is
+  public API in `playwright-core` 1.65.1: `mask?: Array<Locator>` on
+  `PageScreenshotOptions` (`types/types.d.ts:26851`, `26906`) and on
+  `LocatorScreenshotOptions` (`types/types.d.ts:26152`), used by
+  `page.screenshot` (`types/types.d.ts:4591`). Each masked element is covered by
+  an opaque box over its whole bounding box, even when the input type changes.
+  If #112 drives screenshots through raw CDP instead, box-agent paints the same
+  boxes from the elements' bounding boxes before capture.
+- **What the mask cannot cover.** It covers the filled elements only. A site
+  that echoes the value somewhere else (a "signed in as <username>" header, a
+  preview of a pasted token, an error that repeats the input), and the value in
+  page text after a navigation (where the filled element no longer exists), can
+  still reach the model as pixels. Text redaction catches those in snapshots,
+  not in images. These are residuals, named in the threat model and in the
+  DECISIONS "Known gaps". The eval task (#112, B1) checks the login page's
+  screenshot for the value.
 
 Rules that keep it narrow:
 - Plain `browser_type` / `text` params refuse any string that starts with
@@ -268,8 +387,9 @@ Rules that keep it narrow:
 - Playwright MCP has a similar `secrets` option that only rewrites matching text
   in tool responses. Its README calls it "a convenience and not a security
   feature" (`@playwright/mcp@0.0.85`, README, `secrets` config). Hearth's
-  version differs in two ways: the model never gets the value as input in the
-  first place, and the fill is origin-bound.
+  version differs: the model passes a reference instead of a value, the
+  fill is origin- and field-bound, and screenshots are masked. It still does not
+  stop a page from echoing the value.
 
 **API tokens for tools.**
 - Hub-side tools (a future `http_request` run from the hub, webhooks, Telegram)
@@ -338,13 +458,14 @@ prompt injection steering the model; someone in the hub.
 
 | Threat | What they get | Mitigation | Residual |
 |---|---|---|---|
-| **DB leak** (stolen volume, backup, `hearth.db` copied) | ciphertexts, entry names, kinds, origins, timestamps, keyed fingerprints, audit rows | AES-GCM under a DEK wrapped by a KEK that is not in the volume; AAD binds each ciphertext to its row; fingerprints are keyed, so no offline dictionary check | metadata: which sites the owner gave Hearth. Acceptable. |
+| **DB leak** (stolen volume, backup, `hearth.db` copied) | ciphertexts, entry names, kinds, origins, timestamps, keyed fingerprints, audit rows | AES-GCM under a DEK wrapped by a KEK that is not in the volume; AAD binds each ciphertext to its row, scope and policy (origins); fingerprints are keyed, so no offline dictionary check | metadata: which sites the owner gave Hearth. Acceptable. |
 | **Key file leak alone** | nothing | the key file holds no secret data | |
 | **DB and key file together** (whole-host backup, host root) | everything | keep backups apart (install.md); there is no further layer | accepted for a single-owner install |
-| **Box compromise** (malicious package, agent ran something bad) | values filled in this box while it runs: a site password in a page field, a `box-env` token during its command | no model keys or hub tokens in the box; fills are per RPC and origin-bound; box-agent is non-dumpable (0018); scope secrets per session | anything on the CDP-reachable page (0026) or in a command's environment can be read and sent out, because internet egress is open (0023). This is the price of a browser in the box. |
-| **Prompt injection** that tries to exfiltrate | it can name refs; it cannot read values | values never in model input; results redacted (#70 with encodings); `browser_fill` refuses foreign origins; `vault:` is refused in plain-text params; per-secret `use: auto \| approve` once approvals land (M3); audit of every use | the model can run JS or a bash command over CDP to read a filled field and encode it beyond what the redactor knows. Mitigation with #107: no free `evaluate` tool, and a page that had a secret fill marks the tab "tainted" until navigation; text from it goes through redaction with encodings. Not airtight; name it in DECISIONS. |
+| **Box compromise** (malicious package, agent ran something bad) | values filled in this box while it runs: a site password in a page field, a `box-env` token during its command | no model keys or hub tokens in the box; fills are per RPC, origin-bound (checked in the hub before the value is sent) and field-bound; box-agent is non-dumpable (0018); scope secrets per session | anything on the CDP-reachable page (0026) or in a command's environment can be read and sent out, because internet egress is open (0023). This is the price of a browser in the box. |
+| **Prompt injection** that tries to exfiltrate | it can name refs and use them on bound origins; it does not get values as tool arguments | the model passes refs, not values; text results redacted for the whole session (box-agent `[secret]` plus #70 with encodings); filled elements masked in every later screenshot of the tab; `browser_fill` refuses foreign origins (hub and box) and non-credential fields; `vault:` is refused in plain-text params; per-secret `use: auto \| approve` once approvals land (M3); audit of every use | (1) a site that echoes the value elsewhere on the page, or shows it in page text after a navigation, puts it in a screenshot as pixels, which no string redaction reaches; (2) the model can run JS or a bash command over CDP to read a filled field and encode it beyond what the redactor knows; #112 has no free `evaluate` tool, but `bash` in the box remains; (3) script or user content on a bound origin (XSS, an uploaded page) passes the origin check; (4) a same-document change between the box's check and the fill is not detected. Not airtight; named in DECISIONS. |
 | **Hub compromise** (RCE in the hub, malicious pi extension, Docker socket) | everything: the hub holds the DEK and can call any resolver; the hub is root-equivalent via the Docker socket (`deploy/compose.yaml:17-22`) | keep the hub small; extensions allowlisted (0015) | total. Nothing in this design, OpenBao included, changes that while the hub is the one that uses secrets. |
 | **Logs, events, trajectories** | values that slipped through | sink redaction (0021) of every resolved vault value, registered at use and at startup for values already used | low-entropy values (a 6-character password) also redact innocent text; encodings until #70 |
+| **DB write without the key** (an attacker or a bug that can write `hearth.db` but not read the key file) | can try to widen a login's `origins` or move a session-scoped entry to global | origins, `use`, `hosts`, `allow_any_field` and `scope_session_id` are in the AAD (Data model), so an edited row fails to decrypt and the use fails with `vault.entry-corrupt` | can delete rows or roll a row back to an older copy of itself with its old version; audit rows record the version used |
 | **XSS or a stolen login cookie in the UI** | write access to the vault, no read access | the API has **no read-back endpoint**; CSP (0017); `SameSite=Strict` cookie (0014); rotate and delete are audited | an attacker with the cookie can swap a login's password or origins. Require the owner password again for `origins` changes. |
 
 ## Recommendation
@@ -354,8 +475,9 @@ prompt injection steering the model; someone in the hub.
    every use.
 2. **Settings UI for model and secrets**, replacing `.env` model lines and
    `deploy/secrets/model_key`, with an automatic import on upgrade.
-3. **`browser_fill` with `vault:` refs**, origin-bound, resolved in the hub per
-   RPC, redacted on the way back. Shape the details with #107.
+3. **`browser_fill` with `vault:` refs** (#112's tool), origin-bound in the hub
+   and again in the box, field-bound, resolved in the hub per RPC, redacted
+   from text for the whole session and masked in screenshots.
 4. **Extensible, not built:** a `VaultKeyProvider` interface (wrap/unwrap the DEK:
    file now, OpenBao transit later) and a `VaultEntryBackend` interface (SQLite
    now, OpenBao KV v2 later). `bw:` / `op:` resolvers only on request.
@@ -367,8 +489,9 @@ prompt injection steering the model; someone in the hub.
 **License and maintenance.**
 - MPL-2.0. A Linux Foundation project and the open-source fork of HashiCorp
   Vault.
-- Active: last push 2026-11-12, 499 contributors, about 9k stars, 376 open
-  issues.
+- Active: last push 2026-11-12, 373 contributors (GitHub contributors API,
+  `repos/openbao/openbao/contributors`, non-anonymous, read 2026-11-16), about
+  9k stars, 376 open issues.
 - Releases `v2.7.2` and `v2.6.5` both came out on 2026-10-26, and 2.7.x ships
   monthly.
 - It moves fast and drops things. 2.7.0 moved every cloud KMS seal and
@@ -519,7 +642,7 @@ Migration N (next free number when it lands):
 CREATE TABLE vault_key (
   id INTEGER PRIMARY KEY CHECK (id = 1),     -- one data key per hub
   wrapped_dek BLOB NOT NULL,                 -- AES-KW(KEK, DEK)
-  kek_check TEXT NOT NULL,                   -- HMAC-SHA256(KEK, "hearth-vault-kek-check"), hex
+  kek_check TEXT NOT NULL,                   -- HMAC-SHA256(CK, "hearth-vault/v1 kek-check"), hex
   provider TEXT NOT NULL,                    -- 'file' | later 'openbao-transit'
   created_at INTEGER NOT NULL,
   rotated_at INTEGER
@@ -530,8 +653,9 @@ CREATE TABLE secret (
   workspace_id TEXT NOT NULL REFERENCES workspace (id),
   name TEXT NOT NULL,                        -- vault:<name>
   kind TEXT NOT NULL CHECK (kind IN ('model-key', 'login', 'token')),
-  scope_session_id TEXT,                     -- null = global
-  meta_json TEXT NOT NULL CHECK (json_valid(meta_json)),  -- provider | origins[] | use, hosts[]; never secret
+  scope_session_id TEXT,                     -- null = global; in the AAD
+  policy_json TEXT NOT NULL CHECK (json_valid(policy_json)),  -- canonical JSON: origins[], allow_any_field | use, hosts[]; in the AAD
+  meta_json TEXT NOT NULL CHECK (json_valid(meta_json)),      -- label, provider; display only, not authenticated
   iv BLOB NOT NULL,                          -- 12 bytes
   ciphertext BLOB NOT NULL,                  -- AES-256-GCM(DEK, iv, json fields, aad)
   version INTEGER NOT NULL,                  -- bumped on rotate; part of the AAD
@@ -543,12 +667,22 @@ CREATE TABLE secret (
 ) STRICT;
 ```
 
-- **AAD** = `hearth-vault/v1|<id>|<workspace_id>|<name>|<kind>|<version>`, so a
-  ciphertext copied to another row, name or older version fails to decrypt.
-- **Fingerprint key** `FK` = HKDF-SHA256(DEK, info `"hearth-vault-fingerprint"`).
-  It is keyed, so a leaked fingerprint cannot be checked against a dictionary.
-  The display format matches `SecretValue.fingerprint` (12 hex) with a different
-  prefix.
+- **AAD** = `hearth-vault/v1|<id>|<workspace_id>|<name>|<kind>|<version>|<scope_session_id or "">|<SHA-256 hex of policy_json>`.
+  A ciphertext copied to another row, name or older version fails to decrypt.
+  So does a row whose bound origins, `use`, `hosts`, `allow_any_field` or
+  session scope was changed by a database write: binding a login to a new
+  origin needs the DEK. The resolver decrypts before every use, so it always
+  checks the policy it enforces; a failure is `vault.entry-corrupt` and is
+  audited. `policy_json` is written in a canonical form (sorted keys, origins
+  sorted and lower-cased) so the hash is stable.
+- **Changing the policy** (`PATCH` with new origins or scope) re-encrypts the
+  entry with a new IV and `version + 1` in the same transaction. The owner
+  password is required for an `origins` change (Threat model).
+- **Fingerprint key** `FK` = HKDF-SHA256(M, info `"hearth-vault/v1 fingerprint"`),
+  derived from the master key, not the DEK, so a DEK rotation keeps every
+  fingerprint (see "Envelope and subkeys"). It is keyed, so a leaked fingerprint
+  cannot be checked against a dictionary. The display format matches
+  `SecretValue.fingerprint` (12 hex) with a different prefix.
 - **Delete** removes the row; the audit record keeps id, name and fingerprint.
   There is no soft delete, so no undeleted ciphertext is kept.
 - **Uses** go to the existing `audit` table:
@@ -573,11 +707,13 @@ Code layout:
 JSON bodies only (0010).
 
 ```
-GET    /v1/secrets                    -> [{id, name, kind, scope, meta, fingerprint, version,
+GET    /v1/secrets                    -> [{id, name, kind, scope, policy, meta, fingerprint, version,
                                             createdAt, updatedAt, lastUsedAt}]   // never a value
-POST   /v1/secrets                    {name, kind, scope?, meta, fields}  -> 201 {id, fingerprint}
+POST   /v1/secrets                    {name, kind, scope?, policy, meta, fields}  -> 201 {id, fingerprint}
 PUT    /v1/secrets/:id/value          {fields}                            -> {fingerprint, version}  // rotate
-PATCH  /v1/secrets/:id                {name?, scope?, meta?}  // changing login origins needs {password}
+PATCH  /v1/secrets/:id                {name?, scope?, policy?, meta?}  // name/scope/policy re-encrypt (version+1); origins need {password}
+POST   /v1/vault/rotate-key           {password}  -> {kekCheck}   // only with HEARTH_VAULT_KEY_NEXT_REF set
+GET    /v1/vault/status               -> {state: "enabled"|"disabled", reason?, kekCheck?}
 DELETE /v1/secrets/:id                                                    -> 204
 GET    /v1/secrets/:id/uses?before=   -> [{at, tool, sessionId, origin, fingerprint}]  // from audit
 GET    /v1/settings/model             -> {provider, model, keyRef, source: "settings"|"env", providers:[...]}
@@ -646,10 +782,12 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
    hard-coded `HEARTH_MODEL_KEY_REF`, `hearth.env.example` drops the model lines,
    and the hub warns if they are still set. `env:` and `file:` refs keep working
    for anyone who wants them (the settings UI accepts any ref).
-5. **No vault key file at all on an old compose file:** the hub runs as today
-   (env model config), and the Settings page shows "vault disabled: add
-   deploy/secrets/vault_key". No data is lost and nothing is generated into
-   the volume.
+5. **No vault key file at all on an old compose file:** the same rule as any
+   missing key ("A missing or wrong key file"): the hub starts with the vault
+   disabled, runs as today (env model config, `file:` model key), and the
+   Settings page shows "vault disabled: add deploy/secrets/vault_key". No data
+   is lost, nothing is generated into the volume, and the import of step 2
+   waits until a key file is present.
 
 ## Proposed DECISIONS text
 
@@ -668,12 +806,18 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 >
 > - **Store.** Secrets are rows of a `secret` table. Each row is encrypted with
 >   AES-256-GCM (WebCrypto in Bun, fresh 96-bit IV, AAD = id, workspace, name,
->   kind and version) under one data key. The data key is stored only wrapped
->   with AES-KW by the vault key. No other crypto, no hand-written primitives.
+>   kind, version, session scope and a hash of the policy: bound origins, `use`,
+>   `hosts`, `allow_any_field`) under one data key. The data key is stored only
+>   wrapped with AES-KW. No other crypto, no hand-written primitives.
 > - **Vault key.** 32 random bytes in `deploy/secrets/vault_key`, a compose
->   secret read through the SecretStore (`HEARTH_VAULT_KEY_REF`). It is never
->   generated into the data volume, and a mismatch is a startup error. Backup is
->   the volume plus the key file, kept apart. Losing the key loses the vault.
+>   secret read through the SecretStore (`HEARTH_VAULT_KEY_REF`). HKDF-SHA256
+>   derives three subkeys from it: the wrapping key, the `kek_check` key and the
+>   fingerprint key. It is never generated into the data volume. If it is
+>   missing, invalid or does not match, the hub still starts with the vault
+>   disabled, `env:` / `file:` refs keep working, and Settings shows the reason.
+>   Rotation supplies `vault_key.next` beside it, rewraps in one transaction,
+>   then cuts over. Backup is the volume plus the key file, kept apart. Losing
+>   the key loses the vault.
 > - **Refs.** `vault:<name>[#field]` through a `VaultSecretResolver` (E7). Kinds
 >   are `model-key`, `login` (username, password, TOTP seed, bound origins) and
 >   `token` (`use: hub | box-env`). `#totp` is computed in the hub; the seed never
@@ -684,8 +828,14 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 >   The hub audits the use (E10, before the use), resolves the ref at the tool
 >   RPC boundary and puts the value only in that RPC. It redacts the value
 >   from results, events, logs and trajectories (0015, 0021, #70).
->   `browser_fill` fills a `login` only on a frame whose origin is in the
->   entry's origins. Model keys and `use: hub` tokens never enter a box.
+>   `browser_fill` (#112) fills a `login` only when the page origin the box
+>   reported (checked in the hub) and the element's frame origin (checked in
+>   the box just before the fill) are in the entry's origins, and only into a
+>   password, username or one-time-code field unless the entry allows any
+>   field. Box-agent replaces filled values with `[secret]` in text for the rest
+>   of the session and masks filled elements in every later screenshot of the
+>   tab (Playwright `screenshot({ mask })`). Model keys and `use: hub` tokens
+>   never enter a box.
 > - **Model settings** move to a `setting` row edited in the UI. `HEARTH_MODEL*`
 >   in the environment wins while set (read-only card), and on first start the
 >   current key file is imported.
@@ -702,6 +852,13 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 > - **Known gaps:**
 >   - a command in the box can read a filled field over CDP (0026) and send it
 >     out over open egress;
+>   - screenshots are masked only over the filled elements: a site that echoes
+>     the value elsewhere, or shows it in page text after a navigation, puts it
+>     in a screenshot the model sees;
+>   - script or user content on a bound origin (XSS, an uploaded page) passes
+>     the origin check;
+>   - a same-document change between the box's origin check and the fill is not
+>     detected;
 >   - redaction misses encodings it does not know;
 >   - short values over-redact.
 >
@@ -712,8 +869,12 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
 1. **core+hub: vault store.** Migration (`vault_key`, `secret`, `setting`),
    WebCrypto envelope, keyed fingerprints, `VaultSecretResolver`, the
    `VaultKeyProvider` / `VaultEntryBackend` interfaces with file and SQLite
-   implementations, startup key check. Tests:
+   implementations, startup key check, vault-disabled state, master key
+   rotation with `vault_key.next`. Tests:
    - a wrong AAD, wrong key and swapped rows fail;
+   - a row whose `policy_json` or `scope_session_id` was edited in SQL fails;
+   - a missing or wrong key file starts the hub with the vault disabled;
+   - a crash between rewrap and cutover recovers on either key;
    - no value appears in any error or log;
    - rotate invalidates the cache.
 2. **hub: secrets API and audit.** The routes above, `secret.*` audit actions
@@ -733,8 +894,10 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
    work into #70.
 7. **box+hub: `browser_fill` with `vault:` refs** (blocked on #107's tool
    surface). Covers secret params, origin check in box-agent, refusal of
-   `vault:` in plain text params, the "tainted tab" rule, and an eval task with
-   a local login page.
+   `vault:` in plain text params, the hub and box origin checks, the field
+   check, session-wide `[secret]` text redaction, screenshot masking, and an
+   eval task with a local login page that also checks a screenshot after a
+   show-password toggle.
 8. **hub: TOTP for logins** with `otpauth` (MIT), `#totp` field.
 9. **hub: `box-env` tokens** for one exec RPC (opt-in per entry, UI warning).
 10. **Later / enterprise:** an OpenBao transit `VaultKeyProvider` (then a KV v2
