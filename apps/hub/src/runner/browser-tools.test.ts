@@ -139,4 +139,33 @@ describe("registration", () => {
     expect(BROWSER_TOOLS).toContain("browser_forward");
     for (const tool of registered) expect(tool.executionMode).toBe("sequential");
   });
+
+  test("each tool calls its own browser method through a lease, released after", async () => {
+    const tools = new Map<
+      string,
+      { execute: (id: string, params: unknown, signal?: AbortSignal) => Promise<unknown> }
+    >();
+    const pi = {
+      registerTool: (tool: { name: string; execute: never }) => tools.set(tool.name, tool),
+    } as unknown as ExtensionAPI;
+    const calls: string[] = [];
+    let released = 0;
+    const box = {
+      ensureBox: async () => ({ boxId: "bx_1", release: () => released++ }),
+      operations: () => ({
+        browser: {
+          call: async (method: string) => {
+            calls.push(method);
+            return method === "browser.tabs" ? { tabs: [], active: null } : action();
+          },
+        },
+      }),
+    } as unknown as RunnerBox;
+    registerBrowserTools(pi, box);
+    for (const name of ["browser_back", "browser_forward", "browser_navigate", "browser_tabs"]) {
+      await tools.get(name)?.execute("call_1", {});
+    }
+    expect(calls).toEqual(["browser.back", "browser.forward", "browser.navigate", "browser.tabs"]);
+    expect(released).toBe(4);
+  });
 });
