@@ -456,6 +456,42 @@ describe("input checks", () => {
   });
 });
 
+describe("writes", () => {
+  test("a taken name is refused before anything is audited or stored", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    await addModelKey(h);
+    const error = await h.vault
+      .create(LOCAL_PRINCIPAL, { name: "model", kind: "token", fields: { value: TOKEN } })
+      .catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "secret.name-taken" });
+    const detailed = auditRows(h.db, "secret.create").filter((r) => r.detail_json !== null);
+    expect(detailed).toHaveLength(1);
+  });
+
+  test("a rotated value joins the redaction set; a row changed meanwhile is a conflict", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const { id } = await addModelKey(h);
+    h.registered.length = 0;
+    await h.vault.rotate(LOCAL_PRINCIPAL, id, { fields: { value: MODEL_KEY_2 } });
+    expect(h.registered).toEqual([MODEL_KEY_2]);
+    const store = new SqliteVaultStore(h.db);
+    store.replaceValue = () => false;
+    const raced = new HubVault({
+      store,
+      authorizer: new AllowAllAuthorizer({ audit: new SqliteAuditSink(h.db) }),
+      audit: new SqliteAuditSink(h.db),
+      keySecrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+      register: () => {},
+    });
+    const error = await raced
+      .rotate(LOCAL_PRINCIPAL, id, { fields: { value: "another-value-1f" } })
+      .catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "secret.conflict" });
+  });
+});
+
 describe("scope and kind", () => {
   test("a scoped entry is usable only in its session, never through the hub's store", async () => {
     const h = await start({ env: { VAULT_KEY: KEY_A } });
