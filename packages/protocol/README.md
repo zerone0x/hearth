@@ -242,6 +242,7 @@ box does not have browser tools.
 | Method | Params | Result |
 |---|---|---|
 | `browser.navigate` | `url` (http, https, `about:blank`), `tab?`, `expect?`, `expectTimeoutMs?` | action result + `status` |
+| `browser.back`, `browser.forward` | `tab?`, `expect?`, `expectTimeoutMs?` | action result + `status`; `navigation_failed` with no such history entry |
 | `browser.snapshot` | `tab?`, `ref?` (subtree), `depth?` | `tab`, `url`, `title`, `snapshot` |
 | `browser.find` | `text` or `regex`, `tab?`, `max?` | `snapshotId`, `lines`, `matches`, `limitReached` |
 | `browser.click` | `ref`, `element`, `button?`, `double?`, `expect?`, `expectTimeoutMs?` | action result |
@@ -270,7 +271,7 @@ box does not have browser tools.
 
 | Code | Owner | Disposition |
 |---|---|---|
-| `browser.unavailable` (no CDP answer) | `box` | `give-up` when mutating, `retry` when read-only |
+| `browser.unavailable` (no CDP answer, or Chromium gone during the call) | `box` | `give-up` when mutating, `retry` when read-only |
 | `browser.no-tab`, `browser.bad-url`, `browser.stale-ref` (screenshot or subtree), `browser.failed` | `user` | `give-up` |
 
 ## Versioning

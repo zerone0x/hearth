@@ -2467,7 +2467,7 @@ timeout, and a covered or disabled target did the same.
 ### Decision
 
 - **Protocol 1.3: `browser.*` methods are tool methods.** `browser.navigate`,
-  `snapshot`, `find`, `click`, `type`, `select`, `press`, `wait`, `screenshot`
+  `back`, `forward`, `snapshot`, `find`, `click`, `type`, `select`, `press`, `wait`, `screenshot`
   and `tabs` (`packages/protocol/src/browser.ts`) join `ToolParams` and
   `ToolResults`, so they reuse the tool RPC of 0011 unchanged: `rpc` frames,
   once-per-boot ids, per-call deadlines (`browserBudgetMs` plus the grace),
@@ -2475,7 +2475,9 @@ timeout, and a covered or disabled target did the same.
   are mutating (never re-sent to a new boot, `give-up` when the outcome is
   unknown); observing ones are `retry`. New codes: `browser.unavailable`
   (box), `browser.no-tab`, `browser.bad-url`, `browser.stale-ref`,
-  `browser.failed` (user). A minor bump: a 1.2 box connects as before and
+  `browser.failed` (user). `browser.unavailable` also covers Chromium going
+  away during a call (killed or restarted: the page's browser is
+  disconnected when the call fails); the next call reconnects. A minor bump: a 1.2 box connects as before and
   answers a browser method `unknown-method`; the hub's tool turns that into
   "this box has no browser tools". A box-agent built without browser tools
   answers the same way.
@@ -2517,8 +2519,19 @@ timeout, and a covered or disabled target did the same.
 - **Snapshot cap.** Snapshot text in a result is at most
   `MAX_SNAPSHOT_TEXT_BYTES` (24 KiB), cut at a line end with a marker; the
   whole snapshot (up to 4 MiB) is written to
-  `/workspace/.hearth/browser/s<generation>.txt` for `read`. `browser.find`
-  returns only matching lines (default 20, at most 200).
+  `/workspace/.hearth/browser/s<generation>.txt` for `read`. The box writes
+  that file on its own, so it goes through `openPlainFile` like the exec
+  spill (0011): a symlinked `.hearth` or `browser` directory is refused, the
+  file is opened `O_NOFOLLOW | O_NONBLOCK` (a FIFO there fails at once
+  instead of blocking the serial call queue) and created 0600. A refused
+  spill returns the cut snapshot with no path. `browser.find` returns only
+  matching lines (default 20, at most 200); an invalid `regex` is
+  `tool.bad-params`.
+- **Back and forward.** `browser.back` and `browser.forward` move one entry
+  in the tab's history. They are navigations: mutating, navigate's budget,
+  every ref of the tab stale afterwards, the new page's snapshot in the
+  result, `expect` checked. With no such entry the outcome is
+  `navigation_failed` and nothing happens.
 - **One call at a time per box.** Browser calls run in arrival order; a call
   whose budget ran out while queued never starts. The runner registers the
   tools as `sequential`.
@@ -2530,7 +2543,10 @@ timeout, and a covered or disabled target did the same.
   registered by the `hearth-tools` extension and active in every session.
   Each call takes a box lease and calls `browser.*` through the tool RPC.
   Text results are a JSON header line and the snapshot inside a
-  `<page-content>` block marked as untrusted page content. An acting result
+  `<page-content>` block marked as untrusted page content. A page cannot
+  leave the block: every `<page-content` or `</page-content` in page text
+  (snapshot lines, find lines, and the title, URL and dialog text in the
+  header), in any case and spacing, has its `<` written `&lt;`. An acting result
   that is not ok fails the tool call with the same text, so the trajectory
   counts `stale_ref` and `not_verified`. `browser_screenshot` returns the JPEG
   (quality 70, then 50, then 30; a full page falls back to the viewport; at
@@ -2543,8 +2559,11 @@ timeout, and a covered or disabled target did the same.
 - Not in this change: `browser_fill` with vault refs and redaction of filled
   values (#118), the screenshot mask (#118), the eval tasks B1-B6 (#119),
   approvals on `element` (M3), coordinate clicks, `browser_evaluate`.
-- Until #117 the screenshot bytes are also in the `pi.tool_execution_end`
-  event of the call (at most 1 MiB, under `MAX_RUNNER_EVENT_BYTES`).
+- Until #117 the screenshot is kept only inside the `pi.tool_execution_end`
+  event of the call, as base64, and only while that event fits
+  `MAX_RUNNER_EVENT_BYTES` (1 MiB). A JPEG over about 768 KiB makes the
+  event larger, and the event is then stored truncated (its first 4 KiB and
+  its size): the image is not kept.
 - The agent works in the same browser the owner sees; the desktop lock that
   makes agent input tools answer "user is in control" is #120's.
 - `playwright-core` follows Playwright's tested Chromium, while the box runs
@@ -2559,16 +2578,26 @@ timeout, and a covered or disabled target did the same.
   stale refs refused before dispatch (older snapshot, after an action, after
   a navigation, closed tab, foreign shape), the five pre-dispatch refusals,
   verification, the snapshot cap at exactly the limit and one byte over,
-  find, screenshots, tabs and call ordering.
+  find, screenshots, tabs, back and forward, error codes and call ordering.
+  The spill uses the real writer on a temp root: a 0600 file in a new
+  `.hearth/browser`, the 4 MiB cap, and no spill (nothing written outside,
+  no hang) through a symlinked `.hearth`, `.hearth/browser` or file, or a
+  FIFO at the path.
 - `apps/box-agent/src/browser/playwright.test.ts`: the same tools on
   `playwright-core` against a real headless Chromium over CDP (CI `web-e2e`
   job): type, select and click verified, disabled and covered targets refused
-  fast, a stale ref after navigation, a screenshot, and a reconnect after the
-  browser restarts; without a browser, `browser.unavailable` after the dial
+  fast, a stale ref after navigation and after the page navigates by itself,
+  dialogs settled and reported, back and forward, a refused connection as
+  `navigation_failed`, an element screenshot, Chromium killed mid-call as
+  `browser.unavailable`, and a reconnect after the browser restarts; without a browser, `browser.unavailable` after the dial
   timeout.
 - `apps/hub/src/box/tool-rpc.test.ts`: a real hub and box-agent; a 1.2
   box-agent answers `unknown-method`, a 1.3 one answers snapshot, click and a
   stale ref.
+- `apps/hub/src/runner/browser-tools.test.ts` and
+  `browser-tools.chromium.test.ts` (real Chromium): one `<page-content>`
+  block per result even when the page writes `</page-content> SYSTEM: ...`;
+  the dialogs header; find wrapping; every tool `sequential`.
 - `apps/hub/src/runner/runner.test.ts`: the faux model reads a ref off a
   snapshot and clicks it; image results; failed outcomes as tool errors; the
   older-box message.

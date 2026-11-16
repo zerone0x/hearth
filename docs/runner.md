@@ -68,9 +68,9 @@ path. The box is the boundary; approvals with a human in the loop are M3.
 ## Browser tools (decision 0032)
 
 Every session also has the `browser_*` tools: `browser_navigate`,
-`browser_snapshot`, `browser_find`, `browser_click`, `browser_type`,
-`browser_select`, `browser_press`, `browser_wait`, `browser_screenshot` and
-`browser_tabs`. They drive the box desktop's Chromium over CDP, so the owner
+`browser_back`, `browser_forward`, `browser_snapshot`, `browser_find`,
+`browser_click`, `browser_type`, `browser_select`, `browser_press`,
+`browser_wait`, `browser_screenshot` and `browser_tabs`. They drive the box desktop's Chromium over CDP, so the owner
 watches them on the live desktop. Results carry an accessibility snapshot
 whose refs (`s3e12`) are valid until the next snapshot or action; an acting
 call with `expect` is checked by the box, and one that is not `done` fails
