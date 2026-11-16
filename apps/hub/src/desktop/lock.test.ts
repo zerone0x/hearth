@@ -31,6 +31,7 @@ function setup(options: { allow?: (action: string) => boolean; failEvents?: bool
     },
   };
   const fail = { events: options.failEvents === true };
+  const logs: string[] = [];
   const locks = new DesktopLocks({
     authorizer,
     sessions: {
@@ -57,10 +58,10 @@ function setup(options: { allow?: (action: string) => boolean; failEvents?: bool
     },
     ttlMs: TTL,
     now: () => clock.now,
-    log: () => undefined,
+    log: (line) => logs.push(line),
   });
   const actions = () => events.map((e) => e.payload["action"]);
-  return { clock, calls, events, states, locks, fail, actions };
+  return { clock, calls, events, states, locks, fail, actions, logs };
 }
 
 async function codeOf(promise: Promise<unknown>): Promise<string | undefined> {
@@ -260,5 +261,92 @@ describe("DesktopLocks: the check the agent's tools use", () => {
     expect((error as HearthError).message).toBe(USER_IN_CONTROL);
     await t.locks.release(LOCAL_PRINCIPAL, "ses_1");
     expect(() => t.locks.assertUnlocked("ses_1")).not.toThrow();
+  });
+});
+
+describe("DesktopLocks: one change at a time, logs, shutdown", () => {
+  /** Locks whose event appends wait until the test lets each one through. */
+  function gated() {
+    const waiting: (() => void)[] = [];
+    const events: string[] = [];
+    const locks = new DesktopLocks({
+      authorizer: { authorize: async () => ({ allowed: true, policy: "test" }) },
+      sessions: {
+        scope: { workspaceId: DEFAULT_WORKSPACE_ID },
+        get: async (_p, id) => ({ id, state: "idle" }) as never,
+      },
+      events: {
+        append: async (_s, _id, event) => {
+          await new Promise<void>((resolve) => waiting.push(resolve));
+          events.push(String((event.payload as { action: string }).action));
+          return { seq: events.length, duplicate: false };
+        },
+      },
+      log: () => undefined,
+    });
+    const next = async () => {
+      for (let i = 0; i < 50 && waiting.length === 0; i++) await Bun.sleep(1);
+      waiting.shift()?.();
+    };
+    return { locks, events, next };
+  }
+  const who = (id: string): Principal => ({ ...LOCAL_PRINCIPAL, id });
+
+  test("two people taking over at once: one wins, the other is refused, one record", async () => {
+    const g = gated();
+    const a = codeOf(g.locks.acquire(who("usr_a"), "ses_1"));
+    const b = codeOf(g.locks.acquire(who("usr_b"), "ses_1"));
+    await g.next();
+    expect([await a, await b]).toEqual([undefined, "desktop.locked"]);
+    expect(g.events).toEqual(["acquired"]);
+  });
+
+  test("a third change still waits for the second after the first finished", async () => {
+    const g = gated();
+    const first = g.locks.acquire(who("usr_a"), "ses_1");
+    const second = g.locks.release(who("usr_a"), "ses_1");
+    await g.next();
+    await first;
+    // The release is now writing its record; a take-over by someone else waits for it.
+    const third = g.locks.acquire(who("usr_b"), "ses_1");
+    await g.next();
+    await second;
+    await g.next();
+    expect(await codeOf(third)).toBeUndefined();
+    expect(g.events).toEqual(["acquired", "released", "acquired"]);
+    expect(g.locks.holder("ses_1")?.principalId).toBe("usr_b");
+  });
+
+  test("each change is logged; a record that fails is logged", async () => {
+    const t = setup();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    await t.locks.release(LOCAL_PRINCIPAL, "ses_1");
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.clock.now += TTL;
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.fail.events = true;
+    await t.locks.viewerLeft("ses_1", LOCAL_PRINCIPAL.id);
+    t.clock.now += TTL;
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
+    await Bun.sleep(0);
+    expect(t.logs.map((l) => l.replace(/^desktop: session ses_1 /, ""))).toEqual([
+      `lock acquired by ${LOCAL_PRINCIPAL.id}`,
+      "lock released",
+      `lock acquired by ${LOCAL_PRINCIPAL.id}`,
+      "lock expired",
+      `lock acquired by ${LOCAL_PRINCIPAL.id}`,
+      "lock release failed: Error: disk full",
+      "lock expired",
+      "lock expiry not recorded: Error: disk full",
+    ]);
+  });
+
+  test("shutdown drops every lock", async () => {
+    const t = setup();
+    await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
+    t.locks.shutdown();
+    expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
+    expect(t.locks.allowsInput("ses_1", LOCAL_PRINCIPAL.id)).toBe(false);
   });
 });

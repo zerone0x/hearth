@@ -96,10 +96,6 @@ export class DesktopLocks implements DesktopLockCheck {
     this.#log = options.log ?? ((line) => console.error(line));
   }
 
-  get ttlMs(): number {
-    return this.#ttl;
-  }
-
   // -- The check the agent's tools use ----------------------------------------
 
   isDesktopLocked(sessionId: SessionId): boolean {
@@ -245,11 +241,9 @@ export class DesktopLocks implements DesktopLockCheck {
 
   /** Fires when the lease would lapse; a renewed lease re-arms for the rest. */
   #arm(sessionId: SessionId, lease: Lease): void {
-    clearTimeout(lease.timer);
     const wait = Math.max(0, lease.expiresAt - this.#now());
     lease.timer = setTimeout(() => {
-      lease.timer = undefined;
-      if (this.#leases.get(sessionId) !== lease) return;
+      // A lease that ended has its timer cleared; this one is still current.
       if (this.#now() < lease.expiresAt) {
         this.#arm(sessionId, lease);
         return;
@@ -275,7 +269,6 @@ export class DesktopLocks implements DesktopLockCheck {
   async #end(sessionId: SessionId, lease: Lease, why: DesktopLockEnd): Promise<void> {
     // Recorded first; should the event fail, the lease still lapses on its own.
     await this.#append(sessionId, { action: why, holder: { ...lease.holder } });
-    if (this.#leases.get(sessionId) !== lease) return;
     clearTimeout(lease.timer);
     this.#leases.delete(sessionId);
     this.#log(`desktop: session ${sessionId} lock ${why}`);
