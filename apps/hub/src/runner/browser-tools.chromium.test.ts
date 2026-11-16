@@ -5,7 +5,10 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chromiumPath, TestChromium } from "../../../box-agent/src/browser/chromium.testkit";
+import { TestChromium } from "../../../box-agent/src/browser/chromium.testkit";
+
+const chromiumPath = process.env["HEARTH_CHROMIUM"] ?? "";
+
 import { PlaywrightDriver } from "../../../box-agent/src/browser/playwright";
 import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { browserContent } from "./browser-tools";
@@ -20,7 +23,7 @@ describe.skipIf(chromiumPath === "")("page content from a real page cannot leave
   let tools: BrowserTools;
 
   beforeAll(async () => {
-    chromium = new TestChromium();
+    chromium = new TestChromium(chromiumPath);
     server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,

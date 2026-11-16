@@ -9,7 +9,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BrowserActionResult } from "@hearth/protocol";
 import { ToolCallError } from "../tools/errors";
-import { chromiumPath, TestChromium } from "./chromium.testkit";
+import { TestChromium } from "./chromium.testkit";
+
+const chromiumPath = process.env["HEARTH_CHROMIUM"] ?? "";
+
 import { PlaywrightDriver } from "./playwright";
 import { BrowserTools } from "./tools";
 
@@ -55,7 +58,7 @@ describe.skipIf(chromiumPath === "")("browser tools on a real Chromium", () => {
   const killChrome = () => chromium.kill();
 
   beforeAll(async () => {
-    chromium = new TestChromium();
+    chromium = new TestChromium(chromiumPath);
     server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,

@@ -1,7 +1,7 @@
 /**
  * A real Chromium (or chrome-headless-shell) with CDP on loopback and its own
  * profile, started the way the box entrypoint starts it (decision 0026), for
- * the tests that run when `HEARTH_CHROMIUM` names a binary.
+ * the tests that run when the test file is given a Chromium binary.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -9,12 +9,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const chromiumPath = process.env["HEARTH_CHROMIUM"] ?? "";
-
 export class TestChromium {
   readonly port = 19_000 + Math.floor(Math.random() * 5000);
   readonly profile = mkdtempSync(join(tmpdir(), "hearth-browser-"));
   #child: ChildProcess | undefined;
+
+  /** `path`: the binary, as the test file got it. */
+  constructor(readonly path: string) {}
 
   get endpoint(): string {
     return `http://127.0.0.1:${this.port}`;
@@ -22,7 +23,7 @@ export class TestChromium {
 
   async start(): Promise<void> {
     this.#child = spawn(
-      chromiumPath,
+      this.path,
       [
         "--headless=new",
         "--no-sandbox",
