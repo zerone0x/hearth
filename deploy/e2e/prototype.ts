@@ -262,26 +262,31 @@ async function rawKeys(page: Page, sessionId: string, keys: [number, boolean][])
               if (buf.length < 24 + n) return;
               buf.splice(0, 24 + n);
               stage = 4;
-              const out: number[] = [];
-              for (const [sym, down] of keys) {
-                out.push(
-                  4,
-                  down ? 1 : 0,
-                  0,
-                  0,
-                  (sym >>> 24) & 255,
-                  (sym >>> 16) & 255,
-                  (sym >>> 8) & 255,
-                  sym & 255,
-                );
-              }
-              ws.send(Uint8Array.from(out));
-              setTimeout(() => {
+              // One message per key, paced like a typist: a burst can reach the
+              // page before Ctrl+L has moved the focus to the address bar.
+              const send = async () => {
+                for (const [i, [sym, down]] of keys.entries()) {
+                  ws.send(
+                    Uint8Array.of(
+                      4,
+                      down ? 1 : 0,
+                      0,
+                      0,
+                      (sym >>> 24) & 255,
+                      (sym >>> 16) & 255,
+                      (sym >>> 8) & 255,
+                      sym & 255,
+                    ),
+                  );
+                  await new Promise((r) => setTimeout(r, i === 3 ? 500 : 30));
+                }
+                await new Promise((r) => setTimeout(r, 2_000));
                 clearTimeout(timer);
                 ws.onclose = null;
                 ws.close();
                 resolve("sent");
-              }, 2_000);
+              };
+              void send();
             } else {
               return;
             }
