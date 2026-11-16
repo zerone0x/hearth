@@ -14,7 +14,9 @@
  * Both checks read source text, so they cannot evaluate code. A test name
  * built from a template literal matches with each `${…}` standing for any
  * non-empty text: the table cites the name the runner prints, such as
- * "/: every directive …" for `${path}: every directive …`. A name built any
+ * "/: every directive …" for `${path}: every directive …`. A template whose
+ * literal text is shorter than MIN_TEMPLATE_LITERAL characters (such as
+ * `${type} ${json}`) is not citable, since it would match almost any name. A name built any
  * other way (a concatenation, a variable) is not found; rename the test to a
  * literal or a template literal. A name spelled out in a comment is not found
  * either, by design.
@@ -188,14 +190,20 @@ export function invariantRefs(architecture: string): InvariantRef[] {
 const DECLARATION =
   /^[ \t]*(?:test|it|describe)(?:\.\w+(?:\((?:[^()]|\([^()]*\))*\))?)*\(\s*(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/gm;
 
+/** Fewest literal characters a template test name needs to be citable. */
+export const MIN_TEMPLATE_LITERAL = 12;
+
 /** `\'` read as `'`: the name the runner prints, not the source spelling. */
 const unescaped = (written: string) => written.replace(/\\([\s\S])/g, "$1");
 
 /** Whether a declared name, as written, is `name`: a template literal's `${…}` matches any non-empty text. */
 function namesMatch(quote: string, written: string, name: string): boolean {
   if (quote !== "`" || !written.includes("${")) return unescaped(written) === name;
-  const pattern = written
-    .split(/\$\{[^}]*\}/)
+  const parts = written.split(/\$\{[^}]*\}/);
+  // A template that is mostly placeholders (`${a} ${b}`) would match almost any
+  // name; it cannot be cited. Its literal text must carry the meaning.
+  if (parts.join("").trim().length < MIN_TEMPLATE_LITERAL) return false;
+  const pattern = parts
     .map((part) => unescaped(part).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join(".+");
   return new RegExp(`^${pattern}$`, "s").test(name);

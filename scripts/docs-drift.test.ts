@@ -192,6 +192,18 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
     ]);
   });
 
+  test("a template that is mostly placeholders cannot be cited, so it never matches an unrelated name", () => {
+    const text = "  test(`${frame.type} ${JSON.stringify(frame)}`, () => {});\n";
+    expect(declaresTest(text, "file streams take workspace-relative paths")).toBe(false);
+    expect(declaresTest(text, "a b")).toBe(false);
+    // A short literal is not enough either: `${name} is never shown` would match any "x is never shown".
+    expect(declaresTest("  test(`${a} is ${b}`, fn)", "anything is anywhere")).toBe(false);
+    // Enough literal text keeps a template citable.
+    const cited =
+      "  test(`${path}: every directive is exactly the one 0017 justifies`, () => {});\n";
+    expect(declaresTest(cited, "/: every directive is exactly the one 0017 justifies")).toBe(true);
+  });
+
   test("a modifier, a describe and a template literal declare a name too", () => {
     expect(declaresTest('test.skipIf(me === 0)("skipped as root", fn)', "skipped as root")).toBe(
       true,
@@ -211,10 +223,10 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
     expect(declaresTest(built, "every directive holds")).toBe(false);
     expect(declaresTest(built, "/: every directive holds, mostly")).toBe(false);
     expect(declaresTest(built, "/: every directive")).toBe(false);
-    expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 (x) 2")).toBe(true);
-    expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 yxy 2")).toBe(false);
-    expect(declaresTest("test(`a ${x} b`, fn)", "a 1 b")).toBe(true);
-    expect(declaresTest("test(`a ${x} b`, fn)", "za 1 b")).toBe(false);
+    expect(declaresTest("test(`${a} (x) answers it ${b}`, fn)", "1 (x) answers it 2")).toBe(true);
+    expect(declaresTest("test(`${a} (x) answers it ${b}`, fn)", "1 yxy answers it 2")).toBe(false);
+    expect(declaresTest("test(`a box ${x} b answers`, fn)", "a box 1 b answers")).toBe(true);
+    expect(declaresTest("test(`a box ${x} b answers`, fn)", "za box 1 b answers")).toBe(false);
     expect(declaresTest("test(`plain`, fn)", "plain")).toBe(true);
     expect(declaresTest("// test(`${p}: in a comment`, fn)", "/: in a comment")).toBe(false);
   });
