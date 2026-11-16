@@ -9,8 +9,16 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type BlobRef, DEFAULT_WORKSPACE_ID, LOCAL_PRINCIPAL, MAX_BLOB_BYTES } from "@hearth/core";
-import { SESSION_COOKIE } from "../auth";
+import {
+  type BlobRef,
+  type BlobStore,
+  blobRefOf,
+  DEFAULT_WORKSPACE_ID,
+  LOCAL_PRINCIPAL,
+  MAX_BLOB_BYTES,
+} from "@hearth/core";
+import { Hono } from "hono";
+import { type HubEnv, SESSION_COOKIE } from "../auth";
 import { type Hub, startHub } from "../server";
 import { openDatabase, SqliteBlobStore } from "../store";
 import { exportBlobs } from "../trajectory-cli";
@@ -18,9 +26,14 @@ import {
   imageRefs,
   imagesToRefs,
   missingImageText,
+  mountBlobRoutes,
   type PendingBlob,
   restoreImages,
+  SessionBlobs,
+  storeBlobs,
 } from "./blobs";
+import { capText } from "./cap";
+import { capResult } from "./turn-tracer";
 
 const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
 const dirs: string[] = [];
@@ -301,5 +314,105 @@ describe("trajectory CLI --export-blobs", () => {
     expect(readFileSync(join(out, `${f.refA.sha256}.jpg`)).equals(f.shotA)).toBe(true);
     expect(statSync(join(out, `${f.refA.sha256}.jpg`)).mode & 0o777).toBe(0o600);
     expect(await exportBlobs(f.dbPath, "se_unknown", join(tempDir(), "none"))).toEqual([]);
+  });
+});
+
+describe("edges the mutation check found (decision 0037)", () => {
+  test("imageRefs and capResult take results that are not content arrays", () => {
+    expect(imageRefs(undefined)).toEqual([]);
+    expect(imageRefs({ content: "x" })).toEqual([]);
+    expect(capResult("plain text")).toEqual({ ...capText("plain text") });
+    expect(capResult(null)).toEqual({ ...capText("") });
+    // No images: neither the count nor the references are added.
+    expect(Object.keys(capResult({ content: [{ type: "text", text: "t" }] }))).not.toContain(
+      "images",
+    );
+    expect(Object.keys(capResult({ content: [{ type: "text", text: "t" }] }))).not.toContain(
+      "image_blobs",
+    );
+  });
+
+  test("storeBlobs without a store stores nothing and does not fail", async () => {
+    const bytes = jpeg(6);
+    await storeBlobs(undefined, scope, "se_1", [{ ref: blobRefOf(bytes), bytes }]);
+  });
+
+  test("restoreImages passes over null and non-object content items", async () => {
+    const entries = [{ content: [null, "text", 3] }];
+    expect(await restoreImages(entries, undefined, scope, "se_1")).toEqual(entries);
+  });
+
+  test("a store error that is not a HearthError is a 500 that does not echo its message", async () => {
+    const app = new Hono<HubEnv>();
+    app.use(async (c, next) => {
+      c.set("principal", LOCAL_PRINCIPAL);
+      await next();
+    });
+    const failing: BlobStore = {
+      put: async () => {
+        throw new Error("unused");
+      },
+      get: async () => {
+        throw new Error("disk error at /data/hearth.db");
+      },
+      list: async () => [],
+    };
+    mountBlobRoutes(
+      app,
+      new SessionBlobs({
+        authorizer: { authorize: async () => ({ allowed: true, policy: "test" }) },
+        blobs: failing,
+        sessions: { get: async () => undefined },
+      }),
+    );
+    const res = await app.request(`/v1/sessions/se_1/blobs/${"0".repeat(64)}`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).not.toContain("/data/hearth.db");
+  });
+
+  test("the trajectory CLI exports blobs from the command line and still prints the trajectory", async () => {
+    const f = await fixture();
+    const db = openDatabase(f.dbPath);
+    const second = await new SqliteBlobStore(db).put(scope, f.a, jpeg(42));
+    db.close();
+    const out = join(tempDir(), "exported");
+    const run = Bun.spawnSync(
+      [
+        process.execPath,
+        join(import.meta.dir, "..", "trajectory-cli.ts"),
+        "--db",
+        f.dbPath,
+        "--export-blobs",
+        out,
+        f.a,
+      ],
+      { stdout: "pipe", stderr: "pipe", env: { ...process.env, HEARTH_MODEL_KEY_REF: "" } },
+    );
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout.toString()).toContain('"kind":"session"');
+    expect(run.stderr.toString()).toContain(`wrote 2 blob(s) to ${out}`);
+    expect(readdirSync(out).sort()).toEqual(
+      [`${f.refA.sha256}.jpg`, `${second.sha256}.jpg`].sort(),
+    );
+    // Without the option nothing is exported; a missing DIR is a usage error.
+    const plain = Bun.spawnSync(
+      [process.execPath, join(import.meta.dir, "..", "trajectory-cli.ts"), "--db", f.dbPath, f.a],
+      { stdout: "pipe", stderr: "pipe", env: { ...process.env, HEARTH_MODEL_KEY_REF: "" } },
+    );
+    expect(plain.exitCode).toBe(0);
+    expect(plain.stderr.toString()).not.toContain("blob(s)");
+    const usage = Bun.spawnSync(
+      [
+        process.execPath,
+        join(import.meta.dir, "..", "trajectory-cli.ts"),
+        "--db",
+        f.dbPath,
+        f.a,
+        "--export-blobs",
+      ],
+      { stdout: "pipe", stderr: "pipe", env: { ...process.env, HEARTH_MODEL_KEY_REF: "" } },
+    );
+    expect(usage.exitCode).toBe(2);
+    expect(usage.stderr.toString()).toContain("--export-blobs DIR");
   });
 });

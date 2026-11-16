@@ -89,6 +89,27 @@ describe("put and get", () => {
   });
 });
 
+describe("scope checks", () => {
+  test("an empty workspace or session id is refused by put, get and list", async () => {
+    const bytes = jpeg(1);
+    const code = async (p: Promise<unknown>) =>
+      await p.then(
+        () => "resolved",
+        (e: unknown) => (e as HearthError).code,
+      );
+    const sha256 = (await store.put(scope, S, bytes)).sha256;
+    for (const [s, id] of [
+      [{ workspaceId: "" }, S],
+      [scope, ""],
+    ] as const) {
+      expect(await code(store.put(s, id, bytes))).toBe("blob.invalid");
+      expect(await code(store.get(s, id, sha256))).toBe("blob.invalid");
+      expect(await code(store.list(s, id))).toBe("blob.invalid");
+    }
+    expect(count("session_blob")).toBe(1);
+  });
+});
+
 describe("the cap", () => {
   test("exactly MAX_BLOB_BYTES is stored; one byte more is refused and nothing is written", async () => {
     const at = new Uint8Array(MAX_BLOB_BYTES).fill(1);
@@ -146,5 +167,8 @@ describe("sniffBlobMime", () => {
       "application/octet-stream",
     );
     expect(sniffBlobMime(ascii("RIFF\0\0\0\0WAVE"))).toBe("application/octet-stream");
+    // The shortest blobs of each type: exactly the magic number.
+    expect(sniffBlobMime(ascii("GIF89a"))).toBe("image/gif");
+    expect(sniffBlobMime(ascii("RIFF\0\0\0\0WEBP"))).toBe("image/webp");
   });
 });
