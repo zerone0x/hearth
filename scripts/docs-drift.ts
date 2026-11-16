@@ -5,7 +5,21 @@
  *   row of the README's configuration table, the row names a file that really
  *   mentions it, and no `HEARTH_*` row names a variable the repo no longer has;
  * - every row of the "Invariants and tests" table in docs/ARCHITECTURE.md
- *   names a test file that exists and a test name that is in it.
+ *   names a file that exists, and each test name the row cites after a file is
+ *   declared in it: `test(`, `it(` or `describe(` (also with a modifier such as
+ *   `test.skipIf(…)(` or `test.each(…)(`) at the start of a line, with the
+ *   whole name as its first argument, so a substring, a comment or a string
+ *   elsewhere does not count.
+ *
+ * Both checks read source text, so they cannot evaluate code. A test name
+ * built from a template literal matches with each `${…}` standing for any
+ * non-empty text: the table cites the name the runner prints, such as
+ * "/: every directive …" for `${path}: every directive …`. A template whose
+ * literal text is shorter than MIN_TEMPLATE_LITERAL characters (such as
+ * `${type} ${json}`) is not citable, since it would match almost any name. A name built any
+ * other way (a concatenation, a variable) is not found; rename the test to a
+ * literal or a template literal. A name spelled out in a comment is not found
+ * either, by design.
  */
 
 /** A `HEARTH_*` or `OTEL_*` variable name; a template prefix such as `OTEL_..._${signal}` is not one. */
@@ -18,12 +32,13 @@ export interface SourceFile {
 
 /**
  * Whether a tracked file is shipped code whose variables the README must list:
- * the apps, packages, scripts and deploy files, but not tests, test data, the
+ * the apps, packages, scripts and deploy files and the root `.json` files
+ * (`package.json` scripts read variables too), but not lockfiles, tests, test data, the
  * e2e harnesses (their variables are documented in their own headers) or docs.
  */
 export function isShippedCode(path: string): boolean {
-  if (!/^(apps|packages|scripts|deploy)\//.test(path)) return false;
-  if (/\.(md|lock|json)$/.test(path)) return false;
+  if (!/^(apps|packages|scripts|deploy)\/|^[^/]+\.json$/.test(path)) return false;
+  if (/\.(md|lock)$/.test(path)) return false;
   if (/\.test\.tsx?$/.test(path) || /\.dom\.tsx$/.test(path)) return false;
   if (/(^|\/)(testdata|e2e)\//.test(path)) return false;
   return true;
@@ -134,8 +149,9 @@ export interface InvariantRef {
 
 /**
  * The test references of the `## Invariants and tests` table: in its last
- * cell, each `` `path` `` followed by one or more `"test name"`s. A row with
- * none is returned with an empty file, so the check reports it.
+ * cell, each `` `path` `` followed by zero or more `"test name"`s. A path with
+ * no name is returned with an empty test, so the check still finds the file.
+ * A row with no path is returned with an empty file, so the check reports it.
  */
 export function invariantRefs(architecture: string): InvariantRef[] {
   const refs: InvariantRef[] = [];
@@ -145,20 +161,63 @@ export function invariantRefs(architecture: string): InvariantRef[] {
     const promise = row[0] ?? "";
     const guard = row[row.length - 1] ?? "";
     let file = "";
-    let found = false;
+    let named = false;
+    const fileOnly = () => {
+      if (file !== "" && !named) refs.push({ promise, file, test: "" });
+    };
     for (const m of guard.matchAll(/`([^`]+)`|"([^"]+)"/g)) {
-      if (m[1] !== undefined) file = m[1];
-      else if (file !== "") {
+      if (m[1] !== undefined) {
+        fileOnly();
+        file = m[1];
+        named = false;
+      } else if (file !== "") {
         refs.push({ promise, file, test: m[2] as string });
-        found = true;
+        named = true;
       }
     }
-    if (!found) refs.push({ promise, file: "", test: "" });
+    fileOnly();
+    if (file === "") refs.push({ promise, file: "", test: "" });
   }
   return refs;
 }
 
-/** Each reference whose file is missing or does not contain the test name. */
+/**
+ * A test declaration that starts a line: `test`, `it` or `describe`, any
+ * modifiers (`.skipIf(…)`, `.each(…)`, `.only`), then `(` and a quoted first
+ * argument, which may be on the next line. Group 1 is the quote, group 2 the
+ * name as written.
+ */
+const DECLARATION =
+  /^[ \t]*(?:test|it|describe)(?:\.\w+(?:\((?:[^()]|\([^()]*\))*\))?)*\(\s*(["'`])((?:\\[\s\S]|(?!\1)[^\\])*)\1/gm;
+
+/** Fewest literal characters a template test name needs to be citable. */
+export const MIN_TEMPLATE_LITERAL = 12;
+
+/** `\'` read as `'`: the name the runner prints, not the source spelling. */
+const unescaped = (written: string) => written.replace(/\\([\s\S])/g, "$1");
+
+/** Whether a declared name, as written, is `name`: a template literal's `${…}` matches any non-empty text. */
+function namesMatch(quote: string, written: string, name: string): boolean {
+  if (quote !== "`" || !written.includes("${")) return unescaped(written) === name;
+  const parts = written.split(/\$\{[^}]*\}/);
+  // A template that is mostly placeholders (`${a} ${b}`) would match almost any
+  // name; it cannot be cited. Its literal text must carry the meaning.
+  if (parts.join("").trim().length < MIN_TEMPLATE_LITERAL) return false;
+  const pattern = parts
+    .map((part) => unescaped(part).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".+");
+  return new RegExp(`^${pattern}$`, "s").test(name);
+}
+
+/** Whether the source declares a test or group named `name` (see DECLARATION): a name in a comment or a string does not count. */
+export function declaresTest(text: string, name: string): boolean {
+  for (const m of text.matchAll(DECLARATION)) {
+    if (namesMatch(m[1] as string, m[2] as string, name)) return true;
+  }
+  return false;
+}
+
+/** Each reference whose file is missing or does not declare the test name. */
 export function invariantDrift(
   refs: readonly InvariantRef[],
   read: (path: string) => string | undefined,
@@ -172,7 +231,7 @@ export function invariantDrift(
     }
     const text = read(ref.file);
     if (text === undefined) errors.push(`invariant "${ref.promise}": no file ${ref.file}`);
-    else if (!text.includes(ref.test)) {
+    else if (ref.test !== "" && !declaresTest(text, ref.test)) {
       errors.push(`invariant "${ref.promise}": ${ref.file} has no test "${ref.test}"`);
     }
   }
