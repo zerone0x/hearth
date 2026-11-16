@@ -1,11 +1,28 @@
 import { join } from "node:path";
-import { formatHit, type Hit, scanText } from "./forbidden";
+import {
+  type Forbidden,
+  formatHit,
+  type Hit,
+  mask,
+  parseConfig,
+  scanPath,
+  scanText,
+} from "./forbidden";
 
+// Scans the git repository this script sits in (its parent directory).
 const root = join(import.meta.dir, "..");
-const config = (await Bun.file(join(import.meta.dir, "forbidden-terms.json")).json()) as {
-  sha256: string[];
-};
-const forbidden = new Set(config.sha256.map((h) => h.toLowerCase()));
+const configPath = join(import.meta.dir, "forbidden-terms.json");
+
+let forbidden: Forbidden;
+try {
+  forbidden = parseConfig(await Bun.file(configPath).json());
+} catch (err) {
+  console.error(`forbidden: bad config scripts/forbidden-terms.json: ${(err as Error).message}`);
+  process.exit(1);
+}
+if (forbidden.size === 0) {
+  console.warn("forbidden: warning: scripts/forbidden-terms.json lists no terms; nothing checked");
+}
 
 const ls = Bun.spawnSync(["git", "ls-files", "-z"], { cwd: root });
 if (ls.exitCode !== 0) {
@@ -17,12 +34,13 @@ const paths = ls.stdout.toString().split("\0").filter(Boolean);
 const hits: Hit[] = [];
 await Promise.all(
   paths.map(async (path) => {
+    hits.push(...scanPath(path, forbidden));
     if (path === "bun.lock" || path.endsWith("/bun.lock")) return;
     const file = Bun.file(join(root, path));
     if (!(await file.exists())) return; // deleted in the working tree
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (bytes.subarray(0, 8000).includes(0)) return; // binary
-    hits.push(...scanText(path, new TextDecoder().decode(bytes), forbidden));
+    hits.push(...scanText(mask(path, forbidden), new TextDecoder().decode(bytes), forbidden));
   }),
 );
 
