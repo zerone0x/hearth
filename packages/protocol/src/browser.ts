@@ -117,6 +117,12 @@ interface Acting {
 export type BrowserTabAction = "list" | "new" | "select" | "close";
 export type BrowserButton = "left" | "right" | "middle";
 
+type BrowserHistoryParams = Base & {
+  readonly tab?: number;
+  readonly expect?: BrowserExpect;
+  readonly expectTimeoutMs?: number;
+};
+
 export interface BrowserParams {
   /** Load `url` (http, https or `about:blank`) in the tab. */
   "browser.navigate": Base & {
@@ -125,6 +131,10 @@ export interface BrowserParams {
     readonly expect?: BrowserExpect;
     readonly expectTimeoutMs?: number;
   };
+  /** Goes back one entry in the tab's history. */
+  "browser.back": BrowserHistoryParams;
+  /** Goes forward one entry in the tab's history. */
+  "browser.forward": BrowserHistoryParams;
   /** The tab's snapshot, or the subtree under `ref`, to `depth`. */
   "browser.snapshot": Base & {
     readonly tab?: number;
@@ -255,6 +265,8 @@ export interface BrowserTab {
 
 export interface BrowserResults {
   "browser.navigate": BrowserActionResult;
+  "browser.back": BrowserActionResult;
+  "browser.forward": BrowserActionResult;
   "browser.snapshot": BrowserPageInfo & { readonly snapshot: BrowserSnapshot };
   "browser.find": BrowserPageInfo & {
     readonly snapshotId: string;
@@ -283,6 +295,8 @@ export type BrowserMethod = keyof BrowserParams;
 
 export const BROWSER_METHODS: readonly BrowserMethod[] = [
   "browser.navigate",
+  "browser.back",
+  "browser.forward",
   "browser.snapshot",
   "browser.find",
   "browser.click",
@@ -297,6 +311,8 @@ export const BROWSER_METHODS: readonly BrowserMethod[] = [
 /** Methods that change the page or the tabs; never re-sent to a new boot. */
 export const MUTATING_BROWSER_METHODS: readonly BrowserMethod[] = [
   "browser.navigate",
+  "browser.back",
+  "browser.forward",
   "browser.click",
   "browser.type",
   "browser.select",
@@ -329,6 +345,8 @@ export function browserBudgetMs<M extends BrowserMethod>(
     case "browser.tabs":
       return observe + BROWSER_NAVIGATION_TIMEOUT_MS;
     case "browser.navigate":
+    case "browser.back":
+    case "browser.forward":
       return (
         observe + BROWSER_NAVIGATION_TIMEOUT_MS + (p.expectTimeoutMs ?? DEFAULT_EXPECT_TIMEOUT_MS)
       );
@@ -407,6 +425,8 @@ export const BROWSER_PARAMS: {
   readonly [M in BrowserMethod]: (f: Fields) => BrowserParams[M];
 } = {
   "browser.navigate": (f) => ({ ...base(f), url: url(f, "url"), ...tab(f), ...expectation(f) }),
+  "browser.back": (f) => ({ ...base(f), ...tab(f), ...expectation(f) }),
+  "browser.forward": (f) => ({ ...base(f), ...tab(f), ...expectation(f) }),
   "browser.snapshot": (f) => ({
     ...base(f),
     ...tab(f),
@@ -565,6 +585,8 @@ export const BROWSER_RESULTS: {
   readonly [M in BrowserMethod]: (f: Fields) => BrowserResults[M];
 } = {
   "browser.navigate": action,
+  "browser.back": action,
+  "browser.forward": action,
   "browser.snapshot": (f) => ({ ...pageInfo(f), snapshot: snapshotOf(f.object("snapshot")) }),
   "browser.find": (f) => {
     const lines = array(f, "lines", MAX_FIND_LINES);

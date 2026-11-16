@@ -130,6 +130,10 @@ export class BrowserTools {
     switch (method) {
       case "browser.navigate":
         return (await this.navigate(p)) as BrowserResults[M];
+      case "browser.back":
+        return (await this.history(-1, p)) as BrowserResults[M];
+      case "browser.forward":
+        return (await this.history(1, p)) as BrowserResults[M];
       case "browser.snapshot":
         return (await this.snapshot(p)) as BrowserResults[M];
       case "browser.find":
@@ -319,7 +323,12 @@ export class BrowserTools {
     const text = tagRefs(raw, generation);
     let match: (line: string) => boolean;
     if (params.regex !== undefined) {
-      const regex = new RegExp(params.regex, "i");
+      let regex: RegExp;
+      try {
+        regex = new RegExp(params.regex, "i");
+      } catch (error) {
+        throw new ToolCallError("tool.bad-params", `regex: ${firstLine(error)}`);
+      }
       match = (line) => regex.test(line);
     } else {
       const needle = (params.text ?? "").toLowerCase();
@@ -355,6 +364,38 @@ export class BrowserTools {
       return await this.#failed(tab, error, { status: null });
     }
     return await this.#finish(tab, params.expect, params.expectTimeoutMs, { status });
+  }
+
+  /**
+   * `browser.back` (-1) and `browser.forward` (+1): a navigation like
+   * `navigate`, so every ref of the tab is stale after it and the result
+   * carries the new page's snapshot. No such history entry is
+   * `navigation_failed`, with nothing done.
+   */
+  async history(
+    delta: -1 | 1,
+    params: BrowserParams["browser.back" | "browser.forward"],
+  ): Promise<BrowserActionResult> {
+    const tab = await this.#tab(params.tab);
+    tab.takeDialogs();
+    let moved: { readonly status: number | null } | null;
+    try {
+      moved = await tab.history(delta, BROWSER_NAVIGATION_TIMEOUT_MS);
+    } catch (error) {
+      return await this.#failed(tab, error, { status: null });
+    }
+    if (moved === null) {
+      return await this.#result(tab, {
+        ok: false,
+        outcome: "navigation_failed",
+        message: `there is no ${delta < 0 ? "previous" : "next"} page in this tab's history. Nothing was done.`,
+        verified: null,
+        status: null,
+      });
+    }
+    return await this.#finish(tab, params.expect, params.expectTimeoutMs, {
+      status: moved.status,
+    });
   }
 
   async act(
@@ -431,6 +472,7 @@ export class BrowserTools {
     try {
       state = await tab.inspect(local, BROWSER_OBSERVE_TIMEOUT_MS);
     } catch (error) {
+      if (error instanceof DriverError && error.kind === "unavailable") throw toolError(error);
       return {
         outcome: "not_actionable",
         message: `the target could not be inspected: ${firstLine(error)}`,
@@ -547,7 +589,7 @@ export class BrowserTools {
     extra: { status?: number | null } = {},
   ): Promise<BrowserActionResult> {
     if (!(error instanceof DriverError)) throw error;
-    if (error.kind === "failed") throw new ToolCallError("browser.failed", error.message);
+    if (error.kind === "failed" || error.kind === "unavailable") throw toolError(error);
     const outcome: BrowserOutcome = error.kind === "timeout" ? "timeout" : "navigation_failed";
     return await this.#result(tab, {
       ok: false,
@@ -692,10 +734,22 @@ export class BrowserTools {
     try {
       return await fn();
     } catch (error) {
-      if (error instanceof DriverError) throw new ToolCallError("browser.failed", error.message);
+      if (error instanceof DriverError) throw toolError(error);
       throw error;
     }
   }
+}
+
+/**
+ * A driver failure as the call's error: the browser going away is the box's
+ * (`browser.unavailable`, the next call reconnects); anything else is
+ * `browser.failed`.
+ */
+function toolError(error: DriverError): ToolCallError {
+  return new ToolCallError(
+    error.kind === "unavailable" ? "browser.unavailable" : "browser.failed",
+    error.message,
+  );
 }
 
 function firstLine(error: unknown): string {

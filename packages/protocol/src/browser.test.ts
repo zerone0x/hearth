@@ -58,6 +58,8 @@ describe("browser methods (protocol 1.3)", () => {
   test("acting methods are mutating, observing ones are not", () => {
     for (const m of [
       "browser.navigate",
+      "browser.back",
+      "browser.forward",
       "browser.click",
       "browser.type",
       "browser.select",
@@ -107,6 +109,8 @@ describe("browser methods (protocol 1.3)", () => {
         "browser.navigate",
         { callId: "c", url: "http://x/", expect: { urlIncludes: "/x" }, expectTimeoutMs: 0 },
       ],
+      ["browser.back", { callId: "c" }],
+      ["browser.forward", { callId: "c", tab: 2, expect: { urlIncludes: "/b" } }],
       ["browser.snapshot", { callId: "c", tab: 1, ref: "s1e2", depth: 3 }],
       ["browser.find", { callId: "c", text: "Save" }],
       ["browser.find", { callId: "c", regex: "^- button", max: 5 }],
@@ -134,6 +138,8 @@ describe("browser methods (protocol 1.3)", () => {
         "browser.navigate",
         { callId: "c", url: "http://x/", expectTimeoutMs: MAX_EXPECT_TIMEOUT_MS + 1 },
       ],
+      ["browser.back", { callId: "c", expect: {} }],
+      ["browser.forward", { callId: "c", tab: -1 }],
       ["browser.find", { callId: "c" }],
       ["browser.find", { callId: "c", text: "a", regex: "b" }],
       ["browser.find", { callId: "c", regex: "(" }],
@@ -201,6 +207,12 @@ describe("browser methods (protocol 1.3)", () => {
     expect(browserBudgetMs("browser.click", { ...click, expectTimeoutMs: 20_000 })).toBe(
       browserBudgetMs("browser.click", click) - DEFAULT_EXPECT_TIMEOUT_MS + 20_000,
     );
+    // Going back or forward is a navigation: its budget is navigate's.
+    for (const m of ["browser.back", "browser.forward"] as const) {
+      expect(browserBudgetMs(m, { callId: "c" })).toBe(
+        browserBudgetMs("browser.navigate", { callId: "c", url: "http://x/" }),
+      );
+    }
     expect(
       browserBudgetMs("browser.wait", { callId: "c", textVisible: "x", timeoutMs: 30_000 }),
     ).toBeGreaterThan(30_000);

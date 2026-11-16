@@ -20,10 +20,14 @@ export interface TargetState {
   readonly covered: boolean;
 }
 
-/** A failure of a driver call, mapped to an outcome by the tools. */
+/**
+ * A failure of a driver call, mapped to an outcome by the tools.
+ * `unavailable`: the browser went away during the call (Chromium killed or
+ * restarted); the box's fault, and the next call reconnects.
+ */
 export class DriverError extends Error {
   constructor(
-    readonly kind: "timeout" | "navigation" | "failed",
+    readonly kind: "timeout" | "navigation" | "failed" | "unavailable",
     message: string,
   ) {
     super(message);
@@ -44,6 +48,8 @@ export interface DriverTab {
   /** Dialogs dismissed since the last call, oldest first; clears the list. */
   takeDialogs(): DriverDialog[];
   goto(url: string, timeoutMs: number): Promise<{ readonly status: number | null }>;
+  /** Goes back (-1) or forward (+1) in the tab's history; null when there is no such entry. */
+  history(delta: -1 | 1, timeoutMs: number): Promise<{ readonly status: number | null } | null>;
   /** The aria snapshot (Playwright's `ai` mode), of the page or the subtree under `ref`. */
   snapshot(options: {
     readonly ref?: string;

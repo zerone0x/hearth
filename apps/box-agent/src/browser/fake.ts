@@ -34,8 +34,13 @@ export class FakeTab implements DriverTab {
   /** JPEG sizes the screenshot returns, per quality. */
   screenshotBytes: (quality: number, fullPage: boolean) => number = () => 1000;
   closed = false;
+  /** A failure the next snapshot throws. */
+  failSnapshot: DriverError | undefined;
   #navigations = 0;
   #dialogs: DriverDialog[] = [];
+  /** Session history: URL and title of each entry, and the current one. */
+  #history: Array<{ url: string; title: string }> = [];
+  #at = -1;
 
   constructor(private readonly driver: FakeDriver) {}
 
@@ -45,6 +50,12 @@ export class FakeTab implements DriverTab {
 
   /** The page moved to a new document. */
   navigate(url: string, title = ""): void {
+    this.#history = [...this.#history.slice(0, this.#at + 1), { url, title }];
+    this.#at = this.#history.length - 1;
+    this.#show(url, title);
+  }
+
+  #show(url: string, title: string): void {
     this.pageUrl = url;
     this.pageTitle = title;
     this.#navigations++;
@@ -81,7 +92,20 @@ export class FakeTab implements DriverTab {
     return { status: 200 };
   }
 
+  async history(delta: -1 | 1): Promise<{ status: number | null } | null> {
+    this.actions.push(delta < 0 ? "back" : "forward");
+    this.#fail();
+    const entry = this.#history[this.#at + delta];
+    if (entry === undefined) return null;
+    this.#at += delta;
+    this.#show(entry.url, entry.title);
+    return { status: 200 };
+  }
+
   async snapshot(options: { ref?: string; depth?: number }): Promise<string> {
+    const failure = this.failSnapshot;
+    this.failSnapshot = undefined;
+    if (failure !== undefined) throw failure;
     this.snapshots.push({
       ...(options.ref === undefined ? {} : { ref: options.ref }),
       ...(options.depth === undefined ? {} : { depth: options.depth }),
@@ -128,8 +152,10 @@ export class FakeTab implements DriverTab {
     return [...this.visibleText].some((t) => t.includes(text));
   }
 
-  async screenshot(options: { fullPage: boolean; quality: number }): Promise<Buffer> {
-    this.actions.push(`screenshot q${options.quality}${options.fullPage ? " full" : ""}`);
+  async screenshot(options: { ref?: string; fullPage: boolean; quality: number }): Promise<Buffer> {
+    this.actions.push(
+      `screenshot${options.ref === undefined ? "" : ` ${options.ref}`} q${options.quality}${options.fullPage ? " full" : ""}`,
+    );
     return fakeJpeg(this.screenshotBytes(options.quality, options.fullPage), 1280, 800);
   }
 

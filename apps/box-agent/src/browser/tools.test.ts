@@ -432,6 +432,13 @@ describe("navigate", () => {
       "javascript:alert(1)",
       "data:text/html,x",
       "chrome://settings",
+      // The scheme is the start of the URL, not a substring of it.
+      "javascript:alert('http://x/')",
+      " http://x/",
+      // about: is about:blank only, exactly.
+      "about:config",
+      "about:blank.evil",
+      "about:blankx",
     ]) {
       const error = await tools.run("browser.navigate", { callId: "c", url }).catch((e) => e);
       expect((error as ToolCallError).code).toBe("browser.bad-url");
@@ -726,5 +733,166 @@ describe("one call at a time", () => {
     expect((aborted as ToolCallError).code).toBe("tool.internal");
     await tools.run("browser.press", { callId: "d", key: "Enter" });
     expect(page.actions).toEqual(["press page x", "press page Enter"]);
+  });
+});
+
+describe("review rework 1", () => {
+  test("browser.tabs new refuses a URL that is not http, https or about:blank, opening no tab", async () => {
+    const { tools, driver } = setup();
+    for (const url of ["file:///etc/passwd", "javascript:alert('http://x/')", "about:config"]) {
+      const error = await tools
+        .run("browser.tabs", { callId: "c", action: "new", url })
+        .catch((e) => e);
+      expect((error as ToolCallError).code).toBe("browser.bad-url");
+    }
+    expect(driver.pages).toHaveLength(1);
+    const list = await tools.run("browser.tabs", {
+      callId: "c",
+      action: "new",
+      url: "about:blank",
+    });
+    expect(list.tabs).toHaveLength(2);
+  });
+
+  test("an expect on the URL fails when the URL does not match", async () => {
+    const { tools, page } = setup();
+    page.targets.set("e3", {
+      onClick: (tab) => tab.navigate("http://127.0.0.1:8000/done", "Done"),
+    });
+    await snapshotId(tools);
+    const moved = await tools.run("browser.click", {
+      callId: "c",
+      ref: "s1e3",
+      element: "Save",
+      expect: { urlIncludes: "/done" },
+    });
+    expect(moved).toMatchObject({ ok: true, verified: true });
+    const wait = await tools.run("browser.wait", {
+      callId: "c",
+      urlIncludes: "/form",
+      timeoutMs: 300,
+    });
+    expect(wait).toMatchObject({ ok: false, outcome: "not_verified", verified: false });
+  });
+
+  test("a poll that throws (the page between documents) never counts as verified", async () => {
+    const { tools, page } = setup();
+    let polls = 0;
+    page.title = async () => {
+      polls++;
+      throw new Error("Execution context was destroyed");
+    };
+    const result = await tools.run("browser.wait", {
+      callId: "c",
+      titleIncludes: "Form",
+      timeoutMs: 300,
+    });
+    expect(result).toMatchObject({ ok: false, outcome: "not_verified", verified: false });
+    expect(polls).toBeGreaterThan(1);
+  });
+
+  test("a screenshot by ref passes Playwright's ref", async () => {
+    const { tools, page } = setup();
+    await snapshotId(tools);
+    const shot = await tools.run("browser.screenshot", { callId: "c", ref: "s1e3" });
+    expect(shot.mimeType).toBe("image/jpeg");
+    expect(page.actions).toEqual(["screenshot e3 q70"]);
+  });
+
+  test("a key press on a disabled element is not refused", async () => {
+    const { tools, page } = setup();
+    await snapshotId(tools);
+    const result = await tools.run("browser.press", { callId: "c", ref: "s1e4", key: "Tab" });
+    expect(result.outcome).toBe("done");
+    expect(page.actions).toEqual(["press e4 Tab"]);
+  });
+
+  test("an observation's driver failure is browser.failed; the browser going away is browser.unavailable", async () => {
+    const { tools, page } = setup();
+    page.failSnapshot = new DriverError("failed", "snapshot: boom");
+    let error = await tools.run("browser.snapshot", { callId: "c" }).catch((e) => e);
+    expect(error).toBeInstanceOf(ToolCallError);
+    expect((error as ToolCallError).code).toBe("browser.failed");
+    expect((error as ToolCallError).message).toContain("snapshot: boom");
+    page.failSnapshot = new DriverError("unavailable", "the box browser went away");
+    error = await tools.run("browser.find", { callId: "c", text: "x" }).catch((e) => e);
+    expect((error as ToolCallError).code).toBe("browser.unavailable");
+    page.failSnapshot = new DriverError("timeout", "Timeout 10000ms exceeded");
+    error = await tools.run("browser.snapshot", { callId: "c" }).catch((e) => e);
+    expect((error as ToolCallError).code).toBe("browser.failed");
+    // A bug that is not a driver failure is not dressed up as one.
+    page.failSnapshot = new TypeError("oops") as never;
+    error = await tools.run("browser.snapshot", { callId: "c" }).catch((e) => e);
+    expect(error).toBeInstanceOf(TypeError);
+  });
+
+  test("the browser going away during an action is browser.unavailable, not browser.failed", async () => {
+    const { tools, page } = setup();
+    await snapshotId(tools);
+    page.failNext = new DriverError("unavailable", "the box browser went away");
+    const error = await tools
+      .run("browser.click", { callId: "c", ref: "s1e3", element: "Save" })
+      .catch((e) => e);
+    expect((error as ToolCallError).code).toBe("browser.unavailable");
+    page.inspect = async () => {
+      throw new DriverError("unavailable", "gone");
+    };
+    await snapshotId(tools);
+    const inspect = await tools
+      .run("browser.click", { callId: "c", ref: "s2e3", element: "Save" })
+      .catch((e) => e);
+    expect((inspect as ToolCallError).code).toBe("browser.unavailable");
+  });
+
+  test("an invalid regex in find is tool.bad-params", async () => {
+    const { tools } = setup();
+    const error = await tools.run("browser.find", { callId: "c", regex: "(" }).catch((e) => e);
+    expect((error as ToolCallError).code).toBe("tool.bad-params");
+  });
+
+  test("back and forward move in the history, make old refs stale and return the new snapshot", async () => {
+    const { tools, page } = setup();
+    await tools.run("browser.navigate", { callId: "c", url: "http://127.0.0.1:8000/next" });
+    const before = await snapshotId(tools);
+    const back = await tools.run("browser.back", {
+      callId: "c",
+      expect: { urlIncludes: "/form" },
+    });
+    expect(back).toMatchObject({
+      ok: true,
+      outcome: "done",
+      verified: true,
+      status: 200,
+      url: "http://127.0.0.1:8000/form",
+    });
+    expect(back.snapshot?.snapshotId).not.toBe(before);
+    expect(back.snapshot?.text).toContain(`[ref=${back.snapshot?.snapshotId}e3]`);
+    const stale = await tools.run("browser.click", {
+      callId: "c",
+      ref: `${before}e3`,
+      element: "Save",
+    });
+    expect(stale.outcome).toBe("stale_ref");
+    const forward = await tools.run("browser.forward", { callId: "c" });
+    expect(forward).toMatchObject({ ok: true, url: "http://127.0.0.1:8000/next" });
+    expect(page.actions).toEqual(["goto http://127.0.0.1:8000/next", "back", "forward"]);
+  });
+
+  test("no history entry is navigation_failed, nothing done, with a snapshot", async () => {
+    const { tools, page } = setup();
+    const forward = await tools.run("browser.forward", { callId: "c" });
+    expect(forward).toMatchObject({ ok: false, outcome: "navigation_failed", status: null });
+    expect(forward.message).toContain("no next page");
+    expect(forward.snapshot).not.toBeNull();
+    const back = await tools.run("browser.back", { callId: "c" });
+    expect(back.message).toContain("no previous page");
+    expect(page.url()).toBe("http://127.0.0.1:8000/form");
+  });
+
+  test("a driver failure while going back is an outcome, like navigate", async () => {
+    const { tools, page } = setup();
+    page.failNext = new DriverError("timeout", "goBack: Timeout");
+    const result = await tools.run("browser.back", { callId: "c" });
+    expect(result).toMatchObject({ ok: false, outcome: "timeout", status: null });
   });
 });

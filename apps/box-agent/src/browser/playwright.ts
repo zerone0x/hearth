@@ -42,12 +42,25 @@ function driverError(error: unknown): DriverError {
   return new DriverError("failed", message);
 }
 
-async function wrap<T>(fn: () => Promise<T>): Promise<T> {
+/**
+ * Runs a Playwright call and maps its failure. With `page`, a failure while
+ * the page's browser is disconnected (Chromium killed mid-call) is
+ * `unavailable`, not a failure of the action.
+ */
+async function wrap<T>(fn: () => Promise<T>, page?: Page): Promise<T> {
   try {
     return await fn();
   } catch (error) {
+    if (page !== undefined && !connected(page)) {
+      const message = (error instanceof Error ? error.message : String(error)).split("\n")[0];
+      throw new DriverError("unavailable", `the box browser went away during the call: ${message}`);
+    }
     throw driverError(error);
   }
+}
+
+function connected(page: Page): boolean {
+  return page.context().browser()?.isConnected() ?? true;
 }
 
 class PlaywrightTab implements DriverTab {
@@ -69,6 +82,10 @@ class PlaywrightTab implements DriverTab {
     });
   }
 
+  #run<T>(fn: () => Promise<T>): Promise<T> {
+    return wrap(fn, this.#page);
+  }
+
   get navigations(): number {
     return this.#navigations;
   }
@@ -88,9 +105,23 @@ class PlaywrightTab implements DriverTab {
   }
 
   goto(url: string, timeoutMs: number): Promise<{ status: number | null }> {
-    return wrap(async () => {
+    return this.#run(async () => {
       const response = await this.#page.goto(url, { timeout: timeoutMs, waitUntil: "load" });
       return { status: response?.status() ?? null };
+    });
+  }
+
+  history(delta: -1 | 1, timeoutMs: number): Promise<{ status: number | null } | null> {
+    return this.#run(async () => {
+      const before = { navigations: this.#navigations, url: this.#page.url() };
+      const options = { timeout: timeoutMs, waitUntil: "load" as const };
+      const response =
+        delta < 0 ? await this.#page.goBack(options) : await this.#page.goForward(options);
+      if (response !== null) return { status: response.status() };
+      // Playwright answers null both for "no such entry" and for a move with no
+      // response (same document, cache): only a move that happened counts.
+      const moved = this.#navigations !== before.navigations || this.#page.url() !== before.url;
+      return moved ? { status: null } : null;
     });
   }
 
@@ -100,7 +131,7 @@ class PlaywrightTab implements DriverTab {
       timeout: options.timeoutMs,
       ...(options.depth === undefined ? {} : { depth: options.depth }),
     };
-    return wrap(() =>
+    return this.#run(() =>
       options.ref === undefined
         ? this.#page.ariaSnapshot(settings)
         : this.#page.getByRef(options.ref).ariaSnapshot(settings),
@@ -108,7 +139,7 @@ class PlaywrightTab implements DriverTab {
   }
 
   inspect(ref: string, timeoutMs: number): Promise<TargetState> {
-    return wrap(async () => {
+    return this.#run(async () => {
       const target = this.#page.getByRef(ref);
       if ((await target.count()) === 0) {
         return { found: false, visible: false, enabled: false, editable: false, covered: false };
@@ -146,7 +177,7 @@ class PlaywrightTab implements DriverTab {
     timeoutMs: number,
   ): Promise<void> {
     const target = this.#page.getByRef(ref);
-    return wrap(() =>
+    return this.#run(() =>
       options.double
         ? target.dblclick({ button: options.button, timeout: timeoutMs })
         : target.click({ button: options.button, timeout: timeoutMs }),
@@ -154,17 +185,17 @@ class PlaywrightTab implements DriverTab {
   }
 
   fill(ref: string, text: string, timeoutMs: number): Promise<void> {
-    return wrap(() => this.#page.getByRef(ref).fill(text, { timeout: timeoutMs }));
+    return this.#run(() => this.#page.getByRef(ref).fill(text, { timeout: timeoutMs }));
   }
 
   select(ref: string, values: readonly string[], timeoutMs: number): Promise<void> {
-    return wrap(async () => {
+    return this.#run(async () => {
       await this.#page.getByRef(ref).selectOption([...values], { timeout: timeoutMs });
     });
   }
 
   press(ref: string | undefined, key: string, timeoutMs: number): Promise<void> {
-    return wrap(() =>
+    return this.#run(() =>
       ref === undefined
         ? this.#page.keyboard.press(key)
         : this.#page.getByRef(ref).press(key, { timeout: timeoutMs }),
@@ -190,7 +221,7 @@ class PlaywrightTab implements DriverTab {
       quality: options.quality,
       timeout: options.timeoutMs,
     };
-    return wrap(() =>
+    return this.#run(() =>
       options.ref === undefined
         ? this.#page.screenshot({ ...settings, fullPage: options.fullPage })
         : this.#page.getByRef(options.ref).screenshot(settings),
@@ -198,11 +229,11 @@ class PlaywrightTab implements DriverTab {
   }
 
   bringToFront(): Promise<void> {
-    return wrap(() => this.#page.bringToFront());
+    return this.#run(() => this.#page.bringToFront());
   }
 
   close(): Promise<void> {
-    return wrap(() => this.#page.close());
+    return this.#run(() => this.#page.close());
   }
 }
 
