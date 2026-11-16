@@ -156,11 +156,17 @@ describe("vault key", () => {
     expect(h.status).toMatchObject({ state: "enabled", key: "current" });
     expect(h.db.query("SELECT count(*) AS n FROM vault_key").get()).toEqual({ n: 1 });
     expect(auditRows(h.db, "vault.key.create")).toHaveLength(1);
+    expect(h.logs).toContain("vault: created the data key");
+    expect(h.logs.join("\n")).toContain("vault: enabled (kek_check ");
     await addModelKey(h);
     expect((await h.secrets.resolve("vault:model")).reveal()).toBe(MODEL_KEY);
     expect((await h.secrets.resolve("vault:model#value")).reveal()).toBe(MODEL_KEY);
     // The key text itself joins the redaction set.
     expect(h.registered).toContain(KEY_A);
+    // A second start finds the data key: nothing is created or audited again.
+    const again = await start({ env: { VAULT_KEY: KEY_A } });
+    expect(auditRows(again.db, "vault.key.create")).toHaveLength(1);
+    expect(again.logs).not.toContain("vault: created the data key");
   });
 
   const disabled: [string, Start, string][] = [
@@ -221,6 +227,14 @@ describe("vault key", () => {
     const right = await start({ env: { VAULT_KEY: KEY_A } });
     expect(right.status).toMatchObject({ state: "enabled" });
     expect((await right.secrets.resolve("vault:model")).reveal()).toBe(MODEL_KEY);
+  });
+
+  test("a key that goes missing after the data key exists: key-missing, not corrupt", async () => {
+    await start({ env: { VAULT_KEY: KEY_A } });
+    const gone = await start({ keyRef: "file:/nonexistent/vault_key" });
+    expect(gone.status).toMatchObject({ state: "disabled", reason: "key-missing" });
+    const bad = await start({ env: { VAULT_KEY: "short" } });
+    expect(bad.status).toMatchObject({ state: "disabled", reason: "key-invalid" });
   });
 
   test("a damaged wrapped data key under a matching key: store-corrupt", async () => {
@@ -425,6 +439,10 @@ describe("input checks", () => {
       register: () => {},
     });
     expect(vault.currentStatus).toEqual({ state: "starting" });
+    // A use before anyone opened the vault waits for the open, it does not fail.
+    await expect(vault.readForHub("none", undefined, "vault:none")).rejects.toMatchObject({
+      code: "secret.not-found",
+    });
     expect(await vault.status(LOCAL_PRINCIPAL)).toMatchObject({ state: "enabled" });
     expect(vault.currentStatus).toMatchObject({ state: "enabled" });
     await vault.list(LOCAL_PRINCIPAL);
@@ -570,6 +588,12 @@ describe("scope and kind", () => {
       "vault.field-unknown",
     );
     expect((await errorOf(h.secrets.resolve("vault:nope"))).code).toBe("secret.not-found");
+    for (const ref of ["env:VAULT_KEY", "vault:Bad Name", "vault:hubtok#"]) {
+      const error = await errorOf(
+        h.vault.use(ref, { sessionId: "s", tool: "t", kinds: ["token"] }),
+      );
+      expect(error.code).toBe("secret.malformed-ref");
+    }
   });
 });
 
@@ -694,8 +718,15 @@ describe("master key rotation through vault_key.next", () => {
       env: { VAULT_KEY: KEY_A, VAULT_KEY_NEXT: KEY_B },
       nextKeyRef: "env:VAULT_KEY_NEXT",
     });
-    expect(rotating.status).toMatchObject({ state: "enabled", key: "next" });
     const checkB = kekCheck(rotating.db);
+    expect(rotating.status).toEqual({
+      state: "enabled",
+      key: "next",
+      kekCheck: checkB.slice(0, 12),
+    });
+    // New entries after the rotation take their fingerprint from the next key.
+    await addModelKey(rotating, "after", MODEL_KEY);
+    expect(fingerprintOf(rotating.db, "after")).toBe(fingerprintOf(rotating.db, "model"));
     expect(checkB).not.toBe(checkA);
     const fpB = fingerprintOf(rotating.db, "model");
     expect(fpB).not.toBe(fpA);
@@ -728,6 +759,25 @@ describe("master key rotation through vault_key.next", () => {
     // The old key alone no longer opens the vault.
     const old = await start({ env: { VAULT_KEY: KEY_A } });
     expect(old.status).toMatchObject({ state: "disabled", reason: "key-mismatch" });
+  });
+
+  test("an entry that does not decrypt keeps its fingerprint; the rotation goes on", async () => {
+    const first = await start({ env: { VAULT_KEY: KEY_A } });
+    await addModelKey(first, "good", MODEL_KEY);
+    await addModelKey(first, "bad", MODEL_KEY_2);
+    first.db.run("UPDATE secret SET name = 'moved' WHERE name = 'bad'");
+    const fpBad = fingerprintOf(first.db, "moved");
+    const fpGood = fingerprintOf(first.db, "good");
+    const rotating = await start({
+      env: { VAULT_KEY: KEY_A, VAULT_KEY_NEXT: KEY_B },
+      nextKeyRef: "env:VAULT_KEY_NEXT",
+    });
+    expect(rotating.status).toMatchObject({ state: "enabled", key: "next" });
+    expect(rotating.logs.join("\n")).toContain(
+      "entry moved does not decrypt; its fingerprint is kept",
+    );
+    expect(fingerprintOf(rotating.db, "moved")).toBe(fpBad);
+    expect(fingerprintOf(rotating.db, "good")).not.toBe(fpGood);
   });
 
   test("a crash in the middle of the rewrap leaves the old key in force; the next start finishes", async () => {
@@ -765,6 +815,7 @@ describe("master key rotation through vault_key.next", () => {
       nextKeyRef: "file:/nonexistent/vault_key.next",
     });
     expect(missing.status).toMatchObject({ state: "enabled", key: "current" });
+    expect(missing.logs.join("\n")).not.toContain("the next key is not used");
     const bad = await start({
       env: { VAULT_KEY: KEY_A, VAULT_KEY_NEXT: "short" },
       nextKeyRef: "env:VAULT_KEY_NEXT",

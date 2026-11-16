@@ -510,16 +510,13 @@ export class HubVault implements VaultReader {
         .catch(() => {});
       throw vaultSecretError(ref, code, problem);
     };
-    if (!VAULT_FIELDS[row.kind].fields.includes(fieldName)) {
-      return refuse("vault.field-unknown", `a ${row.kind} has no field ${fieldName}`);
-    }
     let fields: Record<string, string>;
     try {
       // Decrypt first: the scope and policy checked below are authentic only
       // once the AAD that binds them verified.
       fields = await openEntry(state.dek, bindingOf(row), row);
-    } catch (error) {
-      if (!(error instanceof VaultCryptoError)) throw error;
+    } catch {
+      // Any failure here (a bad tag, a bound column no AAD can hold) is a corrupt row.
       return refuse("vault.entry-corrupt", "the entry does not decrypt (edited or moved)");
     }
     if (!context.kinds.includes(row.kind)) {
@@ -534,9 +531,9 @@ export class HubVault implements VaultReader {
     if (row.scopeSessionId !== null && row.scopeSessionId !== context.sessionId) {
       return refuse("vault.scope-mismatch", "the entry is scoped to another session");
     }
-    const value = fields[fieldName];
+    const value = VAULT_FIELDS[row.kind].fields.includes(fieldName) ? fields[fieldName] : undefined;
     if (value === undefined) {
-      return refuse("vault.field-unknown", `the entry has no field ${fieldName}`);
+      return refuse("vault.field-unknown", `a ${row.kind} has no field ${fieldName}`);
     }
     // Write-before-use (PRD §6.10, §10): no record, no value.
     try {
@@ -553,13 +550,11 @@ export class HubVault implements VaultReader {
 
   async #open(): Promise<VaultStatus> {
     const current = await this.#loadKey(this.#o.keyRef, "HEARTH_VAULT_KEY_REF");
-    let next: VaultKeyProvider | undefined;
-    if (this.#o.nextKeyRef !== undefined && this.#o.nextKeyRef !== "") {
-      const loaded = await this.#loadKey(this.#o.nextKeyRef, "HEARTH_VAULT_KEY_NEXT_REF");
-      if (loaded.ok) next = loaded.keys;
-      else if (loaded.reason === "key-invalid") {
-        this.#log(`vault: the next key is not used: ${loaded.detail}`);
-      }
+    // An unset next ref, or a next file that does not exist, means no rotation.
+    const loaded = await this.#loadKey(this.#o.nextKeyRef, "HEARTH_VAULT_KEY_NEXT_REF");
+    const next = loaded.ok ? loaded.keys : undefined;
+    if (!loaded.ok && loaded.reason === "key-invalid") {
+      this.#log(`vault: the next key is not used: ${loaded.detail}`);
     }
     let record = this.#o.store.keyRecord();
     if (record === undefined) {
