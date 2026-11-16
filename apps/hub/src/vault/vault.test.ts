@@ -1604,6 +1604,7 @@ describe("redaction", () => {
     for (const env of [{ VAULT_KEY: KEY_B }, {}]) {
       const refused = await dump(env);
       expect(refused.error).toBeInstanceOf(UnredactedDumpError);
+      expect((refused.error as Error).name).toBe("UnredactedDumpError");
       expect(String((refused.error as Error).message)).toContain("--unredacted-ok");
       expect(String((refused.error as Error).message)).not.toContain(KEY_B);
       expect(refused.warnings).toEqual([]);
@@ -1654,7 +1655,8 @@ describe("redaction", () => {
     const refused = run(["se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_B });
     expect(refused.exitCode).toBe(1);
     expect(refused.stdout.toString()).toBe("");
-    expect(refused.stderr.toString()).toContain("refusing to dump");
+    // One line, the reason and the way out, no stack trace.
+    expect(refused.stderr.toString()).toBe(`${new UnredactedDumpError("key-mismatch").message}\n`);
     const forced = run(["--unredacted-ok", "se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_B });
     expect(forced.exitCode).toBe(0);
     const ok = run(["se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_A });

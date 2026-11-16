@@ -75,8 +75,8 @@ export function redactValues(
       written = end;
       start = from;
       end = to;
-    } else if (to > end) {
-      end = to;
+    } else {
+      end = Math.max(end, to);
     }
   }
   return out + text.slice(written, start) + mask + text.slice(end);

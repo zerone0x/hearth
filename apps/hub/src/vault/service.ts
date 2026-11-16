@@ -140,12 +140,9 @@ export interface VaultUse {
  * anything else, a `blob:` URL included.
  */
 function originOf(raw: string): string | undefined {
-  try {
-    const url = new URL(raw);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.origin : undefined;
-  } catch {
-    return undefined;
-  }
+  if (!URL.canParse(raw)) return undefined;
+  const url = new URL(raw);
+  return url.protocol === "https:" || url.protocol === "http:" ? url.origin : undefined;
 }
 
 export interface HubVaultOptions {
@@ -743,12 +740,8 @@ export class HubVault implements VaultReader {
   #warnIfShared(ref: SecretRef): void {
     const parsed = parseSecretRef(ref);
     if (parsed.scheme !== "file") return;
-    let mode: number;
-    try {
-      mode = statSync(parsed.body).mode & 0o777;
-    } catch {
-      return;
-    }
+    // It was just read, so it exists; a stat that still fails says nothing.
+    const mode = (statSync(parsed.body, { throwIfNoEntry: false })?.mode ?? 0) & 0o777;
     if ((mode & 0o077) !== 0) {
       this.#log(
         `vault: the key file ${parsed.body} is readable by others (mode ${mode.toString(8)}); run chmod 600 on it`,

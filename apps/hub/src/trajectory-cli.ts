@@ -137,8 +137,7 @@ if (import.meta.main) {
       }),
     );
   } catch (error) {
-    if (!(error instanceof UnredactedDumpError)) throw error;
-    console.error(error.message);
+    console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
 }

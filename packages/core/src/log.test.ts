@@ -92,6 +92,9 @@ describe("Logger", () => {
     expect(redactValues("no secret here", ["absent"], "#")).toBe("no secret here");
     expect(redactValues("aaaa", ["aa", ""], "#")).toBe("#");
     expect(redactValues("x-ab-y-ab", ["ab"], "#")).toBe("x-#-y-#");
+    // Touching values are one span; a value with a quote is found raw too.
+    expect(redactValues("<abcdef>", ["def", "abc"], "#")).toBe("<#>");
+    expect(redactValues('raw a"b\\c here', ['a"b\\c'], "#")).toBe("raw # here");
   });
 
   test("credential shapes are redacted without being known", () => {
