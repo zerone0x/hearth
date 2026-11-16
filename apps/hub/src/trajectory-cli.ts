@@ -6,23 +6,33 @@
  *
  * Reads only; safe while the hub runs (WAL). Output is redacted like the
  * API's: the model key (`HEARTH_MODEL_KEY_REF`, the hub's own setting) is
- * resolved first, so a key an older build stored raw is redacted too.
+ * resolved first, so a key an older build stored raw is redacted too. With
+ * `HEARTH_VAULT_KEY_REF`, every vault value is redacted as well (decision
+ * 0031); the vault is only opened, never created or rotated here.
  */
 
 import { join } from "node:path";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
-import { createDefaultSecretStore, DEFAULT_WORKSPACE_ID, type SecretStore } from "@hearth/core";
+import {
+  AllowAllAuthorizer,
+  createDefaultSecretStore,
+  DEFAULT_WORKSPACE_ID,
+  type SecretStore,
+} from "@hearth/core";
 import { redactHub, registerKnownSecrets } from "./obs/redaction";
 import { readAllEvents } from "./obs/routes";
 import { buildTrajectory, toJsonl } from "./obs/trajectory";
 import { HUB_VERSION } from "./obs/version";
-import { openDatabase, SqliteEventStore } from "./store";
+import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "./store";
+import { HubVault } from "./vault";
 
 export interface DumpOptions {
   /** Where `keyRefs` resolve; defaults to the hub's default SecretStore. */
   readonly secrets?: SecretStore;
   /** SecretStore references whose values are redacted (the model key). */
   readonly keyRefs?: readonly string[];
+  /** The vault key reference: every stored vault value is redacted too. */
+  readonly vaultKeyRef?: string;
   readonly warn?: (message: string) => void;
 }
 
@@ -31,14 +41,29 @@ export async function dumpTrajectory(
   sessionId: string,
   options: DumpOptions = {},
 ): Promise<string> {
-  const keyRefs = options.keyRefs ?? [];
+  // A `vault:` model key is among the vault's values, registered below.
+  const keyRefs = (options.keyRefs ?? []).filter((ref) => !ref.startsWith("vault:"));
+  const secrets = options.secrets ?? createDefaultSecretStore();
+  const warn = options.warn ?? ((m: string) => console.error(m));
   if (keyRefs.length > 0) {
-    const secrets = options.secrets ?? createDefaultSecretStore();
-    const warn = options.warn ?? ((m: string) => console.error(m));
     await registerKnownSecrets(secrets, keyRefs, warn);
   }
   const db = openDatabase(dbPath);
   try {
+    const store = new SqliteVaultStore(db);
+    if (options.vaultKeyRef !== undefined && store.keyRecord() !== undefined) {
+      // Opening registers every value it can decrypt; a key row exists, so it writes nothing.
+      const audit = new SqliteAuditSink(db);
+      const status = await new HubVault({
+        store,
+        audit,
+        authorizer: new AllowAllAuthorizer({ audit }),
+        keySecrets: secrets,
+        keyRef: options.vaultKeyRef,
+        log: () => {},
+      }).open();
+      if (status.state !== "enabled") warn("vault values are not redacted: the vault is disabled");
+    }
     const events = await readAllEvents(
       new SqliteEventStore(db),
       { workspaceId: DEFAULT_WORKSPACE_ID },
@@ -69,5 +94,11 @@ if (import.meta.main) {
     process.exit(2);
   }
   const keyRef = process.env["HEARTH_MODEL_KEY_REF"];
-  process.stdout.write(await dumpTrajectory(db, sessionId, { keyRefs: keyRef ? [keyRef] : [] }));
+  const vaultKeyRef = process.env["HEARTH_VAULT_KEY_REF"];
+  process.stdout.write(
+    await dumpTrajectory(db, sessionId, {
+      keyRefs: keyRef ? [keyRef] : [],
+      ...(vaultKeyRef ? { vaultKeyRef } : {}),
+    }),
+  );
 }

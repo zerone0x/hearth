@@ -110,6 +110,43 @@ unset HEARTH_MODEL_KEY
 
 A model without a key (a local endpoint) still needs the file; leave it empty.
 
+### Create the vault key
+
+The vault (decision 0031) encrypts the secrets you add in Settings with a key
+kept outside the database: `deploy/secrets/vault_key`, the base64 of 32 random
+bytes. This step creates it, readable only by you (and root, which the hub runs
+as). It never overwrites an existing key, so it is safe to run again; every
+upgrade runs it too. You never type, paste or edit this file:
+
+```sh install:vault-key
+[ -e secrets/vault_key ] || (umask 077 && head -c 32 /dev/urandom | base64 > secrets/vault_key)
+```
+
+**Back it up apart from the data volume.** The database alone, or a backup of
+the volume, decrypts nothing; the key alone holds no secret. Lose the key and
+every secret in the vault is lost. If the file is missing or does not match
+the database, the hub still starts with the vault disabled and logs why
+(`vault: disabled (key-missing)` or `key-mismatch`); model keys given as
+`file:` or `env:` references keep working.
+
+To replace the key, write the new one next to it and restart the hub; it
+rewraps the vault under the new key in one transaction and logs
+`vault: key rotated`:
+
+```sh
+(umask 077 && head -c 32 /dev/urandom | base64 > secrets/vault_key.next)
+docker compose up -d --force-recreate --wait hub
+```
+
+Then move it over the old one and restart again (the cutover). Until then the
+hub runs on `vault_key.next` and says so in its log. Keep the old key with the
+backups taken before the rotation; they need it.
+
+```sh
+mv secrets/vault_key.next secrets/vault_key
+docker compose up -d --force-recreate --wait hub
+```
+
 ### Start
 
 ```sh install:up
@@ -208,6 +245,8 @@ git pull --ff-only
 grep -q '^HEARTH_VERSION=' .env || echo 'HEARTH_VERSION=' >> .env
 version="$(git describe --always --dirty)"
 sed -i "s/^HEARTH_VERSION=.*/HEARTH_VERSION=${version}/" .env
+# The vault key (decision 0031): created if an older install has none, never overwritten.
+[ -e secrets/vault_key ] || (umask 077 && head -c 32 /dev/urandom | base64 > secrets/vault_key)
 docker compose up -d --build --wait hub
 ```
 
@@ -234,5 +273,5 @@ images:
 ```sh install:purge
 docker volume ls -q --filter label=dev.hearth.managed=true --filter label=dev.hearth.instance=hearth | xargs -r docker volume rm
 docker compose down --volumes --rmi all
-rm -f secrets/model_key
+rm -f secrets/model_key secrets/vault_key secrets/vault_key.next
 ```

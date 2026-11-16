@@ -25,7 +25,8 @@ import { redactHub } from "../obs/redaction";
 import { observabilityFromEnv } from "../obs/setup";
 import { SessionRunners } from "../runner";
 import { startHub } from "../server";
-import { openDatabase, SqliteAuditSink, SqliteVaultStore } from "../store";
+import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
+import { dumpTrajectory } from "../trajectory-cli";
 import { HubVault, mountVaultRoutes, type VaultStatus } from ".";
 
 const KEY_A = Buffer.alloc(32, 0xa1).toString("base64");
@@ -62,7 +63,7 @@ interface Harness {
 
 interface Start {
   readonly env?: Record<string, string>;
-  readonly keyRef?: string;
+  readonly keyRef?: string | undefined;
   readonly nextKeyRef?: string;
   readonly audit?: (db: Database) => AuditSink;
   readonly midRotation?: () => void;
@@ -752,7 +753,9 @@ describe("redaction", () => {
       log: () => {},
     });
     await vault.open();
-    const value = "sk-vault-redaction-probe-71e0";
+    const value = "vault-redaction-probe-71e0-plain";
+    // No credential shape: only the registry can catch it.
+    expect(redactHub(value)).toBe(value);
     await vault.create(LOCAL_PRINCIPAL, { name: "probe", kind: "token", fields: { value } });
     // The hub's sink redactor: logs, trajectory export and span attributes (decision 0021).
     expect(redactHub(`error: ${value}`)).not.toContain(value);
@@ -775,6 +778,25 @@ describe("redaction", () => {
     expect(again.registered).toContain(MODEL_KEY);
     expect(again.registered).not.toContain(MODEL_KEY_2);
     expect(again.logs.join("\n")).toContain("entry three does not decrypt");
+  });
+
+  test("the trajectory CLI opens the vault and redacts its values from a stored event", async () => {
+    const value = "vault-trajectory-probe-5a9b-plain";
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    await h.vault.create(LOCAL_PRINCIPAL, { name: "probe", kind: "token", fields: { value } });
+    await new SqliteEventStore(h.db).append({ workspaceId: "ws_default" }, "se_vault", {
+      type: "message.user",
+      payload: { text: `the token is ${value} ok` },
+    });
+    // The harness registers into a spy: the process-wide registry does not know it yet.
+    expect(redactHub(value)).toBe(value);
+    const out = await dumpTrajectory(path, "se_vault", {
+      secrets: createDefaultSecretStore({ env: { VAULT_KEY: KEY_A } }),
+      vaultKeyRef: "env:VAULT_KEY",
+      warn: () => {},
+    });
+    expect(out).toContain("the token is [redacted] ok");
+    expect(out).not.toContain(value);
   });
 
   test("a resolved value joins the redaction set at use", async () => {
