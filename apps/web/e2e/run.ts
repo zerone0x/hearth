@@ -1,7 +1,7 @@
 /**
  * The web UI's e2e (#46) against a real hub (harness.ts) in Chromium:
  * first-run setup → sign out → sign in → create a session → send a message →
- * see the tool card → open the desktop → reload, and the session continues
+ * see the tool card → open the desktop → take it over, type, release → reload, and the session continues
  * (the chat is rebuilt from the event log and a second turn runs) → the box
  * goes away and the desktop says it is asleep → wake. Along the way: the
  * chat and noVNC load only when needed (#84), a link in a reply opens in a new
@@ -178,6 +178,39 @@ try {
   if (!loaded(NOVNC_CHUNK)) throw new Error("the desktop opened without loading the noVNC chunk");
   await page.waitForTimeout(500);
   await shot(page, "2-session-desktop");
+
+  step("take over the desktop: typing reaches the box; release: it no longer does");
+  const desktopRegion = page.getByRole("region", { name: "Desktop" });
+  const keysym = (text: string) => [...text].map((ch) => ch.charCodeAt(0));
+  // View-only before Take over: nothing typed reaches the desktop.
+  await desktopRegion.locator("canvas").click();
+  await page.keyboard.type("no");
+  await page.waitForTimeout(300);
+  if (e2e.vncInput.keys.length !== 0 || e2e.vncInput.pointers !== 0) {
+    throw new Error(`view-only input reached the desktop: ${JSON.stringify(e2e.vncInput)}`);
+  }
+  await page.getByRole("button", { name: "Take over" }).click();
+  await page.getByRole("button", { name: "Release" }).waitFor();
+  await desktopRegion.locator("canvas").click();
+  await page.keyboard.type("hearth");
+  const typed = keysym("hearth");
+  for (let i = 0; i < 50 && e2e.vncInput.keys.length < typed.length; i++) {
+    await page.waitForTimeout(100);
+  }
+  if (JSON.stringify(e2e.vncInput.keys) !== JSON.stringify(typed)) {
+    throw new Error(`typed keys did not reach the desktop: ${JSON.stringify(e2e.vncInput.keys)}`);
+  }
+  if (e2e.vncInput.pointers === 0) throw new Error("the click did not reach the desktop");
+  await shot(page, "2b-desktop-in-control");
+  await page.getByRole("button", { name: "Release" }).click();
+  await page.getByRole("button", { name: "Take over" }).waitFor();
+  const before = { keys: e2e.vncInput.keys.length, pointers: e2e.vncInput.pointers };
+  await desktopRegion.locator("canvas").click();
+  await page.keyboard.type("after");
+  await page.waitForTimeout(300);
+  if (e2e.vncInput.keys.length !== before.keys || e2e.vncInput.pointers !== before.pointers) {
+    throw new Error("input reached the desktop after Release");
+  }
 
   step("reload: the chat is rebuilt from the event log and the session continues");
   await page.reload();

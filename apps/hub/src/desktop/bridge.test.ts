@@ -404,7 +404,7 @@ describe("DesktopBridge with the desktop lock (decision 0033)", () => {
     const t = setup({ locks: true });
     t.open();
     await t.locks.acquire(LOCAL_PRINCIPAL, "ses_1");
-    t.boxes.listener?.disconnected?.("box_1");
+    t.boxes.listener?.disconnected?.("box_1", undefined);
     await Bun.sleep(0);
     expect(t.locks.isDesktopLocked("ses_1")).toBe(false);
   });

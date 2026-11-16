@@ -31,9 +31,9 @@ export {
   MAX_CUT_TEXT_BYTES,
   MAX_ENCODINGS,
   RFB_CLIENT,
+  RfbInputFilter,
   RfbViolation,
   STRIPPED_ENCODINGS,
-  RfbInputFilter,
 } from "./rfb";
 export {
   DESKTOP_LOCK_PATH,

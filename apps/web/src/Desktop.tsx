@@ -107,7 +107,7 @@ export function DesktopPanel({ sessionId }: { sessionId: string }) {
 /** What the control bar says about the lock. */
 export function lockLabel(lock: DesktopLock | undefined): string {
   if (lock === undefined) return "Checking control…";
-  if (lock.mine) return "You are in control. The agent's desktop tools wait.";
+  if (lock.mine) return "You are in control.";
   if (lock.held) return "Someone else is in control.";
   return "View-only.";
 }
