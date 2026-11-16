@@ -230,6 +230,35 @@ describe("live tool output in a DOM", () => {
   });
 });
 
+describe("live tool output after a failed turn", () => {
+  test("a call the turn cut off shows as interrupted, without its live block", async () => {
+    let seq = 0;
+    const ev = (type: string, payload: unknown) => ({ seq: ++seq, ts: 0, type, payload });
+    const call = { type: "toolCall", id: "b2", name: "bash", arguments: { command: "x" } };
+    const step = { role: "assistant", content: [call], stopReason: "toolUse", timestamp: 1 };
+    const chat = applyHubEvents(emptyChat("se_f"), [
+      ev("pi.agent_start", {}),
+      ev("pi.message_start", { message: step }),
+      ev("pi.message_end", { message: step }),
+      ev("pi.tool_execution_start", { toolCallId: "b2", toolName: "bash", args: { command: "x" } }),
+      ev("tool.output", { toolCallId: "b2", seq: 0, text: "partial\n" }),
+      ev("runner.failed", { message: "boom" }),
+    ]);
+    render(
+      <ChatRuntime
+        messages={projectChat(chat)}
+        isRunning={isRunning(chat)}
+        onSend={async () => {}}
+        onInterrupt={async () => {}}
+      >
+        <Thread />
+      </ChatRuntime>,
+    );
+    expect(await screen.findByRole("button", { name: "Tool call bash: interrupted" })).toBeTruthy();
+    expect(screen.queryByRole("log", { name: "Live output of bash" })).toBeNull();
+  });
+});
+
 describe("desktop panel in a DOM", () => {
   /** A stand-in for noVNC's RFB and the WebSocket, counting what gets opened. */
   function fakes() {

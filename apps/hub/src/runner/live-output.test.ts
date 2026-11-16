@@ -159,6 +159,17 @@ describe("LiveToolOutput", () => {
     expect(s.text()).toBe("snow ☃ done\n");
   });
 
+  test("a long line of emoji is never cut inside a surrogate pair", async () => {
+    const s = sink();
+    const { out } = live(s, { longLineChars: 10, holdChars: 3 });
+    // 20 emoji are 40 UTF-16 units; the hold cut (37) falls inside a pair.
+    out.write(bytes("😀".repeat(20)));
+    await wait(30);
+    expect(s.events.length).toBeGreaterThan(0);
+    for (const e of s.events) expect(e.text.isWellFormed()).toBe(true);
+    expect(s.text()).toBe("😀".repeat(18));
+  });
+
   test("close stops it: nothing held back or written later is emitted", async () => {
     const s = sink();
     const { out } = live(s);

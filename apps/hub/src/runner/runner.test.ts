@@ -1112,7 +1112,10 @@ describe("live bash output (decision 0036)", () => {
     // Live output came while the call ran, before its end event.
     expect(first.seq).toBeLessThan(types.indexOf("pi.tool_execution_end") + 1);
     expect(JSON.stringify(outputs)).not.toContain("faux-key-not-a-secret");
-    // The call's end closes its live output: nothing is stored after its end event.
+    // The call's end closes its live output: nothing is stored after its end
+    // event, also once a chunk that arrived just before the result would be due.
+    await Bun.sleep(600);
+    outputs.splice(0, outputs.length, ...h.events.of("se_a", "tool.output"));
     const endSeq = h.events.of("se_a", "pi.tool_execution_end")[0]?.seq ?? 0;
     for (const o of outputs) expect(o.seq).toBeLessThan(endSeq);
     // The result is the answer, redacted as before.

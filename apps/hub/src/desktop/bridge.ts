@@ -354,10 +354,10 @@ export class DesktopBridge {
     return false;
   }
 
-  /** Next free even stream id on this box (decision 0002: the hub opens even ids), below the live output range (0036). */
+  /** Next free even stream id on this box (decision 0002: the hub opens even ids). */
   #allocate(streams: Map<number, Viewer>): number {
     for (;;) {
-      this.#nextId = (this.#nextId + 2) % LIVE_OUTPUT_STREAM_BASE;
+      this.#nextId = nextDesktopStreamId(this.#nextId);
       if (!streams.has(this.#nextId)) return this.#nextId;
     }
   }
@@ -412,4 +412,12 @@ function unavailable(message: string): HearthError {
     disposition: "retry",
     code: "desktop.unavailable",
   });
+}
+
+/**
+ * The even stream id after `id` for a desktop viewer. It wraps below
+ * `LIVE_OUTPUT_STREAM_BASE`, so it never meets a live output stream (0036).
+ */
+export function nextDesktopStreamId(id: number): number {
+  return (id + 2) % LIVE_OUTPUT_STREAM_BASE;
 }

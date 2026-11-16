@@ -73,7 +73,7 @@ export class LiveOutputSender {
   }
 
   write(chunk: Buffer): void {
-    if (this.#closed || this.#accepted >= this.#max) return;
+    if (this.#closed) return;
     const part = chunk.subarray(0, this.#max - this.#accepted);
     if (part.length === 0) return;
     this.#accepted += part.length;
