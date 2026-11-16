@@ -31,7 +31,11 @@ import {
   type Principal,
   type SessionId,
 } from "@hearth/core";
-import type { StreamCloseFrame, StreamDataFrame } from "@hearth/protocol";
+import {
+  LIVE_OUTPUT_STREAM_BASE,
+  type StreamCloseFrame,
+  type StreamDataFrame,
+} from "@hearth/protocol";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import type { SessionManager } from "../session";
 import type { DesktopLocks } from "./lock";
@@ -350,10 +354,10 @@ export class DesktopBridge {
     return false;
   }
 
-  /** Next free even stream id on this box (decision 0002: the hub opens even ids). */
+  /** Next free even stream id on this box (decision 0002: the hub opens even ids), below the live output range (0036). */
   #allocate(streams: Map<number, Viewer>): number {
     for (;;) {
-      this.#nextId = (this.#nextId + 2) % 2 ** 32;
+      this.#nextId = (this.#nextId + 2) % LIVE_OUTPUT_STREAM_BASE;
       if (!streams.has(this.#nextId)) return this.#nextId;
     }
   }

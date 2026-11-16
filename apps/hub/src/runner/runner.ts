@@ -42,6 +42,7 @@ import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/t
 import { HUB_VERSION } from "../obs/version";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
+import { liveToolOutput } from "./live-output";
 import type { CompiledDenyRule } from "./policy";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
 
@@ -239,6 +240,8 @@ export class SessionRunner {
             denyList: options.denyList,
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
+            liveOutput: (toolCallId) =>
+              liveToolOutput(options, toolCallId, () => self?.tracer.turnId),
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),
           }),
         },

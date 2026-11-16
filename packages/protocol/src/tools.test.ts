@@ -6,6 +6,8 @@ import {
   decodeToolResult,
   encodeFrame,
   FS_DEADLINE_MS,
+  isLiveOutputStreamId,
+  LIVE_OUTPUT_STREAM_BASE,
   MAX_EXEC_TIMEOUT_MS,
   MUTATING_TOOL_METHODS,
   PROTOCOL_VERSION,
@@ -18,8 +20,8 @@ import {
 } from "./index";
 
 describe("tool RPC", () => {
-  test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2; browser methods 1.3)", () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
+  test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2; browser methods 1.3; live exec output 1.4)", () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
   });
 
   test("exec params never carry an environment", () => {
@@ -34,6 +36,35 @@ describe("tool RPC", () => {
       ok: true,
       value: { callId: "call_1", command: "env", cwd: "/workspace", timeoutMs: 1000 },
     });
+  });
+
+  test("exec may name a live output stream (1.4); only an even id in the live range", () => {
+    const params = { callId: "c", command: "x", cwd: ".", timeoutMs: 1000 };
+    const ok = decodeToolParams("tool.exec", {
+      ...params,
+      outputStream: LIVE_OUTPUT_STREAM_BASE + 2,
+    });
+    expect(ok).toEqual({
+      ok: true,
+      value: { ...params, outputStream: LIVE_OUTPUT_STREAM_BASE + 2 },
+    });
+    // Without the field the box answers once, as a 1.3 box does.
+    expect(decodeToolParams("tool.exec", params)).toEqual({ ok: true, value: params });
+    for (const bad of [
+      2, // a desktop bridge id
+      LIVE_OUTPUT_STREAM_BASE - 2,
+      LIVE_OUTPUT_STREAM_BASE + 1, // odd: the box's range
+      2 ** 32,
+      "2147483650",
+      1.5,
+    ]) {
+      expect(decodeToolParams("tool.exec", { ...params, outputStream: bad }).ok).toBe(false);
+    }
+    expect(isLiveOutputStreamId(LIVE_OUTPUT_STREAM_BASE)).toBe(true);
+    expect(isLiveOutputStreamId(2 ** 32 - 2)).toBe(true);
+    expect(isLiveOutputStreamId(LIVE_OUTPUT_STREAM_BASE - 2)).toBe(false);
+    expect(isLiveOutputStreamId(LIVE_OUTPUT_STREAM_BASE + 3)).toBe(false);
+    expect(isLiveOutputStreamId(2 ** 32)).toBe(false);
   });
 
   test("params are checked: call id, paths, limits", () => {
