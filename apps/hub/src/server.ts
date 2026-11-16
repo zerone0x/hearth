@@ -179,7 +179,10 @@ export interface HubOptions extends HubListenOptions {
    * The hub-side pi runner (#43, decision 0015): model, key reference,
    * deny-list, extension allowlist. Without it the message routes are not served.
    */
-  readonly runner?: Omit<SessionRunnersOptions, "authorizer" | "events" | "sessions" | "tools">;
+  readonly runner?: Omit<
+    SessionRunnersOptions,
+    "authorizer" | "events" | "sessions" | "tools" | "desktopLocks"
+  >;
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
@@ -496,6 +499,16 @@ export function startHub(options: HubOptions) {
     }),
   );
 
+  // The desktop lock (decision 0033): who may type on a session's desktop.
+  // Made before the runners: their browser tools check it (decision 0035).
+  const desktopLocks = new DesktopLocks({
+    authorizer,
+    sessions,
+    events,
+    ...(options.desktopLockTtlMs === undefined ? {} : { ttlMs: options.desktopLockTtlMs }),
+    ...(options.log === undefined ? {} : { log: options.log }),
+  });
+
   // The runner (decision 0015): one pi session per hub session, tools routed
   // to the session's box through the tool RPC.
   // Only with a runner: the client claims every `tool_` rpc answer, so a second
@@ -520,17 +533,10 @@ export function startHub(options: HubOptions) {
             fail: (sessionId, reason) => sessions.fail(sessionId, reason),
           },
           tools: toolRpc as ToolRpcClient,
+          desktopLocks,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
-  // The desktop lock (decision 0033): who may type on a session's desktop.
-  const desktopLocks = new DesktopLocks({
-    authorizer,
-    sessions,
-    events,
-    ...(options.desktopLockTtlMs === undefined ? {} : { ttlMs: options.desktopLockTtlMs }),
-    ...(options.log === undefined ? {} : { log: options.log }),
-  });
   mountDesktopLockRoutes(app, desktopLocks);
   // The desktop stream (decision 0016): behind the login guard, owner only.
   desktop = new DesktopBridge({
