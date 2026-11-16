@@ -359,6 +359,9 @@ async function takeOverSteps(page: Page, box: string, sessionId: string): Promis
   const typed = "file:///workspace/";
   await canvas.click();
   await page.keyboard.press(FOCUS_ADDRESS_BAR);
+  // The omnibox takes focus a moment after Ctrl+L; a key sent before that is
+  // lost (a CI run dropped the first "f"). A person types slower than this.
+  await page.waitForTimeout(500);
   await page.keyboard.type(typed, { delay: 30 });
   await page.waitForTimeout(1_000);
   await shot(page, "3a-typed");
