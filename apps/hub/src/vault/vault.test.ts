@@ -368,6 +368,17 @@ test("a key file others can read is used, with a warning at every start", async 
   const tight = await start({ keyRef: `file:${keyFile}` });
   expect(tight.status).toMatchObject({ state: "enabled" });
   expect(tight.logs.join("\n")).not.toContain("readable by others");
+  // An env: key is not a file, even when a file of that name is at hand.
+  const cwd = process.cwd();
+  writeFileSync(join(dir, "VAULT_KEY"), "x");
+  chmodSync(join(dir, "VAULT_KEY"), 0o644);
+  process.chdir(dir);
+  try {
+    const env = await start({ env: { VAULT_KEY: KEY_A } });
+    expect(env.logs.join("\n")).not.toContain("readable by others");
+  } finally {
+    process.chdir(cwd);
+  }
 });
 
 describe("input checks", () => {
