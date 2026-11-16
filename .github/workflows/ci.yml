@@ -250,9 +250,27 @@ jobs:
         run: |
           "$RUN_BLOCK" -x "$DOC" install:key
           test "$(stat -c %a secrets/model_key)" = 600
+      - name: "install.md: create the vault key (decision 0031)"
+        working-directory: deploy
+        run: |
+          "$RUN_BLOCK" "$DOC" install:vault-key
+          test "$(stat -c %a secrets/vault_key)" = 600
+          test "$(base64 -d secrets/vault_key | wc -c)" = 32
+          sum="$(sha256sum secrets/vault_key)"
+          # Run twice: never overwritten.
+          "$RUN_BLOCK" "$DOC" install:vault-key
+          test "$(sha256sum secrets/vault_key)" = "$sum"
+          echo "$sum" > "$RUNNER_TEMP/vault_key.sha256"
+          # The upgrade runs the same step, so an install from before the vault gets a key.
+          "$(dirname "$RUN_BLOCK")/doc-block.sh" "$DOC" install:upgrade | grep -xF "$("$(dirname "$RUN_BLOCK")/doc-block.sh" "$DOC" install:vault-key)" >/dev/null
       - name: "install.md: start"
         working-directory: deploy
         run: timeout 1800 "$RUN_BLOCK" -x "$DOC" install:up
+      - name: The hub opened the vault with the generated key
+        working-directory: deploy
+        run: |
+          timeout 60 bash -c 'until docker compose logs hub | grep -q "vault: enabled"; do sleep 1; done'
+          if docker compose logs hub | grep "vault: disabled"; then echo "vault disabled" >&2; exit 1; fi
       - name: The firewall is in place
         run: |
           sudo iptables -S HEARTH-BOX-IN
@@ -290,6 +308,13 @@ jobs:
           echo "want=${want} got=${got}"
           test -n "$want"
           test "$got" = "$want"
+      - name: After the upgrade the vault key is unchanged and the vault still opens
+        working-directory: deploy
+        run: |
+          sha256sum -c "$RUNNER_TEMP/vault_key.sha256"
+          test "$(stat -c %a secrets/vault_key)" = 600
+          timeout 60 bash -c 'until docker compose logs --since 10m hub | grep -q "vault: enabled"; do sleep 1; done'
+          if docker compose logs hub | grep "key-mismatch"; then echo "vault key mismatch after upgrade" >&2; exit 1; fi
       - name: After the upgrade the session continues
         run: timeout 300 bun deploy/e2e/prototype.ts upgrade
       - name: "install.md: uninstall"
@@ -312,6 +337,7 @@ jobs:
           test -z "$left"
           if docker volume inspect hearth_hearth-data >/dev/null 2>&1; then echo "volume hearth_hearth-data left" >&2; exit 1; fi
           if docker image inspect hearth-hub:local >/dev/null 2>&1; then echo "image hearth-hub:local left" >&2; exit 1; fi
+          test ! -e secrets/vault_key
       - name: Logs
         if: failure()
         working-directory: deploy

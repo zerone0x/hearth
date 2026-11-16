@@ -21,8 +21,10 @@ import {
 } from "@hearth/core";
 import { Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { lineFields, lineLevel } from "../obs/hub-log";
 import { redactHub } from "../obs/redaction";
 import { observabilityFromEnv } from "../obs/setup";
+import { Telemetry } from "../obs/telemetry";
 import { SessionRunners } from "../runner";
 import { startHub } from "../server";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
@@ -317,6 +319,14 @@ describe("stored rows are bound by the AAD", () => {
     h.db.run("UPDATE secret SET version = 1");
     expect((await errorOf(h.secrets.resolve("vault:model"))).code).toBe("vault.entry-corrupt");
   });
+});
+
+test("vault log lines: component vault, warn when disabled or mid-rotation", () => {
+  expect(lineFields("vault: enabled (kek_check 0123456789ab)")).toEqual({ component: "vault" });
+  expect(lineLevel("vault: enabled (kek_check 0123456789ab)")).toBe("info");
+  expect(lineLevel("vault: disabled (key-missing): x")).toBe("warn");
+  expect(lineLevel("vault: running on vault_key.next, the rotation is committed")).toBe("warn");
+  expect(lineLevel("vault: key rotation failed, still on the current key: x")).toBe("error");
 });
 
 describe("scope and kind", () => {
@@ -762,6 +772,27 @@ describe("redaction", () => {
     const lines: string[] = [];
     observabilityFromEnv({}, (line) => lines.push(line)).logger.info(`key was ${value}`);
     expect(lines.join("\n")).not.toContain(value);
+    // Span attributes and status, with the redactor setup.ts gives telemetry.
+    const exported: string[] = [];
+    const telemetry = new Telemetry({
+      redact: redactHub,
+      spanExporter: {
+        export: (spans, done) => {
+          exported.push(JSON.stringify(spans.map((s) => [s.attributes, s.status])));
+          done({ code: 0 });
+        },
+        shutdown: () => Promise.resolve(),
+        forceFlush: () => Promise.resolve(),
+      },
+    });
+    telemetry.endSpan(
+      telemetry.startSpan("tool", { arg: value }),
+      {},
+      { type: "x", message: value },
+    );
+    await telemetry.shutdown();
+    expect(exported.join("")).toContain("[redacted]");
+    expect(exported.join("")).not.toContain(value);
     // The runner's redactor for stored events (decision 0015).
     const runners = new SessionRunners({
       config: { provider: "faux", model: "m" },
