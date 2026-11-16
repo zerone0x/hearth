@@ -186,6 +186,24 @@ function boxBrowserUrls(box: string): string[] {
   return JSON.parse(docker("exec", box, "bun", "-e", script)) as string[];
 }
 
+/** Evaluates `expression` in the box browser's first page over CDP; returns the JSON value. */
+function boxPageEval(box: string, expression: string): string {
+  const script = `
+const list = await (await fetch("http://127.0.0.1:9222/json/list")).json();
+const target = list.find((t) => t.type === "page");
+const ws = new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((r) => ws.addEventListener("open", r));
+ws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: ${JSON.stringify(expression)}, returnByValue: true } }));
+const reply = await new Promise((r) => ws.addEventListener("message", (e) => r(JSON.parse(e.data))));
+console.log(JSON.stringify(reply.result?.result?.value ?? reply));
+ws.close();`;
+  try {
+    return docker("exec", box, "bun", "-e", script);
+  } catch (error) {
+    return String(error);
+  }
+}
+
 /** Waits until the box's Chromium shows `url`, or returns what it shows. */
 async function waitForBoxUrl(box: string, url: string, ms: number): Promise<string[]> {
   let urls: string[] = [];
@@ -345,6 +363,46 @@ async function takeOverSteps(page: Page, box: string, sessionId: string): Promis
   await page.getByRole("button", { name: "Take over" }).click();
   await page.getByRole("button", { name: "Release" }).waitFor();
   const typed = "file:///workspace/";
+  // DIAG (#120): where do pointer and key events stop?
+  console.log(
+    `e2e: diag listen: ${boxPageEval(box, "window.__hits = []; for (const t of ['mousedown','mouseup','keydown','focus','blur']) addEventListener(t, (e) => window.__hits.push(t + ':' + (e.key ?? '')), true); document.hasFocus()")}`,
+  );
+  const diagX = (label: string) => {
+    const run = (...args: string[]) => {
+      const out = Bun.spawnSync(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+      return `${out.stdout.toString()}${out.stderr.toString()}`.trim();
+    };
+    console.log(
+      `e2e: diag ${label} active: ${run("exec", "-e", "DISPLAY=:1", box, "xprop", "-root", "_NET_ACTIVE_WINDOW")}`,
+    );
+    console.log(
+      `e2e: diag ${label} focus: ${run("exec", "-e", "DISPLAY=:1", box, "xdpyinfo")
+        .split("\n")
+        .filter((l) => /focus|keycode/i.test(l))
+        .join(" | ")}`,
+    );
+    console.log(
+      `e2e: diag ${label} hits: ${boxPageEval(box, "JSON.stringify({ hits: window.__hits, focus: document.hasFocus() })")}`,
+    );
+  };
+  diagX("before-click");
+  console.log(
+    `e2e: diag tree: ${Bun.spawnSync(
+      ["docker", "exec", "-e", "DISPLAY=:1", box, "xwininfo", "-root", "-tree"],
+      { stdout: "pipe" },
+    )
+      .stdout.toString()
+      .split("\n")
+      .filter((l) => /chrom|hearth|openbox|\d+x\d+\+0\+0/i.test(l))
+      .slice(0, 20)
+      .join("\n")}`,
+  );
+  await canvas.click();
+  await page.waitForTimeout(500);
+  diagX("after-click");
+  await page.keyboard.type("xy", { delay: 30 });
+  await page.waitForTimeout(500);
+  diagX("after-xy");
   await canvas.click();
   await page.keyboard.press("Control+L");
   await page.keyboard.type(typed, { delay: 30 });
