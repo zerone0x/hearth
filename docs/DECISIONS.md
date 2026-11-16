@@ -2805,3 +2805,118 @@ with a short bound.
   real `startHub` wiring and trajectory step (`browser-lock.test.ts`), and a
   compose-e2e step: Take over, an agent `browser_tabs` call is refused with
   `desktop.locked`, Release, the same call works in the box's Chromium.
+
+## 0037: Content-addressed blob store for images; trajectories reference screenshots by hash (amends 0021)
+
+- Date: 2026-11-16
+- Status: accepted
+- Issue: #117 (follows 0032's "Storing the bytes by hash is #117")
+
+### Context
+
+`browser_screenshot` (0032) returns a JPEG of up to 1 MiB to the model as a pi
+image part. The runner recorded every pi event with that part inside, as
+base64: in `pi.tool_execution_end`, in the tool result message's
+`pi.message_start` and `pi.message_end`, and in the `runner.entry` a rebuild
+reads back. Each copy counted against `MAX_RUNNER_EVENT_BYTES` (1 MiB), so a
+screenshot over about 768 KiB made those events truncated and the image was
+lost, while a smaller one was stored four times and replayed to every client
+reading the event log (0006 already said bulk bytes need a separate store).
+The trajectory (0021) recorded only `images: 1`.
+
+### Decision
+
+- **A hub `BlobStore`, in the hub's SQLite database** (`@hearth/core`
+  `BlobStore`, `apps/hub/src/store/blob-store.ts`, migration
+  `content-addressed blobs and their sessions`). Table `blob` holds each
+  distinct content once, keyed by the lowercase hex SHA-256 of its bytes (a
+  `CHECK` refuses any other key), with its size and media type; table
+  `session_blob` records which sessions put it, keyed by
+  `(workspace_id, session_id, sha256)`. Both refuse `UPDATE` by trigger.
+  - **Why SQLite and not files under the data volume:** the bytes then share
+    the database's durability (`synchronous = FULL`, 0006), its backup (one
+    file on the one volume), its transactions (the blob and its session link
+    commit together) and the boundary rule that only `apps/hub/src/store`
+    touches storage. There is no file path built from input, so no traversal,
+    no temp-file-and-rename, no orphan files after a crash, and the session
+    scope is one join. The cost is database size: screenshots are at most
+    1 MiB, which SQLite stores well as BLOBs. If the volume of blobs ever
+    outgrows that, the `BlobStore` interface lets a file or object-store
+    implementation replace this one.
+- **Write once, idempotently, with a cap.** `put` hashes the bytes itself
+  and inserts with `ON CONFLICT DO NOTHING`, so the same bytes, from any
+  number of events or sessions, are one row. Blobs over `MAX_BLOB_BYTES`
+  (4 MiB, the event payload cap of 0006) are refused (`blob.too-large`); the
+  runner does not try to store them (below).
+- **The media type is sniffed from the bytes** (JPEG, PNG, GIF, WebP magic
+  numbers, else `application/octet-stream`), never taken from the tool's
+  claim, so a blob can never be served as HTML or script.
+- **Events keep a reference, not the bytes.** When the runner records an
+  event, each image part in a `content` array (a message's or a tool
+  result's) becomes `{type: "image", mimeType, blob: {sha256, size, mime}}`,
+  plus `omitted: "too-large"` over the cap. The bytes are put in the store
+  in the event chain, before the event that names them is appended, so an
+  event never refers to a blob that is not stored; a failed put fails the
+  runner like a failed append (0015). Only `content` arrays are rewritten: an
+  image-shaped object in tool arguments is kept as the model sent it.
+- **The model still gets the image.** Only what is recorded changes; pi's
+  in-memory session keeps the base64. A runner rebuilt from the event log
+  after a hub restart (0015) reads each referenced image back from the store
+  and puts it back in the session in pi's own shape, so the model sees the
+  same messages; an image that is not in the store (over the cap, or a hub
+  without a store) comes back as a text part naming its hash and why, never
+  as an image part without data.
+- **Trajectory, amending 0021.** A `tool_call` record's `result` keeps
+  `images` (the count) and adds `image_blobs: [{sha256, size, mime,
+  omitted?}]`, one per image, in order. An added field: the schema stays
+  `hearth.trajectory/2`. No base64 is in a trajectory record.
+- **API.** `GET /v1/sessions/:id/blobs/:sha256`, behind the login guard like
+  every `/v1` route, authorizes `session.blob` against the session's
+  workspace before it reads anything (0022), then checks the session exists
+  (`session.not-found`, as every session route). Then the blob is looked up
+  only through that session's `session_blob` rows: a malformed hash, a
+  traversal attempt, an unknown hash and another session's hash all get the
+  same 404 `blob.not-found` (the same-answer rule of #85, #90, #94). The
+  answer has the sniffed `content-type`, `x-content-type-options: nosniff`,
+  `content-security-policy: default-src 'none'; sandbox`,
+  `cache-control: private, no-store` and `content-disposition: inline` for
+  an image, `attachment` otherwise, named `<sha256>.<ext>`.
+- **CLI.** `bun apps/hub/src/trajectory-cli.ts [--db PATH] --export-blobs DIR
+  <session-id>` also writes each blob of the session to `DIR` as
+  `<sha256>.<ext>` (0600, the directory 0700 when created), the names the
+  trajectory's `image_blobs` give. Names come from the store's validated
+  hashes, never from event text.
+
+### Consequences
+
+- **Retention follows the session.** A blob is kept while a session refers
+  to it; no blob or link is deleted yet. Deleting a session's data with a
+  retention policy is #83's; it will drop that session's `session_blob` rows
+  and then any `blob` no session refers to, under a new decision.
+- **Blobs are not text-redacted.** The redaction of 0015 and 0021 works on
+  text; a screenshot can show a secret on the page. Screenshots are to be
+  masked at capture, in the box, before they leave it (#118, vault follow-up);
+  until then a blob holds what the page showed, like the model's own view.
+- 0032's consequence that a screenshot over about 768 KiB is lost from the
+  event log no longer holds: the events now carry only the reference.
+- Events recorded before this change keep their base64 (the log is
+  append-only, 0006); their trajectory has `images` without `image_blobs`.
+- The compose install's faux model declares image input
+  (`"input": ["text", "image"]`), so pi sends it the screenshot and the e2e
+  can check the model got the bytes the blob API serves.
+- Proof: `store/blob-store.test.ts` (write, read, dedup, list, another
+  session or workspace, malformed hashes, the cap at exactly the limit and
+  one byte over, immutability, sniffing); `obs/blobs.test.ts` (the replacer,
+  the cap and `content`-only rewriting, the rebuild helper, the route's
+  headers, the same answer for unknown, other-session, malformed and
+  traversing hashes, `session.blob` authorized first and audited, 401
+  without login, the CLI export); `runner/runner.test.ts` (the model gets
+  the image while no event holds its base64, dedup across two calls, each
+  blob stored before the first event naming it, a failed put fails the
+  runner, a rebuilt runner gets the image back, a missing blob becomes
+  text, `image_blobs` in the step and the trajectory);
+  `session-existence.test.ts` and `principal.test.ts` (the blob route
+  under the same-answer and principal rules); the compose e2e
+  (`deploy/e2e/prototype.ts` step 5f: a real screenshot reaches the faux
+  model, the trajectory and event log name it and hold no base64, the blob
+  API serves its bytes, and again after the upgrade).

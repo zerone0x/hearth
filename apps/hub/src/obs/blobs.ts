@@ -134,8 +134,9 @@ export async function restoreImages<T>(
     if (!isImageRef(part)) return part;
     const stored = await blobs?.get(scope, sessionId, part.blob.sha256);
     if (stored === undefined) return { type: "text", text: missingImageText(part.blob) };
-    const { blob: _blob, ...rest } = part;
-    return { ...rest, data: Buffer.from(stored.bytes).toString("base64") };
+    // pi's own key order (type, data, mimeType), so a rebuilt session is the same JSON.
+    const { type, blob: _blob, ...rest } = part;
+    return { type, data: Buffer.from(stored.bytes).toString("base64"), ...rest };
   };
   const walk = async (v: unknown, key: string): Promise<unknown> => {
     if (Array.isArray(v)) {

@@ -12,7 +12,9 @@
  * - `POST /faux/script` `[{"text": "..."} | {"toolCalls": [{id, name, arguments}]}]`:
  *   replaces the script.
  * - `GET /faux/requests`: every completion request seen so far, as
- *   `{authorization, model, lastRole}`, so a test can check which key the hub sent.
+ *   `{authorization, model, lastRole, images}`, so a test can check which key the
+ *   hub sent and which images the model got (`images`: the sha256 of each
+ *   `data:image/...;base64,` URL in the request, decision 0037).
  * - `GET /faux/blank`: an empty page, on another origin than the hub.
  *
  *   bun deploy/e2e/faux-model.ts [port]      # binds 127.0.0.1, default port 18080
@@ -32,6 +34,15 @@ export interface FauxRequest {
   readonly authorization: string | null;
   readonly model: string;
   readonly lastRole: string;
+  /** The sha256 of every base64 data-URL image in the request, in order. */
+  readonly images: readonly string[];
+}
+
+/** The sha256 of each `data:image/<type>;base64,<data>` URL in `text`. */
+export function dataUrlImages(text: string): string[] {
+  return [...text.matchAll(/data:image\/[a-z0-9.+-]+;base64,([A-Za-z0-9+/=]+)/g)].map((m) =>
+    new Bun.CryptoHasher("sha256").update(Buffer.from(m[1] ?? "", "base64")).digest("hex"),
+  );
 }
 
 export interface FauxModelServer {
@@ -135,7 +146,14 @@ export function startFauxModel(port = 0): FauxModelServer {
         return Response.json(requests);
       }
       if (req.method === "POST" && url.pathname.endsWith("/chat/completions")) {
-        const body = (await req.json().catch(() => ({}))) as {
+        const raw = await req.text();
+        const body = (() => {
+          try {
+            return JSON.parse(raw);
+          } catch {
+            return {};
+          }
+        })() as {
           model?: unknown;
           stream?: unknown;
           messages?: Array<{ role?: unknown }>;
@@ -145,6 +163,7 @@ export function startFauxModel(port = 0): FauxModelServer {
           authorization: req.headers.get("authorization"),
           model,
           lastRole: String(body.messages?.at(-1)?.role ?? ""),
+          images: dataUrlImages(raw),
         });
         if (body.stream !== true) {
           return Response.json({ error: "the faux model only streams" }, { status: 400 });
