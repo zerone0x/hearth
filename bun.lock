@@ -19,6 +19,7 @@
         "@earendil-works/pi-coding-agent": "1.5.2",
         "@hearth/core": "workspace:*",
         "@hearth/protocol": "workspace:*",
+        "playwright-core": "1.65.1",
       },
     },
     "apps/hub": {

@@ -10,6 +10,16 @@
  * `dist/core/tools/*.d.ts`); see the README table.
  */
 
+import {
+  BROWSER_METHODS,
+  BROWSER_PARAMS,
+  BROWSER_RESULTS,
+  type BrowserParams,
+  type BrowserResults,
+  browserBudgetMs,
+  isBrowserMethod,
+  MUTATING_BROWSER_METHODS,
+} from "./browser";
 import { FieldError, Fields, isObj, MAX_ID_LENGTH } from "./fields";
 import type { FailureDisposition, FailureOwner, JsonValue } from "./frames";
 
@@ -60,7 +70,8 @@ interface Base {
   readonly callId: string;
 }
 
-export interface ToolParams {
+/** The browser methods (protocol 1.3, `browser.ts`) are tool methods too. */
+export interface ToolParams extends BrowserParams {
   /** `ReadOperations.readFile` and `EditOperations.readFile`. */
   "tool.readFile": Base & { readonly path: string };
   /** `ReadOperations.access` (`write: false`) and `EditOperations.access` (`write: true`). */
@@ -107,7 +118,7 @@ export interface ToolParams {
   "tool.cancel": Base & { readonly target: string };
 }
 
-export interface ToolResults {
+export interface ToolResults extends BrowserResults {
   /** `data` is the file's bytes in base64, so binary files survive. */
   "tool.readFile": { readonly data: string; readonly size: number };
   "tool.access": Record<string, never>;
@@ -161,6 +172,7 @@ export const TOOL_METHODS: readonly ToolMethod[] = [
   "tool.grep",
   "tool.exec",
   "tool.cancel",
+  ...BROWSER_METHODS,
 ];
 
 /**
@@ -171,6 +183,7 @@ export const MUTATING_TOOL_METHODS: ReadonlySet<ToolMethod> = new Set([
   "tool.writeFile",
   "tool.mkdir",
   "tool.exec",
+  ...MUTATING_BROWSER_METHODS,
 ]);
 
 export function isToolMethod(method: string): method is ToolMethod {
@@ -182,6 +195,9 @@ export function isToolMethod(method: string): method is ToolMethod {
  * own budget for the call plus `TOOL_DEADLINE_GRACE_MS`.
  */
 export function toolDeadlineMs<M extends ToolMethod>(method: M, params: ToolParams[M]): number {
+  if (isBrowserMethod(method)) {
+    return browserBudgetMs(method, params as BrowserParams[typeof method]) + TOOL_DEADLINE_GRACE_MS;
+  }
   switch (method) {
     case "tool.exec":
       return (params as ToolParams["tool.exec"]).timeoutMs + TOOL_DEADLINE_GRACE_MS;
@@ -213,7 +229,12 @@ export type ToolErrorCode =
   | "tool.result-expired"
   | "tool.internal"
   | "tool.deadline"
-  | "tool.outcome-unknown";
+  | "tool.outcome-unknown"
+  | "browser.unavailable"
+  | "browser.no-tab"
+  | "browser.stale-ref"
+  | "browser.bad-url"
+  | "browser.failed";
 
 /**
  * Owner and retry disposition of each error code (PRD §8.1, principle 2).
@@ -237,6 +258,15 @@ export const TOOL_ERRORS: Readonly<
   "tool.internal": { owner: "box", disposition: "retry-cold" },
   "tool.deadline": { owner: "box", disposition: "give-up" },
   "tool.outcome-unknown": { owner: "box", disposition: "give-up" },
+  // The box's Chromium did not answer on its CDP port (restarting, crashed).
+  "browser.unavailable": { owner: "box", disposition: "give-up" },
+  // The model named a tab that does not exist, or a URL scheme the tools refuse.
+  "browser.no-tab": { owner: "user", disposition: "give-up" },
+  "browser.bad-url": { owner: "user", disposition: "give-up" },
+  // A screenshot or subtree snapshot named a ref that is not of the latest snapshot.
+  "browser.stale-ref": { owner: "user", disposition: "give-up" },
+  // Playwright refused the call for a reason that is no outcome (a bad key name, say).
+  "browser.failed": { owner: "user", disposition: "give-up" },
 };
 
 export function isToolErrorCode(code: string): code is ToolErrorCode {
@@ -254,7 +284,9 @@ export function classifyToolError(
 ): { readonly owner: FailureOwner; readonly disposition: FailureDisposition } {
   if (!isToolErrorCode(code)) return { owner: "box", disposition: "give-up" };
   if (
-    (code === "tool.deadline" || code === "tool.outcome-unknown") &&
+    (code === "tool.deadline" ||
+      code === "tool.outcome-unknown" ||
+      code === "browser.unavailable") &&
     !MUTATING_TOOL_METHODS.has(method)
   ) {
     return { owner: "box", disposition: "retry" };
@@ -290,6 +322,7 @@ function stringArray(f: Fields, key: string, maxItems: number): string[] {
 const base = (f: Fields): Base => ({ callId: f.id("callId") });
 
 const PARAMS: { readonly [M in ToolMethod]: (f: Fields) => ToolParams[M] } = {
+  ...BROWSER_PARAMS,
   "tool.readFile": (f) => ({ ...base(f), path: path(f, "path") }),
   "tool.access": (f) => ({ ...base(f), path: path(f, "path"), write: f.bool("write") }),
   "tool.imageMimeType": (f) => ({ ...base(f), path: path(f, "path") }),
@@ -329,6 +362,7 @@ const PARAMS: { readonly [M in ToolMethod]: (f: Fields) => ToolParams[M] } = {
 };
 
 const RESULTS: { readonly [M in ToolMethod]: (f: Fields) => ToolResults[M] } = {
+  ...BROWSER_RESULTS,
   "tool.readFile": (f) => ({
     data: f.string("data", Math.ceil(MAX_TOOL_FILE_BYTES / 3) * 4),
     size: f.int("size", 0, MAX_TOOL_FILE_BYTES),

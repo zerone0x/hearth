@@ -25,6 +25,7 @@ export {
   MAX_JSON_DEPTH,
   MAX_TEXT_LENGTH,
 } from "./fields";
+export * from "./browser";
 export * from "./frames";
 export { checkHelloVersion, rejectHello } from "./handshake";
 export {
