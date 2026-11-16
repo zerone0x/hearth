@@ -132,6 +132,7 @@ const ARCH = `# A
 | One | 0001 | \`x.test.ts\` "first"; "second"<br>\`y.test.ts\` "third" |
 | Two | 0002 | nothing named |
 | Three | 0003 | \`z.ts\` (a script check)<br>\`x.test.ts\` "first" |
+| Four | 0004 | \`x.test.ts\` "first"<br>\`w.ts\` (a script check) |
 `;
 
 describe("docs/ARCHITECTURE.md invariants table", () => {
@@ -143,6 +144,8 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
       { promise: "Two", file: "", test: "" },
       { promise: "Three", file: "z.ts", test: "" },
       { promise: "Three", file: "x.test.ts", test: "first" },
+      { promise: "Four", file: "x.test.ts", test: "first" },
+      { promise: "Four", file: "w.ts", test: "" },
     ]);
   });
 
@@ -153,6 +156,7 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
       'invariant "One": no file y.test.ts',
       'invariant "Two" names no test',
       'invariant "Three": no file z.ts',
+      'invariant "Four": no file w.ts',
     ]);
     files["z.ts"] = "check();";
     expect(invariantDrift(invariantRefs(ARCH), (path) => files[path])).not.toContain(
@@ -209,6 +213,8 @@ describe("docs/ARCHITECTURE.md invariants table", () => {
     expect(declaresTest(built, "/: every directive")).toBe(false);
     expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 (x) 2")).toBe(true);
     expect(declaresTest("test(`${a} (x) ${b}`, fn)", "1 yxy 2")).toBe(false);
+    expect(declaresTest("test(`a ${x} b`, fn)", "a 1 b")).toBe(true);
+    expect(declaresTest("test(`a ${x} b`, fn)", "za 1 b")).toBe(false);
     expect(declaresTest("test(`plain`, fn)", "plain")).toBe(true);
     expect(declaresTest("// test(`${p}: in a comment`, fn)", "/: in a comment")).toBe(false);
   });
