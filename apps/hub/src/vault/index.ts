@@ -6,5 +6,6 @@ export {
   type SecretView,
   type VaultDisabledReason,
   type VaultStatus,
+  type VaultUse,
   type VaultUseContext,
 } from "./service";

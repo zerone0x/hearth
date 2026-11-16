@@ -54,6 +54,7 @@ import {
   type VaultEntryRecord,
   type VaultKeyProvider,
   type VaultKind,
+  type VaultPolicy,
   type VaultReader,
   vaultSecretError,
   withAudit,
@@ -110,10 +111,40 @@ export interface VaultUseContext {
   readonly sessionId: SessionId;
   readonly tool: string;
   readonly toolCallId?: string;
-  /** The page origin the box reported, for a site login. */
+  /**
+   * The page origin the box reported. A login is handed out only when this
+   * origin is one its policy names (`vault.origin-mismatch` otherwise).
+   */
   readonly origin?: string;
   /** Kinds this use accepts. */
   readonly kinds: readonly VaultKind[];
+}
+
+/**
+ * What a tool use gets: the value and the entry's policy, read from the row
+ * whose AAD just verified, so a caller (`browser_fill`, #118) can enforce
+ * `allow_any_field` or a token's hosts without a second, unauthenticated read.
+ */
+export interface VaultUse {
+  readonly value: SecretValue;
+  readonly name: string;
+  readonly kind: VaultKind;
+  readonly field: string;
+  readonly policy: VaultPolicy;
+}
+
+/**
+ * `scheme://host[:port]` of an `http(s)` page origin or URL, as `URL.origin`
+ * prints it (scheme and host lower-cased, default port dropped); undefined for
+ * anything else, a `blob:` URL included.
+ */
+function originOf(raw: string): string | undefined {
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface HubVaultOptions {
@@ -442,28 +473,30 @@ export class HubVault implements VaultReader {
   // ---- Uses ----
 
   /** `vault:` through the SecretStore: hub-side, global entries, model keys and hub tokens. */
-  readForHub(name: string, field: string | undefined, ref: SecretRef): Promise<string> {
-    return this.#reveal(name, field, ref, {
+  async readForHub(name: string, field: string | undefined, ref: SecretRef): Promise<string> {
+    const revealed = await this.#reveal(name, field, ref, {
       consumer: "hub",
       kinds: ["model-key", "token"],
     });
+    return revealed.value;
   }
 
   /**
    * A use by a tool in a session (the hook for `browser_fill`, #118): the
-   * entry must be global or scoped to that session and of an accepted kind.
+   * entry must be global or scoped to that session and of an accepted kind,
+   * and a login is handed out only on one of its policy's origins.
    */
-  async use(ref: SecretRef, context: VaultUseContext): Promise<SecretValue> {
+  async use(ref: SecretRef, context: VaultUseContext): Promise<VaultUse> {
     const parsed = parseSecretRef(ref);
     const body = parsed.scheme === "vault" ? parseVaultRefBody(parsed.body) : undefined;
     if (body === undefined) {
       throw vaultSecretError(ref, "secret.malformed-ref", "expected vault:<name>[#field]");
     }
-    const value = await this.#reveal(body.name, body.field, ref, {
+    const revealed = await this.#reveal(body.name, body.field, ref, {
       consumer: "tool",
       ...context,
     });
-    return new SecretValue(value);
+    return { ...revealed, value: new SecretValue(revealed.value) };
   }
 
   async #reveal(
@@ -478,7 +511,7 @@ export class HubVault implements VaultReader {
       readonly toolCallId?: string;
       readonly origin?: string;
     },
-  ): Promise<string> {
+  ): Promise<{ value: string; name: string; kind: VaultKind; field: string; policy: VaultPolicy }> {
     await this.open();
     const state = this.#state;
     if (!state.enabled) {
@@ -522,13 +555,22 @@ export class HubVault implements VaultReader {
       return refuse("vault.kind-mismatch", `a ${row.kind} entry cannot be used here`);
     }
     if (row.kind === "token" && context.consumer === "hub") {
-      const policy = JSON.parse(row.policyJson) as { use?: string };
-      if (policy.use !== "hub") {
+      const tokenPolicy = JSON.parse(row.policyJson) as { use?: string };
+      if (tokenPolicy.use !== "hub") {
         return refuse("vault.kind-mismatch", "this token is for box commands, not the hub");
       }
     }
     if (row.scopeSessionId !== null && row.scopeSessionId !== context.sessionId) {
       return refuse("vault.scope-mismatch", "the entry is scoped to another session");
+    }
+    // Authentic: the AAD that binds the policy verified above.
+    const policy = JSON.parse(row.policyJson) as VaultPolicy;
+    if (row.kind === "login") {
+      const origins = (policy as { origins?: readonly string[] }).origins ?? [];
+      const origin = context.origin === undefined ? undefined : originOf(context.origin);
+      if (origin === undefined || !origins.includes(origin)) {
+        return refuse("vault.origin-mismatch", "this login is not bound to the page's origin");
+      }
     }
     const value = VAULT_FIELDS[row.kind].fields.includes(fieldName) ? fields[fieldName] : undefined;
     if (value === undefined) {
@@ -542,7 +584,7 @@ export class HubVault implements VaultReader {
     }
     this.#o.store.touch(this.#workspaceId, row.id, this.#now());
     this.#register(value);
-    return value;
+    return { value, name: row.name, kind: row.kind, field: fieldName, policy };
   }
 
   // ---- Opening and key rotation ----

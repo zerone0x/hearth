@@ -291,9 +291,10 @@ describe("stored rows are bound by the AAD", () => {
       h.vault.use("vault:github#password", {
         sessionId: "ses_1",
         tool: "browser_fill",
+        origin: "https://github.com",
         kinds: ["login"],
       });
-    expect((await use()).reveal()).toBe(LOGIN.password);
+    expect((await use()).value.reveal()).toBe(LOGIN.password);
     h.db.run(
       `UPDATE secret SET policy_json = '{"allow_any_field":false,"origins":["https://evil.example","https://github.com"]}'`,
     );
@@ -532,6 +533,27 @@ describe("writes", () => {
       .catch((e: unknown) => e);
     expect(error).toMatchObject({ code: "secret.conflict" });
   });
+
+  test("the store replaces a value only from the version it read", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    const { id } = await addModelKey(h);
+    const store = new SqliteVaultStore(h.db);
+    const before = store.byId("ws_default", id);
+    const next = {
+      iv: new Uint8Array(12),
+      ciphertext: new Uint8Array(32),
+      fingerprint: "hmac:000000000000",
+      version: 2,
+      updatedAt: 5,
+    };
+    for (const stale of [0, 2, 7]) {
+      expect(store.replaceValue("ws_default", id, stale, next)).toBe(false);
+    }
+    expect(store.replaceValue("ws_other", id, 1, next)).toBe(false);
+    expect(store.byId("ws_default", id)).toEqual(before);
+    expect(store.replaceValue("ws_default", id, 1, next)).toBe(true);
+    expect(store.byId("ws_default", id)?.version).toBe(2);
+  });
 });
 
 describe("scope and kind", () => {
@@ -547,7 +569,7 @@ describe("scope and kind", () => {
     });
     const ctx = (sessionId: string) => ({ sessionId, tool: "bash", kinds: ["token"] as const });
     expect(
-      (await h.vault.use("vault:scoped", { ...ctx("ses_1"), kinds: ["token"] })).reveal(),
+      (await h.vault.use("vault:scoped", { ...ctx("ses_1"), kinds: ["token"] })).value.reveal(),
     ).toBe(TOKEN);
     expect(
       (await errorOf(h.vault.use("vault:scoped", { ...ctx("ses_2"), kinds: ["token"] }))).code,
@@ -618,6 +640,118 @@ describe("scope and kind", () => {
       );
       expect(error.code).toBe("secret.malformed-ref");
     }
+  });
+});
+
+describe("tool uses: origin, policy and fields", () => {
+  test("a login is handed out only on one of its origins; the use returns the authenticated policy", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "github",
+      kind: "login",
+      policy: { origins: ["https://github.com", "https://gist.github.com:8443"] },
+      fields: LOGIN,
+    });
+    const use = (origin?: string, ref = "vault:github#password") =>
+      h.vault.use(ref, {
+        sessionId: "ses_1",
+        tool: "browser_fill",
+        ...(origin === undefined ? {} : { origin }),
+        kinds: ["login"],
+      });
+    for (const origin of [
+      undefined,
+      "",
+      "not a url",
+      "https://evil.example",
+      "https://github.com.evil.example",
+      "https://evil.example/https://github.com",
+      "http://github.com",
+      "https://github.com:444",
+      "https://gist.github.com",
+      "wss://github.com",
+      "blob:https://github.com/0b1c",
+    ]) {
+      const error = await errorOf(use(origin));
+      expect(`${origin}: ${error.code}`).toBe(`${origin}: vault.origin-mismatch`);
+      expect(error.message).not.toContain(LOGIN.password);
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+    const refused = auditRows(h.db, "secret.use-refused");
+    expect(refused).toHaveLength(11);
+    expect(JSON.parse(refused[3]?.detail_json ?? "{}")).toMatchObject({
+      code: "vault.origin-mismatch",
+      origin: "https://evil.example",
+    });
+    // The page's origin, however it is spelled, and only then the value.
+    for (const origin of [
+      "https://github.com",
+      "HTTPS://GitHub.com",
+      "https://github.com:443",
+      "https://github.com/login?next=/",
+      "https://gist.github.com:8443",
+    ]) {
+      const used = await use(origin);
+      expect(used.value.reveal()).toBe(LOGIN.password);
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(5);
+    const used = await use("https://github.com", "vault:github#username");
+    expect(used.value.reveal()).toBe(LOGIN.username);
+    expect({ ...used, value: undefined }).toEqual({
+      value: undefined,
+      name: "github",
+      kind: "login",
+      field: "username",
+      policy: {
+        allow_any_field: false,
+        origins: ["https://gist.github.com:8443", "https://github.com"],
+      },
+    });
+    // A token has no origin to check; its policy comes back for the caller.
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "deploy",
+      kind: "token",
+      policy: { use: "box-env", hosts: ["API.example.com"] },
+      fields: { value: TOKEN },
+    });
+    const token = await h.vault.use("vault:deploy", {
+      sessionId: "ses_1",
+      tool: "bash",
+      kinds: ["token"],
+    });
+    expect(token.value.reveal()).toBe(TOKEN);
+    expect(token.policy).toEqual({ hosts: ["api.example.com"], use: "box-env" });
+    expect(token.field).toBe("value");
+  });
+
+  test("a field name that is not one of the kind's fields is refused, even an Object member", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await addModelKey(h);
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "github",
+      kind: "login",
+      policy: { origins: ["https://github.com"] },
+      fields: LOGIN,
+    });
+    for (const field of ["constructor", "tostring", "valueof", "hasownproperty", "value_x"]) {
+      expect((await errorOf(h.secrets.resolve(`vault:model#${field}`))).code).toBe(
+        "vault.field-unknown",
+      );
+    }
+    for (const field of ["constructor", "value", "password_x"]) {
+      const error = await errorOf(
+        h.vault.use(`vault:github#${field}`, {
+          sessionId: "ses_1",
+          tool: "browser_fill",
+          origin: "https://github.com",
+          kinds: ["login"],
+        }),
+      );
+      expect(`${field}: ${error.code}`).toBe(`${field}: vault.field-unknown`);
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
   });
 });
 
@@ -783,6 +917,29 @@ describe("master key rotation through vault_key.next", () => {
     // The old key alone no longer opens the vault.
     const old = await start({ env: { VAULT_KEY: KEY_A } });
     expect(old.status).toMatchObject({ state: "disabled", reason: "key-mismatch" });
+  });
+
+  test("a next key that does not match is not used: the current key's reason stands", async () => {
+    const first = await start({ env: { VAULT_KEY: KEY_A } });
+    await addModelKey(first);
+    const checkA = kekCheck(first.db);
+    const KEY_C = Buffer.alloc(32, 0xc3).toString("base64");
+    const wrong = await start({
+      env: { VAULT_KEY: KEY_B, VAULT_KEY_NEXT: KEY_C },
+      nextKeyRef: "env:VAULT_KEY_NEXT",
+    });
+    expect(wrong.status).toMatchObject({
+      state: "disabled",
+      reason: "key-mismatch",
+      expectedKekCheck: checkA.slice(0, 12),
+    });
+    const missing = await start({
+      keyRef: undefined,
+      env: { VAULT_KEY_NEXT: KEY_C },
+      nextKeyRef: "env:VAULT_KEY_NEXT",
+    });
+    expect(missing.status).toMatchObject({ state: "disabled", reason: "key-missing" });
+    expect(kekCheck(missing.db)).toBe(checkA);
   });
 
   test("an entry that does not decrypt keeps its fingerprint; the rotation goes on", async () => {

@@ -32,6 +32,7 @@ export type SecretErrorCode =
   | "vault.scope-mismatch"
   | "vault.kind-mismatch"
   | "vault.field-unknown"
+  | "vault.origin-mismatch"
   | "vault.audit-failed";
 
 /**

@@ -156,6 +156,31 @@ describe("vault crypto", () => {
   });
 });
 
+describe("known-answer vectors", () => {
+  // Computed outside this code (Python's hmac for RFC 5869 HKDF-SHA256 with an
+  // empty salt, OpenSSL's id-aes256-wrap for RFC 3394). A change of an info
+  // string, the salt or the wrap would make every existing vault unreadable.
+  const master = Uint8Array.from({ length: 32 }, (_, i) => i);
+  const dataKeyBytes = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+
+  test("the master key's base64, kek_check, fingerprint and wrapped data key are pinned", async () => {
+    expect(parseMasterKey("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")).toEqual(master);
+    const keys = await MasterKeyProvider.fromBytes(master);
+    expect(keys.kekCheck).toBe("24579c183628dda650ab5fc7bbddb137d29eee27f4e1fec345fcf6238d0b95c9");
+    expect(await keys.fingerprint("hearth-kat-value")).toBe("hmac:57bef1b0178b");
+    const dataKey = await crypto.subtle.importKey("raw", dataKeyBytes, "AES-GCM", true, [
+      "encrypt",
+      "decrypt",
+    ]);
+    const wrapped = await keys.wrap(dataKey);
+    expect(Buffer.from(wrapped).toString("hex")).toBe(
+      "67aa00a9969659f248f54cdc85baf24ea9d23c04a95378d18250153b93047361121bea2e10ec7780",
+    );
+    const unwrapped = await keys.unwrap(wrapped);
+    expect(new Uint8Array(await crypto.subtle.exportKey("raw", unwrapped))).toEqual(dataKeyBytes);
+  });
+});
+
 describe("master key text", () => {
   test("the base64 of exactly 32 bytes, with a trailing newline, parses", () => {
     const text = `${Buffer.from(masterA).toString("base64")}\n`;
