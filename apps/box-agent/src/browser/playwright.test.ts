@@ -225,3 +225,26 @@ describe.skipIf(chromiumPath === undefined || chromiumPath === "")(
     }, 60_000);
   },
 );
+
+describe("no browser on the CDP port", () => {
+  test("a call fails with browser.unavailable after the connect timeout, and the next one dials again", async () => {
+    // A port nobody listens on: bind one, then close it.
+    const probe = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    const port = probe.port;
+    probe.stop(true);
+    const driver = new PlaywrightDriver({
+      endpoint: `http://127.0.0.1:${port}`,
+      connectTimeoutMs: 600,
+    });
+    const tools = new BrowserTools({ driver, root: "/nonexistent" });
+    for (let i = 0; i < 2; i++) {
+      const started = Date.now();
+      const error = await tools.run("browser.snapshot", { callId: "c" }).catch((e: unknown) => e);
+      expect((error as { code?: string }).code).toBe("browser.unavailable");
+      // It kept dialing for the whole connect timeout, not one refused attempt.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(400);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    }
+    expect(driver.connects).toBe(0);
+  }, 20_000);
+});

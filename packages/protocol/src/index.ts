@@ -5,6 +5,7 @@
  * a hub-local path or address. See README.md for the frame list.
  */
 
+export * from "./browser";
 export {
   type DecodeError,
   type DecodeErrorCode,
@@ -25,7 +26,6 @@ export {
   MAX_JSON_DEPTH,
   MAX_TEXT_LENGTH,
 } from "./fields";
-export * from "./browser";
 export * from "./frames";
 export { checkHelloVersion, rejectHello } from "./handshake";
 export {

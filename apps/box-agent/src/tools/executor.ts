@@ -238,7 +238,12 @@ export class ToolExecutor {
         log.info("tool call done", {
           ok: true,
           duration_ms,
-          ...(typeof exit.outcome === "string" ? { exec_outcome: exit.outcome } : {}),
+          ...(typeof exit.outcome === "string"
+            ? {
+                [frame.method.startsWith("browser.") ? "browser_outcome" : "exec_outcome"]:
+                  exit.outcome,
+              }
+            : {}),
           ...(exit.exitCode === undefined ? {} : { exit_code: exit.exitCode }),
         });
       } else {

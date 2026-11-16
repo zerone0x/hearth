@@ -22,6 +22,9 @@ import {
   type TargetState,
 } from "./driver";
 
+/** Pause between dials while the browser's CDP port is not up. */
+const DIAL_RETRY_MS = 250;
+
 export interface PlaywrightDriverOptions {
   /** The CDP endpoint, `http://127.0.0.1:9222` in the box. */
   readonly endpoint: string;
@@ -223,9 +226,7 @@ export class PlaywrightDriver implements BrowserDriver {
     if (this.#browser?.isConnected()) return this.#browser;
     this.#connecting ??= (async () => {
       try {
-        const browser = await chromium.connectOverCDP(this.#options.endpoint, {
-          timeout: this.#options.connectTimeoutMs,
-        });
+        const browser = await this.#dial();
         this.#connects++;
         browser.on("disconnected", () => {
           if (this.#browser === browser) this.#browser = undefined;
@@ -244,6 +245,26 @@ export class PlaywrightDriver implements BrowserDriver {
       }
     })();
     return await this.#connecting;
+  }
+
+  /**
+   * Dials until the endpoint answers or the connect timeout passed: right
+   * after the box starts, or while the supervisor restarts Chromium, the port
+   * is closed for a moment.
+   */
+  async #dial(): Promise<Browser> {
+    const deadline = Date.now() + this.#options.connectTimeoutMs;
+    for (;;) {
+      const left = deadline - Date.now();
+      try {
+        return await chromium.connectOverCDP(this.#options.endpoint, {
+          timeout: Math.max(1, left),
+        });
+      } catch (error) {
+        if (Date.now() + DIAL_RETRY_MS >= deadline) throw error;
+        await Bun.sleep(DIAL_RETRY_MS);
+      }
+    }
   }
 
   async #context(): Promise<BrowserContext> {

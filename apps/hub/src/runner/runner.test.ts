@@ -40,6 +40,7 @@ import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
 import type { BoxLease, SessionView } from "../session/manager";
 import { openDatabase, SqliteLoginStore } from "../store";
+import { BROWSER_TOOLS, NO_BROWSER_IN_BOX } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import {
   compileDenyList,
@@ -50,7 +51,6 @@ import {
   scrubHubTempPaths,
 } from "./policy";
 import { mountRunnerRoutes } from "./routes";
-import { BROWSER_TOOLS, NO_BROWSER_IN_BOX } from "./browser-tools";
 import { REDACTED, RESTART_OUTCOME_UNKNOWN } from "./runner";
 import { type RunnerConfig, SessionRunners, type SessionRunnersOptions } from "./runners";
 
@@ -133,9 +133,7 @@ class FakeBoxes {
 
   #newExecutor(): ToolExecutor {
     this.browser =
-      this.driver === null
-        ? undefined
-        : new BrowserTools({ driver: this.driver, root: this.root });
+      this.driver === null ? undefined : new BrowserTools({ driver: this.driver, root: this.root });
     return new ToolExecutor({
       root: this.root,
       ...(this.browser === undefined ? {} : { browser: this.browser }),
