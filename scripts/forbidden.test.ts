@@ -21,17 +21,24 @@ describe("parseConfig", () => {
   test("an empty list is valid and checks nothing", () => {
     expect(parseConfig({ terms: [] }).size).toBe(0);
   });
+  test("keeps every hash of the same length and accepts length 1", () => {
+    const f = parseConfig({
+      terms: [entry, { sha256: sha256("abcdefg"), length: 7 }, { sha256: sha256("q"), length: 1 }],
+    });
+    expect(f.get(7)?.size).toBe(2);
+    expect(f.get(1)?.has(sha256("q"))).toBe(true);
+  });
   test.each([
-    ["the old flat list", { sha256: [entry.sha256] }],
-    ["null", null],
-    ["a bare hash", { terms: [entry.sha256] }],
-    ["a short hash", { terms: [{ ...entry, sha256: "abc" }] }],
-    ["a missing length", { terms: [{ sha256: entry.sha256 }] }],
-    ["a zero length", { terms: [{ ...entry, length: 0 }] }],
-    ["a fractional length", { terms: [{ ...entry, length: 6.5 }] }],
-    ["a string length", { terms: [{ ...entry, length: "7" }] }],
-  ])("rejects %s", (_name, config) => {
-    expect(() => parseConfig(config)).toThrow();
+    ["the old flat list", { sha256: [entry.sha256] }, "config must be"],
+    ["null", null, "config must be"],
+    ["a bare hash", { terms: [entry.sha256] }, "terms[0].sha256"],
+    ["a short hash", { terms: [{ ...entry, sha256: "abc" }] }, "terms[0].sha256"],
+    ["a missing length", { terms: [{ sha256: entry.sha256 }] }, "terms[0].length"],
+    ["a zero length", { terms: [{ ...entry, length: 0 }] }, "terms[0].length"],
+    ["a fractional length", { terms: [{ ...entry, length: 6.5 }] }, "terms[0].length"],
+    ["a string length", { terms: [{ ...entry, length: "7" }] }, "terms[0].length"],
+  ])("rejects %s", (_name, config, message) => {
+    expect(() => parseConfig(config)).toThrow(message);
   });
 });
 

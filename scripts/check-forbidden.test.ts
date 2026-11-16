@@ -15,7 +15,13 @@ afterEach(() => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-function run(files: Record<string, string | Uint8Array>, config: unknown = CONFIG) {
+type Opts = { git?: boolean; deleteAfterAdd?: string[] };
+
+function run(
+  files: Record<string, string | Uint8Array>,
+  config: unknown = CONFIG,
+  opts: Opts = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "hearth-forbidden-"));
   dirs.push(root);
   mkdirSync(join(root, "scripts"));
@@ -28,13 +34,21 @@ function run(files: Record<string, string | Uint8Array>, config: unknown = CONFI
     mkdirSync(dirname(join(root, path)), { recursive: true });
     writeFileSync(join(root, path), body);
   }
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
-  for (const cmd of [
-    ["git", "init", "-q"],
-    ["git", "add", "-A"],
-  ]) {
-    expect(Bun.spawnSync(cmd, { cwd: root, env }).exitCode).toBe(0);
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CEILING_DIRECTORIES: dirname(root), // never find a repo above the temp dir
+  };
+  if (opts.git !== false) {
+    for (const cmd of [
+      ["git", "init", "-q"],
+      ["git", "add", "-A"],
+    ]) {
+      expect(Bun.spawnSync(cmd, { cwd: root, env }).exitCode).toBe(0);
+    }
   }
+  for (const path of opts.deleteAfterAdd ?? []) rmSync(join(root, path));
   const p = Bun.spawnSync([process.execPath, "scripts/check-forbidden.ts"], { cwd: root, env });
   return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
 }
@@ -60,6 +74,29 @@ describe("check-forbidden.ts", () => {
     expect(r.err.toLowerCase()).not.toContain(WORD);
   });
 
+  test("hits are listed sorted by path, then line", () => {
+    const r = run({ "b/vexmor.md": "clean\n", "a.md": `x\n${WORD}\n${WORD}\n` });
+    expect(r.code).toBe(1);
+    expect(r.err.trim().split("\n")).toEqual([
+      expect.stringContaining("forbidden: a.md:2 "),
+      expect.stringContaining("forbidden: a.md:3 "),
+      expect.stringContaining("forbidden: b/******.md (file path) "),
+    ]);
+  });
+
+  test("a tracked file deleted from the working tree is skipped", () => {
+    const r = run({ "gone.md": "clean\n", "README.md": "clean\n" }, CONFIG, {
+      deleteAfterAdd: ["gone.md"],
+    });
+    expect(r).toEqual({ code: 0, out: "", err: "" });
+  });
+
+  test("outside a git repository it fails", () => {
+    const r = run({ "README.md": "clean\n" }, CONFIG, { git: false });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("forbidden: git ls-files failed");
+  });
+
   test("bun.lock files and binary files are not read", () => {
     const binary = new Uint8Array([0, ...new TextEncoder().encode(` ${WORD}\n`)]);
     const r = run({
@@ -82,7 +119,10 @@ describe("check-forbidden.ts", () => {
   ])("a malformed config (%s) fails", (_name, config) => {
     const r = run({ "README.md": "clean\n" }, config);
     expect(r.code).toBe(1);
-    expect(r.err).toContain("forbidden: bad config scripts/forbidden-terms.json");
+    // One clean line, not a crash with a stack trace.
+    expect(r.err.trim().split("\n")).toEqual([
+      expect.stringContaining("forbidden: bad config scripts/forbidden-terms.json: "),
+    ]);
   });
 
   test("an empty term list passes with a warning", () => {
