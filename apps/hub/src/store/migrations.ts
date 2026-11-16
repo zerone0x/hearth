@@ -214,6 +214,46 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX login_session_by_expiry ON login_session (expires_at);
     `,
   },
+  {
+    // The vault (#114, decision 0031, docs/research/vault.md "Data model").
+    // `vault_key` holds the one data key, wrapped (AES-KW) by a subkey of the
+    // key file; `kek_check` tells a wrong key file from a corrupt store.
+    // `secret` holds one AES-256-GCM ciphertext per entry; its AAD binds id,
+    // workspace, name, kind, version, scope and the SHA-256 of `policy_json`,
+    // so an edit of any of them fails to decrypt. `meta_json` (label,
+    // provider) is display only. No value is ever stored in clear.
+    version: 6,
+    name: "vault: wrapped data key and encrypted secrets",
+    sql: `
+      CREATE TABLE vault_key (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        wrapped_dek BLOB NOT NULL,
+        kek_check TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        rotated_at INTEGER
+      ) STRICT;
+
+      CREATE TABLE secret (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('model-key', 'login', 'token')),
+        scope_session_id TEXT REFERENCES session (id),
+        policy_json TEXT NOT NULL CHECK (json_valid(policy_json)),
+        meta_json TEXT NOT NULL CHECK (json_valid(meta_json)),
+        iv BLOB NOT NULL CHECK (length(iv) = 12),
+        ciphertext BLOB NOT NULL,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        UNIQUE (workspace_id, name)
+      ) STRICT;
+      CREATE INDEX audit_by_resource ON audit (resource_type, resource_id, at);
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */
