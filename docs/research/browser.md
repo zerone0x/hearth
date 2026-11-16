@@ -20,9 +20,9 @@ shallow-cloned on 2026-11-16. Stars and push dates come from the GitHub REST API
 | browser-use | [browser-use/browser-use](https://github.com/browser-use/browser-use) | `4b5b1b0aa0ab45a1d6a2a31984d37d3e748c0134` | MIT | n/a |
 | CRI | [cyrus-and/chrome-remote-interface](https://github.com/cyrus-and/chrome-remote-interface) | `a2e85b8094bc5af41db6e891e59e8d551a79fa86` | MIT | n/a |
 
-`raydocs/egolite-jev` is the repo the issue names. Its description and homepage
-point to `raydocs/ego-verified-actions`, and both URLs clone to the same commit,
-so it was renamed. The skill inside is called "ego-verified-actions".
+`raydocs/egolite-jev` is the repo the issue names, and its current name:
+`github.com/raydocs/ego-verified-actions` redirects to it (HTTP 301), and both
+URLs clone to the same commit. The skill inside is called "ego-verified-actions".
 
 **npm registry** (`https://registry.npmjs.org/<pkg>` and
 `https://api.npmjs.org/downloads/point/last-week/<pkg>`, read 2026-11-16):
@@ -219,7 +219,7 @@ target per step from an "indexed element table", and "code owns observation,
 execution, verification and exit conditions" (`README.md:14-20`,
 `README.en.md:7`). It runs on ego lite (`README.en.md:13`). There is also a
 second host for an external Chrome over CDP, whose real-browser acceptance "has
-not been run in this repo" (`docs/CDP-USAGE.md:1-8`).
+not been run in this repo" (`docs/CDP-USAGE.md:1-9`, translated from Chinese).
 
 Useful details:
 - **Execution guards.** They "reject stale, covered, unavailable and
@@ -479,8 +479,8 @@ default context, so the owner sees the agent's tab on the live desktop
 ### 4. Tool surface for pi
 
 The tools are Hearth custom tools in the runner (PRD §8.2.1, `docs/PRD.md:286`), routed as new
-`rpc` methods `browser.*` in protocol 1.2, a minor bump like 0011. A 1.1 box
-answers them as unknown. Names follow #93 and Playwright MCP's shapes.
+`rpc` methods `browser.*` in protocol 1.3, a minor bump like 0011 and 0021
+(the protocol is 1.2 today). A 1.2 box answers them as unknown. Names follow #93 and Playwright MCP's shapes.
 Every acting tool takes `element`, a short human description used by
 approvals (M3) and shown on the live desktop, and the optional `expect`.
 
@@ -490,7 +490,8 @@ approvals (M3) and shown on the live desktop, and the optional `expect`.
 | `browser_snapshot` | `tab?`, `ref?` (subtree), `depth?` | `{ url, title, snapshotId }` + snapshot text (capped, spill path when cut) |
 | `browser_find` | `text` or `regex`, `tab?`, `max?` | matching snapshot lines with refs |
 | `browser_click` | `ref`, `element`, `button?`, `double?`, `expect?` | `{ ok, outcome, url, title, verified }` + fresh snapshot |
-| `browser_type` | `ref`, `element`, `text` **or** `secret` (a vault ref), `submit?`, `expect?` | same; never echoes `text` when `secret` is used |
+| `browser_type` | `ref`, `element`, `text`, `submit?`, `expect?` | same |
+| `browser_fill` | `ref`, `element`, `secret` (a vault ref, `vault:<name>#field`), `submit?`, `expect?` | same; never echoes the value; fails with `browser.origin-mismatch` when the page origin is not one the credential is bound to (aligned with the vault research, PR #113) |
 | `browser_select` | `ref`, `element`, `values[]`, `expect?` | same |
 | `browser_press` | `key`, `ref?`, `expect?` | same |
 | `browser_wait` | `urlIncludes?`, `textVisible?`, `textGone?`, `timeoutMs` (≤ 30 000) | `{ ok, verified, url, title }` + snapshot |
@@ -539,7 +540,7 @@ approvals (M3) and shown on the live desktop, and the optional `expect`.
   the page (CDP has no auth, 0026). That is the box trust domain the owner
   accepted: do not give the agent a credential it may not use. Whether site
   logins should enter the box at all is #108's call. This doc only needs a
-  `secret` param and the redaction rule above.
+  `browser_fill` with its `secret` param, origin binding and the redaction rule above.
 - **Cookies instead of passwords.** The persistent profile on the home volume
   (0026) means a site the owner signs into once on the desktop stays signed
   in. For many sites that is the simpler path, with the same trust caveat.
