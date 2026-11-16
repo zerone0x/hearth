@@ -16,6 +16,7 @@
 import {
   type Authorizer,
   type BoxId,
+  type Decision,
   type EventStore,
   HearthError,
   type JsonValue,
@@ -25,6 +26,7 @@ import {
 import {
   checkHelloVersion,
   decodeFrame,
+  EncodeError,
   encodeFrame,
   type Frame,
   Heartbeat,
@@ -42,6 +44,7 @@ import {
   type StreamOpenFrame,
   type WireMessage,
 } from "@hearth/protocol";
+import { bodyOf, type RequestBody } from "../request-body";
 import {
   BOX_CREDENTIAL_PREFIX,
   type BoxBinding,
@@ -182,6 +185,31 @@ export class BoxConnection {
     if (this.state === "closed") return;
     this.socket.send(encodeFrame(frame));
   }
+
+  /** Sends a frame `encodeFrame` already produced. */
+  sendEncoded(data: string | Uint8Array): void {
+    if (this.state === "closed") return;
+    this.socket.send(data);
+  }
+}
+
+/**
+ * Encodes an `rpc` frame the caller built from its own params. Params the
+ * protocol cannot carry (nested deeper than `MAX_JSON_DEPTH`, a non-finite
+ * number, ...) are the caller's mistake, not a hub fault: they become a
+ * classified `rpc.invalid-params` instead of escaping as a `RangeError`.
+ */
+export function encodeRpc(frame: RpcFrame): string | Uint8Array {
+  try {
+    return encodeFrame(frame);
+  } catch (error) {
+    if (!(error instanceof EncodeError)) throw error;
+    throw new HearthError(`the params of ${frame.method} cannot be sent: ${error.error.message}`, {
+      owner: "user",
+      disposition: "give-up",
+      code: "rpc.invalid-params",
+    });
+  }
 }
 
 function boxPrincipal(binding: BoxBinding): Principal {
@@ -280,11 +308,13 @@ export class BoxConnections {
   /**
    * Sends an `rpc` frame whose answer a listener collects. Returns the boot id
    * it went to, or undefined when the box is not connected (nothing was sent).
+   * Throws `rpc.invalid-params` (nothing was sent) for params the protocol
+   * cannot carry.
    */
   sendRpc(boxId: BoxId, frame: RpcFrame): string | undefined {
     const conn = this.#byBox.get(boxId);
     if (conn === undefined || conn.state !== "open") return undefined;
-    conn.send(frame);
+    conn.sendEncoded(encodeRpc(frame));
     return conn.bootId;
   }
 
@@ -355,7 +385,11 @@ export class BoxConnections {
    * gone meanwhile, and a policy that allowed a cross-workspace echo still
    * sends nothing to the box.
    */
-  async echo(principal: Principal, boxId: BoxId, params: JsonValue): Promise<JsonValue> {
+  async echo(
+    principal: Principal,
+    boxId: BoxId,
+    params: JsonValue | RequestBody<JsonValue>,
+  ): Promise<JsonValue> {
     const boxWorkspace = this.#byBox.get(boxId)?.binding?.workspaceId ?? principal.workspaceId;
     const decision = await this.#authorizer.authorize(principal, "box.echo", {
       workspaceId: boxWorkspace,
@@ -374,15 +408,28 @@ export class BoxConnections {
         code: "authz.denied",
       });
     }
-    return await this.rpc(boxId, "echo", params, this.#echoDeadlineMs);
+    // The body is read only now, after `authorize` and the visibility check
+    // (#32): a caller who may not echo learns nothing from its body.
+    return await this.rpc(boxId, "echo", await bodyOf(params), this.#echoDeadlineMs);
   }
 
-  /** Send an `rpc` to a connected box and wait for its `rpc.result`, up to `deadlineMs`. */
+  /**
+   * Send an `rpc` to a connected box and wait for its `rpc.result`, up to
+   * `deadlineMs`. Params the protocol cannot carry reject with
+   * `rpc.invalid-params`; nothing is sent and nothing stays pending.
+   */
   rpc(boxId: BoxId, method: string, params: JsonValue, deadlineMs: number): Promise<JsonValue> {
     const conn = this.#byBox.get(boxId);
     if (conn === undefined || conn.state !== "open") return Promise.reject(notConnected(boxId));
     this.#rpcCounter += 1;
     const id = `rpc_${this.#rpcCounter}`;
+    let data: string | Uint8Array;
+    try {
+      // Encoded before the pending entry and its timer exist, so a refusal leaves neither.
+      data = encodeRpc({ type: "rpc", id, method, params });
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         conn.pending.delete(id);
@@ -395,7 +442,7 @@ export class BoxConnections {
         );
       }, deadlineMs);
       conn.pending.set(id, { resolve, reject, timer });
-      conn.send({ type: "rpc", id, method, params });
+      conn.sendEncoded(data);
     });
   }
 
@@ -490,22 +537,37 @@ export class BoxConnections {
     const versionReject = checkHelloVersion(hello);
     if (versionReject !== null) return this.#reject(conn, versionReject);
 
-    const binding = await this.#authenticate(hello);
-    if (conn.isClosed) return;
-    if (binding === undefined) {
+    // A store or policy that throws (SQLITE_BUSY, a disk error) is the hub's
+    // trouble: the box gets `reject` `internal`, which it retries, and the
+    // socket closes as rejected, never silence and a later "no hello" (#32).
+    let binding: Authenticated | undefined;
+    let decision: Decision;
+    try {
+      binding = await this.#authenticate(hello);
+      if (conn.isClosed) return;
+      if (binding === undefined) {
+        return this.#reject(conn, {
+          type: "reject",
+          reason: "bad-credential",
+          message: "the credential is unknown, expired, already used or revoked",
+        });
+      }
+      decision = await this.#authorizer.authorize(boxPrincipal(binding.binding), "box.connect", {
+        workspaceId: binding.binding.workspaceId,
+        type: "box",
+        id: binding.binding.boxId,
+      });
+    } catch (error) {
+      if (conn.isClosed) return;
+      this.#log(`box ${hello.boxId}: hello failed on the hub: ${String(error)}`);
       return this.#reject(conn, {
         type: "reject",
-        reason: "bad-credential",
-        message: "the credential is unknown, expired, already used or revoked",
+        reason: "internal",
+        message: "the hub could not check the credential; try again",
       });
     }
-    const principal = boxPrincipal(binding.binding);
-    const decision = await this.#authorizer.authorize(principal, "box.connect", {
-      workspaceId: binding.binding.workspaceId,
-      type: "box",
-      id: binding.binding.boxId,
-    });
     if (conn.isClosed) return;
+    const principal = boxPrincipal(binding.binding);
     if (!decision.allowed) {
       return this.#reject(conn, {
         type: "reject",
@@ -544,9 +606,7 @@ export class BoxConnections {
     if (waiters !== undefined) for (const wake of [...waiters]) wake();
   }
 
-  async #authenticate(
-    hello: HelloFrame,
-  ): Promise<{ binding: BoxBinding; credential?: string } | undefined> {
+  async #authenticate(hello: HelloFrame): Promise<Authenticated | undefined> {
     if (hello.credential.startsWith(JOIN_TOKEN_PREFIX)) {
       const outcome = await this.#credentials.redeemJoinToken(hello.boxId, hello.credential);
       if (outcome.kind === "rejected") {
@@ -718,6 +778,12 @@ export class BoxConnections {
     }
     conn.pending.clear();
   }
+}
+
+/** A box whose credential checked out, and the credential to send in `welcome`. */
+interface Authenticated {
+  readonly binding: BoxBinding;
+  readonly credential?: string;
 }
 
 /** How the calls of a connection that is dropped on purpose fail. */

@@ -8,6 +8,7 @@
 import { HearthError } from "@hearth/core";
 import type { Context, Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { jsonBody, RequestBody } from "../request-body";
 import type { SessionRunners } from "./runners";
 
 /** Most bytes of one user message. */
@@ -57,13 +58,16 @@ function invalid(message: string): HearthError {
   });
 }
 
-async function body(c: Context<HubEnv>): Promise<Record<string, unknown>> {
-  let value: unknown;
-  try {
-    value = await c.req.json();
-  } catch {
-    throw invalid("the body is not JSON");
-  }
+/**
+ * The body as a JSON object, read when the service asks for it: after
+ * `authorize` (#32). `check` validates it.
+ */
+function body<T>(c: Context<HubEnv>, check: (input: Record<string, unknown>) => T): RequestBody<T> {
+  const json = jsonBody(c.req, "request.invalid");
+  return new RequestBody(async () => check(object(await json.read())));
+}
+
+function object(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw invalid("expected a JSON object");
   }
@@ -79,13 +83,15 @@ function nonNegativeInt(raw: string | undefined, fallback: number, name: string)
 export function mountRunnerRoutes(app: Hono<HubEnv>, runners: SessionRunners): void {
   app.post("/v1/sessions/:id/messages", async (c) => {
     try {
-      const input = await body(c);
-      const keys = Object.keys(input);
-      const text = input["text"];
-      if (keys.length !== 1 || typeof text !== "string") {
-        throw invalid('expected exactly {"text": string}');
-      }
-      if (text.length > MAX_MESSAGE_CHARS) throw invalid("the message is too long");
+      const text = body(c, (input) => {
+        const keys = Object.keys(input);
+        const value = input["text"];
+        if (keys.length !== 1 || typeof value !== "string") {
+          throw invalid('expected exactly {"text": string}');
+        }
+        if (value.length > MAX_MESSAGE_CHARS) throw invalid("the message is too long");
+        return value;
+      });
       await runners.send(c.get("principal"), c.req.param("id"), text);
       return c.json({ ok: true }, 202);
     } catch (error) {
@@ -102,16 +108,16 @@ export function mountRunnerRoutes(app: Hono<HubEnv>, runners: SessionRunners): v
   });
   app.post("/v1/sessions/:id/runner", async (c) => {
     try {
-      const input = await body(c);
-      for (const key of Object.keys(input)) {
-        if (key !== "codemode") throw invalid(`unknown field ${JSON.stringify(key)}`);
-      }
-      if (input["codemode"] !== undefined && typeof input["codemode"] !== "boolean") {
-        throw invalid("codemode must be a boolean");
-      }
-      const runner = await runners.configure(c.get("principal"), c.req.param("id"), {
-        codemode: input["codemode"] === true,
+      const options = body(c, (input) => {
+        for (const key of Object.keys(input)) {
+          if (key !== "codemode") throw invalid(`unknown field ${JSON.stringify(key)}`);
+        }
+        if (input["codemode"] !== undefined && typeof input["codemode"] !== "boolean") {
+          throw invalid("codemode must be a boolean");
+        }
+        return { codemode: input["codemode"] === true };
       });
+      const runner = await runners.configure(c.get("principal"), c.req.param("id"), options);
       return c.json({ ok: true, runner }, 200);
     } catch (error) {
       return failure(c, error);

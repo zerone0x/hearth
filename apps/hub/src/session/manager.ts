@@ -43,6 +43,7 @@ import {
   SYSTEM_PRINCIPAL,
   type WorkspaceScope,
 } from "@hearth/core";
+import { bodyOf, type RequestBody } from "../request-body";
 import type { SessionRow, SqliteSessionStore } from "../store/sessions";
 import { CONNECT_DEADLINE_CLASS, classifyExit, type ExitClass } from "./exits";
 import { canTransition, isSessionState, type SessionState, TRANSITION_ACTIONS } from "./states";
@@ -240,12 +241,19 @@ export class SessionManager {
 
   // -- API ----------------------------------------------------------------------
 
-  /** Create a session. No box starts (lazy start, PRD §6.2): it goes `creating → idle`. */
-  async create(principal: Principal, input: CreateSessionInput = {}): Promise<SessionView> {
+  /**
+   * Create a session. No box starts (lazy start, PRD §6.2): it goes `creating → idle`.
+   * A `RequestBody` input is read after `authorize` (#32).
+   */
+  async create(
+    principal: Principal,
+    body: CreateSessionInput | RequestBody<CreateSessionInput> = {},
+  ): Promise<SessionView> {
     await this.ready;
     const suffix = newSuffix();
     const id = `se_${suffix}`;
     await this.#authorize(principal, TRANSITION_ACTIONS.creating, id);
+    const input = await bodyOf(body);
     const now = this.#now();
     this.#store.insertSession(this.#scope, {
       id,

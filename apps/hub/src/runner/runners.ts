@@ -36,6 +36,7 @@ import {
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import { registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
+import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
@@ -158,9 +159,11 @@ export class SessionRunners {
   async configure(
     principal: Principal,
     sessionId: SessionId,
-    input: RunnerOptionsInput,
+    body: RunnerOptionsInput | RequestBody<RunnerOptionsInput>,
   ): Promise<RunnerView> {
     await this.#authorize(principal, "session.configure", sessionId);
+    // A `RequestBody` is read only now, after `authorize` (#32).
+    const input = await bodyOf(body);
     if (this.#runners.has(sessionId) || (await this.#readLog(sessionId)).header !== undefined) {
       throw failure("runner.configured", "runner options are set before the first message");
     }
@@ -187,8 +190,14 @@ export class SessionRunners {
   }
 
   /** Send a user message: starts a turn in the background. */
-  async send(principal: Principal, sessionId: SessionId, text: string): Promise<void> {
+  async send(
+    principal: Principal,
+    sessionId: SessionId,
+    message: string | RequestBody<string>,
+  ): Promise<void> {
     const session = await this.#authorize(principal, "session.message", sessionId);
+    // A `RequestBody` is read only now, after `authorize` (#32).
+    const text = await bodyOf(message);
     if (session.state === "failed" || session.state === "archived") {
       throw new HearthError(`session ${sessionId} is ${session.state}`, {
         owner: "hub",

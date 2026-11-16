@@ -6,6 +6,7 @@ import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE 
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
 import { HUB_VERSION } from "./obs/version";
+import { jsonBody, type RequestBody } from "./request-body";
 import { isWebAssetRequest, mountWebAssets } from "./web/static";
 
 export interface AppDeps {
@@ -71,8 +72,11 @@ function refuse(status: 401 | 403 | 415 | 421, code: string, message: string): R
 }
 
 /** HTTP status for a classified failure of an API call. */
-function statusFor(error: HearthError): 403 | 409 | 500 | 502 | 504 {
+function statusFor(error: HearthError): 400 | 403 | 409 | 500 | 502 | 504 {
   switch (error.code) {
+    case "request.invalid-json":
+    case "rpc.invalid-params":
+      return 400;
     case "authz.denied":
       return 403;
     case "box.not-connected":
@@ -181,14 +185,10 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
 
     // Internal endpoint for the M0 echo round trip (docs/DECISIONS.md, 0008).
     // The caller is the signed-in principal (0014); `echo` calls `authorize`
-    // with it before anything else.
+    // with it before anything else, the body included: `echo` reads it only
+    // after `authorize` (#32).
     app.post("/v1/boxes/:boxId/echo", async (c) => {
-      let params: JsonValue;
-      try {
-        params = (await c.req.json()) as JsonValue;
-      } catch {
-        return c.json({ ok: false, error: { code: "request.invalid-json" } }, 400);
-      }
+      const params = jsonBody(c.req, "request.invalid-json") as RequestBody<JsonValue>;
       try {
         const result = await deps.boxes.echo(c.get("principal"), c.req.param("boxId"), params);
         return c.json({ ok: true, result }, 200);

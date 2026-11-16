@@ -10,6 +10,7 @@
 import { HearthError } from "@hearth/core";
 import type { Context, Hono } from "hono";
 import type { HubEnv } from "../auth";
+import { jsonBody, RequestBody } from "../request-body";
 import type { CreateSessionInput, SessionManager } from "./manager";
 
 function statusFor(error: HearthError): 400 | 403 | 404 | 409 | 500 {
@@ -73,13 +74,10 @@ export function parseCreateSession(body: unknown): CreateSessionInput {
 export function mountSessionRoutes(app: Hono<HubEnv>, sessions: SessionManager): void {
   app.post("/v1/sessions", async (c) => {
     try {
-      let body: unknown;
-      try {
-        body = await c.req.json();
-      } catch {
-        throw invalid("the body is not JSON");
-      }
-      const session = await sessions.create(c.get("principal"), parseCreateSession(body));
+      // Read and checked after `authorize` (#32).
+      const json = jsonBody(c.req, "request.invalid");
+      const body = new RequestBody(async () => parseCreateSession(await json.read()));
+      const session = await sessions.create(c.get("principal"), body);
       return c.json({ ok: true, session }, 201);
     } catch (error) {
       return failure(c, error);

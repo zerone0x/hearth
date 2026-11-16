@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { type JsonValue, LOCAL_PRINCIPAL, type Principal } from "@hearth/core";
 import { type AppOptions, createApp } from "../app";
 import type { BoxConnections } from "../box/connections";
+import { bodyOf, type RequestBody } from "../request-body";
 import { openDatabase, SqliteLoginStore } from "../store";
 import {
   ARGON2ID_PARAMS,
@@ -70,7 +71,12 @@ function harness(
   const kdf = cheapKdf();
   const commands: Principal[] = [];
   const boxes = {
-    echo: async (principal: Principal, _boxId: string, params: JsonValue) => {
+    echo: async (
+      principal: Principal,
+      _boxId: string,
+      body: JsonValue | RequestBody<JsonValue>,
+    ) => {
+      const params = await bodyOf(body);
       commands.push(principal);
       return params;
     },
@@ -219,7 +225,12 @@ describe("every route except /healthz and the login needs a session", () => {
     const auth = Object.create(h.auth) as AuthService;
     auth.authenticate = (token) => (h.auth.authenticate(token) === undefined ? undefined : other);
     const boxes = {
-      echo: async (principal: Principal, _boxId: string, params: JsonValue) => {
+      echo: async (
+        principal: Principal,
+        _boxId: string,
+        body: JsonValue | RequestBody<JsonValue>,
+      ) => {
+        const params = await bodyOf(body);
         h.commands.push(principal);
         return params;
       },
