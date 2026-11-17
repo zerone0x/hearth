@@ -314,6 +314,35 @@ export const MIGRATIONS: readonly Migration[] = [
         CHECK (access_mode IS NULL OR access_mode IN ('yolo', 'ask'));
     `,
   },
+  {
+    // The approval records of the access gate (#155, decision 0048): one row
+    // per tool call the gate held for the owner. A row is written after its
+    // `approval.requested` event and leaves `pending` exactly once (a
+    // conditional UPDATE), so a hub restart can mark the ones still pending
+    // interrupted (PRD §8.1 principle 7) and the session list can show them.
+    version: 10,
+    name: "approvals",
+    sql: `
+      CREATE TABLE approval (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        session_id TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        rule TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('yolo', 'ask')),
+        status TEXT NOT NULL CHECK (status IN
+          ('pending', 'approved', 'denied', 'expired', 'cancelled', 'interrupted')),
+        requested_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        decided_at INTEGER,
+        decided_by TEXT,
+        reason TEXT
+      ) STRICT;
+      CREATE INDEX approval_by_status ON approval (workspace_id, status);
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

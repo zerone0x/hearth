@@ -34,6 +34,7 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
+import { APPROVAL_INTERRUPTED, type Approvals } from "../approvals/service";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { DesktopLockCheck } from "../desktop/lock";
 import { knownSecrets, registerSecret } from "../obs/redaction";
@@ -135,6 +136,11 @@ export interface SessionRunnersOptions {
    * per tool call. Unset (tests), every call is recorded as the default `ask`.
    */
   readonly accessMode?: (sessionId: SessionId) => AccessMode;
+  /**
+   * The approval records (decision 0048): a call the gate holds in `ask`
+   * mode waits on one. Unset (tests), such a call is blocked.
+   */
+  readonly approvals?: Pick<Approvals, "request" | "cancel" | "hasPending">;
 }
 
 export interface RunnerOptionsInput {
@@ -306,6 +312,14 @@ export class SessionRunners {
     }
     if (text.length === 0) throw failure("request.invalid", "the message is empty");
     const runner = await this.runner(sessionId);
+    const approvals = this.#o.approvals;
+    if (runner.status === "running" && approvals?.hasPending(sessionId) === true) {
+      // #71: a new message rejects the pending approval and is queued into the
+      // turn, which reads it after the denied call, before its next model call.
+      await runner.steer(text);
+      await approvals.cancel(sessionId, "new message");
+      return;
+    }
     this.#contextFresh.delete(sessionId);
     await runner.send(text);
   }
@@ -315,7 +329,10 @@ export class SessionRunners {
     await this.#authorize(principal, "session.interrupt", sessionId);
     const pending = this.#runners.get(sessionId)?.pending;
     if (pending === undefined) return false;
-    return (await pending).interrupt();
+    const interrupted = await (await pending).interrupt();
+    // The abort cancels a pending approval through the call's signal; this is the backstop.
+    await this.#o.approvals?.cancel(sessionId, "stopped");
+    return interrupted;
   }
 
   /** Events after `cursor` (cursor resume, PRD §6.1). */
@@ -385,6 +402,7 @@ export class SessionRunners {
       );
     }
     const resolveMode = this.#o.accessMode;
+    const approvals = this.#o.approvals;
     return SessionRunner.create({
       sessionId,
       scope: this.#scope,
@@ -396,6 +414,13 @@ export class SessionRunners {
       denyList: this.#denyList,
       commandRules: this.#commandRules,
       ...(resolveMode === undefined ? {} : { accessMode: () => resolveMode(sessionId) }),
+      ...(approvals === undefined
+        ? {}
+        : {
+            approve: (request, signal) =>
+              approvals.request({ ...request, sessionId }, signal ?? undefined),
+          }),
+      heldCalls: log.held,
       extensions: this.#extensions,
       codemode: log.codemode,
       ...(log.header === undefined ? {} : { entries: [log.header, ...log.entries] }),
@@ -506,11 +531,14 @@ export class SessionRunners {
     entries: FileEntry[];
     codemode: boolean;
     context: ContextFile[] | undefined;
+    held: Map<string, string>;
   }> {
     let header: FileEntry | undefined;
     const entries: FileEntry[] = [];
     let codemode = false;
     let context: ContextFile[] | undefined;
+    /** The last approval event of each tool call the gate held (decision 0048). */
+    const approvalOf = new Map<string, string>();
     let cursor = 0;
     for (;;) {
       const page = await this.#o.events.read(this.#scope, sessionId, cursor, 1000);
@@ -527,12 +555,26 @@ export class SessionRunners {
           codemode = payload.codemode === true;
         } else if (event.type === "runner.context" && payload !== null) {
           context = payload.files as ContextFile[];
+        } else if (event.type.startsWith("approval.") && payload !== null) {
+          const call = (payload as { toolCallId?: unknown }).toolCallId;
+          if (typeof call === "string") approvalOf.set(call, event.type.slice("approval.".length));
         }
       }
       cursor = page.cursor;
       if (!page.hasMore) break;
     }
-    return { header, entries, codemode, context };
+    const held = new Map<string, string>();
+    for (const [call, last] of approvalOf) {
+      // Approved: it may have reached the box, so its outcome is unknown, as any call's.
+      if (last === "approved") continue;
+      held.set(
+        call,
+        last === "requested" || last === "interrupted"
+          ? APPROVAL_INTERRUPTED
+          : `Denied (approval ${last}) before the hub restarted; the command was not run.`,
+      );
+    }
+    return { header, entries, codemode, context, held };
   }
 
   async #authorize(

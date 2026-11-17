@@ -32,6 +32,7 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_EXECUTE_TOOL,
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from "@opentelemetry/semantic-conventions/incubating";
+import type { ApprovalOutcome } from "../approvals/service";
 import type { RpcOutcome, RpcTrace } from "../box/tool-rpc";
 import type { BashVerdict } from "../runner/bash-policy";
 import { imageRefs } from "./blobs";
@@ -219,6 +220,17 @@ interface ToolState {
   refused: string | undefined;
   /** The access mode the call was preflighted under (decision 0045). */
   accessMode: string | undefined;
+  /** How the owner's approval ended, when the gate held the call (decision 0048). */
+  approval: ToolApproval | undefined;
+}
+
+/** The `approval` field of a `tool_call` record (decision 0048). */
+interface ToolApproval {
+  id: string;
+  rule: string;
+  decision: string;
+  decided_by: string | null;
+  waited_ms: number;
 }
 
 interface Turn {
@@ -230,6 +242,8 @@ interface Turn {
   modelCalls: number;
   toolCalls: number;
   toolFailures: number;
+  /** Time spent waiting for the owner's approvals (decision 0048). */
+  approvalWaitMs: number;
   tokens: { input: number; output: number; cache_read: number; cache_write: number };
   cost: number;
   model:
@@ -387,6 +401,7 @@ export class TurnTracer {
       modelCalls: 0,
       toolCalls: 0,
       toolFailures: 0,
+      approvalWaitMs: 0,
       tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
       cost: 0,
       model: undefined,
@@ -432,6 +447,7 @@ export class TurnTracer {
         model_calls: turn.modelCalls,
         tool_calls: turn.toolCalls,
         tool_failures: turn.toolFailures,
+        ...(turn.approvalWaitMs === 0 ? {} : { approval_wait_ms: round(turn.approvalWaitMs) }),
         tokens: turn.tokens,
         cost_usd: turn.cost,
         ...this.#stamp(this.#clock.wall(), now),
@@ -630,6 +646,7 @@ export class TurnTracer {
       bashPolicy: undefined,
       refused: undefined,
       accessMode: undefined,
+      approval: undefined,
     });
   }
 
@@ -646,6 +663,26 @@ export class TurnTracer {
   onAccessMode(toolCallId: string, mode: string): void {
     const tool = this.#tools.get(toolCallId);
     if (tool !== undefined) tool.accessMode = mode;
+  }
+
+  /**
+   * The gate held the call for the owner (decision 0048): how it ended. The
+   * wait is the owner's time, not the tool's: it is recorded apart, as
+   * `approval.waited_ms`, and summed on the turn as `approval_wait_ms`.
+   */
+  onApproval(toolCallId: string, rule: string, outcome: ApprovalOutcome): void {
+    const turn = this.#turn;
+    if (turn !== undefined) turn.approvalWaitMs += outcome.waitedMs;
+    const tool = this.#tools.get(toolCallId);
+    if (tool === undefined) return;
+    tool.approval = {
+      id: outcome.approvalId,
+      rule,
+      decision: outcome.status,
+      decided_by: outcome.decidedBy,
+      waited_ms: round(outcome.waitedMs),
+    };
+    if (!outcome.approved) tool.denied = outcome.reason;
   }
 
   /** The deny-list blocked the call before it reached the box. */
@@ -775,6 +812,7 @@ export class TurnTracer {
         outcome,
         // Every tool call, in both modes (decisions 0043, 0045); null if never preflighted.
         access_mode: tool.accessMode ?? null,
+        ...(tool.approval === undefined ? {} : { approval: tool.approval }),
         ...(tool.denied === undefined ? {} : { denied_reason: tool.denied }),
         ...(tool.bashPolicy === undefined
           ? {}

@@ -4,6 +4,12 @@
  * classes implement.
  */
 
+export {
+  type ApprovalFinish,
+  type ApprovalRow,
+  type ApprovalStatus,
+  SqliteApprovalStore,
+} from "./approval-store";
 export { SqliteAuditSink } from "./audit-sink";
 export { SqliteBlobStore, type SqliteBlobStoreOptions } from "./blob-store";
 export {

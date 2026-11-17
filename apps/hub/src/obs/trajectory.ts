@@ -17,7 +17,10 @@
  * UTF-8 with their byte count and sha256. Events written before `/2` project
  * with `request: null` and `output: null`. A `tool_call` carries
  * `access_mode` (`yolo` or `ask`, decision 0045), an added field; calls
- * recorded before it project with `access_mode: null`.
+ * recorded before it project with `access_mode: null`. A call the access
+ * gate held for the owner also carries `approval` (`id`, `rule`, `decision`,
+ * `decided_by`, `waited_ms`), and each `approval.*` event is an `approval`
+ * record (decision 0048); both are added fields and kinds under `/2`.
  *
  * Built at read time, so older sessions get the current projection and the
  * log stays the only source of truth. Payloads were redacted when written.
@@ -247,7 +250,18 @@ export function buildTrajectory(
         break;
       }
       default:
-        if (BOX_EVENTS.has(e.type)) {
+        if (e.type.startsWith("approval.")) {
+          // The approval lifecycle (decision 0048): who decided what, and when (`at`).
+          const { approvalId, toolCallId, ...detail } = p;
+          out.push({
+            ...base(e),
+            kind: "approval",
+            event: e.type.slice("approval.".length),
+            approval_id: approvalId ?? null,
+            tool_call_id: toolCallId ?? null,
+            detail,
+          });
+        } else if (BOX_EVENTS.has(e.type)) {
           const id = str(p["boxId"]) ?? str(p["box_id"]);
           if (id !== null) boxId = id;
           out.push({ ...base(e), kind: "box", op: e.type, detail: e.payload });

@@ -19,7 +19,9 @@
  *   (PRD §6.3) and interrupted (still running when the turn ended);
  * - the 64 KiB cap on a tool's output;
  * - live output of a running `bash` call (`tool.output`, decision 0036),
- *   shown until the call's result replaces it.
+ *   shown until the call's result replaces it;
+ * - the approvals of calls the access gate held (`approval.*`, decision
+ *   0048), by tool call id, for the card's Approve/Deny branch.
  *
  * Pure, so a reload rebuilds the same chat from the log and then continues
  * from the cursor.
@@ -62,7 +64,42 @@ export interface HearthChat {
   readonly interruptedCalls: readonly string[];
   /** Live output of running tool calls by tool call id, until each one ends. */
   readonly live: Readonly<Record<string, LiveOutput>>;
+  /** The approval of each tool call the access gate held, by tool call id (decision 0048). */
+  readonly approvals: Readonly<Record<string, ApprovalCard>>;
 }
+
+export type ApprovalStatus =
+  | "pending"
+  | "approved"
+  | "denied"
+  | "expired"
+  | "cancelled"
+  | "interrupted";
+
+/** One approval as the card shows it, folded from its `approval.*` events. */
+export interface ApprovalCard {
+  readonly id: string;
+  readonly toolCallId: string;
+  readonly summary: string;
+  readonly rule: string;
+  readonly reason: string;
+  readonly expiresAt: number;
+  readonly status: ApprovalStatus;
+  /** Who decided (`user:<id>`), for approved and denied. */
+  readonly by: string | null;
+  /** When it ended (epoch ms). */
+  readonly at: number | null;
+  /** Why it was cancelled (`new message`, `stopped`). */
+  readonly why: string | null;
+}
+
+const APPROVAL_ENDS: ReadonlySet<string> = new Set([
+  "approved",
+  "denied",
+  "expired",
+  "cancelled",
+  "interrupted",
+]);
 
 /** The streamed output of a running call so far (redacted by the hub). */
 export interface LiveOutput {
@@ -80,6 +117,7 @@ export function emptyChat(sessionId: string): HearthChat {
     interrupting: false,
     interruptedCalls: [],
     live: {},
+    approvals: {},
   };
 }
 
@@ -104,7 +142,7 @@ export function toPiClientEvent(threadId: string, event: HubEvent): PiClientEven
 export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
   if (event.seq <= chat.cursor) return chat;
   const p = record(event.payload);
-  let { pi, pending, notices, interrupting, interruptedCalls, live } = chat;
+  let { pi, pending, notices, interrupting, interruptedCalls, live, approvals } = chat;
   const notice = (tone: Notice["tone"], text: string) => [
     ...notices,
     { seq: event.seq, tone, text, at: pi.messages.length },
@@ -132,6 +170,51 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
         [id]: {
           text: text.length > MAX_TOOL_OUTPUT ? text.slice(text.length - MAX_TOOL_OUTPUT) : text,
           truncated: before.truncated || p["truncated"] === true,
+        },
+      };
+      break;
+    }
+    case "approval.requested": {
+      const call = p["toolCallId"];
+      const id = p["approvalId"];
+      if (typeof call !== "string" || typeof id !== "string") break;
+      const text = (key: string) => (typeof p[key] === "string" ? (p[key] as string) : "");
+      approvals = {
+        ...approvals,
+        [call]: {
+          id,
+          toolCallId: call,
+          summary: text("summary"),
+          rule: text("rule"),
+          reason: text("reason"),
+          expiresAt: typeof p["expiresAt"] === "number" ? p["expiresAt"] : event.ts,
+          status: "pending",
+          by: null,
+          at: null,
+          why: null,
+        },
+      };
+      break;
+    }
+    case "approval.approved":
+    case "approval.denied":
+    case "approval.expired":
+    case "approval.cancelled":
+    case "approval.interrupted": {
+      const call = p["toolCallId"];
+      const status = event.type.slice("approval.".length);
+      const before = typeof call === "string" ? approvals[call] : undefined;
+      if (before === undefined || before.id !== p["approvalId"] || !APPROVAL_ENDS.has(status)) {
+        break;
+      }
+      approvals = {
+        ...approvals,
+        [before.toolCallId]: {
+          ...before,
+          status: status as ApprovalStatus,
+          by: typeof p["by"] === "string" ? p["by"] : null,
+          at: typeof p["at"] === "number" ? p["at"] : event.ts,
+          why: typeof p["why"] === "string" ? p["why"] : null,
         },
       };
       break;
@@ -174,7 +257,16 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       pi = reducePiThreadState(pi, piEvent);
     }
   }
-  return { pi, cursor: event.seq, pending, notices, interrupting, interruptedCalls, live };
+  return {
+    pi,
+    cursor: event.seq,
+    pending,
+    notices,
+    interrupting,
+    interruptedCalls,
+    live,
+    approvals,
+  };
 }
 
 /** `live` without `toolCallId`'s entry, or empty for `null`. */
@@ -187,6 +279,11 @@ function dropLive(live: HearthChat["live"], toolCallId: string | null): HearthCh
 
 export function applyHubEvents(chat: HearthChat, events: readonly HubEvent[]): HearthChat {
   return events.reduce(applyHubEvent, chat);
+}
+
+/** Whether a tool call of this chat waits for the owner's approval now. */
+export function hasPendingApproval(chat: HearthChat): boolean {
+  return Object.values(chat.approvals).some((a) => a.status === "pending");
 }
 
 /** A turn is in flight: a message was sent and the agent has not ended. */

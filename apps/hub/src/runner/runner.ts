@@ -40,6 +40,7 @@ import {
   secretForms,
   type WorkspaceScope,
 } from "@hearth/core";
+import type { ApprovalOutcome } from "../approvals/service";
 import {
   imagesToRefs,
   type PendingBlob,
@@ -51,7 +52,7 @@ import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
 import { type AccessMode, DEFAULT_ACCESS_MODE } from "../settings/access-mode";
-import { ACCESS_EXTENSION, accessExtension } from "./access";
+import { ACCESS_EXTENSION, accessExtension, type GateRequest } from "./access";
 import type { CommandRule } from "./bash-policy";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
@@ -88,6 +89,20 @@ export interface SessionRunnerOptions {
    * default `ask`.
    */
   readonly accessMode?: () => AccessMode;
+  /**
+   * Waits for the owner's decision on a call the gate holds in `ask` mode
+   * (`Approvals.request`, decision 0048). Unset: such a call is blocked.
+   */
+  readonly approve?: (
+    request: GateRequest & { readonly turnId?: string },
+    signal: AbortSignal | undefined,
+  ) => Promise<ApprovalOutcome>;
+  /**
+   * Calls whose approval had not been granted when the hub stopped, by tool
+   * call id, with the text their tool result gets on rebuild: they never
+   * reached the box, so they are "denied, not run", not "outcome unknown".
+   */
+  readonly heldCalls?: ReadonlyMap<string, string>;
   /** Already filtered by the allowlist. */
   readonly extensions?: readonly PinnedExtension[];
   /** pi's codemode tool (decision 0015). Off by default. */
@@ -321,6 +336,25 @@ export class SessionRunner {
             resolve: options.accessMode ?? (() => DEFAULT_ACCESS_MODE),
             onMode: (toolCallId, mode) =>
               self?.observe(() => self?.tracer.onAccessMode(toolCallId, mode)),
+            denyList: options.denyList,
+            ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
+            onBashVerdict: (toolCallId, verdict) =>
+              self?.observe(() => self?.tracer.onBashVerdict(toolCallId, verdict)),
+            onDenied: (_name, toolCallId, reason) =>
+              self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
+            ...(options.approve === undefined
+              ? {}
+              : {
+                  approve: (request: GateRequest, signal: AbortSignal | undefined) => {
+                    const turnId = self?.tracer.turnId;
+                    return (options.approve as NonNullable<SessionRunnerOptions["approve"]>)(
+                      turnId === undefined ? request : { ...request, turnId },
+                      signal,
+                    );
+                  },
+                }),
+            onApproval: (toolCallId, rule, outcome) =>
+              self?.observe(() => self?.tracer.onApproval(toolCallId, rule, outcome)),
           }),
         },
         {
@@ -329,9 +363,6 @@ export class SessionRunner {
             box,
             boxCwd,
             denyList: options.denyList,
-            ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
-            onBashVerdict: (toolCallId, verdict) =>
-              self?.observe(() => self?.tracer.onBashVerdict(toolCallId, verdict)),
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
             onRefused: (_name, toolCallId, code) =>
@@ -397,7 +428,9 @@ export class SessionRunner {
           role: "toolResult",
           toolCallId: orphan.id,
           toolName: orphan.name,
-          content: [{ type: "text", text: RESTART_OUTCOME_UNKNOWN }],
+          content: [
+            { type: "text", text: options.heldCalls?.get(orphan.id) ?? RESTART_OUTCOME_UNKNOWN },
+          ],
           isError: true,
           timestamp: Date.now(),
         });
@@ -427,11 +460,14 @@ export class SessionRunner {
           });
         }
       }
+      const unknown = orphans.filter((o) => options.heldCalls?.has(o.id) !== true);
       if (orphans.length > 0) {
-        runner.#record("runner.outcome-unknown", {
-          reason: "hub restart",
-          toolCallIds: orphans.map((o) => o.id),
-        });
+        if (unknown.length > 0) {
+          runner.#record("runner.outcome-unknown", {
+            reason: "hub restart",
+            toolCallIds: unknown.map((o) => o.id),
+          });
+        }
         runner.#flushEntries();
         await runner.#chain;
       }
@@ -510,6 +546,28 @@ export class SessionRunner {
       throw error;
     }
     this.#turn = this.#runTurn(text);
+  }
+
+  /**
+   * Queue the owner's message into the running turn (pi's `steer`): it is
+   * read before the next model call. Used when a new message cancels a
+   * pending approval (#71). Rejects with `runner.busy` when no turn runs.
+   */
+  async steer(text: string): Promise<void> {
+    if (this.#status !== "running") {
+      throw new HearthError(`session ${this.sessionId} has no turn running`, {
+        owner: "user",
+        disposition: "retry",
+        code: "runner.busy",
+      });
+    }
+    const turnId = this.tracer.turnId;
+    await this.#o.events.append(this.#o.scope, this.sessionId, {
+      type: "message.user",
+      ...(turnId === undefined ? {} : { turnId }),
+      payload: { text: this.#redact(text), steered: true },
+    });
+    await this.#session.steer(text);
   }
 
   /** Abort the running turn; the session stays usable. */

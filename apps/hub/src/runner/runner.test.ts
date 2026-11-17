@@ -292,8 +292,13 @@ interface HarnessExtra {
   accessMode: SessionRunnersOptions["accessMode"];
 }
 
+/**
+ * The harness runs in `yolo` unless a test names a mode: most tests here are
+ * about routing, vault use and recovery, not the gate. Every `ask` test sets
+ * its mode (and its approvals) itself.
+ */
 function accessModeOption(accessMode: SessionRunnersOptions["accessMode"]) {
-  return accessMode === undefined ? {} : { accessMode };
+  return { accessMode: accessMode ?? (() => "yolo" as const) };
 }
 
 function vaultOption(vault: SessionRunnersOptions["vault"]) {

@@ -13,6 +13,7 @@ import {
   VaultSecretResolver,
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
+import { Approvals, mountApprovalRoutes } from "./approvals";
 import { AuthService } from "./auth";
 import { BIFROST_SYSTEM_ENTRIES, BifrostService, type BifrostServiceOptions } from "./bifrost";
 import {
@@ -47,6 +48,7 @@ import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "
 import { AccessModes, ModelSettings, mountAccessModeRoutes, mountSettingsRoutes } from "./settings";
 import {
   openDatabase,
+  SqliteApprovalStore,
   SqliteAuditSink,
   SqliteBlobStore,
   SqliteBoxCredentialStore,
@@ -224,6 +226,12 @@ export interface HubOptions extends HubListenOptions {
   readonly boxImage?: string;
   /** Lease of the desktop lock (decision 0033). Defaults to `DESKTOP_LOCK_TTL_MS`; tests change it. */
   readonly desktopLockTtlMs?: number;
+  /**
+   * How long the owner has to decide on a held tool call before it is denied
+   * (decision 0048; `HEARTH_APPROVAL_TIMEOUT_S`). Defaults to
+   * `DEFAULT_APPROVAL_TIMEOUT_MS` (10 minutes).
+   */
+  readonly approvalTimeoutMs?: number;
   /** Session manager timings and bounds (idle time, relaunch bounds); see `SessionManagerOptions`. */
   readonly sessions?: Partial<
     Pick<
@@ -604,6 +612,20 @@ export function startHub(options: HubOptions) {
     log: options.log ?? (() => {}),
   });
   mountAccessModeRoutes(app, accessModes);
+  // The approval records the access gate waits on (decision 0048). A restart
+  // turns every approval still pending into `approval.interrupted` first.
+  const approvals = new Approvals({
+    store: new SqliteApprovalStore(db),
+    events,
+    audit,
+    authorizer,
+    ...(options.approvalTimeoutMs === undefined ? {} : { timeoutMs: options.approvalTimeoutMs }),
+    log: options.log ?? (() => {}),
+  });
+  const approvalsReady = approvals
+    .recover()
+    .catch((error: unknown) => options.log?.(`approvals: could not recover: ${String(error)}`));
+  mountApprovalRoutes(app, approvals);
   // The model settings load after the vault opens; a first message waits for them.
   const modelReady = Promise.withResolvers<void>();
   const runners =
@@ -626,6 +648,7 @@ export function startHub(options: HubOptions) {
           // browser_fill resolves logins through the vault (decision 0039).
           vault,
           accessMode: (sessionId) => accessModes.resolve(sessionId),
+          approvals,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
@@ -701,6 +724,9 @@ export function startHub(options: HubOptions) {
     bifrostReady,
     /** The access mode setting and its resolver (decision 0045). */
     accessModes,
+    /** The approval records of the access gate (decision 0048), and the restart recovery. */
+    approvals,
+    approvalsReady,
     /** The model settings (decision 0038), loaded (and imported) once the vault opened. */
     modelSettings,
     settingsReady,
@@ -783,6 +809,7 @@ export function startHub(options: HubOptions) {
       bifrost?.stop();
       toolRpc?.close();
       void runners?.close();
+      approvals.close();
       desktop?.shutdown();
       desktopLocks.shutdown();
       boxes.shutdown();

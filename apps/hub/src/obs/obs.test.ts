@@ -275,6 +275,8 @@ interface SetupOptions {
   exportTo?: string;
   denyList?: CompiledDenyRule[];
   commandRules?: CommandRule[];
+  /** The session's access mode (decision 0045); unset, the default `ask`. */
+  accessMode?: "yolo" | "ask";
   /** Box start or wake latency: the test clock moves this far during each lease. */
   leaseWaitMs?: number;
   /** Runs after each lease (the AGENTS.md refresh); a throw fails the runner. */
@@ -334,6 +336,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     model: faux.getModel(),
     denyList: options.denyList ?? [],
     ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
+    ...(options.accessMode === undefined ? {} : { accessMode: () => options.accessMode ?? "ask" }),
     ...(options.entries === undefined ? {} : { entries: options.entries }),
     ...(options.contextFiles === undefined
       ? {}
@@ -632,6 +635,8 @@ describe("bash calls record the command rules' verdict (#69)", () => {
         { name: "no-push", command: ["git"], subcommand: "push", action: "deny" },
         { name: "rm-rf", command: ["rm"], flags: [["-r"], ["-f"]], action: "ask" },
       ],
+      // In `yolo` an `ask` verdict runs at once (decision 0043); `deny` still blocks.
+      accessMode: "yolo",
     });
     await turn(s, "go", [
       call("bash", { command: "nice git push origin" }, "c_push"),
@@ -653,7 +658,7 @@ describe("bash calls record the command rules' verdict (#69)", () => {
       },
       rpcs: [],
     });
-    // `ask` is recorded and, with no approval gate yet, the command runs.
+    // `ask` is recorded and, in `yolo`, the command runs.
     expect(byId("c_rm")).toMatchObject({
       outcome: "ok",
       bash_policy: { action: "ask", rule: "rm-rf", command: "rm -fr gone" },
