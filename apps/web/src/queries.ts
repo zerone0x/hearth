@@ -20,6 +20,8 @@ export const keys = {
   vaultStatus: ["vault-status"] as const,
   secrets: ["secrets"] as const,
   modelSettings: ["model-settings"] as const,
+  accessMode: ["access-mode"] as const,
+  sessionAccessMode: (id: string) => ["session-access-mode", id] as const,
 };
 
 /** How often an open desktop re-reads its lock: a lease can lapse or be taken meanwhile. */

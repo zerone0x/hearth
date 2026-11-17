@@ -3616,6 +3616,94 @@ behind it would be off on a new install, which must start in `ask`.
   fallback, a gate exception blocks in both modes, and an allowlisted extension
   cannot take the gate's reserved name.
 
+## 0045: Access mode setting: a global default, a per-session override, one resolver per tool call
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #154 (design: `docs/research/m3-models-access.md`, question 3 and
+  proposed issue 2; PRD v0.5.1 §6.5; decisions 0042, 0043)
+
+### Context
+
+PRD §6.5 gives every session an access mode, `yolo` or `ask`, with a global
+default in Settings, a per-session override shown on the session, an audit row
+for each change, and the mode recorded on every tool call. Decision 0043 makes
+the access gate a built-in loaded in both modes. This entry covers the setting
+and the recording; the gate itself (what `ask` stops, the approval cards) is
+#155.
+
+### Decision
+
+- **Global default.** Stored as the `access_mode` setting (`{mode}`) in the
+  `setting` table next to `model` (0038). `GET /v1/settings/access-mode`
+  answers `{mode, source, updatedAt}`; `PUT {mode: "yolo" | "ask"}` saves it.
+- **Unset means `ask`, also on an existing install.** A new install starts in
+  `ask` (0042). An install from before this change has no saved value either;
+  it reads as `ask` too, the safer choice, rather than keeping today's
+  unasked behaviour as `yolo`. Until the gate lands (#155) the two modes run
+  tools the same way, so the upgrade changes nothing an owner can see except
+  the recorded mode. A stored value the hub cannot read is also `ask`.
+- **Per-session override.** Migration 9 adds `session.access_mode`
+  (`yolo`, `ask`, or NULL to follow the global default, enforced by a CHECK).
+  `GET /v1/sessions/:id/access-mode` answers `{sessionId, override, global,
+  mode}`; `PUT {mode: "yolo" | "ask" | null}` sets or clears it. Archived
+  sessions keep their value; it is not used.
+- **Guards as the other settings routes.** The request guard (Host, Origin,
+  JSON content type; 0010) and the login guard (0014) run first. The service
+  authorizes before it reads the body (`settings.access_mode.update`,
+  `session.access_mode.update`, `settings.read`, `session.read`; #32); a
+  session route looks the session up only after `authorize`, so a refused
+  caller cannot tell an unknown id from another workspace's (#90).
+- **Audited, then logged, then stored.** A change writes its audit row
+  (`settings.access_mode.update` or `session.access_mode.update`, with the new
+  and previous mode) first; if that fails nothing else happens. Then a
+  `session.access_mode` event `{mode, previous, override, global, changed:
+  "global" | "session", by}` goes to every session whose mode it may change:
+  the one session for an override, or every non-archived session that follows
+  the global default for a global change. Then the row is written, and one log
+  line says what changed.
+- **One resolver, read per tool call.** `AccessModes.resolve(sessionId)`
+  (`apps/hub/src/settings/access-mode.ts`) returns `override ?? global`. The
+  runner calls it from a `tool_call` handler in a new built-in extension,
+  `hearth-access` (`apps/hub/src/runner/access.ts`), registered first and
+  reserved in `RESERVED_EXTENSION_NAMES`. Nothing is cached, so a change
+  applies to the next tool call, also in the middle of a turn. #155 grows this
+  extension into the gate of 0043 and calls the same resolver. An exception in
+  the resolver blocks the call (pi's `tool_call` rule), fail-closed as 0043
+  says for the gate.
+- **Trajectory.** Each `tool_call` step records `access_mode`, the mode it
+  was preflighted under, also when the deny-list then blocks it (the access
+  handler runs before `hearth-tools`). It is an added field, so the schema
+  stays `hearth.trajectory/2` (0021: added fields do not bump it; precedent
+  0037). Calls recorded before this change project with `access_mode: null`.
+- **UI.** An "Access mode" card on `#/settings` (native select and a Save
+  button, TanStack Query) and an "Access" select in the session header:
+  "Default (<global>)", "Ask", "Yolo", saved on change. Both are shadcn
+  `native-select`, so the CSP stays as 0038 left it; the web e2e uses both and
+  fails on any violation. The card says plainly that approval prompts are not
+  in this version yet.
+
+### Alternatives rejected
+
+- **Existing installs default to `yolo`** to keep today's behaviour by name.
+  The behaviour is the same until #155 either way, and when the gate lands an
+  owner who never chose should get the safer mode; `yolo` is one click away.
+- **Write the global default at first start** (`insertIfAbsent`). An unset
+  value already reads as `ask`; a row would only hide whether the owner chose.
+- **The override in the `setting` table** under a per-session key. The
+  session row is where the session's other choices live; a column keeps the
+  read per tool call one primary-key lookup and goes away with the session.
+- **The event only on the changed session for a global change.** The
+  sessions that follow the default are the ones whose mode changed; their logs
+  should say so, as the research asks ("global or per session").
+
+### Consequences
+
+- Migration 9 is taken. Parallel PRs that also add a migration (#69, #156)
+  renumber theirs on merge.
+- #155 needs no new setting or plumbing: it reads `resolve` in
+  `hearth-access` and adds its `approval.*` fields next to `access_mode`.
+
 ## 0046: Bifrost as a compose service: vault secrets through a tmpfs handoff, keys pushed from the vault, model traffic in #157
 
 - Date: 2026-11-17
