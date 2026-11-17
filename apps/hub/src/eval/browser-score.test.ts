@@ -6,10 +6,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  B2_EXPECTED as B2_RECORD,
   claimsDone,
   findLeaks,
   formatReport,
@@ -79,7 +80,14 @@ describe("the recorded run", () => {
       (["B1", "B2", "B3", "B4", "B5", "B6"] as const).map((id) => [id, true, false, []]),
     );
     expect(report.pass).toBe(true);
-    expect(task(report, "B1")).toMatchObject({ toolCalls: 9, modelCalls: 10, claimedDone: true });
+    expect(task(report, "B1")).toMatchObject({
+      toolCalls: 9,
+      modelCalls: 10,
+      claimedDone: true,
+      tokens: { input: 0, output: 231 },
+      costUsd: 0,
+    });
+    expect(formatReport(report)).toMatch(/^B6 +pass +false +1 +2 /m);
     expect(task(report, "B2").notVerified).toBe(1);
     expect(task(report, "B5").staleRef).toBe(1);
     expect(task(report, "B6").claimedDone).toBe(false);
@@ -198,6 +206,46 @@ describe("each checker reads the trajectory, not the model", () => {
     );
   });
 
+  test("B1: no server record, hashes missing on both shots, or a second unmasked shot fail", () => {
+    expectOnlyFails(
+      edited((records) => {
+        for (const r of toolCalls(records, "B1")) {
+          setText(r, textOf(r).replaceAll("successful logins", "logins"));
+        }
+      }),
+      "B1",
+      /no server record of the logins/,
+    );
+    // No hash on either screenshot is not a match.
+    expectOnlyFails(
+      edited((records) => {
+        for (const r of toolCalls(records, "B1").filter(
+          (x) => x["name"] === "browser_screenshot",
+        )) {
+          setText(r, textOf(r).replace(/"sha256":"[0-9a-f]+",/, ""));
+        }
+      }),
+      "B1",
+      /no screenshot of the black reference box/,
+    );
+    // A second shot of the field, unmasked, after a masked one.
+    expectOnlyFails(
+      edited((records) => {
+        const shots = toolCalls(records, "B1").filter((x) => x["name"] === "browser_screenshot");
+        const field = shots[0] as Rec;
+        const black = shots[1] as Rec;
+        const again = { ...field };
+        setText(
+          again,
+          textOf(field).replace(/"sha256":"[0-9a-f]+"/, `"sha256":"${"1".repeat(64)}"`),
+        );
+        records.splice(records.indexOf(black) + 1, 0, again);
+      }),
+      "B1",
+      /is not masked/,
+    );
+  });
+
   test("B2: another record, or two accepted submissions, fail", () => {
     expectOnlyFails(
       edited((records) => {
@@ -294,6 +342,20 @@ describe("each checker reads the trajectory, not the model", () => {
       }),
       "B4",
       /no verified 'Saved:'/,
+    );
+  });
+
+  test("B5: a second stale ref retried fails, even after a first one answered well", () => {
+    expectOnlyFails(
+      edited((records) => {
+        const calls = toolCalls(records, "B5");
+        const stale = calls.find((r) => /stale_ref/.test(textOf(r))) as Rec;
+        const last = calls.at(-1) as Rec;
+        // Another stale_ref after the turn's last click, then a click again: a retry.
+        records.splice(records.indexOf(last) + 1, 0, { ...stale }, { ...last });
+      }),
+      "B5",
+      /after stale_ref came browser_click/,
     );
   });
 
@@ -430,6 +492,19 @@ describe("secret leaks", () => {
     expect(findLeaks([{ where: "x", text: "[redacted]" }], [SECRET, ""])).toEqual([]);
   });
 
+  test("labels: a form equal to an earlier one keeps the earlier label", () => {
+    // Plain ASCII: raw = JSON = URL forms, and base64 = base64url.
+    expect(leakForms("plain1")).toEqual([
+      { needle: "plain1", form: "raw" },
+      { needle: "cGxhaW4x", form: "base64" },
+      { needle: "706c61696e31", form: "hex" },
+    ]);
+    // Every secret is searched, not only the first.
+    expect(findLeaks([{ where: "x", text: "has two-22" }], ["one-11", "two-22"])).toEqual([
+      { where: "x", form: "raw" },
+    ]);
+  });
+
   test("a value in the trajectory, a blob's name or bytes, or the log fails the run", () => {
     const leaky = edited((records) => {
       const r = toolCalls(records, "B1")[0] as Rec;
@@ -455,17 +530,79 @@ describe("secret leaks", () => {
     const byBytes = scoreTrajectory({
       trajectory: GOLDEN,
       secrets: [SECRET],
-      blobs: [blob("a.jpg", `\xff\xd8 comment ${SECRET}`)],
+      blobs: [blob("0.jpg", "\xff\xd8"), blob("a.jpg", `\xff\xd8 comment ${SECRET}`)],
     });
     expect(byBytes.leaks.map((l) => l.where)).toContain("blob:a.jpg");
     expect(byBytes.pass).toBe(false);
     const inLog = scoreTrajectory({
       trajectory: GOLDEN,
       secrets: [SECRET],
-      logs: [{ name: "hub.log", text: `ok\nfill ${SECRET}\n` }],
+      logs: [
+        { name: "events.jsonl", text: "clean\n" },
+        { name: "hub.log", text: `ok\nfill ${SECRET}\n` },
+      ],
     });
     expect(inLog.leaks).toContainEqual({ where: "log:hub.log:2", form: "raw" });
     expect(inLog.pass).toBe(false);
+  });
+});
+
+/** A trajectory of one turn: a prompt, then tool calls with these result texts. */
+function oneTurn(prompt: string, calls: Array<{ name: string; text: string; args?: Rec }>): string {
+  const base = { schema: "hearth.trajectory/2", session_id: "se_x", turn_id: "turn_x" };
+  return toJsonl([
+    { ...base, kind: "user_input", input: "prompt", prompt: { text: prompt } },
+    ...calls.map((c) => ({
+      ...base,
+      kind: "tool_call",
+      name: c.name,
+      args: c.args ?? {},
+      result: { text: c.text },
+      is_error: false,
+    })),
+  ]);
+}
+
+describe("reading results", () => {
+  test("a header after another line, and a match or URL in the turn's only step, are found", () => {
+    const b3 = oneTurn("B3: one step", [
+      {
+        name: "browser_back",
+        text: [
+          "a line before the header",
+          '{"tool":"browser_back","url":"http://127.0.0.1:1/b3/items/5","ok":true,"outcome":"done"}',
+          "Server record: log /b3/items > /b3/items?color=red > /b3/items/2 > /b3/items/5",
+        ].join("\n"),
+      },
+    ]);
+    expect(scoreTrajectory({ trajectory: b3, tasks: ["B3"] }).pass).toBe(true);
+    // The URL is read back past a later step without a header; a bad URL is no path.
+    const later = oneTurn("B3: one step", [
+      {
+        name: "browser_back",
+        text: '{"tool":"browser_back","url":"http://127.0.0.1:1/b3/items/5","ok":true,"outcome":"done"}\nServer record: log /b3/items > /b3/items?color=red > /b3/items/2 > /b3/items/5',
+      },
+      { name: "bash", text: "ok" },
+    ]);
+    expect(scoreTrajectory({ trajectory: later, tasks: ["B3"] }).pass).toBe(true);
+    const bad = scoreTrajectory({
+      trajectory: later.replace("http://127.0.0.1:1/b3/items/5", "not a url"),
+      tasks: ["B3"],
+    });
+    expect(bad.tasks[0]?.reasons).toEqual(["final URL is not a url, not /b3/items/5"]);
+  });
+
+  test("the last record wins over an earlier one, wherever it sits", () => {
+    const saved = (n: number) =>
+      `{"tool":"browser_click","ok":true}\nSaved record: ${B2_RECORD} (server: accepted ${n}, rejected 0)`;
+    const two = oneTurn("B2: x", [
+      { name: "browser_click", text: saved(1) },
+      { name: "browser_click", text: saved(2) },
+      { name: "browser_snapshot", text: '{"tool":"browser_snapshot"}\nno record here' },
+    ]);
+    expect(scoreTrajectory({ trajectory: two, tasks: ["B2"] }).tasks[0]?.reasons).toEqual([
+      "server accepted 2 submissions, not 1",
+    ]);
   });
 });
 
@@ -490,6 +627,23 @@ describe("the CLI", () => {
       expect(leak.stdout.toString()).toMatch(/secret leaks: [1-9]/);
       expect(leak.exitCode).toBe(1);
       expect(run().exitCode).toBe(2);
+      // Flags in any order and repeated: the second log and a blob's name are searched too.
+      writeFileSync(secrets, JSON.stringify(["never-in-the-run-41"]));
+      const clean = join(dir, "clean.log");
+      writeFileSync(clean, "nothing here\n");
+      const leaky = join(dir, "leaky.log");
+      writeFileSync(leaky, "fill never-in-the-run-41\n");
+      expect(run("--secrets", secrets, file).exitCode).toBe(0);
+      const logs = run("--log", clean, file, "--secrets", secrets, "--log", leaky);
+      expect(logs.stdout.toString()).toContain(`raw form in log:${leaky}:1`);
+      expect(logs.exitCode).toBe(1);
+      const blobs = join(dir, "blobs");
+      mkdirSync(blobs);
+      writeFileSync(join(blobs, "a.jpg"), "\xff\xd8");
+      writeFileSync(join(blobs, "never-in-the-run-41.jpg"), "\xff\xd8");
+      const named = run(file, "--secrets", secrets, "--blobs", blobs);
+      expect(named.stdout.toString()).toContain("raw form in blob-name:never-in-the-run-41.jpg");
+      expect(named.exitCode).toBe(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
