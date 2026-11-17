@@ -350,11 +350,6 @@ export class SessionManager {
           this.#log(`session ${sessionId}: could not stop box ${box.id}: ${String(error)}`);
         }
       }
-      try {
-        await this.#onArchived?.(sessionId);
-      } catch (error) {
-        this.#log(`session ${sessionId}: after the archive: ${String(error)}`);
-      }
       return view(row);
     });
   }
