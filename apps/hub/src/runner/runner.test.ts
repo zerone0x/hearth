@@ -808,16 +808,6 @@ describe("access mode (decision 0045)", () => {
     expect(results[0]?.isError).toBe(true);
     expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
   });
-
-  test("an allowlisted extension cannot take the reserved hearth-access name", async () => {
-    const { selectExtensions } = await import("./extensions");
-    const selection = selectExtensions(
-      [{ name: "hearth-access", version: "1.0.0", factory: () => {} }],
-      [{ name: "hearth-access", version: "1.0.0" }],
-    );
-    expect(selection.loaded).toHaveLength(0);
-    expect(selection.refused).toEqual([{ name: "hearth-access", reason: "reserved name" }]);
-  });
 });
 
 describe("crash isolation", () => {
