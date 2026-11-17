@@ -570,6 +570,8 @@ export function startHub(options: HubOptions) {
           },
           tools: toolRpc as ToolRpcClient,
           desktopLocks,
+          // browser_fill resolves logins through the vault (decision 0039).
+          vault,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);

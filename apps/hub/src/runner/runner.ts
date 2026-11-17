@@ -258,6 +258,10 @@ export class SessionRunner {
       },
       // The desktop lock check of the browser tools (decision 0035).
       assertDesktopUnlocked: () => inner.assertDesktopUnlocked?.(),
+      // browser_fill's vault use (decision 0039); absent without a vault.
+      ...(inner.useSecret === undefined
+        ? {}
+        : { useSecret: inner.useSecret.bind(inner) as NonNullable<RunnerBox["useSecret"]> }),
     };
     try {
       const settingsManager = SettingsManager.inMemory({});

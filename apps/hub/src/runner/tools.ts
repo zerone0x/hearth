@@ -17,6 +17,9 @@
  * - The `browser_*` tools (browser-tools.ts, decision 0032) go to the box the
  *   same way, as `browser.*` methods of the tool RPC, and refuse while the
  *   owner holds the desktop lock (decision 0035).
+ * - Every value `browser_fill` filled (decision 0039) is replaced in the text
+ *   of every later tool result of the session, whatever the tool, before the
+ *   model reads it.
  */
 
 import {
@@ -29,7 +32,14 @@ import {
   createWriteToolDefinition,
   type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
-import type { BoxId } from "@hearth/core";
+import {
+  type BoxId,
+  LOG_REDACTED,
+  redactValues,
+  type SecretValue,
+  type VaultKind,
+  type VaultPolicy,
+} from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { BoxLease } from "../session/manager";
 import { registerBrowserTools } from "./browser-tools";
@@ -57,11 +67,32 @@ export interface RunnerBox {
    */
   prepare?(lease: BoxLease): Promise<void>;
   /**
+   * Resolves a `vault:` login for `browser_fill` (decision 0039): the session's
+   * `HubVault.use` with the page origin the box reported, audited before it
+   * returns. Unset (no vault), `browser_fill` refuses.
+   */
+  useSecret?(ref: string, context: SecretUseContext): Promise<FillSecret>;
+  /**
    * Throws `desktop.locked` while a person holds this session's desktop lock
    * (`DesktopLocks.assertUnlocked`, decision 0033). The browser tools call it
    * before anything else; unset, nothing is locked.
    */
   assertDesktopUnlocked?(): void;
+}
+
+/** What `browser_fill` tells the vault about a use. */
+export interface SecretUseContext {
+  readonly toolCallId: string;
+  /** The owner frame's origin, as the box reported it. */
+  readonly origin: string;
+}
+
+/** A login value for `browser_fill`, with the policy read from the authenticated row. */
+export interface FillSecret {
+  readonly value: SecretValue;
+  readonly kind: VaultKind;
+  readonly field: string;
+  readonly policy: VaultPolicy;
 }
 
 export interface HearthToolsOptions {
@@ -116,6 +147,8 @@ function absolute(path: string | undefined, boxCwd: string): string {
 export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFactory {
   const { box, boxCwd } = options;
   return (pi) => {
+    // The values browser_fill filled in this session: never shown to the model.
+    const filled = new Set<string>();
     pi.registerTool({
       ...createReadToolDefinition(boxCwd),
       execute: (id, params, signal, onUpdate, ctx) =>
@@ -231,7 +264,7 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         }),
     });
 
-    registerBrowserTools(pi, box, options.onRefused);
+    registerBrowserTools(pi, box, options.onRefused, filled);
 
     pi.on("tool_call", (event) => {
       if (PATH_TOOLS.has(event.toolName)) {
@@ -248,7 +281,8 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
       let changed = false;
       const content = event.content.map((part) => {
         if (part.type !== "text") return part;
-        const text = scrubHubTempPaths(part.text, options.hubTempDir);
+        let text = scrubHubTempPaths(part.text, options.hubTempDir);
+        if (filled.size > 0) text = redactValues(text, filled, LOG_REDACTED);
         if (text === part.text) return part;
         changed = true;
         return { ...part, text };
