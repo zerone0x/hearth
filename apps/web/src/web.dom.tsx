@@ -202,6 +202,13 @@ describe("settings page in a DOM", () => {
     renderApp("#/settings");
     fireEvent.click(await screen.findByRole("button", { name: "Add secret" }));
     const form = await screen.findByRole("form", { name: "Add secret" });
+    // The kind picks the fields: a site login asks for origins, a username and a password.
+    const kind = within(form).getByLabelText("Kind");
+    fireEvent.change(kind, { target: { value: "login" } });
+    expect(within(form).getByLabelText("Origins")).toBeTruthy();
+    expect(within(form).getByLabelText("username")).toBeTruthy();
+    fireEvent.change(kind, { target: { value: "model-key" } });
+    expect(within(form).queryByLabelText("Origins")).toBeNull();
     fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "openai-key" } });
     const value = within(form).getByLabelText("Value") as HTMLInputElement;
     expect(value.type).toBe("password");
