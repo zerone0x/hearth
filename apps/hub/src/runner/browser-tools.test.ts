@@ -245,10 +245,46 @@ describe("the desktop lock (decision 0035)", () => {
     const order: string[] = [];
     const r = rig(() => order.push("check"));
     await r.tools.get("browser_navigate")?.execute("call_1", { url: "about:blank" });
-    expect(order).toEqual(["check"]);
+    expect(order).toEqual(["check", "check"]);
     expect(r.seen.leases).toBe(1);
     expect(r.seen.calls).toEqual(["browser.navigate"]);
     expect(r.refused).toEqual([]);
+  });
+
+  test("an owner who takes over during a slow ensureBox is refused: lease released, no box call", async () => {
+    let held = false;
+    let released = 0;
+    const tools = new Map<string, Tool>();
+    const pi = {
+      registerTool: (tool: { name: string; execute: never }) => tools.set(tool.name, tool),
+    } as unknown as ExtensionAPI;
+    const calls: string[] = [];
+    const refused: Array<[string, string, string]> = [];
+    const box = {
+      assertDesktopUnlocked: () => {
+        if (held) locked();
+      },
+      ensureBox: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        held = true; // the owner takes over while the box wakes
+        return { boxId: "bx_1", release: () => released++ };
+      },
+      operations: () => ({
+        browser: {
+          call: async (method: string) => {
+            calls.push(method);
+            return action();
+          },
+        },
+      }),
+    } as unknown as RunnerBox;
+    registerBrowserTools(pi, box, (name, id, code) => refused.push([name, id, code]));
+    await expect(tools.get("browser_navigate")?.execute("call_1", {})).rejects.toThrow(
+      DESKTOP_LOCKED_MESSAGE,
+    );
+    expect(calls).toEqual([]);
+    expect(released).toBe(1);
+    expect(refused).toEqual([["browser_navigate", "call_1", "desktop.locked"]]);
   });
 
   test("the same tool works again once the lock is released", async () => {
