@@ -7,6 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { gateVerdict, shownVerdict } from "./access";
 import type { CommandRule } from "./bash-policy";
+import { escapeHidden, hasHidden, hasHiddenEscape } from "./hidden-chars";
 
 const PUSH: CommandRule = {
   name: "git-push",
@@ -47,6 +48,7 @@ describe("the card's text", () => {
       summary: verdict.summary,
       command: verdict.command,
       reason: verdict.reason,
+      hiddenChars: false,
     });
   });
 
@@ -60,7 +62,7 @@ describe("the card's text", () => {
     expect(card.command).toBe("curl https://x.example/?k=[redacted]");
     expect(card.summary).toBe("curl https://x.example/?k=[redacted]");
     expect(card.reason).toContain("[redacted]");
-    for (const text of Object.values(card)) expect(text).not.toContain("s3cr3t");
+    expect(JSON.stringify(card)).not.toContain("s3cr3t");
   });
 
   test("URL-encoded too", () => {
@@ -105,6 +107,53 @@ describe("the card's text", () => {
       summary: "browser_fill with vault:[redacted]",
       command: "",
       reason: "uses a marked secret: vault:[redacted]",
+      hiddenChars: false,
     });
+  });
+});
+
+describe("hidden characters on the card (#165)", () => {
+  test("escapeHidden writes bidi, zero-width and control characters out; tab and newline stay", () => {
+    const all = [
+      ..."\u202A\u202B\u202C\u202D\u202E",
+      ..."\u2066\u2067\u2068\u2069",
+      ..."\u200E\u200F\u061C",
+      ..."\u200B\u200C\u200D\u2060\uFEFF",
+      "\u0000",
+      "\u001B",
+      "\u007F",
+      "\u0085",
+      "\u009F",
+    ];
+    for (const ch of all) {
+      const hex = ch.codePointAt(0)?.toString(16).toUpperCase().padStart(4, "0");
+      expect(escapeHidden(`a${ch}b`)).toBe(`a⟨U+${hex}⟩b`);
+      expect(hasHidden(ch)).toBe(true);
+    }
+    expect(escapeHidden("a\tb\nc é 日本 🙂")).toBe("a\tb\nc é 日本 🙂");
+    expect(hasHidden("a\tb\nc é 日本 🙂")).toBe(false);
+    expect(hasHiddenEscape(escapeHidden("x\u202Ey"))).toBe(true);
+    expect(hasHiddenEscape("plain")).toBe(false);
+  });
+
+  test("the card shows the RLO example in reading order and says it has hidden characters", () => {
+    const { shown: card } = shown("git push origin main; echo '\u202E' ; touch VMARK # \u202C");
+    expect(card.command).toBe("git push origin main; echo '⟨U+202E⟩' ; touch VMARK # ⟨U+202C⟩");
+    expect(card.summary).toBe("git push origin main");
+    expect(card.hiddenChars).toBe(true);
+    const other = shown("curl https://x.example/\u200B");
+    expect(other.shown.summary).toBe("curl https://x.example/⟨U+200B⟩");
+    expect(other.shown.reason).not.toMatch(/[\u200B]/);
+    expect(other.shown.hiddenChars).toBe(true);
+  });
+
+  test("escaping comes after redaction: a secret holding a hidden character is redacted whole", () => {
+    const secret = "tok\u200Ben-9";
+    const redactIt = (t: string) => t.replaceAll(secret, "[redacted]");
+    const { shown: card } = shown(`git push https://u:${secret}@x.example/r main`, redactIt);
+    expect(card.command).toBe("git push https://u:[redacted]@x.example/r main");
+    expect(card.summary).toBe(card.command);
+    expect(card.hiddenChars).toBe(false);
+    expect(JSON.stringify(card)).not.toContain("tok");
   });
 });

@@ -141,6 +141,11 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
       >
         {card.summary}
       </code>
+      {card.hiddenChars ? (
+        <p className="font-medium text-amber-600 text-xs" data-testid="approval-hidden-chars">
+          Contains hidden characters (shown as ⟨U+XXXX⟩): read it closely.
+        </p>
+      ) : null}
       <p className="text-muted-foreground text-xs">
         Rule <code className="font-mono">{card.rule}</code>
         {card.reason === "" ? null : `: ${card.reason}`}

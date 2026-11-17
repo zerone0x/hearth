@@ -1221,6 +1221,38 @@ describe("the access gate (decisions 0043, 0048)", () => {
     expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
   });
 
+  test("hidden characters are escaped in the stored, listed and logged card, which says so (#165)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 30 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const rlo = "git push origin main; : '\u202E' ; touch VMARK # \u202C";
+    const plain = "git push origin main";
+    h.faux.setResponses([
+      call("bash", { command: rlo }, "c_rlo"),
+      call("bash", { command: plain }, "c_plain"),
+      fauxAssistantMessage("x"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const listed: Array<{ command: string; hidden_chars: boolean }> = [];
+    for (let i = 0; i < 2; i++) {
+      const id = await pendingId(h);
+      listed.push(...(await approvals.list(LOCAL_PRINCIPAL)));
+      await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    }
+    await (await h.runners.runner("se_a")).settled();
+    const escaped = "git push origin main; : '⟨U+202E⟩' ; touch VMARK # ⟨U+202C⟩";
+    const requested = h.events.of("se_a", "approval.requested").map((e) => e.payload);
+    expect(requested).toMatchObject([
+      { command: escaped, hidden_chars: true },
+      { command: plain, hidden_chars: false },
+    ]);
+    expect(listed).toMatchObject([
+      { command: escaped, hidden_chars: true },
+      { command: plain, hidden_chars: false },
+    ]);
+    expect(JSON.stringify(requested)).not.toMatch(/[\u202A-\u202E]/);
+  });
+
   test("a stop while the request is still being recorded cancels it at once; interrupt returns", async () => {
     const h = await harness({ commandRules: [PUSH_RULE] });
     const recording = Promise.withResolvers<void>();

@@ -47,6 +47,7 @@ import {
   withAudit,
 } from "@hearth/core";
 import { bodyOf, type RequestBody } from "../request-body";
+import { hasHiddenEscape } from "../runner/hidden-chars";
 import type { ApprovalRow, ApprovalStatus, SqliteApprovalStore } from "../store/approval-store";
 
 /** How long the owner has to decide (PRD §6.5: a timeout denies). */
@@ -78,6 +79,8 @@ export interface ApprovalRequest {
   /** The rule's reason, shown on the card. */
   readonly reason: string;
   readonly mode: "yolo" | "ask";
+  /** The shown text held hidden characters, escaped by the gate as `⟨U+XXXX⟩` (#165). */
+  readonly hiddenChars?: boolean;
   readonly turnId?: string;
 }
 
@@ -103,6 +106,8 @@ export interface ApprovalView {
   readonly command: string;
   readonly rule: string;
   readonly mode: "yolo" | "ask";
+  /** The card text holds escaped hidden characters (`⟨U+XXXX⟩`; #165), read from the stored text. */
+  readonly hidden_chars: boolean;
   readonly status: ApprovalStatus;
   readonly requestedAt: EpochMs;
   readonly expiresAt: EpochMs;
@@ -149,6 +154,7 @@ function viewOf(row: ApprovalRow): ApprovalView {
     command: row.command,
     rule: row.rule,
     mode: row.mode,
+    hidden_chars: hasHiddenEscape(row.summary) || hasHiddenEscape(row.command),
     status: row.status,
     requestedAt: row.requestedAt,
     expiresAt: row.expiresAt,
@@ -236,6 +242,7 @@ export class Approvals {
         rule: row.rule,
         reason: req.reason,
         mode: row.mode,
+        hidden_chars: req.hiddenChars === true,
         requestedAt: row.requestedAt,
         expiresAt: row.expiresAt,
       });

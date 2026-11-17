@@ -571,6 +571,7 @@ describe("approval cards in a DOM (decision 0048)", () => {
     ending: Array<{ type: string; payload: unknown }>,
     command = "git push origin main",
     summary = command,
+    hiddenChars = false,
   ) {
     let seq = 0;
     const ev = (type: string, payload: unknown) => ({ seq: ++seq, ts: 0, type, payload });
@@ -592,6 +593,7 @@ describe("approval cards in a DOM (decision 0048)", () => {
         rule: "git-push",
         reason: "git push needs the owner",
         mode: "ask",
+        hidden_chars: hiddenChars,
         expiresAt: Date.now() + 90_000,
       }),
     ];
@@ -656,6 +658,25 @@ describe("approval cards in a DOM (decision 0048)", () => {
     expect(full.className).toContain("break-all");
     expect(full.className).not.toMatch(/truncate|line-clamp|overflow-hidden|max-h-/);
     expect(within(panel).getByText(/Approve runs all of it/)).toBeTruthy();
+  });
+
+  test("hidden characters the hub escaped are shown as text, with a warning on the card", async () => {
+    const escaped = ": '⟨U+202E⟩' ; touch VMARK # ⟨U+202C⟩";
+    approvalHub([], escaped, escaped, true);
+    renderApp("#/s/se_1");
+    const panel = await screen.findByRole("region", { name: "Approval needed" });
+    expect(within(panel).getByTestId("approval-hidden-chars").textContent).toContain(
+      "hidden characters",
+    );
+    expect(within(panel).getByTestId("approval-summary").textContent).toBe(escaped);
+    expect(within(panel).getByTestId("approval-command").textContent).toBe(escaped);
+  });
+
+  test("no warning when the hub saw no hidden characters", async () => {
+    approvalHub([]);
+    renderApp("#/s/se_1");
+    const panel = await screen.findByRole("region", { name: "Approval needed" });
+    expect(within(panel).queryByTestId("approval-hidden-chars")).toBeNull();
   });
 
   test("a pipe to curl before the matched git push is on the card", async () => {
