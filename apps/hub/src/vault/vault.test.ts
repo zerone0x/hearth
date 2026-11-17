@@ -1719,10 +1719,9 @@ describe("redaction", () => {
     );
     const cli = join(import.meta.dir, "..", "trajectory-cli.ts");
     const run = (out: string, key: string) =>
-      Bun.spawnSync(
-        [process.execPath, cli, "--db", path, "--export-blobs", out, "se_shot"],
-        { env: { PATH: process.env["PATH"] ?? "", HEARTH_VAULT_KEY_REF: "env:K", K: key } },
-      );
+      Bun.spawnSync([process.execPath, cli, "--db", path, "--export-blobs", out, "se_shot"], {
+        env: { PATH: process.env["PATH"] ?? "", HEARTH_VAULT_KEY_REF: "env:K", K: key },
+      });
     const refusedDir = join(dir, "refused-blobs");
     const refused = run(refusedDir, KEY_B);
     expect(refused.exitCode).toBe(1);

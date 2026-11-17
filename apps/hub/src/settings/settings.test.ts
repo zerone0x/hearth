@@ -630,7 +630,11 @@ describe("the hub", () => {
         const runner = await hub.runners?.runner(session.id);
         await runner?.settled();
         const result = (
-          runner?.messages as Array<{ role: string; toolCallId?: string; isError?: boolean }>
+          (runner?.messages ?? []) as Array<{
+            role: string;
+            toolCallId?: string;
+            isError?: boolean;
+          }>
         ).find((m) => m.role === "toolResult" && m.toolCallId === callId);
         return { isError: result?.isError, text: JSON.stringify(result) };
       };
@@ -647,7 +651,10 @@ describe("the hub", () => {
       expect(tab.actions.filter((a) => a === `fill e3 ${PASSWORD}`)).toHaveLength(2);
       // Each fill was a vault use, bound to the session and the page's origin.
       const uses = await hub.vault.uses(LOCAL_PRINCIPAL, id);
-      const used = uses.map((u) => [String(u.detail["tool_call_id"]), u.detail["origin"]]);
+      const used = uses.map((u) => {
+        const detail = u.detail as Record<string, unknown>;
+        return [String(detail["tool_call_id"]), detail["origin"]];
+      });
       expect(used.sort()).toEqual([
         ["c_fill_1", ORIGIN],
         ["c_fill_2", ORIGIN],
