@@ -32,6 +32,7 @@ export * from "./ids";
 export * from "./log";
 export * from "./secrets";
 export * from "./tenancy";
+export * from "./vault";
 
 /**
  * Exhaustiveness guard for discriminated unions. Put it in the `default` branch

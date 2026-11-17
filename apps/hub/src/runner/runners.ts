@@ -35,7 +35,7 @@ import {
 } from "@hearth/core";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { DesktopLockCheck } from "../desktop/lock";
-import { registerSecret } from "../obs/redaction";
+import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
@@ -150,14 +150,21 @@ export class SessionRunners {
     this.#extensions = selection.loaded;
   }
 
-  /** `text` with every secret the runners use replaced (decision 0015). */
+  /**
+   * `text` with every secret the runners use replaced (decision 0015), and
+   * every value in the hub's registry (decision 0021), which holds each vault
+   * value saved, used or found at open (decision 0031).
+   */
   redact(text: string): string {
-    return redactSecrets(text, this.#secretValues);
+    // One pass over both sets: a value in one that overlaps a value in the other
+    // is replaced as one span, not cut by whichever pass ran first.
+    return redactSecrets(text, [...this.#secretValues, ...knownSecrets()]);
   }
 
   /** Where a tail of `text` that could start one of those secrets begins (decision 0036). */
   secretStart(text: string): number {
-    return secretStart(text, this.#secretValues);
+    // The same set `redact` uses: a vault value must never span a live-output cut.
+    return secretStart(text, [...this.#secretValues, ...knownSecrets()]);
   }
 
   #log(line: string): void {

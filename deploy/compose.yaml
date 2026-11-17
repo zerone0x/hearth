@@ -20,7 +20,11 @@
 # API behind its login (decision 0014) and on loopback or behind TLS.
 #
 # Settings come from deploy/.env (copy hearth.env.example); the model key from
-# the file deploy/secrets/model_key, mounted at /run/secrets/model_key.
+# the file deploy/secrets/model_key, mounted at /run/secrets/model_key. The
+# vault key (decision 0031) is deploy/secrets/vault_key, written by the
+# install:vault-key step; deploy/secrets is mounted read-only at
+# /run/hearth-secrets so the optional vault_key.next of a key rotation needs no
+# compose edit, and a missing key disables the vault instead of failing compose.
 
 name: hearth
 
@@ -88,6 +92,8 @@ services:
       HEARTH_MODEL: ${HEARTH_MODEL:-}
       HEARTH_MODEL_KEY_REF: file:/run/secrets/model_key
       HEARTH_MODELS_FILE: ${HEARTH_MODELS_FILE:-}
+      HEARTH_VAULT_KEY_REF: file:/run/hearth-secrets/vault_key
+      HEARTH_VAULT_KEY_NEXT_REF: file:/run/hearth-secrets/vault_key.next
       HEARTH_IDLE_MINUTES: ${HEARTH_IDLE_MINUTES:-}
       HEARTH_BOX_EGRESS: ${HEARTH_BOX_EGRESS:-}
       HEARTH_BOX_INSTANCE: ${HEARTH_BOX_INSTANCE:-hearth}
@@ -101,6 +107,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /run/hearth:/run/hearth:ro
       - ./config:/etc/hearth:ro
+      - ./secrets:/run/hearth-secrets:ro
 
 secrets:
   model_key:
