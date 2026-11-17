@@ -3840,3 +3840,105 @@ secrets at start, before the hub could call its API.
   `tcp-reset`. The compose e2e therefore also probes an unused address in
   Bifrost's subnet, which only the firewall can answer: it must be refused by
   the `tcp-reset` rule, whose counter must move.
+
+## 0047: Per-session Bifrost virtual keys: id only in the hub, rotated per runner build, spend from the request log
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #157 (design: research #152, `docs/research/m3-models-access.md`,
+  question 4; service: 0046)
+
+### Context
+
+PRD §6.4 and §11.3: with Bifrost, every session's model calls use a virtual
+key (VK) of their own with a budget and an explicit model allowlist (empty
+means none), and the UI shows the session's spend from Bifrost's request log.
+0046 put Bifrost next to the hub and left the traffic switch to this issue.
+
+### Decision
+
+- **Route.** With `HEARTH_BIFROST_URL` set, each runner build asks
+  `SessionVirtualKeys.route` for the session's route. The runner gets a pi
+  runtime of its own with one provider, `hearth-bifrost`, at Bifrost's
+  OpenAI-compatible `/v1` (`openai-completions`), model id
+  `<bifrost provider>/<model>`, and the VK set with `setRuntimeApiKey` (memory
+  only). The model keeps pi's catalog limits and prices. No provider key is
+  resolved for it. Without `HEARTH_BIFROST_URL`, nothing changes (0038).
+- **Lifecycle.** The first runner build of a session (its first model call)
+  `POST`s a VK named `session-<id>` with `provider_configs: [{provider,
+  allowed_models: [model], key_ids: ["*"]}]`, `allow_all_providers: false`,
+  the session budget (reset `1Y`, a lifetime) and a rate limit (120 requests a
+  minute). The hub stores only the VK id, provider, model, budget and an
+  active flag (`session_virtual_key`, migration 10). Every later build `PUT`s
+  a changed model (a model switch) or budget, then rotates the key; the old
+  value is refused at once. An archive deactivates the VK (`is_active:
+  false`, a session-manager hook); `SessionVirtualKeys.remove` deletes it
+  (the request log stays). The hub has no session delete yet; when it gets
+  one, it calls `remove`.
+- **The value stays in the hub's memory.** It is added to the redaction
+  registry at once, so an echo is redacted from events, trajectories and log
+  lines, and it never reaches a box (boxes hold no model credential, §6.4).
+- **Allowlist.** `checkAllowlist` refuses an empty list, `*` and blank ids
+  before anything is sent (`bifrost.empty-allowlist`). Bifrost v2.5.1 accepts
+  a VK with an empty `allowed_models` (probed), so the check is the hub's.
+  The VK body always says `allow_all_providers: false`.
+- **Audit.** `bifrost.vk.create`, `.update`, `.rotate`, `.deactivate` and
+  `.delete` are written before the call (system principal), with the VK id,
+  never the value; `settings.session_budget.update` for the budget.
+- **Budget.** One default for every session (`session_budget` setting, $5 on
+  a new install), on the Settings page. Saving it `PUT`s it to every active
+  VK at once; a VK that misses it gets it at its next build. A per-session
+  override is left for later.
+- **Refusals.** A model call is classified by the HTTP status pi puts first
+  in its error text (`402: {...}`), not by Bifrost's labels: 402 is the
+  budget, 429 the rate limit. The turn ends and a `runner.gateway` event
+  `{status, code, message}` is recorded, with Bifrost's text (which names the
+  spend and the budget); the chat shows it as an error notice. The session
+  stays usable: a raised budget lets the next message run. pi itself retries
+  a 429 before the turn ends; it does not retry a 402.
+- **Bifrost down.** While Bifrost is configured but not `ok`, a message is
+  refused with `runner.gateway-unavailable`, never sent around it (that would
+  skip the budget). The hub still does not `depends_on` Bifrost in compose, so
+  the UI and `/healthz` stay up and say why.
+- **Direct for providers Bifrost does not serve.** A model whose provider is
+  not in `BIFROST_PROVIDERS` (a `models.json` endpoint, such as the compose
+  e2e's faux model) keeps the direct path, with one log line per provider; its
+  spend view says `direct`.
+- **Spend.** `GET /v1/sessions/:id/spend` reads `GET
+  /api/logs/stats?virtual_key_ids=<id>` (requests, tokens, cost) and
+  `GET /v1/settings/session-budget` the total over every key. The session
+  header shows "$spent of $budget, N tokens", re-read every 10 s and after
+  each message, and says "budget reached" once spend is at or over it.
+  Bifrost writes its log in batches of about 5 s, so a call shows a few
+  seconds after it ends.
+- **Tests.** Against a fake gateway (`virtual-keys.test.ts`) and against the
+  real binary with a fake provider and a local price list
+  (`virtual-keys.binary.test.ts`, run by CI's Bifrost step): the UI spend
+  equals the sum of the session's request-log rows after the flush, the third
+  call over a $0.03 budget is refused with the message, rotation, the
+  allowlist `PUT` and the archive's deactivation.
+
+### Alternatives rejected
+
+- **One shared runtime with a provider per session.** Simpler to cache, but
+  every session's key would sit in one runtime's credentials.
+- **Bifrost's native per-provider routes (`/anthropic`, `/genai`) so each
+  model keeps its own API.** More mappings and a test per API; the
+  OpenAI-compatible route works for every provider Bifrost serves. Provider
+  features only that API has (Anthropic prompt caching hints) may be lost.
+- **Fall back to the direct path while Bifrost is down.** A session would
+  spend without a budget.
+- **Check the budget in the hub before each message.** Bifrost's own counter
+  is the one that refuses; the hub's copy would lag by the flush.
+- **Spend per model call in the trajectory.** Bifrost's answer to pi carries
+  no cost; pi's own `runner.usage` (tokens, catalog cost) stays the
+  per-call record. Left for later.
+
+### Consequences
+
+- A session can overshoot its budget by the calls in flight; `install.md`
+  says so.
+- `runner.usage` and pi's session entries name the provider `hearth-bifrost`
+  for calls through Bifrost.
+- A fresh install whose Bifrost cannot start (no access to `getbifrost.ai`)
+  cannot chat until it does; `/healthz` and the refusal say why.

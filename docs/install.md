@@ -57,9 +57,15 @@ Read this before you install.
   covers Bifrost's address. Its admin password and the key that encrypts the
   provider keys in its store are vault entries the hub generates; they reach
   Bifrost through a memory-only volume, never a file beside its store. Model
-  calls do not go through Bifrost yet (#157), so the hub does not depend on
-  it: it starts and stays healthy when Bifrost cannot, and `/healthz` says
-  `"bifrost":"unavailable"`.
+  calls go through Bifrost with a virtual key per session, a budget (Settings,
+  "Session budget", $5 by default) and that session's model as the only
+  allowed one (decision 0047). The hub starts without it: while Bifrost is
+  down, `/healthz` says `"bifrost":"unavailable"` and a message is refused
+  with "the model gateway (Bifrost) is not available". A model from a
+  `models.json` endpoint is not served by Bifrost and goes direct, without a
+  budget. A session can go past its budget by the calls already in flight
+  (Bifrost checks the budget before a call, on the spend so far), and its
+  spend shows about 10 s after a call (Bifrost writes its log in batches).
 - **Bifrost needs outbound HTTPS** (see [Bifrost's egress](#bifrosts-egress)).
 
 ## First run
@@ -173,12 +179,12 @@ docker compose up -d --force-recreate --wait hub
 Bifrost connects out to:
 
 - the model providers whose keys you add (for example `api.anthropic.com`,
-  `api.openai.com`), once model calls go through it (#157);
+  `api.openai.com`);
 - `getbifrost.ai`, for its model price list (`/datasheet`) and model
   parameters, at its first start and every 24 hours after. **On its first
   start Bifrost v2.5.1 exits if the price list cannot be downloaded** and it
   has none stored yet; compose restarts it until it can. The hub runs
-  meanwhile (model calls do not use Bifrost yet). On a host without
+  meanwhile, but refuses messages until Bifrost is up. On a host without
   this access, set `framework.pricing.pricing_url` and `model_parameters_url`
   in `deploy/bifrost/config.json` to a mirror you host.
 
@@ -191,7 +197,7 @@ box firewall, which applies to boxes only.
 
 ```sh install:up
 docker compose up -d --build --wait hub
-# Bifrost (decision 0046): no model call uses it yet, so the hub does not wait for it.
+# Bifrost (decisions 0046, 0047): the hub does not wait for it; messages wait until it is up.
 docker compose up -d bifrost || echo "Bifrost did not start; the hub runs without it (see Check it)"
 ```
 
