@@ -922,6 +922,7 @@ has `card`, `dialog`, `input`, `label`, `badge`, `button`; add `table`,
    show-password toggle.
 8. **hub: TOTP for logins** with `otpauth` (MIT), `#totp` field.
 9. **hub: `box-env` tokens** for one exec RPC (opt-in per entry, UI warning).
+   Done in #130 (decision 0041).
 10. **Later / enterprise:** an OpenBao transit `VaultKeyProvider` (then a KV v2
     backend) with an AppRole credential through the SecretStore. Optional `bw:`
     and `op:` read-only resolvers. An encrypted export/import. A per-secret

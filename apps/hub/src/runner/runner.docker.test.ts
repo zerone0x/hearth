@@ -3,7 +3,8 @@
  * on pi-ai's faux model (no model credits), a real `DockerBoxProvider` and the
  * real box image. Over the HTTP API, behind the login, one message makes the
  * model write and edit a file in the box's /workspace and run a command there;
- * the results come back as events through the cursor API.
+ * the results come back as events through the cursor API. A last command gets
+ * a `box-env` vault token in its environment (decision 0041) and prints its hash.
  *
  * Runs only with HEARTH_DOCKER_TESTS=1 (AGENTS.md). CI runs it in the
  * `box-provider` job after `scripts/box-firewall.sh apply`.
@@ -14,12 +15,18 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { LOCAL_PRINCIPAL, type SecretStore, SecretValue } from "@hearth/core";
+import {
+  createDefaultSecretStore,
+  LOCAL_PRINCIPAL,
+  type SecretStore,
+  SecretValue,
+} from "@hearth/core";
 import { SESSION_COOKIE } from "../auth";
 import { DEFAULT_DOCKER_SOCKET } from "../box/docker/config";
 import { DockerBoxProvider } from "../box/docker/provider";
@@ -48,6 +55,9 @@ const fauxSecrets: SecretStore = {
   preflight: async () => ({ ok: true, failures: [] }) as never,
   invalidate: () => {},
 };
+
+/** A box-env vault token (decision 0041): distinctive, so a leak is found by search. */
+const BOX_TOKEN = "ghp_dockerBoxEnv61c0d2e9f7";
 
 interface StoredEvent {
   seq: number;
@@ -87,6 +97,17 @@ describe.skipIf(!enabled)("pi runner with a Docker box (M1 core)", () => {
         secrets: fauxSecrets,
         modelRuntime,
       },
+      // A vault for the box-env token (decision 0041).
+      vault: {
+        keyRef: "env:HEARTH_RUNNER_VAULT_KEY",
+        keySecrets: createDefaultSecretStore({
+          env: {
+            HEARTH_RUNNER_VAULT_KEY: Buffer.from(
+              crypto.getRandomValues(new Uint8Array(32)),
+            ).toString("base64"),
+          },
+        }),
+      },
     });
     const h = hub;
     const cookie = `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`;
@@ -101,6 +122,15 @@ describe.skipIf(!enabled)("pi runner with a Docker box (M1 core)", () => {
       });
       return { status: res.status, json: (await res.json()) as Record<string, unknown> };
     };
+
+    expect((await h.vaultReady).state).toBe("enabled");
+    const added = await api("/v1/secrets", {
+      name: "github",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: BOX_TOKEN },
+    });
+    expect(added.status).toBe(201);
 
     const created = await api("/v1/sessions", { title: "runner e2e" });
     expect(created.status).toBe(201);
@@ -137,6 +167,24 @@ describe.skipIf(!enabled)("pi runner with a Docker box (M1 core)", () => {
         ],
         { stopReason: "toolUse" },
       ),
+      // A vault token in the real box's environment for one command only.
+      fauxAssistantMessage(
+        [
+          fauxToolCall(
+            "bash",
+            {
+              command: "printenv GH_TOKEN | tr -d '\\n' | sha256sum; printenv GH_TOKEN",
+              env: { GH_TOKEN: "vault:github" },
+            },
+            { id: "c_env" },
+          ),
+        ],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(
+        [fauxToolCall("bash", { command: "printenv GH_TOKEN || echo unset" }, { id: "c_after" })],
+        { stopReason: "toolUse" },
+      ),
       fauxAssistantMessage("done"),
     ]);
     const sent = await api(`/v1/sessions/${id}/messages`, { text: "edit hello.txt and show it" });
@@ -171,7 +219,15 @@ describe.skipIf(!enabled)("pi runner with a Docker box (M1 core)", () => {
       ["c_write", "write", false],
       ["c_edit", "edit", false],
       ["c_bash", "bash", false],
+      ["c_env", "bash", false],
+      ["c_after", "bash", false],
     ]);
+    const envText = ends[3]?.result.content.map((c) => c.text ?? "").join("") ?? "";
+    expect(envText).toContain(createHash("sha256").update(BOX_TOKEN).digest("hex"));
+    expect(envText).toContain("[redacted]");
+    expect(ends[4]?.result.content.map((c) => c.text ?? "").join("")).toContain("unset");
+    // The value is in no event the API serves.
+    expect(JSON.stringify(events)).not.toContain(BOX_TOKEN);
     const bash = ends[2]?.result.content.map((c) => c.text ?? "").join("") ?? "";
     // The edit landed in the box's /workspace, and the command ran in the container.
     expect(bash).toContain("edited from pi");

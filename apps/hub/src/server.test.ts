@@ -72,7 +72,7 @@ describe("GET /healthz", () => {
   test("returns 200 from the app", async () => {
     const res = await createApp().request("/healthz");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: "ok", protocol: "1.5", version: HUB_VERSION });
+    expect(await res.json()).toEqual({ status: "ok", protocol: "1.6", version: HUB_VERSION });
   });
 
   test("every other route, known or not, needs a session (decision 0014)", async () => {
