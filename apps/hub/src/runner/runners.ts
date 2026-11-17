@@ -321,10 +321,8 @@ export class SessionRunners {
     const generation = this.#generation;
     const old = entry?.runner;
     const pending = (async () => {
-      if (old !== undefined) {
-        await old.settled();
-        old.dispose();
-      }
+      // Idle means its last turn and that turn's event writes are done (runner.ts).
+      old?.dispose();
       return this.#create(sessionId);
     })();
     const next: RunnerEntry = { pending, generation };

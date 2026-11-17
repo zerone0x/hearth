@@ -399,6 +399,13 @@ describe("first-start import", () => {
     expect(auditRows(again.db, "settings.model.import")).toHaveLength(1);
     expect(auditRows(again.db, "secret.create")).toHaveLength(1);
 
+    // A saved choice is never imported over, even when its entry is gone.
+    const gone = new SqliteVaultStore(again.db).byName(DEFAULT_WORKSPACE_ID, "model-key-anthropic");
+    await again.vault.remove(LOCAL_PRINCIPAL, gone?.id ?? "");
+    const third = await start({ env });
+    expect(auditRows(third.db, "settings.model.import")).toHaveLength(1);
+    expect(third.logs.join("\n")).not.toContain("not imported");
+
     // Once HEARTH_MODEL is gone, the imported choice is used.
     const unlocked = await start();
     expect(unlocked.applied).toEqual([
@@ -410,12 +417,15 @@ describe("first-start import", () => {
     const disabled = await start({ env, vaultKey: false });
     expect(auditRows(disabled.db, "settings.model.import")).toHaveLength(0);
     expect(settingRows(disabled.db)).toBe(0);
+    // Not an error: the import waits for a key file.
+    expect(disabled.logs.join("\n")).not.toContain("not imported");
     for (const db of dbs) db.close();
     dbs = [];
     rmSync(path, { force: true });
 
     const fromVault = await start({ env: { ...env, apiKeyRef: "vault:anthropic-key" } });
     expect(settingRows(fromVault.db)).toBe(0);
+    expect(fromVault.logs.join("\n")).not.toContain("not imported");
 
     await addModelKey(fromVault, "model-key-anthropic", "settings-test-other-3");
     const taken = await start({ env });
