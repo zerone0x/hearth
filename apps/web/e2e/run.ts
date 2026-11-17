@@ -459,6 +459,8 @@ try {
   // A right-to-left override (#165): in a browser this reads as `: '# KRAMV hcuot ; '`.
   // Led by a push so the default rules hold it; the bare example alone matches no rule.
   const rlo = "git push -q origin HEAD:main ; : '\u202E' ; touch VMARK # \u202C";
+  // U+2028 renders as a line break, so `touch LSMARK` can read as a comment (#167).
+  const lsep = "git push -q origin HEAD:main; X=1\u2028# a note, nothing runs here;touch LSMARK";
   const spoof = (command: string, id: string) =>
     fauxAssistantMessage([fauxToolCall("bash", { command }, { id })], { stopReason: "toolUse" });
   await sessionAccess.selectOption("ask");
@@ -467,6 +469,7 @@ try {
     spoof(hidden, "call_spoof1"),
     spoof(piped, "call_spoof2"),
     spoof(rlo, "call_spoof3"),
+    spoof(lsep, "call_spoof4"),
     fauxAssistantMessage("Neither held command ran."),
   ]);
   await page.getByLabel("Message").fill("Push and tidy up");
@@ -508,9 +511,21 @@ try {
   if (!shownText.includes("touch VMARK")) throw new Error("`touch VMARK` is not on the card");
   await shot(page, "2e-approval-hidden-chars");
   await approval.getByRole("button", { name: "Deny" }).click();
+  await fullCommand(
+    "git push -q origin HEAD:main; X=1⟨U+2028⟩# a note, nothing runs here;touch LSMARK",
+    "touch LSMARK",
+  );
+  await approval.getByTestId("approval-hidden-chars").waitFor();
+  // The tool-card headers write them out too, not only the panel.
+  for (const text of await page.getByTestId("tool-card").allTextContents()) {
+    if (/[\u2028\u202A-\u202E]/.test(text)) throw new Error("a tool card shows a raw hidden char");
+  }
+  await shot(page, "2f-approval-line-separator");
+  await approval.getByRole("button", { name: "Deny" }).click();
   await page.getByText("Neither held command ran.").waitFor();
   if (existsSync(join(e2e.workspace, "MARKER"))) throw new Error("a denied command ran");
   if (existsSync(join(e2e.workspace, "VMARK"))) throw new Error("a denied command ran (VMARK)");
+  if (existsSync(join(e2e.workspace, "LSMARK"))) throw new Error("a denied command ran (LSMARK)");
   await sessionAccess.selectOption("default");
   await accessMode.and(page.locator('[data-mode="yolo"]')).waitFor();
 
@@ -557,14 +572,14 @@ try {
   step("reload: the chat is rebuilt from the event log and the session continues");
   await page.reload();
   await page.getByText("I wrote hello.txt in the workspace.").waitFor();
-  // hello.txt, the three S3 pushes and the three denied full-command cards.
+  // hello.txt, the three S3 pushes and the four denied full-command cards.
   await page.getByText("Neither held command ran.").waitFor();
-  if ((await page.getByTestId("tool-card").count()) !== 7) {
-    throw new Error("after a reload the chat should show the seven tool cards again");
+  if ((await page.getByTestId("tool-card").count()) !== 8) {
+    throw new Error("after a reload the chat should show the eight tool cards again");
   }
   // The ended approvals are rebuilt from the log too.
-  if ((await page.getByTestId("approval-ended").count()) !== 5) {
-    throw new Error("after a reload the five ended approvals should say how they ended");
+  if ((await page.getByTestId("approval-ended").count()) !== 6) {
+    throw new Error("after a reload the six ended approvals should say how they ended");
   }
   e2e.faux.setResponses([fauxAssistantMessage("Still here: hello.txt says hello from the box.")]);
   await page.getByLabel("Message").fill("Are you still there?");
@@ -599,8 +614,8 @@ try {
   const cut = page.getByTestId("tool-card").and(page.locator('[data-status="interrupted"]'));
   await cut.getByRole("button", { name: "Tool call bash: interrupted" }).waitFor();
   await page.getByRole("button", { name: "Send" }).waitFor();
-  // The error cards are the S3 calls that were blocked, not run: one expired, three denied.
-  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 4) {
+  // The error cards are the S3 calls that were blocked, not run: one expired, four denied.
+  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 5) {
     throw new Error("an interrupted tool call should not show as an error");
   }
   // The composer floats over the bottom of the thread: centre the card for the shot

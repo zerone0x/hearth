@@ -1253,6 +1253,24 @@ describe("the access gate (decisions 0043, 0048)", () => {
     expect(JSON.stringify(requested)).not.toMatch(/[\u202A-\u202E]/);
   });
 
+  test("a space look-alike is escaped in the stored and listed card, which says so (#167)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 30 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const nbsp = "git push origin main; X=1\u00A0# a note;touch EX";
+    h.faux.setResponses([call("bash", { command: nbsp }, "c_nbsp"), fauxAssistantMessage("x")]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const id = await pendingId(h);
+    const listed = await approvals.list(LOCAL_PRINCIPAL);
+    await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    await (await h.runners.runner("se_a")).settled();
+    const escaped = "git push origin main; X=1⟨U+00A0⟩# a note;touch EX";
+    const requested = h.events.of("se_a", "approval.requested").map((e) => e.payload);
+    expect(requested).toMatchObject([{ command: escaped, hidden_chars: true }]);
+    expect(listed).toMatchObject([{ command: escaped, hidden_chars: true }]);
+    expect(JSON.stringify(requested)).not.toContain("\u00A0");
+  });
+
   test("a stop while the request is still being recorded cancels it at once; interrupt returns", async () => {
     const h = await harness({ commandRules: [PUSH_RULE] });
     const recording = Promise.withResolvers<void>();

@@ -39,6 +39,7 @@ import {
   type EpochMs,
   type EventStore,
   HearthError,
+  hasHiddenEscape,
   type JsonValue,
   type Principal,
   type SessionId,
@@ -47,7 +48,7 @@ import {
   withAudit,
 } from "@hearth/core";
 import { bodyOf, type RequestBody } from "../request-body";
-import { hasHiddenEscape } from "../runner/hidden-chars";
+
 import type { ApprovalRow, ApprovalStatus, SqliteApprovalStore } from "../store/approval-store";
 
 /** How long the owner has to decide (PRD §6.5: a timeout denies). */
