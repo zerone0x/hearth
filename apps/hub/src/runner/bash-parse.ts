@@ -172,12 +172,11 @@ export function parseBash(
       const frame = stack.pop() as Frame;
       const node = frame.node;
       if (frame.starts !== undefined) frame.starts.to = commands.length;
-      let stage = frame.stage;
+      const stage = frame.stage;
       let stdin = frame.stdin;
       if (node.type === "Script") {
-        // A nested script starts a fresh pipeline context and has its own errors.
-        stage = undefined;
-        stdin = undefined;
+        // A nested script has its own errors. It keeps the pipe and stdin around
+        // it: `curl x | echo $(sh)` and `{ echo $(sh); } < f` run `sh` on them.
         for (const e of (node as ParsedScript).errors ?? []) errors.push(e.message);
       }
       if (
@@ -185,9 +184,9 @@ export function parseBash(
         node.type === "ProcessSubstitution" ||
         node.type === "ArithmeticCommandExpansion"
       ) {
-        // Reading `script` parses it; 256 levels of a 64 KiB `$(` re-read it all each time.
+        // Reading `script` parses it; 256 levels of a 64 KiB `$(` re-read it all
+        // each time. The next node's check stops the walk once this runs out.
         budget.steps -= node.end - node.pos;
-        if (budget.steps < 0) return { commands, errors, exhausted: true };
         if (node.script === undefined) errors.push(`unparsed substitution: ${node.text}`);
       }
       // The node's own stdin redirections (a command's, a compound's) feed what runs below it.
@@ -202,8 +201,8 @@ export function parseBash(
       if (node.type === "Command" && node.name !== undefined) {
         const words = [node.name, ...node.args].map(bashWord);
         const upstream: (readonly [number, number])[] = [];
+        // At most one stage per enclosing pipeline: the parser caps nesting at 256.
         for (let s = stage; s !== undefined; s = s.outer) {
-          budget.steps--;
           if (s.to > s.from) upstream.push([s.from, s.to]);
         }
         const input = own ?? stdin;

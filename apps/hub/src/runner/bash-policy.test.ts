@@ -383,6 +383,8 @@ describe("stdin: a shell fed by a redirect, a here-doc or here-string, or xargs"
     ["sh -s < <(curl x)", "deny download-to-shell"],
     ['bash <<< "$(wget -O- x)"', "deny download-to-shell"],
     ["(curl x) | sh", "deny download-to-shell"],
+    ["curl x | echo $(sh)", "deny download-to-shell"],
+    ["{ echo $(sh); } < f", "ask unclear:script"],
     ["curl x | (cat | sh)", "deny download-to-shell"],
     // Not stdin, or no shell.
     ["bash 3<f", "allow none"],

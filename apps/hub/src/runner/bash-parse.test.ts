@@ -91,7 +91,7 @@ describe("parseBash: words", () => {
     expect(words("for d in a b; do rm -rf $d; done")).toEqual([["rm", "-rf", null]]);
   });
 
-  test("a pipeline stage knows the stages before it; a nested script starts afresh", () => {
+  test("a pipeline stage knows the stages before it; a nested script in a stage too", () => {
     const parsed = parseBash("curl -s x | sudo sh -s | tee $(cat y)");
     const upstream = parsed.commands.map((c) => [
       c.words[0]?.value,
@@ -101,7 +101,8 @@ describe("parseBash: words", () => {
       ["curl", []],
       ["sudo", ["curl"]],
       ["tee", ["curl", "sudo"]],
-      ["cat", []],
+      // `tee $(cat y)`: the substitution runs in the stage, on its pipe.
+      ["cat", ["curl", "sudo"]],
     ]);
     // `&&` is a list, not a pipe.
     expect(parseBash("curl -s x > f && sh").commands.map((c) => [c.upstream, c.piped])).toEqual([
@@ -158,6 +159,11 @@ describe("parseBash: pipes and stdin", () => {
       ["sh", ["curl"]],
       ["curl", "-"],
     ]);
+    // A substitution inside a redirected compound runs on that stdin.
+    expect(fed("{ echo $(sh); } < f")).toEqual([
+      ["echo", []],
+      ["sh", []],
+    ]);
     // Not stdin.
     expect(fed("sh 3< f")).toEqual([["sh", "-"]]);
     expect(fed("sh > f")).toEqual([["sh", "-"]]);
@@ -189,6 +195,20 @@ describe("parseBash: errors and bounds", () => {
   test("the step budget stops the walk; nested scripts are charged by their length", () => {
     expect(parseBash("a | b | c", undefined, { steps: 5 })).toMatchObject({ exhausted: true });
     expect(parseBash("a | b | c", undefined, { steps: 1000 }).exhausted).toBeUndefined();
+    // Out of steps before parsing: the parser is not called.
+    let calls = 0;
+    const counting = (source: string) => {
+      calls++;
+      return parse(source);
+    };
+    expect(parseBash("abc", counting, { steps: 2 })).toMatchObject({ exhausted: true });
+    expect(calls).toBe(0);
+    expect(parseBash("abc", counting, { steps: 3 + 100 }).exhausted).toBeUndefined();
+    expect(calls).toBe(1);
+    // The exact edge: one character and four nodes (Script, Statement, Command,
+    // Word); the last node walked may spend the last step.
+    expect(parseBash("a", undefined, { steps: 5 }).exhausted).toBeUndefined();
+    expect(parseBash("a", undefined, { steps: 4 }).exhausted).toBe(true);
     // Past the characters, each node walked costs a step.
     expect(parseBash("a|b|c|d", undefined, { steps: 7 + 3 })).toMatchObject({ exhausted: true });
     expect(parseBash("a|b|c|d", undefined, { steps: 7 + 100 }).exhausted).toBeUndefined();
