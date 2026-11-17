@@ -25,6 +25,7 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { ApprovalOutcome } from "../approvals/service";
 import type { AccessMode } from "../settings/access-mode";
 import { type BashVerdict, type CommandRule, classifyBash } from "./bash-policy";
+import { escapeHidden, hasHidden } from "./hidden-chars";
 import type { CompiledDenyRule } from "./policy";
 
 /** The reserved extension name (`RESERVED_EXTENSION_NAMES`). */
@@ -44,6 +45,8 @@ export interface GateRequest {
   readonly rule: string;
   readonly reason: string;
   readonly mode: AccessMode;
+  /** The shown text held a hidden character, written out as `⟨U+XXXX⟩` (#165). */
+  readonly hiddenChars?: boolean;
 }
 
 export interface AccessExtensionOptions {
@@ -162,7 +165,7 @@ export function gateVerdict(
  * redaction could miss a piece. So the shown parts are taken from the
  * redacted command, parsed again (the same verdict when it holds no secret);
  * if that reads as another rule, the redacted whole command stands in for the
- * part.
+ * part. Hidden characters are then written out as `⟨U+XXXX⟩` (`escapeHidden`).
  */
 export function shownVerdict(
   verdict: GateVerdict,
@@ -171,14 +174,22 @@ export function shownVerdict(
   commandRules: readonly CommandRule[],
   denyList: readonly CompiledDenyRule[],
   redact: (text: string) => string,
-): Pick<GateVerdict, "summary" | "command" | "reason"> {
+): Pick<GateVerdict, "summary" | "command" | "reason"> & { hiddenChars: boolean } {
   const command = redact(verdict.command);
   const again = gateVerdict(toolName, { ...(input as object), command }, commandRules, denyList);
   const same = again.rule === verdict.rule;
-  return {
+  const shown = {
     summary: redact(same ? again.summary : command),
     command,
     reason: redact(same ? again.reason : verdict.reason),
+  };
+  // After redaction and the re-parse, never before: a secret holding a hidden
+  // character is redacted whole, and the parser reads the real characters (#165).
+  return {
+    summary: escapeHidden(shown.summary),
+    command: escapeHidden(shown.command),
+    reason: escapeHidden(shown.reason),
+    hiddenChars: hasHidden(shown.summary + shown.command + shown.reason),
   };
 }
 

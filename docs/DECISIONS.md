@@ -4125,6 +4125,15 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   tool error ("Denied: no decision within 10 min. Not run."), so the turn says
   so. If a system end (timeout, cancel) cannot be recorded, the call is denied
   anyway (fail-closed). If the request cannot be recorded, the call is blocked.
+- **Hidden characters** (#165). After redaction and the re-parse, the gate
+  writes bidi controls, zero-width characters and other C0/C1 controls (not
+  tab or newline) in `summary`, `command` and `reason` as `⟨U+XXXX⟩`
+  (`apps/hub/src/runner/hidden-chars.ts`), so a right-to-left override cannot
+  make a command read as harmless. `approval.requested` carries
+  `hidden_chars`; the list API derives it from the stored escapes (no new
+  column); the card says "Contains hidden characters". The web renders plain
+  text. Residual: a secret split by quoting shows its pieces in `command`,
+  as in main's tool-call records.
 - **Timeout** `HEARTH_APPROVAL_TIMEOUT_MINUTES`, default 10.
 - **Cancel.** A stop cancels with `why: "stopped"`, through the held call's
   abort signal only (pi aborts it on `interrupt`). A stop that lands while the

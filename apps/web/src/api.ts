@@ -143,6 +143,7 @@ export interface PendingApproval {
   readonly toolCallId: string;
   readonly tool: string;
   readonly summary: string;
+  readonly hidden_chars: boolean;
   readonly expiresAt: number;
 }
 

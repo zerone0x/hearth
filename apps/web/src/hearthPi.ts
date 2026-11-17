@@ -88,6 +88,8 @@ export interface ApprovalCard {
   readonly command: string;
   readonly rule: string;
   readonly reason: string;
+  /** The shown text holds hidden characters the hub wrote out as `⟨U+XXXX⟩` (#165). */
+  readonly hiddenChars: boolean;
   readonly expiresAt: number;
   readonly status: ApprovalStatus;
   /** Who decided (`user:<id>`), for approved and denied. */
@@ -200,6 +202,7 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
           command: text("command"),
           rule: text("rule"),
           reason: text("reason"),
+          hiddenChars: p["hidden_chars"] === true,
           expiresAt: typeof p["expiresAt"] === "number" ? p["expiresAt"] : event.ts,
           status: "pending",
           by: null,
