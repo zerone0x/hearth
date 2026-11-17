@@ -156,13 +156,17 @@ class FakeBoxes {
     this.executor = this.#newExecutor();
   }
 
+  /** Rewrites the box's answers on the way to the hub (a buggy or older box). */
+  rewriteAnswer: ((frame: RpcResultFrame) => RpcResultFrame) | undefined;
+
   #newExecutor(): ToolExecutor {
     this.browser =
       this.driver === null ? undefined : new BrowserTools({ driver: this.driver, root: this.root });
     return new ToolExecutor({
       root: this.root,
       ...(this.browser === undefined ? {} : { browser: this.browser }),
-      send: (frame: RpcResultFrame) => {
+      send: (answer: RpcResultFrame) => {
+        const frame = this.rewriteAnswer?.(answer) ?? answer;
         for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
       },
       // Live output (decision 0036), in the same order as the answers.
@@ -2307,6 +2311,30 @@ describe("bash env: vault tokens for one command (decision 0041)", () => {
     expect(live).not.toContain(TOKEN);
     expect(live).not.toContain(TOKEN.slice(0, 9));
     expect(JSON.stringify(h.events.all.get("se_a"))).not.toContain(TOKEN);
+  }, 20_000);
+
+  test("a box that answers with the raw value: the hub scrubs it before pi sees the output", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    // As a box without its own scrub would answer; long, so pi keeps it in a hub temp file.
+    const marker = `raw-answer-${crypto.randomUUID()}`;
+    const output = `${marker}:${TOKEN}\n${"x\n".repeat(3000)}end:${TOKEN}\n`;
+    h.boxes.rewriteAnswer = (frame) =>
+      frame.ok && typeof (frame.result as { output?: unknown }).output === "string"
+        ? { ...frame, result: { ...(frame.result as object), output } }
+        : frame;
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_raw", "true", { GH_TOKEN: "vault:github" }),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_raw");
+    expect(result?.text).toContain(`end:${REDACTED}`);
+    expect(JSON.stringify(runner.messages)).not.toContain(TOKEN);
+    const files = [...new Bun.Glob("pi-bash*").scanSync({ cwd: tmpdir(), absolute: true })]
+      .map((path) => readFileSync(path, "utf8"))
+      .filter((text) => text.includes(marker));
+    expect(files).toHaveLength(1);
+    expect(files[0]).not.toContain(TOKEN);
   }, 20_000);
 
   test("refused before decrypt and before the box: hub tokens, logins, another session's token, a missing entry", async () => {
