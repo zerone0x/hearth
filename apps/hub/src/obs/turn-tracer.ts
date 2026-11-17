@@ -33,6 +33,7 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from "@opentelemetry/semantic-conventions/incubating";
 import type { RpcOutcome, RpcTrace } from "../box/tool-rpc";
+import type { BashVerdict } from "../runner/bash-policy";
 import { imageRefs } from "./blobs";
 import { type CappedText, capJson, capText, type Redact } from "./cap";
 import { spanIds, type Telemetry } from "./telemetry";
@@ -212,6 +213,8 @@ interface ToolState {
   boxId: string | undefined;
   boxWaitMs: number;
   denied: string | undefined;
+  /** The command-rule verdict of a `bash` call (decision 0044). */
+  bashPolicy: BashVerdict | undefined;
   /** The code the call was refused with before dispatch (`desktop.locked`). */
   refused: string | undefined;
 }
@@ -622,6 +625,7 @@ export class TurnTracer {
       boxId: undefined,
       boxWaitMs: 0,
       denied: undefined,
+      bashPolicy: undefined,
       refused: undefined,
     });
   }
@@ -639,6 +643,15 @@ export class TurnTracer {
   onDenied(toolCallId: string, reason: string): void {
     const tool = this.#tools.get(toolCallId);
     if (tool !== undefined) tool.denied = reason;
+  }
+
+  /**
+   * The command rules' verdict on a `bash` call (decision 0044), recorded on
+   * its step as `bash_policy`. `ask` is recorded but not enforced yet.
+   */
+  onBashVerdict(toolCallId: string, verdict: BashVerdict): void {
+    const tool = this.#tools.get(toolCallId);
+    if (tool !== undefined) tool.bashPolicy = verdict;
   }
 
   /**
@@ -752,6 +765,9 @@ export class TurnTracer {
         is_error: isError,
         outcome,
         ...(tool.denied === undefined ? {} : { denied_reason: tool.denied }),
+        ...(tool.bashPolicy === undefined
+          ? {}
+          : { bash_policy: capJson(tool.bashPolicy, this.#redact) }),
         ...(tool.refused === undefined ? {} : { refused_code: tool.refused }),
         exit_code: exec?.exit_code ?? null,
         box_id: tool.boxId ?? null,

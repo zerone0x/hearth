@@ -50,6 +50,7 @@ import {
 import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
+import type { CommandRule } from "./bash-policy";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import { liveToolOutput } from "./live-output";
@@ -77,6 +78,8 @@ export interface SessionRunnerOptions {
   readonly modelRuntime: ModelRuntime;
   readonly model: Model<string>;
   readonly denyList: readonly CompiledDenyRule[];
+  /** Compiled command rules for `bash` (decision 0044). Unset: none. */
+  readonly commandRules?: readonly CommandRule[];
   /** Already filtered by the allowlist. */
   readonly extensions?: readonly PinnedExtension[];
   /** pi's codemode tool (decision 0015). Off by default. */
@@ -309,6 +312,9 @@ export class SessionRunner {
             box,
             boxCwd,
             denyList: options.denyList,
+            ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
+            onBashVerdict: (toolCallId, verdict) =>
+              self?.observe(() => self?.tracer.onBashVerdict(toolCallId, verdict)),
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
             onRefused: (_name, toolCallId, code) =>
