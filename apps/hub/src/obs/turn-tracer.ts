@@ -217,6 +217,8 @@ interface ToolState {
   bashPolicy: BashVerdict | undefined;
   /** The code the call was refused with before dispatch (`desktop.locked`). */
   refused: string | undefined;
+  /** The access mode the call was preflighted under (decision 0045). */
+  accessMode: string | undefined;
 }
 
 interface Turn {
@@ -627,6 +629,7 @@ export class TurnTracer {
       denied: undefined,
       bashPolicy: undefined,
       refused: undefined,
+      accessMode: undefined,
     });
   }
 
@@ -637,6 +640,12 @@ export class TurnTracer {
     if (tool === undefined) return;
     tool.boxId = boxId;
     tool.boxWaitMs += waitMs;
+  }
+
+  /** The access mode the call runs under, read when pi preflighted it (decision 0045). */
+  onAccessMode(toolCallId: string, mode: string): void {
+    const tool = this.#tools.get(toolCallId);
+    if (tool !== undefined) tool.accessMode = mode;
   }
 
   /** The deny-list blocked the call before it reached the box. */
@@ -764,6 +773,8 @@ export class TurnTracer {
         result: capped,
         is_error: isError,
         outcome,
+        // Every tool call, in both modes (decisions 0043, 0045); null if never preflighted.
+        access_mode: tool.accessMode ?? null,
         ...(tool.denied === undefined ? {} : { denied_reason: tool.denied }),
         ...(tool.bashPolicy === undefined
           ? {}

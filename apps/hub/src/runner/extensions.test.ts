@@ -13,7 +13,7 @@ function ext(name: string, version = "1.0.0"): PinnedExtension {
 
 describe("selectExtensions", () => {
   test("the runner's own names are reserved, even when allowlisted at the right version", () => {
-    const names = ["hearth-tools", "codemode", "hearth-trace"];
+    const names = ["hearth-tools", "hearth-access", "codemode", "hearth-trace"];
     expect([...RESERVED_EXTENSION_NAMES].sort()).toEqual([...names].sort());
     const result = selectExtensions(
       names.map((n) => ext(n)),

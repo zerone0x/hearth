@@ -15,7 +15,9 @@
  * hash, and its text on the first call of each prompt version, message count) and its `output` (text, thinking, tool calls with their
  * arguments); `user_input` prompts and every kept text are capped at 16 KiB of
  * UTF-8 with their byte count and sha256. Events written before `/2` project
- * with `request: null` and `output: null`.
+ * with `request: null` and `output: null`. A `tool_call` carries
+ * `access_mode` (`yolo` or `ask`, decision 0045), an added field; calls
+ * recorded before it project with `access_mode: null`.
  *
  * Built at read time, so older sessions get the current projection and the
  * log stays the only source of truth. Payloads were redacted when written.
@@ -202,7 +204,8 @@ export function buildTrajectory(
           kind,
           ...(kind === "model_call"
             ? { request: p["request"] ?? null, output: p["output"] ?? null }
-            : {}),
+            : // Added in /2 (decision 0045): null on calls recorded before the setting.
+              { access_mode: p["access_mode"] ?? null }),
         });
         break;
       }

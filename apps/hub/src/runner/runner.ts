@@ -51,6 +51,8 @@ import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
 import type { CommandRule } from "./bash-policy";
+import { type AccessMode, DEFAULT_ACCESS_MODE } from "../settings/access-mode";
+import { ACCESS_EXTENSION, accessExtension } from "./access";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import { liveToolOutput } from "./live-output";
@@ -80,6 +82,12 @@ export interface SessionRunnerOptions {
   readonly denyList: readonly CompiledDenyRule[];
   /** Compiled command rules for `bash` (decision 0044). Unset: none. */
   readonly commandRules?: readonly CommandRule[];
+  /**
+   * The session's access mode now (decision 0045), read once per tool call and
+   * recorded as `access_mode` on its trajectory record. Unset (tests), the
+   * default `ask`.
+   */
+  readonly accessMode?: () => AccessMode;
   /** Already filtered by the allowlist. */
   readonly extensions?: readonly PinnedExtension[];
   /** pi's codemode tool (decision 0015). Off by default. */
@@ -306,6 +314,15 @@ export class SessionRunner {
     try {
       const settingsManager = SettingsManager.inMemory({});
       const extensionFactories = [
+        // First, so every call has its mode before another handler can block it (0043).
+        {
+          name: ACCESS_EXTENSION,
+          factory: accessExtension({
+            resolve: options.accessMode ?? (() => DEFAULT_ACCESS_MODE),
+            onMode: (toolCallId, mode) =>
+              self?.observe(() => self?.tracer.onAccessMode(toolCallId, mode)),
+          }),
+        },
         {
           name: "hearth-tools",
           factory: hearthToolsExtension({

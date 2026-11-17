@@ -289,6 +289,11 @@ interface HarnessExtra {
   authorizer: Authorizer;
   secrets: SecretStore;
   vault: SessionRunnersOptions["vault"];
+  accessMode: SessionRunnersOptions["accessMode"];
+}
+
+function accessModeOption(accessMode: SessionRunnersOptions["accessMode"]) {
+  return accessMode === undefined ? {} : { accessMode };
 }
 
 function vaultOption(vault: SessionRunnersOptions["vault"]) {
@@ -337,6 +342,7 @@ async function harness(
       boxCwd: root,
       log: () => {},
       ...vaultOption(more.vault ?? extra.vault),
+      ...accessModeOption(more.accessMode ?? extra.accessMode),
     });
     closers.push(() => runners.close());
     return runners;
@@ -794,6 +800,92 @@ describe("approvals", () => {
     await expect(harness({ denyList: [{ tool: "bash", pattern: "(" }] })).rejects.toThrow(
       "bad pattern",
     );
+  });
+});
+
+describe("access mode (decision 0045)", () => {
+  /** The `access_mode` of each `tool_call` step the session recorded, in order. */
+  function modes(h: Harness, sessionId: string) {
+    return h.events
+      .of(sessionId, "runner.step")
+      .map((e) => e.payload as { kind: string; tool_call_id: string; access_mode: unknown })
+      .filter((p) => p.kind === "tool_call")
+      .map((p) => [p.tool_call_id, p.access_mode]);
+  }
+
+  test("each tool call reads the mode once; a change mid-turn applies to the next call", async () => {
+    const mode = new Map<string, "yolo" | "ask">([["se_a", "ask"]]);
+    const reads: string[] = [];
+    const h = await harness(
+      { denyList: [{ tool: "bash", pattern: "rm\\s+-rf", reason: "rm -rf is not allowed here" }] },
+      {
+        accessMode: (sessionId) => {
+          reads.push(sessionId);
+          return mode.get(sessionId) ?? "ask";
+        },
+      },
+    );
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo one" }, "c_1"),
+      // The owner switches the session between two calls of the same turn.
+      () => {
+        mode.set("se_a", "yolo");
+        return call("bash", { command: "echo two" }, "c_2");
+      },
+      // A deny-listed call is blocked by hearth-tools, and still has its mode.
+      call("bash", { command: "rm -rf /workspace" }, "c_3"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(toolResults(runner.messages).map((r) => r.isError)).toEqual([false, false, true]);
+    expect(modes(h, "se_a")).toEqual([
+      ["c_1", "ask"],
+      ["c_2", "yolo"],
+      ["c_3", "yolo"],
+    ]);
+    // Once per call, for this session: never cached across calls.
+    expect(reads).toEqual(["se_a", "se_a", "se_a"]);
+    // The projection carries it too (trajectory /2, an added field).
+    const records = buildTrajectory(h.events.all.get("se_a") ?? [], {
+      sessionId: "se_a",
+      versions: { pi: "test", hub: "test" },
+    }).filter((r) => r["kind"] === "tool_call");
+    expect(records.map((r) => r["access_mode"])).toEqual(["ask", "yolo", "yolo"]);
+  });
+
+  test("a tool call recorded before the setting projects with access_mode null", () => {
+    const records = buildTrajectory(
+      [
+        {
+          workspaceId: "ws_local",
+          sessionId: "se_old",
+          seq: 1,
+          ts: 1,
+          type: "runner.step",
+          payload: { kind: "tool_call", tool_call_id: "c_old", name: "bash", outcome: "ok" },
+        },
+      ],
+      { sessionId: "se_old", versions: { pi: "test", hub: "test" } },
+    ).filter((r) => r["kind"] === "tool_call");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toHaveProperty("access_mode", null);
+  });
+
+  test("a resolver that throws blocks the call (fail-closed) and the box never sees it", async () => {
+    const h = await harness(
+      {},
+      {
+        accessMode: () => {
+          throw new Error("settings unreadable");
+        },
+      },
+    );
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo never" }, "c_x"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results[0]?.isError).toBe(true);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
   });
 });
 
