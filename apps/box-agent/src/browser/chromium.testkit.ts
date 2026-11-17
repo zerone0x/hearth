@@ -28,6 +28,8 @@ export class TestChromium {
         "--headless=new",
         "--no-sandbox",
         "--no-first-run",
+        // As the box entrypoint starts it (decision 0040).
+        "--disable-back-forward-cache",
         "--remote-debugging-address=127.0.0.1",
         `--remote-debugging-port=${this.port}`,
         `--user-data-dir=${this.profile}`,

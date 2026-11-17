@@ -3382,6 +3382,13 @@ how the eval runs in CI without a model key.
 
 ### Consequences
 
+- The first Docker run failed B3: the box's Chromium restored the filtered
+  list from the back-forward cache on Back, which fires no load event, so
+  `browser_back` timed out after 30 s, and the restored page's refs no longer
+  resolved (`Invalid frame in aria-ref selector`). The box entrypoint now
+  starts Chromium with `--disable-back-forward-cache`, as Playwright does
+  for the browsers it launches, so Back loads the page again. The fixture
+  pages are `no-store` too, which was not enough on its own.
 - The scorer does not depend on the script: a real model's run of the same
   prompts scores the same way. That mode (5 runs per model, median and worst,
   as §7 asks) is not built yet; the setup turn is scripted today.

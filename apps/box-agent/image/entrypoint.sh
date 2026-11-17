@@ -90,6 +90,10 @@ chromium_flags=(
   --password-store=basic
   --disable-gpu
   --hide-crash-restore-bubble
+  # A page restored from the back-forward cache fires no load event, so a
+  # Back waits out its timeout, and the restored frame's refs no longer
+  # resolve (found by the browser eval, #119, decision 0040). Back reloads.
+  --disable-back-forward-cache
 )
 # The box is Chromium's sandbox (decisions 0007, 0026): the provider sets this
 # because the boxes' seccomp profile and no-new-privileges leave Chromium's own
