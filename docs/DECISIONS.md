@@ -3651,8 +3651,10 @@ the raw-pattern deny-list, and that an exception in the gate blocks the call.
   64 KiB is not parsed, and one classification has a work budget
   (`MAX_POLICY_STEPS`, 1,000,000 steps: a character parsed, a nested
   script's characters parsed again when its lazy field is read, a node
-  walked, a word checked); past it the verdict is `ask` (`unclear:budget`),
-  and the raw deny-list has already been applied. The worst 64 KiB shapes
+  walked, a word checked); past it the verdict is at least `ask`
+  (`unclear:budget`): the commands already read are still judged, so a
+  readable `git push` before the overflow keeps its `deny`, and the raw
+  deny-list has already been applied. The worst 64 KiB shapes
   known take under 0.3 s. An exception
   from the parser or the walk is a parse error, so the command is one the
   parser cannot read (0043); any other exception in `classifyBash` reaches
@@ -3677,7 +3679,10 @@ the raw-pattern deny-list, and that an exception in the gate blocks the call.
 - **`xargs`.** Words from stdin are added to the command, so a rule's
   `subcommand`, `flags` or `args` test that the written words do not meet is
   `ask` under `xargs` (`echo push | xargs git`); with `-I`/`--replace` any
-  word can be replaced, so a different subcommand is `ask` too.
+  word can be replaced, so a different subcommand is `ask` too, and a shell
+  `-c` string, a wrapper's script (`su -c`, `flock -c`, `watch`, …) or
+  `eval` under `-I`/`-i`/`--replace` is `unclear:script`: xargs puts its
+  input into that string (`echo 'git push' | xargs -I{} sh -c '{}'`).
 - **Rules key on the command, not the string**: `{ name, command[],
   subcommand?, optionsWithValue?, flags?, args?, pipedFrom?, action:
   ask|deny, reason? }`. A one-letter flag matches inside a cluster (`-r` in

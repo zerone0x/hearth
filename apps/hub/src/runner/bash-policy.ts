@@ -867,8 +867,17 @@ const OVER_BUDGET = unclear(
 
 function judgeScript(source: string, ctx: Context): BashVerdict {
   const parsed = parseBash(source, undefined, ctx.budget);
-  if (parsed.exhausted === true) return OVER_BUDGET;
   let verdict = ALLOW;
+  if (parsed.exhausted === true) {
+    // Out of budget: still judge the commands already read, so a readable
+    // `git push` keeps its deny instead of becoming an `ask`.
+    verdict = OVER_BUDGET;
+    const partial = new Scope(parsed);
+    for (const command of parsed.commands) {
+      verdict = stricter(verdict, judgeCommand(command, ctx, partial));
+    }
+    return verdict;
+  }
   if (parsed.errors.length > 0) {
     verdict = unclear("parse-error", `the command did not parse: ${parsed.errors[0]}`);
   }
@@ -920,6 +929,13 @@ function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashV
       unclear("wrapper", `cannot see what ${inner.unclear} runs`, display(inner.words)),
     );
   }
+  if (inner.stdinArgs === "replace" && inner.scripts.length > 0) {
+    // `xargs -I{} su -c {}`: the string is xargs' input, not what is written.
+    return stricter(
+      verdict,
+      unclear("script", "xargs puts its input into a command string", display(command.words)),
+    );
+  }
   for (const script of inner.scripts) {
     const shown = display(command.words);
     verdict = stricter(
@@ -964,6 +980,10 @@ function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashV
   }
   if (name === "source" || name === ".") {
     return stricter(verdict, unclear("script", "runs a script the parser cannot see", shown));
+  }
+  if (inner.stdinArgs === "replace" && (name === "eval" || SHELLS.has(name))) {
+    // `xargs -I{} sh -c '{}'`, `xargs -i eval {}`: the script is xargs' input.
+    return stricter(verdict, unclear("script", "xargs puts its input into a script", shown));
   }
   if (name === "eval") {
     if (args.some((w) => w.value === null)) {

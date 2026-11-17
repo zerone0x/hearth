@@ -96,7 +96,10 @@ again, up to 3 levels. Each simple command is matched against `commandRules`:
 earlier stage of an enclosing pipeline, or a command feeding stdin
 (`sh < <(curl x)`), runs one of those commands. Under `xargs`, words read
 from stdin could hold what `subcommand`, `flags` or `args` look for, so a
-rule that does not match the written words is `ask` (`echo push | xargs git`). The most
+rule that does not match the written words is `ask` (`echo push | xargs git`), and
+with `-I`/`--replace` a shell `-c` string, a wrapper's script or `eval` is `ask` too
+(`xargs -I{} sh -c '{}'`). Past the work budget the commands already read are still
+judged, so a readable `git push` keeps its `deny`. The most
 restrictive result wins: `deny` > `ask` > `allow`. The seed list (`rm -rf`,
 `git push`, `git reset --hard`, `curl | sh`, `dd`, `mkfs`, `chmod -R 777 /`)
 is all `ask`.
