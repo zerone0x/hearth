@@ -1,6 +1,11 @@
 # Hearth PRD
 
-> Status: draft v0.5 · 2026-11-17 · Owner: @zerone0x
+> Status: draft v0.5.1 · 2026-11-17 · Owner: @zerone0x
+
+**What changed in v0.5.1** (decision 0043, issue #152): the access gate
+(§6.5) is a built-in hub extension, not an allowlisted one, and it is loaded in
+both modes: `yolo` skips its `ask` rules, but deny rules still block and the
+mode is recorded on every call. Sections touched: §6.5.
 
 **What changed in v0.5** (decision 0042, issue #148): M3 drops the phone
 channels (PWA, Web Push, Telegram), which move to a new **M6 Anywhere** between
@@ -20,6 +25,8 @@ to M2; image slimming, hibernate polish and resource limits go to v1.0. A new
 
 Changelog:
 
+- v0.5.1 · 2026-11-17 · decision 0043, #152: the access gate is built in
+  and loaded in both modes; `yolo` keeps deny rules.
 - v0.5 · 2026-11-17 · decision 0042, #148: M3 without phone channels; access
   mode `yolo` / `ask`; phone work moves to M6.
 - v0.4 · 2026-11-16 · decision 0030, #106: stage plan by user-visible
@@ -179,7 +186,7 @@ Model calls are made by the runner, in the hub. **The box holds no model credent
 - **P0 (M3)** The owner chooses an **access mode**: `yolo` (the agent runs every tool without asking; today's behaviour) or `ask` (risky actions stop and wait for approve / deny; a timeout denies). A global default lives in Settings and a session can override it. A new install defaults to `ask`.
 - **P0 (M3)** In `ask` mode the risky set is the configurable deny-list of tools and command patterns, matched after bash parsing (#69): for example `git push`, `rm -rf`, a payment page on the desktop, and marked secrets (§6.10).
 - **P0 (M3)** The mode in force is shown on the session and recorded in the trajectory on every tool call; changing the global default or a session's mode is audited.
-- **P0 (M3)** Built on pi, not hand-rolled. pi 1.5.2 has no approval system of its own (its docs/security.md: it does not ask before every tool call), but its extension API has a blocking `tool_call` event (`return { block: true, reason }`, docs/extensions.md). `ask` is a hub-side pi extension on `tool_call` that blocks until the owner decides in the web UI, following pi's example extensions `permission-gate.ts`, `timed-confirm.ts`, `confirm-destructive.ts` and `protected-paths.ts` (`examples/extensions` in `@earendil-works/pi-coding-agent`). `yolo` simply does not load it. The extension goes through the extension allowlist (#56).
+- **P0 (M3)** Built on pi, not hand-rolled. pi 1.5.2 has no approval system of its own (its docs/security.md: it does not ask before every tool call), but its extension API has a blocking `tool_call` event (`return { block: true, reason }`, docs/extensions.md). `ask` is a hub-side pi extension on `tool_call` that blocks until the owner decides in the web UI, following pi's example extensions `permission-gate.ts`, `timed-confirm.ts`, `confirm-destructive.ts` and `protected-paths.ts` (`examples/extensions` in `@earendil-works/pi-coding-agent`). The gate is loaded in both modes (decision 0043): `yolo` skips its `ask` rules, but deny rules still block and the mode is recorded on every call. In `yolo` a bash command the parser cannot read is checked against the raw-pattern deny-list instead. An exception in the gate blocks the call in both modes (fail-closed). The gate is a built-in hub extension under a reserved name, shipped in the repo and reviewed like the rest of the hub, so the extension allowlist (#56), which governs extensions the owner adds, does not apply to it.
 - **P0 (M3)** Approval cards are web-only until M6; their lifecycle is channel-neutral (#71), so Telegram and Web Push reuse it later (§6.6).
 - With the brain in the hub, the gate runs hub-side before a tool call is dispatched to the box: pi's `tool_call` extension event fires before a tool executes and can block it. A denied or timed-out call never reaches the box.
 

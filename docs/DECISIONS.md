@@ -3547,6 +3547,75 @@ in-flight #130 PR.
 - Telegram pairing and the poller lease (§9) apply from M6; the vault key
   needs no owner password because triggers run in M4 and Telegram in M6.
 
+## 0043: The access gate is a built-in loaded in both modes
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #152
+- Supersedes: two points of 0042 ("`yolo` does not load it"; "it goes through
+  the extension allowlist (#56)")
+
+### Context
+
+Decision 0042 (PRD v0.5 §6.5) made `ask` a hub-side pi extension on
+`tool_call` that `yolo` does not load, and sent it through the extension
+allowlist (#56). The M3 research for #152
+(`docs/research/m3-models-access.md`) found both points at odds with the rest
+of §6.5. The mode must be recorded on every tool call, in both modes, and a
+gate that is not loaded records nothing. The config deny-list blocks in every
+session today (decision 0015, `apps/hub/src/runner/tools.ts:342-351`), so a
+`yolo` without the gate would drop deny rules that already apply. And #56's
+allowlist is for extensions the owner adds; it is empty by default, so a gate
+behind it would be off on a new install, which must start in `ask`.
+
+### Decision
+
+- **Loaded in both modes.** The access gate is one `tool_call` handler that
+  runs in `ask` and in `yolo`. In `yolo` it skips the `ask` rules: those calls
+  run at once. `deny` rules still block in both modes, as the config deny-list
+  does today. The mode in force is recorded on every tool call from this one
+  place.
+- **Unparseable commands in `yolo`.** In `ask`, a `bash` command the parser
+  cannot read (a parse error, a non-literal command name, nesting over the
+  limit) asks. In `yolo` that ask would be skipped, so `deny` rules could not
+  match it. Instead the gate falls back to today's raw-pattern deny-list
+  (`apps/hub/src/runner/policy.ts`) for that command: a raw match blocks, no
+  match runs.
+- **Fail-closed.** An exception in the gate blocks the call in both modes (pi:
+  an exception in a `tool_call` handler blocks it, `docs/extensions.md:3253`).
+  This is intended: a broken gate stops tools rather than letting them through
+  unchecked, and the block reason names the error.
+- **A built-in, not an allowlisted extension.** The gate ships in the repo as
+  part of the hub and is registered by the runner under a reserved name, next
+  to `hearth-tools`, `codemode` and `hearth-trace`
+  (`apps/hub/src/runner/extensions.ts`). The extension allowlist (#56) does not
+  apply to it. It is first-party code, reviewed and tested like the rest of the
+  hub; #56 governs extensions the owner adds, which Hearth does not review, and
+  the reserved name keeps an allowlisted extension from shadowing the gate.
+- The rest of 0042 stands: `ask` is built on pi's `tool_call` event, a new
+  install defaults to `ask`, approval cards are web-only until M6.
+
+### Alternatives rejected
+
+- **Literal 0042: `yolo` does not load the gate.** The mode would then be
+  recorded somewhere else for `yolo` calls, and deny rules would need a second
+  handler, or vanish in `yolo`.
+- **Skip unparseable commands in `yolo`.** A command spelled to defeat the
+  parser would then escape deny rules that match it today as raw text.
+- **Fail open on a gate exception in `yolo`.** `yolo` still has deny rules; a
+  bug should not turn them off silently.
+- **Put the gate behind #56.** It would be off on a new install, and the owner
+  would have to allowlist a part of Hearth to get the default mode.
+
+### Consequences
+
+- PRD v0.5.1: §6.5 says the gate runs in both modes, is built in, and falls
+  back to the raw deny-list in `yolo`.
+- The access-mode issues from the research doc carry the tests: deny blocks in
+  `yolo`, an unparseable denied command is blocked in `yolo` by the raw
+  fallback, a gate exception blocks in both modes, and an allowlisted extension
+  cannot take the gate's reserved name.
+
 ## 0044: Bash commands are parsed before the command rules (`unbash`), and only `deny` is enforced until the approval gate
 
 - Date: 2026-11-17
