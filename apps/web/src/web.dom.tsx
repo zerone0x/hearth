@@ -266,6 +266,35 @@ describe("settings page in a DOM", () => {
     );
   });
 
+  // Non-modal (0038), so nothing else stops a stray click from dismissing it (#142).
+  test("the delete confirm stays open after a click outside it; Cancel closes it", async () => {
+    const sent = settingsHub(NONE);
+    renderApp("#/settings");
+    const table = await screen.findByRole("table", { name: "Secrets" });
+    const first = within(table).getAllByTestId("secret-row")[0] as HTMLElement;
+    fireEvent.click(within(first).getByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog");
+    // Radix listens for outside pointer-downs from the next tick on.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    // A whole click on the page behind it: Radix may wait for the click to dismiss.
+    await act(async () => {
+      fireEvent.pointerDown(document.body, { button: 0, pointerType: "mouse" });
+      fireEvent.mouseDown(document.body, { button: 0 });
+      fireEvent.pointerUp(document.body, { button: 0, pointerType: "mouse" });
+      fireEvent.mouseUp(document.body, { button: 0 });
+      fireEvent.click(document.body, { button: 0 });
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(screen.queryByRole("alertdialog")).toBe(confirm);
+    fireEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(sent.filter((c) => c.method === "DELETE")).toHaveLength(0);
+  });
+
   test("the model card saves provider, model and the vault key", async () => {
     const sent = settingsHub({
       ...NONE,
