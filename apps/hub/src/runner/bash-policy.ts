@@ -26,7 +26,14 @@
  * then run, and network calls that do what a rule forbids.
  */
 
-import { type BashWord, parseBash, type SimpleCommand } from "./bash-parse";
+import {
+  type BashWord,
+  type Budget,
+  type ParsedBash,
+  parseBash,
+  type SimpleCommand,
+  type StdinSource,
+} from "./bash-parse";
 import { type CompiledDenyRule, denied } from "./policy";
 
 export type BashAction = "allow" | "ask" | "deny";
@@ -120,44 +127,316 @@ export const DEFAULT_COMMAND_RULES: readonly CommandRule[] = [
 /** Re-parses of `bash -c` / `eval` strings allowed below the top-level command. */
 export const MAX_SHELL_DEPTH = 3;
 
+/**
+ * The work one classification may do, in steps (a character parsed, a
+ * nested script's characters parsed again, a syntax node walked, a word
+ * checked, a command looked at for a pipe). Past it the verdict is `ask`
+ * (`unclear:budget`): the hub's tool_call handler is synchronous. The worst
+ * 64 KiB shapes known take under half of it, and under 300 ms.
+ */
+export const MAX_POLICY_STEPS = 1_000_000;
+
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox-sh"]);
 
-/** A wrapper runs the command in its arguments after its own options. */
+/**
+ * A wrapper runs the command in its arguments after its own options. Options
+ * are read the way getopt does: a short cluster (`-iS'x'`: `-i`, then `-S`
+ * with `x`), a long option or an unambiguous prefix of one (`--us root` is
+ * `--user root`), `--opt=value`, `--` to end them. A long option the table
+ * does not know asks.
+ */
 interface Wrapper {
-  /** Options that take the next word as their value. */
-  readonly withValue?: readonly string[];
+  /** One-letter options that take a value: the rest of the cluster, or the next word. */
+  readonly shortValue?: string;
+  /** One-letter options whose value can only be attached (`xargs -e[EOF]`). */
+  readonly shortOptional?: string;
+  /** Long options with no value, or an optional one after `=`. */
+  readonly long?: readonly string[];
+  /** Long options that take a value: after `=`, or the next word. */
+  readonly longValue?: readonly string[];
+  /**
+   * Options that mean the command is not run (`none`), not knowable (`ask`),
+   * or run by a shell as one string (`shell`: `sudo -s git push` runs
+   * `$SHELL -c 'git push'`; with no command, a shell that reads stdin).
+   */
+  readonly stop?: Readonly<Record<string, "none" | "ask" | "shell">>;
+  /** Options whose value is a shell string, parsed again (`su -c`, `flock -c`). */
+  readonly script?: readonly string[];
   /** Positional words before the command (`timeout DURATION cmd`). */
   readonly positionals?: number;
   /** `NAME=value` words before the command are environment, not the command. */
   readonly assignments?: boolean;
-  /** Options that mean the command is not run, or not knowable: `command -v`, `env -S`. */
-  readonly stop?: Readonly<Record<string, "none" | "ask">>;
+  /**
+   * What the words after the options are: the command (default), files
+   * (`script`), or one user name (`su`); with `files` and `user` options
+   * still count after them.
+   */
+  readonly operands?: "command" | "files" | "user";
+  /** Without a command it runs a shell, which reads stdin (`su`, `chroot DIR`). */
+  readonly shellWhenEmpty?: boolean;
+  /** The words after the options are joined and run by `sh -c` (`watch`). */
+  readonly joinRest?: boolean;
+  /** Appends words read from stdin to the command (`xargs`). */
+  readonly stdinArgs?: boolean;
+  /** What it runs cannot be read from its words (`parallel`): ask. */
+  readonly opaque?: boolean;
+  /** A lone `-` is an option (`env -` is `env -i`). */
+  readonly dashOption?: boolean;
 }
+
+const HELP = { "--help": "none", "--version": "none" } as const;
 
 const WRAPPERS: Readonly<Record<string, Wrapper>> = {
   sudo: {
-    withValue: ["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"],
+    shortValue: "CDghpRrtTUu",
+    long: [
+      "--askpass",
+      "--background",
+      "--bell",
+      "--preserve-env",
+      "--set-home",
+      "--reset-timestamp",
+      "--non-interactive",
+      "--preserve-groups",
+      "--stdin",
+    ],
+    longValue: [
+      "--close-from",
+      "--chdir",
+      "--group",
+      "--host",
+      "--prompt",
+      "--chroot",
+      "--role",
+      "--type",
+      "--command-timeout",
+      "--other-user",
+      "--user",
+    ],
     assignments: true,
-    stop: { "-l": "none", "-v": "none", "-k": "none", "-K": "none", "-e": "ask", "-s": "ask" },
+    stop: {
+      ...HELP,
+      "-l": "none",
+      "--list": "none",
+      "-v": "none",
+      "--validate": "none",
+      "-K": "none",
+      "--remove-timestamp": "none",
+      "-V": "none",
+      "-e": "ask",
+      "--edit": "ask",
+      "-s": "shell",
+      "--shell": "shell",
+      "-i": "shell",
+      "--login": "shell",
+    },
   },
-  doas: { withValue: ["-u", "-C"] },
+  doas: { shortValue: "uC", stop: { "-s": "shell", "-L": "none" } },
   env: {
-    withValue: ["-u", "--unset", "-C", "--chdir"],
+    shortValue: "uCa",
+    long: [
+      "--ignore-environment",
+      "--null",
+      "--debug",
+      "--block-signal",
+      "--default-signal",
+      "--ignore-signal",
+      "--list-signal-handling",
+    ],
+    longValue: ["--unset", "--chdir", "--argv0"],
     assignments: true,
-    stop: { "-S": "ask", "--split-string": "ask" },
+    stop: { ...HELP, "-S": "ask", "--split-string": "ask" },
+    dashOption: true,
   },
-  timeout: { withValue: ["-s", "--signal", "-k", "--kill-after"], positionals: 1 },
-  nice: { withValue: ["-n", "--adjustment"] },
-  ionice: { withValue: ["-c", "-n", "-p", "-P", "-u"] },
-  nohup: {},
-  time: { withValue: ["-f", "--format", "-o", "--output"] },
-  stdbuf: { withValue: ["-i", "-o", "-e"] },
+  timeout: {
+    shortValue: "sk",
+    long: ["--foreground", "--preserve-status", "--verbose"],
+    longValue: ["--signal", "--kill-after"],
+    stop: HELP,
+    positionals: 1,
+  },
+  nice: { shortValue: "n", longValue: ["--adjustment"], stop: HELP },
+  ionice: {
+    shortValue: "cnpPu",
+    long: ["--ignore"],
+    longValue: ["--class", "--classdata", "--pid", "--pgid", "--uid"],
+    stop: HELP,
+  },
+  nohup: { stop: HELP },
+  time: {
+    shortValue: "fo",
+    long: ["--append", "--portability", "--verbose", "--quiet"],
+    longValue: ["--format", "--output"],
+    stop: HELP,
+  },
+  stdbuf: { shortValue: "ioe", longValue: ["--input", "--output", "--error"], stop: HELP },
   builtin: {},
   command: { stop: { "-v": "none", "-V": "none" } },
-  exec: { withValue: ["-a"] },
+  exec: { shortValue: "a" },
   xargs: {
-    withValue: ["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--arg-file", "--delimiter"],
+    shortValue: "adEILnPs",
+    shortOptional: "eil",
+    long: [
+      "--null",
+      "--interactive",
+      "--no-run-if-empty",
+      "--open-tty",
+      "--exit",
+      "--verbose",
+      "--show-limits",
+      "--eof",
+      "--replace",
+      "--max-lines",
+    ],
+    longValue: [
+      "--arg-file",
+      "--delimiter",
+      "--max-args",
+      "--max-chars",
+      "--max-procs",
+      "--process-slot-var",
+    ],
+    stop: HELP,
+    stdinArgs: true,
   },
+  setsid: { long: ["--ctty", "--fork", "--wait"], stop: HELP },
+  chroot: {
+    long: ["--skip-chdir"],
+    longValue: ["--userspec", "--groups"],
+    stop: HELP,
+    positionals: 1,
+    shellWhenEmpty: true,
+  },
+  flock: {
+    shortValue: "wE",
+    long: [
+      "--shared",
+      "--exclusive",
+      "--unlock",
+      "--nonblock",
+      "--nb",
+      "--close",
+      "--no-fork",
+      "--verbose",
+    ],
+    longValue: ["--timeout", "--wait", "--conflict-exit-code"],
+    script: ["-c", "--command"],
+    stop: HELP,
+    positionals: 1,
+  },
+  taskset: {
+    long: ["--all-tasks", "--cpu-list"],
+    stop: { ...HELP, "-p": "none", "--pid": "none" },
+    positionals: 1,
+  },
+  strace: {
+    shortValue: "abeEIoOpPsSuUX",
+    long: [
+      "--follow-forks",
+      "--output-separately",
+      "--summary-only",
+      "--summary",
+      "--no-abbrev",
+      "--verbose",
+      "--quiet",
+      "--silent",
+      "--decode-fds",
+      "--decode-pids",
+      "--absolute-timestamps",
+      "--relative-timestamps",
+      "--syscall-times",
+      "--instruction-pointer",
+      "--stack-trace",
+      "--seccomp-bpf",
+      "--daemonize",
+      "--debug",
+      "--timestamps",
+    ],
+    longValue: [
+      "--attach",
+      "--output",
+      "--expr",
+      "--trace",
+      "--trace-path",
+      "--trace-fds",
+      "--signal",
+      "--status",
+      "--string-limit",
+      "--summary-sort-by",
+      "--summary-columns",
+      "--user",
+      "--env",
+      "--columns",
+      "--const-print-style",
+      "--abbrev",
+      "--raw",
+      "--read",
+      "--write",
+      "--inject",
+      "--fault",
+      "--detach-on",
+    ],
+    stop: HELP,
+  },
+  watch: {
+    shortValue: "nq",
+    long: [
+      "--beep",
+      "--color",
+      "--no-color",
+      "--differences",
+      "--errexit",
+      "--chgexit",
+      "--precise",
+      "--no-title",
+      "--no-wrap",
+      "--exec",
+      "--no-rerun",
+    ],
+    longValue: ["--interval", "--equexit"],
+    stop: HELP,
+    joinRest: true,
+  },
+  unbuffer: {},
+  // `busybox rm -rf /x` runs the applet `rm`; `busybox --list` runs nothing.
+  busybox: { stop: { ...HELP, "--list": "none", "--list-full": "none", "--install": "none" } },
+  su: {
+    shortValue: "gGsw",
+    long: ["--login", "--preserve-environment", "--pty", "--fast"],
+    longValue: ["--group", "--supp-group", "--shell", "--whitelist-environment"],
+    script: ["-c", "--command", "--session-command"],
+    stop: HELP,
+    operands: "user",
+    shellWhenEmpty: true,
+  },
+  runuser: {
+    shortValue: "gGsuw",
+    long: ["--login", "--preserve-environment", "--pty", "--fast"],
+    longValue: ["--group", "--supp-group", "--shell", "--user", "--whitelist-environment"],
+    script: ["-c", "--command", "--session-command"],
+    stop: HELP,
+    operands: "user",
+    shellWhenEmpty: true,
+  },
+  script: {
+    shortValue: "BEImOoT",
+    shortOptional: "t",
+    long: ["--append", "--return", "--flush", "--force", "--quiet", "--timing"],
+    longValue: [
+      "--log-io",
+      "--echo",
+      "--log-in",
+      "--logging-format",
+      "--log-out",
+      "--output-limit",
+      "--log-timing",
+    ],
+    script: ["-c", "--command"],
+    stop: HELP,
+    operands: "files",
+    shellWhenEmpty: true,
+  },
+  parallel: { opaque: true },
 };
 
 /** What the policy decided about one `bash` command. */
@@ -243,12 +522,23 @@ function optionWords(args: readonly BashWord[]): { options: string[]; unknown: b
   return { options, unknown };
 }
 
-/** `option` is present: exactly, or a one-letter short option inside a cluster (`-r` in `-fr`). */
+/**
+ * `option` is present: exactly; a one-letter short option inside a cluster
+ * (`-r` in `-fr`); a long option with `=value`, or a prefix of it, as GNU
+ * getopt reads one (`--rec` is `--recursive`). Every prefix counts, ambiguous
+ * ones too: the rule does not know the command's other options, and erring
+ * strict is the safe side.
+ */
 function hasOption(options: readonly string[], option: string): boolean {
   const letter = /^-[^-]$/.test(option) ? option.slice(1) : undefined;
-  return options.some(
-    (o) => o === option || (letter !== undefined && !o.startsWith("--") && o.includes(letter)),
-  );
+  const long = option.startsWith("--");
+  return options.some((o) => {
+    if (o === option) return true;
+    if (!o.startsWith("--")) return letter !== undefined && o.includes(letter);
+    if (!long) return false;
+    const name = o.includes("=") ? o.slice(0, o.indexOf("=")) : o;
+    return name.length > 2 && option.startsWith(name);
+  });
 }
 
 /**
@@ -273,31 +563,109 @@ function subcommandOf(
     });
 }
 
-function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): Match {
+/** What one parsed script knows about its commands, computed once per script. */
+class Scope {
+  readonly #names: (string | null | undefined)[] = [];
+  readonly #prefix = new Map<CommandRule, Int32Array>();
+  readonly #sources = new Map<StdinSource, Map<CommandRule, boolean>>();
+
+  constructor(
+    readonly parsed: ParsedBash,
+    readonly budget: Budget,
+  ) {}
+
+  /** The basename of what a command runs once unwrapped; `null` when not a literal. */
+  #name(index: number): string | null {
+    let name = this.#names[index];
+    if (name === undefined) {
+      name = runName((this.parsed.commands[index] as SimpleCommand).words);
+      this.#names[index] = name;
+    }
+    return name;
+  }
+
+  /**
+   * An earlier stage of a pipeline the command is in, or a command feeding
+   * its stdin, runs one of `rule.pipedFrom`. Linear: a prefix count per rule
+   * over the script's commands answers each pipeline range in O(1).
+   */
+  pipedFrom(rule: CommandRule, from: readonly string[], command: SimpleCommand): boolean {
+    let prefix = this.#prefix.get(rule);
+    if (prefix === undefined) {
+      const n = this.parsed.commands.length;
+      this.budget.steps -= n;
+      prefix = new Int32Array(n + 1);
+      for (let i = 0; i < n; i++) {
+        const name = this.#name(i);
+        prefix[i + 1] = (prefix[i] as number) + (name !== null && nameMatches(from, name) ? 1 : 0);
+      }
+      this.#prefix.set(rule, prefix);
+    }
+    for (const [start, end] of command.upstream) {
+      if ((prefix[end] as number) > (prefix[start] as number)) return true;
+    }
+    const source = command.stdin;
+    if (source === undefined) return false;
+    let hits = this.#sources.get(source);
+    if (hits === undefined) {
+      hits = new Map();
+      this.#sources.set(source, hits);
+    }
+    let hit = hits.get(rule);
+    if (hit === undefined) {
+      this.budget.steps -= source.commands.length;
+      hit = source.commands.some((words) => {
+        const name = runName(words);
+        return name !== null && nameMatches(from, name);
+      });
+      hits.set(rule, hit);
+    }
+    return hit;
+  }
+}
+
+function runName(words: readonly BashWord[]): string | null {
+  const head = unwrap(words).words[0]?.value;
+  return typeof head === "string" ? basename(head) : null;
+}
+
+function ruleMatches(
+  rule: CommandRule,
+  words: readonly BashWord[],
+  name: string,
+  command: SimpleCommand,
+  scope: Scope,
+  stdinArgs: StdinArgs,
+): Match {
   if (!nameMatches(rule.command, name)) return "no";
-  const args = command.words.slice(1);
+  const args = words.slice(1);
   const results: Match[] = [];
+  // `echo push | xargs git`: words from stdin may hold what an argument test looks for.
+  const notSeen: Match = stdinArgs === "none" ? "no" : "unknown";
   if (rule.subcommand !== undefined) {
     const sub = subcommandOf(args, new Set(rule.optionsWithValue ?? []));
-    results.push(sub === null ? "unknown" : sub === rule.subcommand ? "yes" : "no");
+    results.push(
+      sub === null
+        ? "unknown"
+        : sub === rule.subcommand
+          ? "yes"
+          : sub === undefined || stdinArgs === "replace"
+            ? notSeen
+            : "no",
+    );
   }
   if (rule.flags !== undefined) {
     const { options, unknown } = optionWords(args);
     const all = rule.flags.every((group) => group.some((option) => hasOption(options, option)));
-    results.push(all ? "yes" : unknown ? "unknown" : "no");
+    results.push(all ? "yes" : unknown ? "unknown" : notSeen);
   }
   if (rule.args !== undefined) {
     const literal = new Set(args.map((w) => w.value).filter((v): v is string => v !== null));
     const all = rule.args.every((a) => literal.has(a));
-    results.push(all ? "yes" : args.some((w) => w.value === null) ? "unknown" : "no");
+    results.push(all ? "yes" : args.some((w) => w.value === null) ? "unknown" : notSeen);
   }
   if (rule.pipedFrom !== undefined) {
-    const from = rule.pipedFrom;
-    const piped = command.upstream.some((stage) => {
-      const n = unwrap(stage).words[0]?.value;
-      return typeof n === "string" && nameMatches(from, basename(n));
-    });
-    results.push(piped ? "yes" : "no");
+    results.push(scope.pipedFrom(rule, rule.pipedFrom, command) ? "yes" : "no");
   }
   if (results.includes("no")) return "no";
   return results.includes("unknown") ? "unknown" : "yes";
@@ -306,40 +674,174 @@ function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): M
 interface Unwrapped {
   /** The command that runs; empty when nothing does (`command -v git`, `xargs` alone). */
   readonly words: readonly BashWord[];
-  /** Set when a wrapper option hides what runs (`env -S`, `sudo -s`). */
+  /** Set when a wrapper option hides what runs (`env -S`, `sudo -s`, `parallel`). */
   readonly unclear?: string;
+  /** Shell strings a wrapper runs (`su -c`, `flock -c`, `watch`'s joined words). */
+  readonly scripts: readonly BashWord[];
+  /** A wrapper runs a shell that reads stdin (`su` with no `-c`). */
+  readonly shell: boolean;
+  /**
+   * `xargs` adds words from stdin to the command: after its words
+   * (`append`), or in place of a word (`replace`, with `-I`).
+   */
+  readonly stdinArgs: StdinArgs;
 }
 
-/** Strips wrappers until the command that runs; `VAR=x` words of `env`/`sudo` too. */
+type StdinArgs = "none" | "append" | "replace";
+
+interface OptionRead {
+  readonly stop?: "none" | "ask" | "shell";
+  /** The next word is this option's value. */
+  readonly takesNext: boolean;
+  /** The option's value is a shell string: attached, or the next word when `takesNext`. */
+  readonly script?: string | null;
+  /** A long option the wrapper does not know. */
+  readonly unknown?: boolean;
+}
+
+function longOptions(wrapper: Wrapper): string[] {
+  return [
+    ...(wrapper.long ?? []),
+    ...(wrapper.longValue ?? []),
+    ...(wrapper.script ?? []).filter((o) => o.startsWith("--")),
+    ...Object.keys(wrapper.stop ?? {}).filter((o) => o.startsWith("--")),
+  ];
+}
+
+/** Reads one option word of a wrapper, getopt style. */
+function readOption(wrapper: Wrapper, value: string): OptionRead {
+  if (value.startsWith("--")) {
+    const eq = value.indexOf("=");
+    const given = eq === -1 ? value : value.slice(0, eq);
+    const known = longOptions(wrapper);
+    let option = known.find((o) => o === given);
+    if (option === undefined) {
+      const candidates = known.filter((o) => given.length > 2 && o.startsWith(given));
+      if (candidates.length !== 1) return { takesNext: false, unknown: true };
+      option = candidates[0] as string;
+    }
+    const stop = wrapper.stop?.[option];
+    if (stop !== undefined) return { stop, takesNext: false };
+    if (wrapper.script?.includes(option)) {
+      return eq === -1
+        ? { takesNext: true, script: null }
+        : { takesNext: false, script: value.slice(eq + 1) };
+    }
+    return { takesNext: eq === -1 && (wrapper.longValue ?? []).includes(option) };
+  }
+  // A cluster: `-iS'x'` is `-i` then `-S` with `x`; `-su root` is `-s`, then `-u root`.
+  let shell: { stop?: "shell" } = {};
+  for (let j = 1; j < value.length; j++) {
+    const letter = value[j] as string;
+    const stop = wrapper.stop?.[`-${letter}`];
+    if (stop === "shell") {
+      shell = { stop: "shell" };
+      continue;
+    }
+    if (stop !== undefined) return { stop, takesNext: false };
+    const attached = value.slice(j + 1);
+    if (wrapper.script?.includes(`-${letter}`)) {
+      return attached === ""
+        ? { ...shell, takesNext: true, script: null }
+        : { ...shell, takesNext: false, script: attached };
+    }
+    if ((wrapper.shortValue ?? "").includes(letter))
+      return { ...shell, takesNext: attached === "" };
+    if ((wrapper.shortOptional ?? "").includes(letter)) break;
+  }
+  return { ...shell, takesNext: false };
+}
+
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** Strips wrappers until the command that runs; `VAR=x` words of `env`/`sudo` too. Linear. */
 function unwrap(words: readonly BashWord[]): Unwrapped {
-  let rest = words;
+  let start = 0;
+  let stdinArgs: StdinArgs = "none";
+  const scripts: BashWord[] = [];
+  const result = (rest: readonly BashWord[], extra: Partial<Unwrapped> = {}): Unwrapped => ({
+    words: rest,
+    scripts,
+    shell: false,
+    stdinArgs,
+    ...extra,
+  });
   for (;;) {
-    const head = rest[0]?.value;
-    if (typeof head !== "string") return { words: rest };
+    const head = words[start]?.value;
+    if (typeof head !== "string") return result(words.slice(start));
     const wrapper = WRAPPERS[basename(head)];
-    if (wrapper === undefined) return { words: rest };
-    const withValue = new Set(wrapper.withValue ?? []);
-    let i = 1;
+    if (wrapper === undefined) return result(words.slice(start));
+    const rest = words.slice(start);
+    if (wrapper.opaque === true) return result(rest, { unclear: head });
+    if (wrapper.stdinArgs === true && stdinArgs === "none") stdinArgs = "append";
+    const operands = wrapper.operands ?? "command";
     let positionals = wrapper.positionals ?? 0;
-    for (; i < rest.length; i++) {
-      const value = (rest[i] as BashWord).value;
-      if (value === null) break;
-      if (isOption(value)) {
-        const stop = wrapper.stop?.[value];
-        if (stop === "none") return { words: [] };
-        if (stop === "ask") return { words: rest, unclear: `${head} ${value}` };
-        if (withValue.has(value)) i++;
+    let user = false;
+    let options = true;
+    let viaShell = false;
+    let i = start + 1;
+    for (; i < words.length; i++) {
+      const word = words[i] as BashWord;
+      const value = word.value;
+      if (value === null) {
+        if (operands === "command") break;
+        return result(rest, { unclear: `${head} ${word.text}` });
+      }
+      if (options && isOption(value)) {
+        if (value === "--") {
+          options = false;
+          continue;
+        }
+        const read = readOption(wrapper, value);
+        if (read.unknown === true || read.stop === "ask") {
+          return result(rest, { unclear: `${head} ${value}` });
+        }
+        if (read.stop === "none") return result([]);
+        // `xargs -I {}`, `-i`, `--replace`: stdin words replace any word.
+        if (wrapper.stdinArgs === true && /^(-[^-]*[Ii]|--rep)/.test(value)) stdinArgs = "replace";
+        if (read.stop === "shell") viaShell = true;
+        if (read.script !== undefined) {
+          const script = read.takesNext ? words[i + 1] : { value: read.script, text: value };
+          if (script !== undefined) scripts.push(script);
+        }
+        if (read.takesNext) i++;
         continue;
       }
-      if (wrapper.assignments === true && /^[A-Za-z_][A-Za-z0-9_]*=/.test(value)) continue;
+      if (wrapper.dashOption === true && options && value === "-") continue;
+      if (wrapper.assignments === true && options && ASSIGNMENT.test(value)) continue;
       if (positionals > 0) {
         positionals--;
         continue;
       }
+      if (operands === "files") continue;
+      if (operands === "user") {
+        if (value === "-" || !user) {
+          user ||= value !== "-";
+          continue;
+        }
+        return result(rest, { unclear: `${head} with arguments for its shell` });
+      }
       break;
     }
+    if (operands !== "command") {
+      return result([], { shell: scripts.length === 0 && wrapper.shellWhenEmpty === true });
+    }
+    if (wrapper.joinRest === true || viaShell) {
+      const joined = words.slice(i);
+      if (joined.length > 0) {
+        const literal = joined.every((w) => w.value !== null);
+        scripts.push({
+          value: literal ? joined.map((w) => w.value).join(" ") : null,
+          text: joined.map((w) => w.text).join(" "),
+        });
+      }
+      return result([], { shell: viaShell && joined.length === 0 });
+    }
+    if (i >= words.length && scripts.length === 0 && wrapper.shellWhenEmpty === true) {
+      return result([], { shell: true });
+    }
     // `xargs` alone runs `echo`; `env` alone prints; `nohup` alone fails.
-    rest = rest.slice(i);
+    start = i;
   }
 }
 
@@ -365,6 +867,7 @@ interface Context {
   readonly rules: readonly CommandRule[];
   readonly raw: readonly CompiledDenyRule[];
   readonly depth: number;
+  readonly budget: Budget;
 }
 
 function unclear(why: string, reason: string, command?: string): BashVerdict {
@@ -376,14 +879,22 @@ function unclear(why: string, reason: string, command?: string): BashVerdict {
   };
 }
 
+const OVER_BUDGET = unclear(
+  "budget",
+  `the command is too large to check (over ${MAX_POLICY_STEPS} steps)`,
+);
+
 function judgeScript(source: string, ctx: Context): BashVerdict {
-  const parsed = parseBash(source);
+  const parsed = parseBash(source, undefined, ctx.budget);
+  if (parsed.exhausted === true) return OVER_BUDGET;
   let verdict = ALLOW;
   if (parsed.errors.length > 0) {
     verdict = unclear("parse-error", `the command did not parse: ${parsed.errors[0]}`);
   }
+  const scope = new Scope(parsed, ctx.budget);
   for (const command of parsed.commands) {
-    verdict = stricter(verdict, judgeCommand(command, ctx));
+    verdict = stricter(verdict, judgeCommand(command, ctx, scope));
+    if (ctx.budget.steps < 0) return stricter(verdict, OVER_BUDGET);
   }
   return verdict;
 }
@@ -400,25 +911,60 @@ function rawDeny(words: readonly BashWord[], ctx: Context): BashVerdict | undefi
   };
 }
 
-function judgeCommand(command: SimpleCommand, ctx: Context): BashVerdict {
+/** `git -c alias.p=push p`, `git --config-env=alias.p=VAR p`: an inline alias. */
+function gitInlineAlias(args: readonly BashWord[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const value = (args[i] as BashWord).value;
+    if (value === null) return false;
+    if (!isOption(value)) return false;
+    let config: string | null | undefined;
+    if (value === "-c" || value === "--config-env") config = args[++i]?.value;
+    else if (value.startsWith("--config-env=")) config = value.slice("--config-env=".length);
+    else if (value.startsWith("-c")) config = value.slice(2);
+    else if (GIT_OPTIONS_WITH_VALUE.includes(value)) i++;
+    if (config === null || (config !== undefined && /^alias\./i.test(config))) return true;
+  }
+  return false;
+}
+
+function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashVerdict {
+  ctx.budget.steps -= command.words.length + ctx.rules.length;
   // The command as written, before unwrapping, also meets the raw patterns.
   let verdict = rawDeny(command.words, ctx) ?? ALLOW;
   const inner = unwrap(command.words);
   const words = inner.words;
+  if (inner.unclear !== undefined) {
+    return stricter(
+      verdict,
+      unclear("wrapper", `cannot see what ${inner.unclear} runs`, display(inner.words)),
+    );
+  }
+  for (const script of inner.scripts) {
+    const shown = display(command.words);
+    verdict = stricter(
+      verdict,
+      script.value === null
+        ? unclear("shell", "a wrapper's shell string is not a literal", shown)
+        : nested(script.value, ctx, shown),
+    );
+  }
+  const readsStdin = command.piped || command.stdin !== undefined || inner.stdinArgs !== "none";
+  if (inner.shell && readsStdin) {
+    return stricter(
+      verdict,
+      unclear("script", "a shell runs a script the parser cannot see", display(command.words)),
+    );
+  }
   if (words.length === 0) return verdict;
   const shown = display(words);
-  if (inner.unclear !== undefined) {
-    return stricter(verdict, unclear("wrapper", `cannot see what ${inner.unclear} runs`, shown));
-  }
   verdict = stricter(verdict, rawDeny(words, ctx) ?? ALLOW);
   const head = words[0]?.value;
   if (head === null || head === undefined) {
     return stricter(verdict, unclear("name", "the command name is not a literal", shown));
   }
   const name = basename(head);
-  const unwrapped: SimpleCommand = { words, upstream: command.upstream };
   for (const rule of ctx.rules) {
-    const match = ruleMatches(rule, unwrapped, name);
+    const match = ruleMatches(rule, words, name, command, scope, inner.stdinArgs);
     if (match === "no") continue;
     const action: BashAction = match === "yes" ? rule.action : "ask";
     verdict = stricter(verdict, {
@@ -432,7 +978,7 @@ function judgeCommand(command: SimpleCommand, ctx: Context): BashVerdict {
     });
   }
   const args = words.slice(1);
-  if (name === "alias") {
+  if (name === "alias" || (name === "git" && gitInlineAlias(args))) {
     return stricter(verdict, unclear("alias", "an alias can rename any command", shown));
   }
   if (name === "source" || name === ".") {
@@ -450,8 +996,9 @@ function judgeCommand(command: SimpleCommand, ctx: Context): BashVerdict {
       return stricter(verdict, unclear("shell", "a shell option is not a literal", shown));
     }
     if (index === -1) {
+      // A script file, a pipe, a redirect, a here-doc or here-string, xargs' words: unseen.
       const reads = args.some((w) => w.value !== null && !w.value.startsWith("-"));
-      if (reads || command.upstream.length > 0) {
+      if (reads || readsStdin) {
         return stricter(
           verdict,
           unclear("script", "a shell runs a script the parser cannot see", shown),
@@ -480,14 +1027,16 @@ function nested(source: string, ctx: Context, shown: string): BashVerdict {
 /**
  * The verdict for one `bash` command: `rules` are the compiled command rules,
  * `raw` the config's raw-pattern deny-list (only its `bash` and `*` rules apply).
+ * `steps` is the work budget (tests).
  */
 export function classifyBash(
   command: string,
   rules: readonly CommandRule[],
   raw: readonly CompiledDenyRule[] = [],
+  steps: number = MAX_POLICY_STEPS,
 ): BashVerdict {
-  const ctx: Context = { rules, raw, depth: 0 };
-  // The raw string first, as before #69: it is the fallback when parsing fails.
+  const ctx: Context = { rules, raw, depth: 0, budget: { steps } };
+  // The raw string first, as before #69: it is the fallback when parsing fails or runs out.
   const whole = denied(raw, "bash", { command });
   if (whole !== undefined) {
     return { action: "deny", rule: `raw:${raw.indexOf(whole)}`, reason: whole.reason };

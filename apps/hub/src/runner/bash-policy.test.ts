@@ -72,7 +72,8 @@ const HOSTILE: ReadonlyArray<readonly [string, string, "ask" | "allow", string]>
   // malformed
   ["malformed", 'echo "oops', "ask", "unclear:parse-error"],
   ["malformed", "git status )", "ask", "unclear:parse-error"],
-  ["malformed", DEEP, "ask", "unclear:parse-error"],
+  // Each of the 3,000 levels is parsed again when read: the work budget runs out first.
+  ["malformed", DEEP, "ask", "unclear:budget"],
 ];
 
 describe("the 36 hostile samples (research #153, question 2)", () => {
@@ -223,7 +224,7 @@ describe("wrappers are stripped with their options", () => {
     ["env", "allow none"],
     // Cannot tell what runs.
     ["env -S 'git push'", "ask unclear:wrapper"],
-    ["sudo -s git push", "ask unclear:wrapper"],
+    ["sudo -e /etc/hosts git push", "ask unclear:wrapper"],
     ["sudo $cmd push", "ask unclear:name"],
     ["timeout 5 $cmd", "ask unclear:name"],
   ];

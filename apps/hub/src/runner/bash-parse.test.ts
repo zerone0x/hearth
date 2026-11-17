@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { type ParsedScript, parse } from "unbash";
-import { MAX_COMMAND_BYTES, parseBash } from "./bash-parse";
+import { MAX_COMMAND_BYTES, parseBash, upstreamCommands } from "./bash-parse";
 
 /** The literal word lists of every simple command, `null` for a non-literal word. */
 function words(source: string): (string | null)[][] {
@@ -95,7 +95,7 @@ describe("parseBash: words", () => {
     const parsed = parseBash("curl -s x | sudo sh -s | tee $(cat y)");
     const upstream = parsed.commands.map((c) => [
       c.words[0]?.value,
-      c.upstream.map((s) => s[0]?.value),
+      upstreamCommands(parsed, c).map((s) => s.words[0]?.value),
     ]);
     expect(upstream).toEqual([
       ["curl", []],
@@ -104,7 +104,10 @@ describe("parseBash: words", () => {
       ["cat", []],
     ]);
     // `&&` is a list, not a pipe.
-    expect(parseBash("curl -s x > f && sh").commands.map((c) => c.upstream)).toEqual([[], []]);
+    expect(parseBash("curl -s x > f && sh").commands.map((c) => [c.upstream, c.piped])).toEqual([
+      [[], false],
+      [[], false],
+    ]);
   });
 });
 
@@ -168,7 +171,15 @@ describe("parseBash: a parser failure is a parse error, not a throw", () => {
       value: "$(x)",
       parts: [{ type: "CommandExpansion", ...at, text: "$(x)", script: undefined }],
     };
-    const command = { type: "Command", ...at, name, prefix: [], suffix: [], args: [] };
+    const command = {
+      type: "Command",
+      ...at,
+      name,
+      prefix: [],
+      suffix: [],
+      args: [],
+      redirects: [],
+    };
     const parsed = parseBash("x", () => script(command));
     expect(parsed.errors).toEqual(["unparsed substitution: $(x)"]);
     expect(parsed.commands.map((c) => c.words.map((w) => w.value))).toEqual([[null]]);
