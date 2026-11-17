@@ -29,6 +29,8 @@ export class LocalBoxProvider implements BoxNetworkProvider {
   constructor(
     readonly workspace: string,
     readonly vncPort: number,
+    /** More box environment, such as `HEARTH_CDP_PORT` of a test Chromium. */
+    readonly env: Readonly<Record<string, string>> = {},
   ) {}
 
   #info(boxId: BoxId): BoxInfo | undefined {
@@ -67,6 +69,7 @@ export class LocalBoxProvider implements BoxNetworkProvider {
       env: {
         PATH: process.env["PATH"] ?? "/usr/bin:/bin",
         ...boot.env,
+        ...this.env,
         HEARTH_WORKSPACE: this.workspace,
         HEARTH_VNC_PORT: String(this.vncPort),
       },
