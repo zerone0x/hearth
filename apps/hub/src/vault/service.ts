@@ -371,6 +371,7 @@ export class HubVault implements VaultReader {
           }),
       );
       this.#registerFields(fields);
+      this.#log(`vault: secret ${name} added (${kind}, ${fingerprint})`);
       return { id: binding.id, fingerprint, version: 1 };
     });
   }
@@ -416,6 +417,9 @@ export class HubVault implements VaultReader {
         },
       );
       this.#registerFields(fields);
+      this.#log(
+        `vault: secret ${row.name} rotated to version ${binding.version} (${row.fingerprint} -> ${fingerprint})`,
+      );
       return { fingerprint, version: binding.version };
     });
   }
@@ -434,6 +438,7 @@ export class HubVault implements VaultReader {
         }),
         () => this.#o.store.remove(this.#workspaceId, id),
       );
+      this.#log(`vault: secret ${row.name} deleted (${row.kind}, ${row.fingerprint})`);
     });
   }
 

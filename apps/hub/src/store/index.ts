@@ -27,6 +27,7 @@ export {
   type SessionRow,
   SqliteSessionStore,
 } from "./sessions";
+export { type SettingRow, SqliteSettingStore } from "./setting-store";
 export {
   type SecretUseRow,
   SqliteVaultStore,

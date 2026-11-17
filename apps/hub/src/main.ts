@@ -69,18 +69,27 @@ export function runnerConfigFromEnv(
     throw new Error("HEARTH_MODEL_PROVIDER must be set when HEARTH_MODEL is");
   }
   const keyRef = env["HEARTH_MODEL_KEY_REF"];
-  const modelsFile = env["HEARTH_MODELS_FILE"];
-  if (modelsFile !== undefined && modelsFile !== "") {
-    if (!isAbsolute(modelsFile) || !statSync(modelsFile, { throwIfNoEntry: false })?.isFile()) {
-      throw new Error(`HEARTH_MODELS_FILE must be an absolute path to a file, got "${modelsFile}"`);
-    }
-  }
   return {
     provider,
     model,
     ...(keyRef ? { apiKeyRef: keyRef } : {}),
-    ...(modelsFile ? { modelsFile } : {}),
+    ...modelsFileFromEnv(env),
   };
+}
+
+/**
+ * `HEARTH_MODELS_FILE` (decision 0020), also without `HEARTH_MODEL`: a model
+ * chosen on the Settings page (decision 0038) can come from it.
+ */
+export function modelsFileFromEnv(env: Readonly<Record<string, string | undefined>>): {
+  modelsFile?: string;
+} {
+  const modelsFile = env["HEARTH_MODELS_FILE"];
+  if (modelsFile === undefined || modelsFile === "") return {};
+  if (!isAbsolute(modelsFile) || !statSync(modelsFile, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`HEARTH_MODELS_FILE must be an absolute path to a file, got "${modelsFile}"`);
+  }
+  return { modelsFile };
 }
 
 /** Where `bun run --filter @hearth/web build` puts the UI, relative to this file. */
@@ -158,14 +167,12 @@ if (import.meta.main) {
   const secrets = createDefaultSecretStore();
   await registerStartupSecrets(secrets, runnerConfig, log);
   const hub = startHub({
-    ...(runnerConfig === undefined
-      ? {}
-      : {
-          runner: {
-            config: runnerConfig,
-            telemetry: obs.telemetry,
-          },
-        }),
+    // Always a runner: without HEARTH_MODEL the Settings page picks the model
+    // (decision 0038), and a message before that fails with `runner.no-model`.
+    runner: {
+      config: runnerConfig ?? modelsFileFromEnv(process.env),
+      telemetry: obs.telemetry,
+    },
     // The vault's key is read through the env:/file: store (decision 0031).
     vault: { ...vaultConfigFromEnv(process.env), keySecrets: secrets },
     hostname: process.env["HEARTH_HOST"] || DEFAULT_HOSTNAME,
