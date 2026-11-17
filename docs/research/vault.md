@@ -56,7 +56,7 @@ code written for this note; they are not committed.
   edits it, and backs it up apart from the volume. The hub reads it through the
   SecretStore (`HEARTH_VAULT_KEY_REF=file:/run/secrets/vault_key`). It wraps one
   data key; the database alone, or a backup of the volume, decrypts nothing.
-  No owner password in the key path: triggers and Telegram (M3, M4) must run
+  No owner password in the key path: triggers and Telegram (M4, M6) must run
   while nobody is logged in.
 - **OpenBao (owner's suggestion) is the right enterprise backend, not the M2
   default.** It is MPL-2.0, active, and fits E7 cleanly. Plain HTTP from Bun is
