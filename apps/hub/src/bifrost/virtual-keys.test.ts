@@ -18,7 +18,9 @@ import {
   DEFAULT_WORKSPACE_ID,
   HearthError,
   LOCAL_PRINCIPAL,
+  type Principal,
 } from "@hearth/core";
+import { RequestBody } from "../request-body";
 import { gatewayRefusal } from "../runner/runner";
 import { type Hub, startHub } from "../server";
 import { BifrostClient, checkAllowlist, DEFAULT_SESSION_BUDGET_USD, virtualKeyBody } from ".";
@@ -215,11 +217,21 @@ async function eventsOf(hub: Hub, sessionId: string) {
   return (await hub.events.read({ workspaceId: DEFAULT_WORKSPACE_ID }, sessionId, 0, 1000)).events;
 }
 
+const FOREIGN = Object.freeze({
+  id: "pr_foreign",
+  workspaceId: "ws_other",
+  kind: "user",
+  displayName: "foreign",
+}) as Principal;
+
 describe("the allowlist and the VK body", () => {
   test("an empty allowlist is refused (empty means none), and nothing is sent", async () => {
     expect(() => checkAllowlist([])).toThrow(HearthError);
     expect(() => checkAllowlist(["*"])).toThrow(HearthError);
     expect(() => checkAllowlist([""])).toThrow(HearthError);
+    // Every entry is checked, not only the first.
+    expect(() => checkAllowlist(["gpt-4o-mini", "*"])).toThrow(HearthError);
+    expect(() => checkAllowlist(["gpt-4o-mini", "  "])).toThrow(HearthError);
     expect(checkAllowlist(["gpt-4o-mini", "gpt-4o-mini"])).toEqual(["gpt-4o-mini"]);
     const seen: string[] = [];
     const client = new BifrostClient({
@@ -430,5 +442,29 @@ describe("per-session virtual keys", () => {
     expect(auditActions("settings.session_budget").map((r) => JSON.parse(r.detail))).toEqual([
       { budget_usd: 12.5, previous: 5, previous_source: "default" },
     ]);
+  });
+
+  test("a foreign principal can neither read nor save the session budget", async () => {
+    const { hub, fake } = start();
+    await hub.bifrostReady;
+    await hub.settingsReady;
+    const s = await hub.sessions.create(LOCAL_PRINCIPAL, { title: "a" });
+    await turn(hub, s.id, "hi");
+    const before = fake.bodies.length;
+    let read = false;
+    const body = new RequestBody(async () => {
+      read = true;
+      return { budgetUsd: 1 };
+    });
+    await expect(hub.virtualKeys.putBudget(FOREIGN, body)).rejects.toMatchObject({
+      code: "authz.denied",
+    });
+    await expect(hub.virtualKeys.getBudget(FOREIGN)).rejects.toMatchObject({
+      code: "authz.denied",
+    });
+    expect(read).toBe(false);
+    expect(fake.bodies.length).toBe(before);
+    expect(auditActions("settings.session_budget")).toEqual([]);
+    expect(hub.virtualKeys.budget()).toMatchObject({ budgetUsd: 5, source: "default" });
   });
 });
