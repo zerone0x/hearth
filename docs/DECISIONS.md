@@ -4115,9 +4115,9 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   form: raw, URL-encoded, JSON-escaped) before the request, so no event, row,
   list or trajectory holds a secret the tool step would hide. The parser's
   display can requote or split a word (an unquoted `&` in a value), leaving a
-  piece of a secret that whole-value redaction misses, so when the command
-  holds a secret the shown parts come from the redacted command, parsed again
-  (`shownVerdict`).
+  piece of a secret that whole-value redaction misses, so the shown parts
+  come from the redacted command, parsed again (`shownVerdict`); if that reads
+  as another rule, the redacted whole command stands in for the part.
   It ends once, as `approval.approved | denied | expired | cancelled |
   interrupted`, each audited (`approval.<verb>`) and logged before the call is
   released; the row leaves `pending` with a conditional UPDATE. Every end but

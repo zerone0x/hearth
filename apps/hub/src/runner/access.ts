@@ -159,9 +159,10 @@ export function gateVerdict(
  * What the card shows for `verdict`, redacted. The parser's display of the
  * matched part (`summary`, and a `reason` that quotes it) can requote or
  * split a word, so a secret in it may no longer be whole and whole-value
- * redaction could miss a piece. When the command holds a secret, the shown
- * parts are taken from the redacted command, parsed again; if that reads as
- * another rule, the redacted whole command stands in for the part.
+ * redaction could miss a piece. So the shown parts are taken from the
+ * redacted command, parsed again (the same verdict when it holds no secret);
+ * if that reads as another rule, the redacted whole command stands in for the
+ * part.
  */
 export function shownVerdict(
   verdict: GateVerdict,
@@ -172,9 +173,6 @@ export function shownVerdict(
   redact: (text: string) => string,
 ): Pick<GateVerdict, "summary" | "command" | "reason"> {
   const command = redact(verdict.command);
-  if (command === verdict.command) {
-    return { summary: redact(verdict.summary), command, reason: redact(verdict.reason) };
-  }
   const again = gateVerdict(toolName, { ...(input as object), command }, commandRules, denyList);
   const same = again.rule === verdict.rule;
   return {
