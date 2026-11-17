@@ -4,7 +4,7 @@ import { describeBoxAgent } from "./agent";
 
 describe("describeBoxAgent", () => {
   test("reports the protocol version", () => {
-    expect(describeBoxAgent().protocol).toBe("1.4");
+    expect(describeBoxAgent().protocol).toBe("1.5");
   });
 
   test("reports the installed pi version, which matches the pin", () => {
@@ -23,7 +23,7 @@ describe("describeBoxAgent", () => {
     const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
     clearTimeout(timer);
     expect(code).toBe(2);
-    expect(err).toContain("hearth box-agent (protocol 1.4, pi ");
+    expect(err).toContain("hearth box-agent (protocol 1.5, pi ");
     expect(err).toContain("HEARTH_HUB_URL and HEARTH_BOX_ID must be set");
   });
 });

@@ -354,4 +354,16 @@ describe("secretStart", () => {
     // A longer secret that starts with a shorter one holds the shorter back.
     expect(secretStart("k abc", ["abc", "abcdef"])).toBe(2);
   });
+
+  test("holds back the start of a URL-encoded secret, with hex in either case", () => {
+    const secret = "pw d/q&x";
+    // encodeURIComponent: pw%20d%2Fq%26x; form-urlencoded: pw+d%2Fq%26x.
+    expect(secretStart("u=pw%20d%2", [secret])).toBe(2);
+    expect(secretStart("u=pw%20d%2f", [secret])).toBe(2);
+    expect(secretStart("u=pw+d%2Fq", [secret])).toBe(2);
+    // encodeURI keeps `/` and `&`: pw%20d/q&x.
+    expect(secretStart("u=pw%20d/q", [secret])).toBe(2);
+    // A tail that differs after the escape is not held.
+    expect(secretStart("u=pw%20dX", [secret])).toBe(9);
+  });
 });

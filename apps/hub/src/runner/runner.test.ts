@@ -20,9 +20,11 @@ import {
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
+  AllowAllAuthorizer,
   type AppendResult,
   type Authorizer,
   type BlobRef,
+  createDefaultSecretStore,
   DEFAULT_WORKSPACE_ID,
   type EventPage,
   type EventStore,
@@ -44,8 +46,15 @@ import { ToolRpcClient } from "../box/tool-rpc";
 import { missingImageText } from "../obs/blobs";
 import { buildTrajectory, toJsonl } from "../obs/trajectory";
 import type { BoxLease, SessionView } from "../session/manager";
-import { openDatabase, SqliteBlobStore, SqliteLoginStore } from "../store";
-import { BROWSER_TOOLS, NO_BROWSER_IN_BOX } from "./browser-tools";
+import {
+  openDatabase,
+  SqliteAuditSink,
+  SqliteBlobStore,
+  SqliteLoginStore,
+  SqliteVaultStore,
+} from "../store";
+import { HubVault } from "../vault";
+import { BROWSER_TOOLS, NO_BROWSER_IN_BOX, NO_VAULT_FOR_FILL } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import {
   compileDenyList,
@@ -263,6 +272,11 @@ interface HarnessExtra {
   availableExtensions: PinnedExtension[];
   authorizer: Authorizer;
   secrets: SecretStore;
+  vault: SessionRunnersOptions["vault"];
+}
+
+function vaultOption(vault: SessionRunnersOptions["vault"]) {
+  return vault === undefined ? {} : { vault };
 }
 
 async function harness(
@@ -306,6 +320,7 @@ async function harness(
       availableExtensions: more.availableExtensions ?? extra.availableExtensions ?? [],
       boxCwd: root,
       log: () => {},
+      ...vaultOption(more.vault ?? extra.vault),
     });
     closers.push(() => runners.close());
     return runners;
@@ -1353,6 +1368,35 @@ describe("model key redaction (review of #63)", () => {
     }
   });
 
+  test("a provider error that echoes the key URL-encoded is redacted in every form", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const odd = "sk-ant/odd key+&=9f8e";
+    const store: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(odd) };
+    const runners = await keyedRunners(h, logs, h.rpc, store);
+    const encoded = [
+      encodeURIComponent(odd),
+      encodeURIComponent(odd).replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase()),
+      new URLSearchParams({ k: odd }).toString().slice(2),
+      encodeURI(odd),
+    ];
+    h.faux.setResponses([
+      () => {
+        throw new Error(`401 for ${encoded.map((form) => `?key=${form}`).join(" ")}`);
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    const stored = JSON.stringify([...h.events.all.values()]);
+    expect(stored).toContain("401 for ?key=");
+    for (const text of [stored, logs.join("\n"), JSON.stringify(runner.messages)]) {
+      for (const form of [odd, ...encoded]) expect(text).not.toContain(form);
+      expect(text).not.toContain("sk-ant%2Fodd");
+      expect(text).not.toContain("sk-ant%2fodd");
+    }
+  });
+
   test("a hub log line that names the key is redacted", async () => {
     const h = await harness();
     const logs: string[] = [];
@@ -1818,5 +1862,231 @@ describe("redactSecrets (vault rework)", () => {
   test("a value that overlaps its own next occurrence is redacted as one span", () => {
     expect(redactSecrets("x ababab y", ["abab"])).toBe(`x ${REDACTED} y`);
     expect(redactSecrets("pw=aaaa", ["aaa"])).toBe(`pw=${REDACTED}`);
+  });
+});
+
+describe("browser_fill (decision 0039)", () => {
+  /** Distinctive: the redaction registry is process-wide. */
+  const PASSWORD = "fill-test-pw-7d41c0e9";
+  const USERNAME = "fill-test-user-2b8f";
+  const ORIGIN = "https://login.example";
+
+  /** A real vault on a temp SQLite file with one login bound to ORIGIN. */
+  async function vaultWith(policy: Record<string, unknown> = { origins: [ORIGIN] }) {
+    const dir = workspace();
+    const db = openDatabase(join(dir, "hub.db"));
+    closers.push(() => db.close());
+    const audit = new SqliteAuditSink(db);
+    const vault = new HubVault({
+      store: new SqliteVaultStore(db),
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({
+        env: { VAULT_KEY: Buffer.alloc(32, 0x5c).toString("base64") },
+      }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+    });
+    await vault.open();
+    const { id } = await vault.create(LOCAL_PRINCIPAL, {
+      name: "site",
+      kind: "login",
+      policy,
+      fields: { username: USERNAME, password: PASSWORD },
+    });
+    return { vault, id };
+  }
+
+  /** A sign-in page whose snapshot shows what the password field holds, as a careless page might. */
+  function signIn(driver: FakeDriver, url = `${ORIGIN}/signin`) {
+    const tab = driver.first;
+    tab.navigate(url, "Sign in");
+    tab.targets.set("e2", { field: "username" });
+    tab.targets.set("e3", { field: "password" });
+    Object.defineProperty(tab, "snapshotText", {
+      get: () =>
+        `- generic [ref=e1]:\n  - textbox "User" [ref=e2]\n  - textbox "Password" [ref=e3]: ${tab.targets.get("e3")?.value ?? ""}`,
+    });
+    return tab;
+  }
+
+  const fill = (ref: string, secret: string, id = "c_fill") =>
+    call("browser_fill", { ref, element: "Password", secret }, id);
+
+  function resultsOf(runner: { messages: readonly unknown[] }) {
+    return new Map(toolResults(runner.messages).map((r) => [r.id, r]));
+  }
+
+  test("the value reaches only the box: not the model, the events or a screenshot unmasked", async () => {
+    const driver = new FakeDriver();
+    const tab = signIn(driver);
+    const { vault, id } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    // Something in the box that prints the value (a page dump, a CDP read).
+    writeFileSync(join(h.root, "dump.txt"), `field=${PASSWORD}\n`);
+    const runner = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e3", "vault:site#password"),
+      call("browser_snapshot", {}, "c_snap2"),
+      call("browser_screenshot", {}, "c_shot"),
+      call("bash", { command: "cat dump.txt" }, "c_bash"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const r = resultsOf(runner);
+    expect(r.get("c_fill")?.isError).toBe(false);
+    expect(r.get("c_fill")?.text).toContain('"outcome":"done"');
+    // The box filled it, marked first, and masked it in the screenshot.
+    expect(tab.actions).toContain(`fill e3 ${PASSWORD}`);
+    expect(tab.actions.indexOf("mark e3")).toBeLessThan(tab.actions.indexOf(`fill e3 ${PASSWORD}`));
+    expect(tab.actions).toContain("screenshot q70 masks=e3");
+    // Only the browser.fill frame carried it, with the policy's origins and the field kinds.
+    const carrying = h.boxes.sent.filter((f) => JSON.stringify(f).includes(PASSWORD));
+    expect(carrying.map((f) => f.method)).toEqual(["browser.fill"]);
+    expect(carrying[0]?.params).toMatchObject({
+      ref: "s1e3",
+      value: PASSWORD,
+      origins: [ORIGIN],
+      fields: ["password"],
+    });
+    const fieldFrame = h.boxes.sent.find((f) => f.method === "browser.field");
+    expect(fieldFrame?.params).toMatchObject({ ref: "s1e3" });
+    // The model never read it: not in the fill result, a later snapshot, or bash output.
+    expect(JSON.stringify(runner.messages)).not.toContain(PASSWORD);
+    expect(r.get("c_bash")?.text).toContain("field=[redacted]");
+    expect(r.get("c_snap2")?.text).toContain("[redacted]");
+    // Nor any event of the session.
+    expect(JSON.stringify(h.events.all.get("se_a") ?? [])).not.toContain(PASSWORD);
+    // The use was audited before it was handed out, with the origin the box reported.
+    const uses = await vault.uses(LOCAL_PRINCIPAL, id);
+    expect(uses).toHaveLength(1);
+    expect(uses[0]?.detail).toMatchObject({
+      field: "password",
+      origin: ORIGIN,
+      session_id: "se_a",
+      tool: "browser_fill",
+      tool_call_id: "c_fill",
+    });
+  });
+
+  test("a page on another origin: refused before the value is resolved or sent", async () => {
+    const driver = new FakeDriver();
+    const tab = signIn(driver, "https://evil.example/signin");
+    const { vault, id } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e3", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = resultsOf(runner).get("c_fill");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("vault.origin-mismatch");
+    expect(h.boxes.sent.some((f) => f.method === "browser.fill")).toBe(false);
+    expect(tab.actions.some((a) => a.startsWith("fill"))).toBe(false);
+    expect(await vault.uses(LOCAL_PRINCIPAL, id)).toHaveLength(0);
+  });
+
+  test("a field of the wrong kind is refused in the hub; allow_any_field lets it through", async () => {
+    const driver = new FakeDriver();
+    const tab = signIn(driver);
+    const { vault } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e2", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = resultsOf(runner).get("c_fill");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("browser.field-mismatch");
+    expect(h.boxes.sent.some((f) => f.method === "browser.fill")).toBe(false);
+    expect(tab.actions.some((a) => a.startsWith("fill"))).toBe(false);
+
+    const anyDriver = new FakeDriver();
+    const anyTab = signIn(anyDriver);
+    const any = await vaultWith({ origins: [ORIGIN], allow_any_field: true });
+    const h2 = await harness({}, { vault: any.vault }, anyDriver);
+    const ok = await turn(h2, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e2", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(resultsOf(ok).get("c_fill")?.isError).toBe(false);
+    expect(h2.boxes.sent.find((f) => f.method === "browser.fill")?.params).toMatchObject({
+      fields: [],
+    });
+    expect(anyTab.actions).toContain(`fill e2 ${PASSWORD}`);
+  });
+
+  test("the username goes only into a username field", async () => {
+    const driver = new FakeDriver();
+    const tab = signIn(driver);
+    const { vault } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e2", "vault:site#username"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(resultsOf(runner).get("c_fill")?.isError).toBe(false);
+    expect(tab.actions).toContain(`fill e2 ${USERNAME}`);
+    expect(h.boxes.sent.find((f) => f.method === "browser.fill")?.params).toMatchObject({
+      fields: ["username"],
+    });
+    expect(JSON.stringify(runner.messages)).not.toContain(USERNAME);
+  });
+
+  test("a value instead of a reference is refused without being echoed; no box call", async () => {
+    const driver = new FakeDriver();
+    signIn(driver);
+    const { vault } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      fill("s1e3", "plain-typed-guess-99"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = resultsOf(runner).get("c_fill");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("secret.malformed-ref");
+    expect(result?.text).not.toContain("plain-typed-guess-99");
+    expect(h.boxes.sent.some((f) => f.method.startsWith("browser."))).toBe(false);
+  });
+
+  test("without a vault the tool refuses", async () => {
+    const driver = new FakeDriver();
+    signIn(driver);
+    const h = await harness({}, {}, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      fill("s1e3", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = resultsOf(runner).get("c_fill");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain(NO_VAULT_FOR_FILL);
+  });
+
+  test("a token is not a login: refused by kind", async () => {
+    const driver = new FakeDriver();
+    const tab = signIn(driver);
+    const { vault } = await vaultWith();
+    await vault.create(LOCAL_PRINCIPAL, {
+      name: "api",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: "fill-test-token-5e" },
+    });
+    const h = await harness({}, { vault }, driver);
+    const runner = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e3", "vault:api"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = resultsOf(runner).get("c_fill");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("vault.kind-mismatch");
+    // The vault refused it (the runner asks for logins only), not the tool after a hand-out.
+    expect(result?.text).toContain("a token entry cannot be used here");
+    expect(tab.actions.some((a) => a.startsWith("fill"))).toBe(false);
   });
 });

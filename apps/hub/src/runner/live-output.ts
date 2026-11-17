@@ -9,8 +9,8 @@
  *   tool result goes through. A secret can arrive split across chunks, so
  *   text is only emitted up to a line break (or, for a long line, up to
  *   `holdChars` before its end), never past the start of a tail that could
- *   begin a secret (`secretStart`: a proper prefix of one, raw or
- *   JSON-escaped, however long the secret and whatever line breaks it holds),
+ *   begin a secret (`secretStart`: a proper prefix of one, raw, JSON-escaped
+ *   or URL-encoded, however long the secret and whatever line breaks it holds),
  *   and only where redacting the emitted part alone gives the same text as
  *   redacting it with what follows. The held back tail waits for the next
  *   chunk; whatever is held back when the call ends is never emitted (the
