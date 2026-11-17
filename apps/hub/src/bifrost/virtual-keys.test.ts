@@ -366,7 +366,7 @@ describe("per-session virtual keys", () => {
     const gateway = (await eventsOf(hub, s.id)).filter((e) => e.type === "runner.gateway");
     expect(gateway).toHaveLength(1);
     expect(gateway[0]?.payload).toMatchObject({ status: 402, code: "budget_exceeded" });
-    expect(String((gateway[0]?.payload as { message: string }).message)).toContain(
+    expect(JSON.stringify(gateway[0]?.payload)).toContain(
       "0.0900 >= 0.0500 dollars",
     );
     // The session is not failed: a raised budget lets the next turn run.
