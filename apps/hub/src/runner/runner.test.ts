@@ -1230,6 +1230,35 @@ describe("model key redaction (review of #63)", () => {
     }
   });
 
+  test("a provider error that echoes the key URL-encoded is redacted in every form", async () => {
+    const h = await harness();
+    const logs: string[] = [];
+    const odd = "sk-ant/odd key+&=9f8e";
+    const store: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(odd) };
+    const runners = await keyedRunners(h, logs, h.rpc, store);
+    const encoded = [
+      encodeURIComponent(odd),
+      encodeURIComponent(odd).replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase()),
+      new URLSearchParams({ k: odd }).toString().slice(2),
+      encodeURI(odd),
+    ];
+    h.faux.setResponses([
+      () => {
+        throw new Error(`401 for ${encoded.map((form) => `?key=${form}`).join(" ")}`);
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    const stored = JSON.stringify([...h.events.all.values()]);
+    expect(stored).toContain("401 for ?key=");
+    for (const text of [stored, logs.join("\n"), JSON.stringify(runner.messages)]) {
+      for (const form of [odd, ...encoded]) expect(text).not.toContain(form);
+      expect(text).not.toContain("sk-ant%2Fodd");
+      expect(text).not.toContain("sk-ant%2fodd");
+    }
+  });
+
   test("a hub log line that names the key is redacted", async () => {
     const h = await harness();
     const logs: string[] = [];

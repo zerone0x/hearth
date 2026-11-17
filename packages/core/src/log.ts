@@ -40,12 +40,58 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
- * `text` with every occurrence of every value, raw and JSON-escaped, replaced
- * by `mask`. All occurrences of all values are found in the original text
- * first, and each run of overlapping or touching matches becomes one `mask`.
- * Replacing value by value would let one value cut another: with a username
- * `admin` replaced before the password `admin-pw-tail`, the tail `-pw-tail`
- * would stay. The order of `secrets` does not matter.
+ * The text forms in which `secret` is matched: raw, JSON-escaped (inside a
+ * JSON string), and URL-encoded three ways: `encodeURIComponent`, the
+ * form-urlencoded form a GET form submit puts in a URL (`+` for a space, as
+ * `URLSearchParams` writes it), and `encodeURI`. A form that equals one
+ * already listed is left out, so a plain `abc123` has one form. A value no
+ * encoder takes (a lone surrogate) keeps its other forms.
+ */
+export function secretForms(secret: string): string[] {
+  const forms = new Set<string>([secret, JSON.stringify(secret).slice(1, -1)]);
+  let component: string;
+  try {
+    component = encodeURIComponent(secret);
+  } catch {
+    // URIError: a lone surrogate has no URL-encoded form.
+    return [...forms];
+  }
+  forms.add(component);
+  forms.add(new URLSearchParams({ v: secret }).toString().slice(2));
+  forms.add(encodeURI(secret));
+  return [...forms];
+}
+
+/**
+ * A global regex that finds `form`, with each `%XX` escape matched in either
+ * case of its hex digits (`%2f` and `%2F`); every other character is literal.
+ */
+function formPattern(form: string): RegExp {
+  let source = "";
+  for (const part of form.split(/(%[0-9A-Fa-f]{2})/)) {
+    if (/^%[0-9A-Fa-f]{2}$/.test(part)) {
+      source += `%${hexClass(part.charAt(1))}${hexClass(part.charAt(2))}`;
+    } else {
+      source += part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(source, "g");
+}
+
+function hexClass(digit: string): string {
+  const lower = digit.toLowerCase();
+  const upper = digit.toUpperCase();
+  return lower === upper ? digit : `[${lower}${upper}]`;
+}
+
+/**
+ * `text` with every occurrence of every value, in each of its forms
+ * (`secretForms`: raw, JSON-escaped, URL-encoded), replaced by `mask`. All
+ * occurrences of all values are found in the original text first, and each
+ * run of overlapping or touching matches becomes one `mask`. Replacing value
+ * by value would let one value cut another: with a username `admin` replaced
+ * before the password `admin-pw-tail`, the tail `-pw-tail` would stay. The
+ * order of `secrets` does not matter.
  */
 export function redactValues(
   text: string,
@@ -55,13 +101,20 @@ export function redactValues(
   const needles = new Set<string>();
   for (const secret of secrets) {
     if (secret.length === 0) continue;
-    needles.add(secret);
-    needles.add(JSON.stringify(secret).slice(1, -1));
+    for (const form of secretForms(secret)) needles.add(form);
   }
   const spans: Array<readonly [number, number]> = [];
   for (const needle of needles) {
-    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
-      spans.push([at, at + needle.length]);
+    if (!needle.includes("%")) {
+      for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
+        spans.push([at, at + needle.length]);
+      }
+      continue;
+    }
+    const pattern = formPattern(needle);
+    for (let found = pattern.exec(text); found !== null; found = pattern.exec(text)) {
+      spans.push([found.index, found.index + found[0].length]);
+      pattern.lastIndex = found.index + 1;
     }
   }
   const first = spans.sort((a, b) => a[0] - b[0])[0];
@@ -82,7 +135,7 @@ export function redactValues(
   return out + text.slice(written, start) + mask + text.slice(end);
 }
 
-/** Replace every known secret value, raw and JSON-escaped, and every credential shape. */
+/** Replace every known secret value, in each of its forms (`secretForms`), and every credential shape. */
 export function redactLine(line: string, secrets: Iterable<string> = []): string {
   let out = redactValues(line, secrets);
   for (const pattern of SECRET_PATTERNS) {

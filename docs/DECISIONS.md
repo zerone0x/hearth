@@ -3190,6 +3190,13 @@ field's value, and left screenshots unmasked.
   it, scrubs the fill result and error, and scrubs the text of every later
   tool result of the session, whatever the tool, before the model reads it.
   The vault's registration (0031) covers events, logs and the trajectory.
+  Every scrub (box, hub, vault, model key, live output) is the shared
+  `redactValues`/`secretStart` of `@hearth/core`, which matches each value in
+  these text forms only: raw, JSON-escaped, and URL-encoded
+  (`encodeURIComponent`, form-urlencoded with `+` for a space as a GET form
+  submit writes it, and `encodeURI`), with `%XX` hex in either case. A GET
+  form that carries the value into the URL is therefore scrubbed in the fill
+  result, `browser.tabs` and snapshots.
 - **Masks.** The box marks the element before the fill: a
   `data-hearth-mask` attribute with a fresh token, and an element handle it
   keeps. Every screenshot masks each element with the attribute in every
@@ -3203,6 +3210,13 @@ field's value, and left screenshots unmasked.
 
 ### Consequences
 
+- Known limit of "never echoed": string scrubbing finds only the forms
+  above. A page that transforms the value (base64, a hash, another encoding
+  or charset, a substring) and shows it gets it to the model unscrubbed, and
+  a page that draws the value outside the filled field (a "hello
+  <username>" heading, a canvas) shows it in screenshot pixels, since only
+  the filled elements are masked. Neither is caught; a page under the owner's
+  allowed origins is trusted not to do this.
 - The value enters the box's Chromium and nothing else the model reads. Any
   box command can still read it over CDP (0026: CDP has no auth): the box is
   the trust domain the owner accepted, as the research says.

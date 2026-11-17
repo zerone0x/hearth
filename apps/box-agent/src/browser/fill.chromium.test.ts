@@ -6,6 +6,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { LOG_REDACTED } from "@hearth/core";
 import { ToolCallError } from "../tools/errors";
 import { TestChromium } from "./chromium.testkit";
 import { PlaywrightDriver } from "./playwright";
@@ -26,9 +27,20 @@ function pages(frameOrigin: string): Record<string, string> {
 <div id="black" role="img" aria-label="Black" style="${BOX};background:#000"></div>
 <button onclick="document.getElementById('pw').remove()">Remove</button>
 <button onclick="document.getElementById('pw').removeAttribute('data-hearth-mask')">Strip</button>
-<iframe src="${frameOrigin}/inner" style="width:400px;height:80px"></iframe>`,
-    "/inner": `<!doctype html><title>Inner</title><label>Framed <input type="password"></label>`,
+<iframe src="${frameOrigin}/inner" style="width:400px;height:120px"></iframe>`,
+    "/inner": `<!doctype html><title>Inner</title>
+<input type="password" aria-label="Framed" style="${BOX};outline:none;background:#fff;color:#000;font-size:30px">
+<div role="img" aria-label="Framed black" style="${BOX};background:#000"></div>`,
     "/plain": `<!doctype html><title>Plain</title><p>after</p>`,
+    "/getform": `<!doctype html><title>Get</title><form action="/landing" method="get">
+<label>User <input name="u" autocomplete="username"></label>
+<label>Password <input name="p" type="password"></label><button>Go</button></form>`,
+    "/landing": `<!doctype html><title>Landing</title><p>landed</p>`,
+    "/kinds": `<!doctype html><title>Kinds</title>
+<label>Comment <input id="comment"></label>
+<label>Notes <textarea id="notes"></textarea></label>
+<div role="textbox" aria-label="Rich" contenteditable="true"></div>
+<label>Remember <input type="checkbox"></label>`,
   };
 }
 
@@ -186,5 +198,91 @@ describe.skipIf(chromiumPath === "")("browser_fill on a real Chromium", () => {
     expect(createHash("sha256").update(Buffer.from(after.data, "base64")).digest("hex")).toBe(
       after.sha256,
     );
+  });
+  test("a plain input, a textarea and a contenteditable are other, not a login field", async () => {
+    await tools.run("browser.navigate", { callId: "c", url: `${base}/kinds` });
+    const snap = (await tools.run("browser.snapshot", { callId: "c" })).snapshot.text;
+    const field = async (line: RegExp) =>
+      (await tools.run("browser.field", { callId: "f", ref: refOf(snap, line) })).field;
+    expect(await field(/textbox "Comment"/)).toBe("other");
+    expect(await field(/textbox "Notes"/)).toBe("other");
+    expect(await field(/textbox "Rich"/)).toBe("other");
+    expect(await field(/checkbox "Remember"/)).toBe("none");
+    // vault:x#username never lands in a comment box, #password never in a textarea.
+    for (const [line, kind] of [
+      [/textbox "Comment"/, "username"],
+      [/textbox "Comment"/, "password"],
+      [/textbox "Notes"/, "password"],
+      [/textbox "Rich"/, "username"],
+    ] as const) {
+      const error = await refusal(
+        tools.run("browser.fill", {
+          callId: "c",
+          ref: refOf(snap, line),
+          element: "field",
+          value: SECRET,
+          origins: [base],
+          fields: [kind],
+        }),
+      );
+      expect(error.code).toBe("browser.field-mismatch");
+    }
+  });
+
+  test("a field filled inside an allowed iframe is masked in screenshots", async () => {
+    let snap = await open();
+    const frameOrigin = `http://localhost:${server.port}`;
+    const filled = await tools.run("browser.fill", {
+      callId: "c",
+      ref: refOf(snap, /textbox "Framed"/),
+      element: "Framed",
+      value: SECRET,
+      origins: [frameOrigin],
+      fields: ["password"],
+    });
+    expect(filled.ok).toBe(true);
+    snap = filled.snapshot?.text ?? "";
+    const shot = async (ref: string) =>
+      (await tools.run("browser.screenshot", { callId: "s", ref })).sha256;
+    // The framed field's pixels are a black box, like the black box beside it.
+    expect(await shot(refOf(snap, /textbox "Framed"/))).toBe(
+      await shot(refOf(snap, /img "Framed black"/)),
+    );
+  });
+
+  test("a GET form submit does not leak the value URL-encoded", async () => {
+    const value = 'Pw d!@#x9&"q';
+    const forms = [
+      new URLSearchParams({ p: value }).toString().slice(2),
+      encodeURIComponent(value),
+      encodeURI(value),
+    ];
+    await tools.run("browser.navigate", { callId: "c", url: `${base}/getform` });
+    const snap = (await tools.run("browser.snapshot", { callId: "c" })).snapshot.text;
+    const filled = await tools.run("browser.fill", {
+      callId: "c",
+      ref: refOf(snap, /textbox "Password"/),
+      element: "Password",
+      value,
+      origins: [base],
+      fields: ["password"],
+      submit: true,
+    });
+    expect(filled.ok).toBe(true);
+    let tabs = "";
+    for (let i = 0; i < 50; i++) {
+      tabs = JSON.stringify(await tools.run("browser.tabs", { callId: "c", action: "list" }));
+      if (tabs.includes("/landing?")) break;
+      await Bun.sleep(100);
+    }
+    // The page did submit: the URL carries the field, its value redacted.
+    expect(tabs).toContain(`/landing?u=&p=${LOG_REDACTED}`);
+    const after = (await tools.run("browser.snapshot", { callId: "c" })).snapshot.text;
+    expect(after).toContain("landed");
+    for (const text of [JSON.stringify(filled), tabs, after]) {
+      expect(text).not.toContain(value);
+      for (const form of forms) expect(text).not.toContain(form);
+      expect(text).not.toContain("Pw+d");
+    }
   });
 });
