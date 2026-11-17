@@ -204,6 +204,16 @@ describe("each checker reads the trajectory, not the model", () => {
       "B1",
       /final URL is .*\/b1\/login, not \/b1\/profile/,
     );
+    // A URL that does not parse is no path, not a crash.
+    expectOnlyFails(
+      edited((records) => {
+        for (const r of toolCalls(records, "B1")) {
+          setText(r, textOf(r).replaceAll(/"url":"[^"]*"/g, '"url":"not a url"'));
+        }
+      }),
+      "B1",
+      /final URL is not a url, not \/b1\/profile/,
+    );
   });
 
   test("B1: no server record, hashes missing on both shots, or a second unmasked shot fail", () => {

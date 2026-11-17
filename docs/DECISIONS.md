@@ -3390,5 +3390,5 @@ how the eval runs in CI without a model key.
   not from the reference.
 - The hub's credential-shape redaction can cut a JSON escape in half when it
   runs over a dumped JSONL line (a `token = sha(f"...` in tool arguments
-  broke the line), so the fixture script avoids such text. A fix of the
-  redaction is a separate issue.
+  broke the line), so the fixture script avoids such text. The fix of the
+  redaction is #144.
