@@ -527,11 +527,9 @@ function optionWords(args: readonly BashWord[]): { options: string[]; unknown: b
  */
 function hasOption(options: readonly string[], option: string): boolean {
   const letter = /^-[^-]$/.test(option) ? option.slice(1) : undefined;
-  const long = option.startsWith("--");
   return options.some((o) => {
     if (o === option) return true;
     if (!o.startsWith("--")) return letter !== undefined && o.includes(letter);
-    if (!long) return false;
     const name = o.includes("=") ? o.slice(0, o.indexOf("=")) : o;
     return name.length > 2 && option.startsWith(name);
   });
@@ -561,24 +559,10 @@ function subcommandOf(
 
 /** What one parsed script knows about its commands, computed once per script. */
 class Scope {
-  readonly #names: (string | null | undefined)[] = [];
   readonly #prefix = new Map<CommandRule, Int32Array>();
   readonly #sources = new Map<StdinSource, Map<CommandRule, boolean>>();
 
-  constructor(
-    readonly parsed: ParsedBash,
-    readonly budget: Budget,
-  ) {}
-
-  /** The basename of what a command runs once unwrapped; `null` when not a literal. */
-  #name(index: number): string | null {
-    let name = this.#names[index];
-    if (name === undefined) {
-      name = runName((this.parsed.commands[index] as SimpleCommand).words);
-      this.#names[index] = name;
-    }
-    return name;
-  }
+  constructor(readonly parsed: ParsedBash) {}
 
   /**
    * An earlier stage of a pipeline the command is in, or a command feeding
@@ -588,11 +572,11 @@ class Scope {
   pipedFrom(rule: CommandRule, from: readonly string[], command: SimpleCommand): boolean {
     let prefix = this.#prefix.get(rule);
     if (prefix === undefined) {
+      // Linear in the commands, which the parse already paid for.
       const n = this.parsed.commands.length;
-      this.budget.steps -= n;
       prefix = new Int32Array(n + 1);
       for (let i = 0; i < n; i++) {
-        const name = this.#name(i);
+        const name = runName((this.parsed.commands[i] as SimpleCommand).words);
         prefix[i + 1] = (prefix[i] as number) + (name !== null && nameMatches(from, name) ? 1 : 0);
       }
       this.#prefix.set(rule, prefix);
@@ -609,7 +593,6 @@ class Scope {
     }
     let hit = hits.get(rule);
     if (hit === undefined) {
-      this.budget.steps -= source.commands.length;
       hit = source.commands.some((words) => {
         const name = runName(words);
         return name !== null && nameMatches(from, name);
@@ -889,7 +872,7 @@ function judgeScript(source: string, ctx: Context): BashVerdict {
   if (parsed.errors.length > 0) {
     verdict = unclear("parse-error", `the command did not parse: ${parsed.errors[0]}`);
   }
-  const scope = new Scope(parsed, ctx.budget);
+  const scope = new Scope(parsed);
   for (const command of parsed.commands) {
     verdict = stricter(verdict, judgeCommand(command, ctx, scope));
     if (ctx.budget.steps < 0) return stricter(verdict, OVER_BUDGET);

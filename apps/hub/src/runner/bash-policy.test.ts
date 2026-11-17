@@ -463,6 +463,15 @@ describe("more wrappers", () => {
     ["script -q -c 'git push' /dev/null", "deny git-push"],
     ["script out.txt", "allow none"],
     ["parallel ::: 'git push'", "ask unclear:wrapper"],
+    // getopt edges: an optional value ends the cluster; `--` ends the options.
+    ["xargs -ea git push", "deny git-push"],
+    ["env -- --frob x", "allow none"],
+    ["sudo -- git push", "deny git-push"],
+    // A word that is not a literal among su/script operands; -c with no string.
+    ["script $f -c 'git push'", "ask unclear:wrapper"],
+    ["su $user -c 'git push'", "ask unclear:wrapper"],
+    ["su -c", "allow none"],
+    ["echo git push | su -c", "ask unclear:script"],
   ])("%p: %s", (command, expected) => {
     expect(verdict(command, DENY_ALL)).toBe(expected);
   });
@@ -491,6 +500,7 @@ describe("rule options: GNU long-option prefixes and git inline aliases", () => 
     ["git reset --har", "deny git-reset-hard"],
     ["rm --dir x", "allow none"],
     ["rm -r --force-x", "allow none"],
+    ["rm -r --=x /x", "allow none"],
     ["git -c alias.p=push p", "ask unclear:alias"],
     ["git -c Alias.P=push p", "ask unclear:alias"],
     ["git --config-env=alias.p=X p", "ask unclear:alias"],
@@ -537,8 +547,26 @@ describe("bounded work: the hub's tool_call handler is synchronous", () => {
     expect(performance.now() - started).toBeLessThan(500);
   });
 
+  test("a rule option that is neither one letter nor long matches exactly", () => {
+    const rules: CommandRule[] = [
+      { name: "find-delete", command: ["find"], flags: [["-delete"]], action: "deny" },
+    ];
+    expect(verdict("find . -delete", rules)).toBe("deny find-delete");
+    expect(verdict("find . -d", rules)).toBe("allow none");
+  });
+
+  test("many shells fed by one large stdin source: each rule checks the source once", () => {
+    const command = `{ ${"sh; ".repeat(6000)}} < <(${"a; ".repeat(6000)}curl x)`;
+    expect(command.length).toBeLessThanOrEqual(64 * 1024);
+    const started = performance.now();
+    expect(verdict(command, DENY_ALL)).toBe("deny download-to-shell");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   test("a 64 KiB pipeline is still judged in full", () => {
     expect(verdict(`curl x|${"sh|".repeat(21840)}sh`, DENY_ALL)).toBe("deny download-to-shell");
+    // Every stage is judged within the budget: the last word is the shell rule, not the budget.
+    expect(verdict(`${"sh|".repeat(21844)}sh`, DENY_ALL)).toBe("ask unclear:script");
     expect(verdict(`${"a|".repeat(32760)}git push`, DENY_ALL)).toBe("deny git-push");
     expect(verdict(`${"sudo ".repeat(13000)}git push`, DENY_ALL)).toBe("deny git-push");
   });
