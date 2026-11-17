@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.4** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.5** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -296,6 +296,24 @@ box does not have browser tools.
 |---|---|---|
 | `browser.unavailable` (no CDP answer, or Chromium gone during the call) | `box` | `give-up` when mutating, `retry` when read-only |
 | `browser.no-tab`, `browser.bad-url`, `browser.stale-ref` (screenshot or subtree), `browser.failed` | `user` | `give-up` |
+| `browser.origin-mismatch`, `browser.field-mismatch`, `browser.mask-missing` (1.5) | `user` | `give-up` |
+
+### Secret fill (1.5)
+
+Decision 0039. A 1.4 box answers these `unknown-method`.
+
+| Method | Params | Result |
+|---|---|---|
+| `browser.field` | `ref` | `tab`, `url`, `title`, `field` (`password`, `username`, `one-time-code`, `other`, `none`), `origin` (the owner frame's, or `null`) |
+| `browser.fill` | `ref`, `element`, `value`, `origins`, `fields` (empty: any text field), `submit?`, `expect?`, `expectTimeoutMs?` | action result |
+
+- `browser.fill` refuses with `browser.origin-mismatch` unless the owner
+  frame's origin is in `origins`, and with `browser.field-mismatch` unless the
+  field's kind is in `fields`; nothing is filled. It is mutating.
+- The box never echoes `value`: every later result string, error and spilled
+  snapshot has it replaced by `[redacted]`.
+- The filled element is masked in every later `browser.screenshot`; a filled
+  element gone from a loaded page refuses it with `browser.mask-missing`.
 
 ## Versioning
 
