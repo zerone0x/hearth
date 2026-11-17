@@ -48,6 +48,8 @@ class FakeBoxes {
   readonly streamFrames: Array<{ boxId: string; frame: StreamCloseFrame | { type: string } }> = [];
   connected = true;
   bootId = "boot_1";
+  /** What the box's hello named; unset like a box the hub never saw. */
+  version: { major: number; minor: number } | undefined = { major: 1, minor: 6 };
   /** When true, answers are lost on the way back (a cut connection). */
   dropAnswers = false;
   executor: ToolExecutor;
@@ -64,6 +66,10 @@ class FakeBoxes {
         for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
       },
     });
+  }
+
+  versionOf(_boxId: string) {
+    return this.version;
   }
 
   listen(listener: BoxConnectionListener): () => void {
@@ -165,6 +171,41 @@ describe("ToolRpcClient against a fake box", () => {
       true,
     );
     expect(JSON.stringify(boxes.sent)).not.toContain("never-sent");
+    expect(client.pending).toBe(0);
+  });
+
+  test("secretEnv (decision 0041) goes in the one exec frame, only to a 1.6 box; pi's env never", async () => {
+    const boxes = new FakeBoxes(workspace());
+    const client = new ToolRpcClient({ boxes, log: () => {} });
+    const ops = client.operations("box_1", "call_env");
+    const chunks: Buffer[] = [];
+    expect(ops.bash.acceptsSecretEnv()).toBe(true);
+    await ops.bash.exec('printf "%s" "${#GH_TOKEN}"', boxes.root, {
+      onData: (data) => chunks.push(data),
+      env: { HUB_SECRET: "never-sent" },
+      secretEnv: { GH_TOKEN: "tok-1234" },
+    });
+    expect(Buffer.concat(chunks).toString()).toBe("8");
+    expect((boxes.sent[0]?.params as { env?: unknown } | undefined)?.env).toEqual({
+      GH_TOKEN: "tok-1234",
+    });
+    expect(JSON.stringify(boxes.sent)).not.toContain("never-sent");
+    // An empty map sends no field.
+    await ops.bash.exec("true", boxes.root, { onData: () => {}, secretEnv: {} });
+    expect(Object.hasOwn((boxes.sent[1]?.params ?? {}) as object, "env")).toBe(false);
+    // A 1.5 box, or one whose version is unknown, would drop it: nothing is sent.
+    for (const version of [{ major: 1, minor: 5 }, undefined]) {
+      boxes.version = version;
+      expect(ops.bash.acceptsSecretEnv()).toBe(false);
+      const sent = boxes.sent.length;
+      const error = (await rejection(
+        ops.bash.exec("env", boxes.root, { onData: () => {}, secretEnv: { GH_TOKEN: "tok-1234" } }),
+      )) as HearthError;
+      expect(error.code).toBe("tool.box-too-old");
+      expect(boxes.sent.length).toBe(sent);
+    }
+    // Without secrets an old box still runs commands.
+    await ops.bash.exec("true", boxes.root, { onData: () => {} });
     expect(client.pending).toBe(0);
   });
 

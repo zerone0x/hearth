@@ -483,7 +483,10 @@ function execEnv(f: Fields, key: string): Record<string, string> {
       item.length > MAX_EXEC_ENV_VALUE_LENGTH ||
       item.includes("\u0000")
     ) {
-      f.fail(key, `${name} must be a non-empty string without NUL, at most ${MAX_EXEC_ENV_VALUE_LENGTH} characters`);
+      f.fail(
+        key,
+        `${name} must be a non-empty string without NUL, at most ${MAX_EXEC_ENV_VALUE_LENGTH} characters`,
+      );
     }
     env[name] = item;
   }

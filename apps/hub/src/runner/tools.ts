@@ -263,7 +263,9 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
                     return await ops.bash.exec(command, cwd, {
                       // Scrubbed before pi sees it: its result, updates and temp file.
                       onData: (data) => {
-                        onData(values.length === 0 ? data : Buffer.from(scrub(data.toString("utf8"))));
+                        onData(
+                          values.length === 0 ? data : Buffer.from(scrub(data.toString("utf8"))),
+                        );
                       },
                       ...(execSignal === undefined ? {} : { signal: execSignal }),
                       ...(timeout === undefined ? {} : { timeout }),

@@ -34,10 +34,10 @@ import {
   type RpcResultFrame,
   type StreamCloseFrame,
   type StreamDataFrame,
+  supportsExecEnv,
   type ToolMethod,
   type ToolParams,
   type ToolResults,
-  supportsExecEnv,
   toolDeadlineMs,
 } from "@hearth/protocol";
 import type { BoxConnections } from "./connections";

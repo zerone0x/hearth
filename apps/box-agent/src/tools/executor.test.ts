@@ -6,6 +6,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -282,8 +283,6 @@ describe("exec", () => {
         command: "pwd; env",
         cwd: "sub",
         timeoutMs: 5_000,
-        // pi hands the hub's environment to exec; the protocol has no field for it.
-        env: { LEAK: "from-the-hub" },
       });
       expect(result.outcome).toBe("exited");
       expect(result.exitCode).toBe(0);
@@ -291,7 +290,6 @@ describe("exec", () => {
       expect(lines[0]).toBe(join(h.root, "sub"));
       const vars = lines.slice(1).map((line) => line.split("=")[0]);
       expect(result.output).not.toContain("hj_secret_should_not_leak");
-      expect(result.output).not.toContain("from-the-hub");
       expect(result.output).toContain("HOME=/home/box");
       expect(
         vars.filter(
@@ -340,6 +338,50 @@ describe("exec", () => {
     expect(readFileSync(result.fullOutputPath ?? "", "latin1").endsWith("aEND")).toBe(true);
     // The model can read the spill file back through the tools.
     expect((await h.ok("tool.stat", { ...c, path: result.fullOutputPath })).size).toBe(total);
+  });
+
+  test("env (1.6): the variables reach that one command under the box's own, and the value is replaced in its result", async () => {
+    const h = harness({ env: { ...DEFAULT_EXEC_ENV, HOME: "/home/box" } });
+    const token = "ghp_boxSideToken3f81c2";
+    const result = await h.ok("tool.exec", {
+      ...c,
+      command:
+        'echo "len=${#GH_TOKEN}"; echo "raw=$GH_TOKEN"; printf %s "$GH_TOKEN" | sha256sum; echo "home=$HOME"',
+      cwd: ".",
+      timeoutMs: 5_000,
+      env: { GH_TOKEN: token },
+    });
+    expect(result.output).toContain(`len=${token.length}`);
+    expect(result.output).toContain("raw=[redacted]");
+    expect(result.output).toContain(createHash("sha256").update(token).digest("hex"));
+    expect(result.output).not.toContain(token);
+    expect(result.output).toContain("home=/home/box");
+    // The next command has no such variable.
+    const next = await h.ok("tool.exec", {
+      ...c,
+      callId: "call_2",
+      command: 'echo "next=${GH_TOKEN:-unset}"',
+      cwd: ".",
+      timeoutMs: 5_000,
+    });
+    expect(next.output).toBe("next=unset\n");
+  });
+
+  test("env (1.6): a call with secrets writes no spill file, even past the output cap", async () => {
+    const h = harness();
+    const token = "ghp_noSpillToken0a9d4e";
+    const total = MAX_TOOL_OUTPUT_BYTES * 2;
+    const result = await h.ok("tool.exec", {
+      ...c,
+      command: `printf "%s\\n" "$T"; head -c ${total} /dev/zero | tr '\\0' a; printf "\\n%s" "$T"`,
+      cwd: ".",
+      timeoutMs: 10_000,
+      env: { T: token },
+    });
+    expect(result.truncatedBytes).toBeGreaterThan(0);
+    expect(result.fullOutputPath).toBeNull();
+    expect(result.output.endsWith("\n[redacted]")).toBe(true);
+    expect(existsSync(join(h.root, ".hearth", "exec"))).toBe(false);
   });
 
   test("small output is not marked and not spilled", async () => {

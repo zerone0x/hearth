@@ -297,9 +297,7 @@ export class SessionRunner {
       ...(inner.useEnvSecret === undefined
         ? {}
         : {
-            useEnvSecret: inner.useEnvSecret.bind(inner) as NonNullable<
-              RunnerBox["useEnvSecret"]
-            >,
+            useEnvSecret: inner.useEnvSecret.bind(inner) as NonNullable<RunnerBox["useEnvSecret"]>,
           }),
     };
     try {
