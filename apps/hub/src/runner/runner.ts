@@ -53,6 +53,8 @@ import { HUB_VERSION } from "../obs/version";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import { liveToolOutput } from "./live-output";
+import { type AccessMode, DEFAULT_ACCESS_MODE } from "../settings/access-mode";
+import { ACCESS_EXTENSION, accessExtension } from "./access";
 import type { CompiledDenyRule } from "./policy";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
 
@@ -77,6 +79,12 @@ export interface SessionRunnerOptions {
   readonly modelRuntime: ModelRuntime;
   readonly model: Model<string>;
   readonly denyList: readonly CompiledDenyRule[];
+  /**
+   * The session's access mode now (decision 0045), read once per tool call and
+   * recorded as `access_mode` on its trajectory record. Unset (tests), the
+   * default `ask`.
+   */
+  readonly accessMode?: () => AccessMode;
   /** Already filtered by the allowlist. */
   readonly extensions?: readonly PinnedExtension[];
   /** pi's codemode tool (decision 0015). Off by default. */
@@ -303,6 +311,15 @@ export class SessionRunner {
     try {
       const settingsManager = SettingsManager.inMemory({});
       const extensionFactories = [
+        // First, so every call has its mode before another handler can block it (0043).
+        {
+          name: ACCESS_EXTENSION,
+          factory: accessExtension({
+            resolve: options.accessMode ?? (() => DEFAULT_ACCESS_MODE),
+            onMode: (toolCallId, mode) =>
+              self?.observe(() => self?.tracer.onAccessMode(toolCallId, mode)),
+          }),
+        },
         {
           name: "hearth-tools",
           factory: hearthToolsExtension({

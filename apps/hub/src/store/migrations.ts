@@ -302,6 +302,18 @@ export const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    // The access mode (decision 0045, PRD §6.5): a session's own override of
+    // the global default (the `access_mode` setting). NULL follows the global
+    // default; every change is audited and written to the event log as
+    // `session.access_mode` before the row changes.
+    version: 9,
+    name: "session access mode",
+    sql: `
+      ALTER TABLE session ADD COLUMN access_mode TEXT
+        CHECK (access_mode IS NULL OR access_mode IN ('yolo', 'ask'));
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */
