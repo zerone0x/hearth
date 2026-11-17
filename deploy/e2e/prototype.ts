@@ -44,6 +44,8 @@ if (shots) mkdirSync(shots, { recursive: true });
 interface State {
   readonly sessionUrl: string;
   readonly sessionId: string;
+  /** The sha256 of the screenshot blob (decision 0037), fetched again after the upgrade. */
+  readonly blob?: string;
 }
 
 function step(name: string): void {
@@ -493,6 +495,97 @@ async function browserToolUnderLock(page: Page, sessionId: string): Promise<void
   );
 }
 
+/** `GET /v1/sessions/:id/blobs/:sha256` with the signed-in page's cookie. */
+async function fetchBlob(page: Page, sessionId: string, sha256: string) {
+  return await page.request.get(
+    new URL(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/blobs/${encodeURIComponent(sha256)}`,
+      BASE,
+    ).toString(),
+    { headers: { origin: BASE.origin } },
+  );
+}
+
+/** Checks the blob is served as the screenshot it names: its hash, a JPEG, nosniff. */
+async function checkBlob(page: Page, sessionId: string, sha256: string): Promise<Buffer> {
+  const res = await fetchBlob(page, sessionId, sha256);
+  check(res.status() === 200, `fetching blob ${sha256} answered ${res.status()}`);
+  const body = await res.body();
+  const got = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+  check(got === sha256, `blob ${sha256} has the bytes of ${got}`);
+  check(
+    res.headers()["content-type"] === "image/jpeg",
+    `blob served as ${res.headers()["content-type"]}`,
+  );
+  check(res.headers()["x-content-type-options"] === "nosniff", "blob served without nosniff");
+  return body;
+}
+
+/**
+ * #117 (decision 0037): a `browser_screenshot` reaches the model as an image,
+ * the trajectory names it by hash and keeps no base64, and the API serves the
+ * bytes behind the login. Returns the blob's sha256.
+ */
+async function screenshotBlob(page: Page, sessionId: string): Promise<string> {
+  step("5f. a browser screenshot is kept by hash and fetched through the blob API");
+  const before = (await fauxRequests()).length;
+  await script([
+    { toolCalls: [{ id: "call_shot", name: "browser_screenshot", arguments: {} }] },
+    { text: "Took a screenshot of the box browser." },
+  ]);
+  await page.getByLabel("Message").fill("Take a screenshot of the browser");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByText("Took a screenshot of the box browser.").waitFor({ timeout: TURN_MS });
+  const shot = await toolStep(page, sessionId, "call_shot");
+  check(shot?.["outcome"] === "ok", `browser_screenshot failed: ${JSON.stringify(shot)}`);
+  const refs = (
+    shot?.["result"] as { image_blobs?: { sha256: string; size: number; mime: string }[] }
+  )?.image_blobs;
+  check(
+    refs?.length === 1 && refs[0]?.mime === "image/jpeg",
+    `the screenshot step has no image reference: ${JSON.stringify(shot?.["result"])}`,
+  );
+  const ref = refs?.[0] as { sha256: string; size: number };
+  const body = await checkBlob(page, sessionId, ref.sha256);
+  check(body.byteLength === ref.size, `blob is ${body.byteLength} bytes, ref says ${ref.size}`);
+  // The model got the image itself: its next request carries it.
+  const requests = (await fauxRequests()).slice(before);
+  check(
+    requests.some((r) => r.images.includes(ref.sha256)),
+    `the model never got the screenshot: ${JSON.stringify(requests.map((r) => r.images))}`,
+  );
+  // The trajectory and the event log name it and hold no base64 of it.
+  const base64 = body.toString("base64").slice(0, 64);
+  const trajectory = await page.request.get(
+    new URL(`/v1/sessions/${encodeURIComponent(sessionId)}/trajectory`, BASE).toString(),
+    { headers: { origin: BASE.origin } },
+  );
+  check(trajectory.ok(), `reading the trajectory answered ${trajectory.status()}`);
+  const jsonl = await trajectory.text();
+  check(jsonl.includes(ref.sha256), "the trajectory does not reference the screenshot");
+  check(!jsonl.includes(base64), "the trajectory embeds the screenshot's base64");
+  const events = await page.request.get(
+    new URL(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/events?after=0&limit=1000`,
+      BASE,
+    ).toString(),
+    { headers: { origin: BASE.origin } },
+  );
+  check(!(await events.text()).includes(base64), "the event log embeds the screenshot's base64");
+  // An unknown hash and a traversal get the same 404.
+  const unknown = await fetchBlob(page, sessionId, "0".repeat(64));
+  const traversal = await fetchBlob(page, sessionId, "../../hearth.db");
+  check(
+    unknown.status() === 404 && traversal.status() === 404,
+    `unknown and traversing hashes answered ${unknown.status()} and ${traversal.status()}`,
+  );
+  check(
+    (await unknown.text()) === (await traversal.text()),
+    "an unknown and a traversing hash get different answers",
+  );
+  return ref.sha256;
+}
+
 async function install(browser: Browser): Promise<void> {
   const setupToken = process.env["HEARTH_SETUP_TOKEN"];
   check(setupToken !== undefined && setupToken !== "", "HEARTH_SETUP_TOKEN is required");
@@ -648,6 +741,7 @@ async function install(browser: Browser): Promise<void> {
 
   await takeOver(page, box, sessionId);
   await browserToolUnderLock(page, sessionId);
+  const blob = await screenshotBlob(page, sessionId);
 
   step("6. closing and reopening the page continues the session");
   await page.close();
@@ -666,7 +760,7 @@ async function install(browser: Browser): Promise<void> {
   step("7. an unauthenticated or cross-origin request cannot create a session or run a command");
   await refusals(context, page, sessionId);
 
-  writeFileSync(STATE, JSON.stringify({ sessionUrl, sessionId } satisfies State));
+  writeFileSync(STATE, JSON.stringify({ sessionUrl, sessionId, blob } satisfies State));
   await context.close();
   check(cspViolations.length === 0, `CSP violations: ${cspViolations.join("; ")}`);
 }
@@ -797,6 +891,10 @@ async function upgrade(browser: Browser): Promise<void> {
   await page.getByRole("link", { name: new RegExp(TITLE) }).click();
   check(page.url() === state.sessionUrl, `opened ${page.url()}, not ${state.sessionUrl}`);
   await page.getByText("Still here after the reload.").waitFor();
+  if (state.blob !== undefined) {
+    step("the screenshot blob is still served after the upgrade (decision 0037)");
+    await checkBlob(page, state.sessionId, state.blob);
+  }
   await script([{ text: "Still here after the upgrade." }]);
   await page.getByLabel("Message").fill("And after the upgrade?");
   await page.getByRole("button", { name: "Send" }).click();

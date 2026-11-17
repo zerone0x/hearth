@@ -245,10 +245,46 @@ describe("the desktop lock (decision 0035)", () => {
     const order: string[] = [];
     const r = rig(() => order.push("check"));
     await r.tools.get("browser_navigate")?.execute("call_1", { url: "about:blank" });
-    expect(order).toEqual(["check"]);
+    expect(order).toEqual(["check", "check"]);
     expect(r.seen.leases).toBe(1);
     expect(r.seen.calls).toEqual(["browser.navigate"]);
     expect(r.refused).toEqual([]);
+  });
+
+  test("an owner who takes over during a slow ensureBox is refused: lease released, no box call", async () => {
+    let held = false;
+    let released = 0;
+    const tools = new Map<string, Tool>();
+    const pi = {
+      registerTool: (tool: { name: string; execute: never }) => tools.set(tool.name, tool),
+    } as unknown as ExtensionAPI;
+    const calls: string[] = [];
+    const refused: Array<[string, string, string]> = [];
+    const box = {
+      assertDesktopUnlocked: () => {
+        if (held) locked();
+      },
+      ensureBox: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        held = true; // the owner takes over while the box wakes
+        return { boxId: "bx_1", release: () => released++ };
+      },
+      operations: () => ({
+        browser: {
+          call: async (method: string) => {
+            calls.push(method);
+            return action();
+          },
+        },
+      }),
+    } as unknown as RunnerBox;
+    registerBrowserTools(pi, box, (name, id, code) => refused.push([name, id, code]));
+    await expect(tools.get("browser_navigate")?.execute("call_1", {})).rejects.toThrow(
+      DESKTOP_LOCKED_MESSAGE,
+    );
+    expect(calls).toEqual([]);
+    expect(released).toBe(1);
+    expect(refused).toEqual([["browser_navigate", "call_1", "desktop.locked"]]);
   });
 
   test("the same tool works again once the lock is released", async () => {
@@ -304,6 +340,8 @@ describe("browser_fill in the tool layer (decision 0039)", () => {
     field?: { field: string; origin: string | null };
     secret?: Partial<FillSecret>;
     fill?: () => unknown;
+    /** The owner takes over while the box wakes. */
+    takeOverOnWake?: boolean;
   }) {
     const tools = new Map<string, Tool>();
     const pi = {
@@ -311,8 +349,21 @@ describe("browser_fill in the tool layer (decision 0039)", () => {
     } as unknown as ExtensionAPI;
     const calls: Array<{ method: string; params: unknown }> = [];
     const uses: string[] = [];
+    let held = false;
     const box = {
-      ensureBox: async () => ({ boxId: "bx_1", release: () => {} }),
+      assertDesktopUnlocked: () => {
+        if (held) {
+          throw new HearthError("user is in control", {
+            owner: "user",
+            disposition: "retry",
+            code: "desktop.locked",
+          });
+        }
+      },
+      ensureBox: async () => {
+        if (options.takeOverOnWake === true) held = true;
+        return { boxId: "bx_1", release: () => {} };
+      },
       useSecret: async (_ref: string, context: { origin: string }) => {
         uses.push(context.origin);
         return {
@@ -398,6 +449,13 @@ describe("browser_fill in the tool layer (decision 0039)", () => {
     expect(await failure(r.run())).toContain("vault.kind-mismatch");
     expect(r.calls.map((c) => c.method)).toEqual(["browser.field"]);
     expect(r.filled.size).toBe(0);
+  });
+
+  test("an owner who takes over while the box wakes: refused, nothing asked or sent", async () => {
+    const r = rig({ takeOverOnWake: true });
+    expect(await failure(r.run())).toBe(DESKTOP_LOCKED_MESSAGE);
+    expect(r.calls).toEqual([]);
+    expect(r.uses).toEqual([]);
   });
 
   test("the vault is asked with the origin the box reported", async () => {

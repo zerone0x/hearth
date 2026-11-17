@@ -253,7 +253,7 @@ jobs:
           "$RUN_BLOCK" -x "$DOC" install:configure
           # The edit install.md asks for, done with the models-file option it documents.
           cat > config/models.json <<'JSON'
-          {"providers":{"faux-http":{"baseUrl":"http://127.0.0.1:18080/v1","api":"openai-completions","models":[{"id":"faux-1","name":"Faux"}]}}}
+          {"providers":{"faux-http":{"baseUrl":"http://127.0.0.1:18080/v1","api":"openai-completions","models":[{"id":"faux-1","name":"Faux","input":["text","image"]}]}}}
           JSON
           sed -i -e 's/^HEARTH_MODEL_PROVIDER=.*/HEARTH_MODEL_PROVIDER=faux-http/' \
             -e 's/^HEARTH_MODEL=.*/HEARTH_MODEL=faux-1/' \

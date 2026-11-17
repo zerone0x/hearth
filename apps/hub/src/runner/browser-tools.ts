@@ -458,6 +458,8 @@ export function registerBrowserTools(
         const lease = await box.ensureBox(id);
         try {
           await box.prepare?.(lease);
+          // Again: a cold wake takes seconds, and the owner may have taken over meanwhile.
+          assertDesktopFree(box, name, id, onRefused);
           const ops = box.operations(lease.boxId, id);
           let result: ToolResults[typeof spec.method];
           try {
@@ -534,6 +536,8 @@ function registerFillTool(
       const lease = await box.ensureBox(id);
       try {
         await box.prepare?.(lease);
+        // Again after the wake, as the other browser tools (#133).
+        assertDesktopFree(box, name, id, onRefused);
         const ops = box.operations(lease.boxId, id);
         const call = async <M extends "browser.field" | "browser.fill">(
           method: M,

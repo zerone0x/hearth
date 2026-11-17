@@ -23,6 +23,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { type FileEntry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type Authorizer,
+  type BlobStore,
   DEFAULT_WORKSPACE_ID,
   type EventPage,
   type EventStore,
@@ -81,6 +82,8 @@ export interface RunnerSessions {
 export interface SessionRunnersOptions {
   readonly authorizer: Authorizer;
   readonly events: EventStore;
+  /** Image results by hash (decision 0037). */
+  readonly blobs?: BlobStore;
   readonly sessions: RunnerSessions;
   readonly tools: {
     operations(boxId: string, callId: string, trace?: RpcTrace): BoxToolOperations;
@@ -292,6 +295,7 @@ export class SessionRunners {
       sessionId,
       scope: this.#scope,
       events: this.#o.events,
+      ...(this.#o.blobs === undefined ? {} : { blobs: this.#o.blobs }),
       box: this.#box(sessionId),
       modelRuntime: runtime,
       model: model as Model<string>,

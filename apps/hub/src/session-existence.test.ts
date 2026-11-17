@@ -140,6 +140,7 @@ const ROUTES: [string, string, unknown?][] = [
   ["GET", "/v1/sessions/%/desktop/lock"],
   ["POST", "/v1/sessions/%/desktop/lock", {}],
   ["POST", "/v1/sessions/%/desktop/lock/release", {}],
+  ["GET", `/v1/sessions/%/blobs/${"0".repeat(64)}`],
 ];
 
 /** Another id of the same shape as `id`, that no session has. */

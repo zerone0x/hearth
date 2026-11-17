@@ -31,6 +31,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
+  type BlobStore,
   type EventStore,
   HearthError,
   type JsonValue,
@@ -38,6 +39,7 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
+import { imagesToRefs, type PendingBlob, restoreImages, storeBlobs } from "../obs/blobs";
 import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
@@ -59,6 +61,11 @@ export interface SessionRunnerOptions {
   readonly sessionId: SessionId;
   readonly scope: WorkspaceScope;
   readonly events: EventStore;
+  /**
+   * Where image results go (decision 0037): events keep a reference, and a
+   * rebuild reads the image back. Unset, an image is referenced but not kept.
+   */
+  readonly blobs?: BlobStore;
   readonly box: RunnerBox;
   readonly modelRuntime: ModelRuntime;
   readonly model: Model<string>;
@@ -148,9 +155,18 @@ export const RESTART_OUTCOME_UNKNOWN =
 
 const identity = (text: string): string => text;
 
-function jsonSafe(value: unknown, redact: (text: string) => string = identity): JsonValue {
+/** `value` as stored JSON; image parts become references, their bytes pushed to `pending` (0037). */
+function jsonSafe(
+  value: unknown,
+  redact: (text: string) => string = identity,
+  pending?: PendingBlob[],
+): JsonValue {
   const raw = JSON.stringify(value, (key, v: unknown) =>
-    BULKY_FIELDS.has(key) ? undefined : typeof v === "bigint" ? String(v) : v,
+    BULKY_FIELDS.has(key)
+      ? undefined
+      : typeof v === "bigint"
+        ? String(v)
+        : imagesToRefs(key, v, pending),
   );
   if (raw === undefined) return null;
   const text = redact(raw);
@@ -318,7 +334,14 @@ export class SessionRunner {
       const pi = PiSessionManager.inMemory(
         boxCwd,
         undefined,
-        options.entries === undefined ? undefined : [...options.entries],
+        options.entries === undefined
+          ? undefined
+          : await restoreImages(
+              [...options.entries],
+              options.blobs,
+              options.scope,
+              options.sessionId,
+            ),
       );
       const persisted = pi.getEntries().length;
       // A hub restart cut these calls off: give each an explicit outcome-unknown
@@ -519,9 +542,12 @@ export class SessionRunner {
         const entries = this.#pi.getEntries();
         while (this.#persisted < entries.length) {
           const entry = entries[this.#persisted];
+          const pending: PendingBlob[] = [];
+          const payload = { entry: jsonSafe(entry, this.#o.redact, pending) };
+          await storeBlobs(this.#o.blobs, this.#o.scope, this.sessionId, pending);
           await this.#o.events.append(this.#o.scope, this.sessionId, {
             type: "runner.entry",
-            payload: { entry: jsonSafe(entry, this.#o.redact) },
+            payload,
           });
           this.#persisted++;
         }
@@ -591,14 +617,17 @@ export class SessionRunner {
   /** Append in order; a failed append fails the session, visibly. */
   #record(type: string, payload: unknown): void {
     const turnId = this.tracer?.turnId;
+    const pending: PendingBlob[] = [];
     const event = {
       type,
       ...(turnId === undefined ? {} : { turnId }),
-      payload: jsonSafe(payload, this.#o.redact),
+      payload: jsonSafe(payload, this.#o.redact, pending),
     };
     this.#chain = this.#chain
       .then(async () => {
         if (this.#status === "failed") return;
+        // The bytes first: an event never names a blob that is not stored (0037).
+        await storeBlobs(this.#o.blobs, this.#o.scope, this.sessionId, pending);
         await this.#o.events.append(this.#o.scope, this.sessionId, event);
       })
       .catch((error: unknown) => this.#fail(error));

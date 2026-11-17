@@ -5,6 +5,7 @@
  */
 
 export { SqliteAuditSink } from "./audit-sink";
+export { SqliteBlobStore, type SqliteBlobStoreOptions } from "./blob-store";
 export {
   SqliteBoxCredentialStore,
   type SqliteBoxCredentialStoreOptions,

@@ -308,6 +308,36 @@ describe("the signed-in principal reaches authorize and the audit row", () => {
     expect(f.eventCount(id, "trajectory.label")).toBe(1);
   });
 
+  test("blob route: the guard's principal is authorized for session.blob against the session's workspace (decision 0037)", async () => {
+    const f = fixture();
+    const id = await f.createSession();
+    const workspace = f.sessionWorkspace(id);
+    const unknownHash = "0".repeat(64);
+    const from = mark(f);
+    expect((await f.request(`/v1/sessions/${id}/blobs/${unknownHash}`)).status).toBe(404);
+    expectOther(f, from, ["session.blob", "session.read"]);
+    expect(
+      f
+        .auditRows()
+        .slice(from.rows)
+        .map((r) => [r.action, r.resource_workspace_id, r.allowed]),
+    ).toEqual([
+      ["session.blob", workspace, 1],
+      ["session.read", workspace, 1],
+    ]);
+    f.signedIn.principal = STRANGER;
+    const denied = mark(f);
+    expect((await f.request(`/v1/sessions/${id}/blobs/${unknownHash}`)).status).toBe(403);
+    expect(f.auditRows().slice(denied.rows)).toEqual([
+      {
+        principal_id: STRANGER.id,
+        action: "session.blob",
+        resource_workspace_id: workspace,
+        allowed: 0,
+      },
+    ]);
+  });
+
   test("trajectory routes: checked against the session's workspace, not the caller's", async () => {
     const f = fixture();
     const id = await f.createSession();
