@@ -61,6 +61,12 @@ jobs:
           shell="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell | head -1)"
           test -x "$shell"
           HEARTH_CHROMIUM="$shell" timeout 300 bun test apps/box-agent/src/browser/playwright.test.ts apps/hub/src/runner/browser-tools.chromium.test.ts
+      # The browser eval B1-B6 with box-agent as a local process on the same
+      # Chromium (#119, decision 0040); the Docker run is in box-provider.
+      - name: Browser eval B1-B6, local box-agent (scored from the trajectory)
+        run: |
+          shell="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell | head -1)"
+          HEARTH_CHROMIUM="$shell" HEARTH_EVAL_DIR="$RUNNER_TEMP/browser-eval-local" timeout 600 bun test apps/hub/src/eval/browser-eval.e2e.test.ts
       - name: Web e2e (setup, login, settings, session, tool card, desktop, reload, asleep, mobile)
         env:
           HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/web-e2e
@@ -178,6 +184,23 @@ jobs:
           HEARTH_DOCKER_TESTS: "1"
           HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
         run: timeout 600 bun test apps/hub/src/runner/browser.docker.test.ts
+      # The browser eval (#119, decision 0040; M2 exit for S2): tasks B1-B6 on
+      # the faux model in the box's Chromium against the fixture site served in
+      # the box, the trajectory dumped with trajectory-cli.ts and scored by
+      # browser-score.ts (success, false success, counts, secret leaks).
+      - name: Browser eval B1-B6 in a Docker box under the firewall (M2 exit, #119)
+        env:
+          HEARTH_DOCKER_TESTS: "1"
+          HEARTH_BOX_AGENT_IMAGE: hearth-box:ci
+          HEARTH_EVAL_DIR: ${{ runner.temp }}/browser-eval
+        run: timeout 900 bun test apps/hub/src/eval/browser-eval.e2e.test.ts
+      - name: Upload the browser eval (trajectory, blobs, report)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-eval
+          path: ${{ runner.temp }}/browser-eval
+          if-no-files-found: ignore
       # Desktop stream (#45; decision 0016): the real Xvnc banner through the hub.
       - name: Desktop stream reads the real Xvnc banner through the hub, egress filtered
         env:
