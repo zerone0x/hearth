@@ -329,10 +329,8 @@ export class SessionRunners {
     await this.#authorize(principal, "session.interrupt", sessionId);
     const pending = this.#runners.get(sessionId)?.pending;
     if (pending === undefined) return false;
-    const interrupted = await (await pending).interrupt();
-    // The abort cancels a pending approval through the call's signal; this is the backstop.
-    await this.#o.approvals?.cancel(sessionId, "stopped");
-    return interrupted;
+    // The abort cancels a pending approval through the held call's signal (access.ts).
+    return (await pending).interrupt();
   }
 
   /** Events after `cursor` (cursor resume, PRD §6.1). */

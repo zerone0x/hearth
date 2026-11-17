@@ -342,6 +342,34 @@ describe("the owner's decision", () => {
   });
 });
 
+describe("the store", () => {
+  test("a row leaves pending once: a second end does not overwrite the first", () => {
+    const h = start();
+    h.store.insert(SCOPE, {
+      id: "ap_x",
+      sessionId: "se_a",
+      toolCallId: "c",
+      tool: "bash",
+      summary: "git push",
+      rule: "git-push",
+      mode: "ask",
+      requestedAt: 1,
+      expiresAt: 2,
+    });
+    expect(
+      h.store.finish(SCOPE, "ap_x", { status: "expired", at: 3, by: null, reason: "late" }),
+    ).toBe(true);
+    expect(
+      h.store.finish(SCOPE, "ap_x", { status: "approved", at: 4, by: "user:x", reason: "ok" }),
+    ).toBe(false);
+    expect(h.store.get(SCOPE, "se_a", "ap_x")).toMatchObject({
+      status: "expired",
+      decidedAt: 3,
+      decidedBy: null,
+    });
+  });
+});
+
 describe("a hub restart", () => {
   test("every approval still pending becomes interrupted, with an event, and is never approvable", async () => {
     const db = openDatabase(join(dir, "hub.db"));
