@@ -16,6 +16,7 @@ import {
   DEFAULT_WORKSPACE_ID,
   LOCAL_PRINCIPAL,
   MAX_BLOB_BYTES,
+  redactValues,
 } from "@hearth/core";
 import { Hono } from "hono";
 import { type HubEnv, SESSION_COOKIE } from "../auth";
@@ -28,6 +29,7 @@ import {
   missingImageText,
   mountBlobRoutes,
   type PendingBlob,
+  redactKeepingHashes,
   restoreImages,
   SessionBlobs,
   storeBlobs,
@@ -133,6 +135,37 @@ describe("imagesToRefs", () => {
       [sha(a), sha(b)],
     );
     expect(imageRefs("not content")).toEqual([]);
+  });
+});
+
+describe("redactKeepingHashes (#137)", () => {
+  const redact = (text: string) => redactValues(text, ["c0ffee", "pw-9"], "#");
+  const hash = `ab${"c0ffee".repeat(10)}12`;
+  const other = `12${"c0ffee".repeat(10)}ab`;
+
+  test("a quoted hash of the caller's is kept, as a member and escaped in text; the rest is redacted", () => {
+    const json = JSON.stringify({
+      a: "pw-9 c0ffee",
+      blob: { sha256: hash, size: 3 },
+      text: JSON.stringify({ sha256: hash, note: "c0ffee" }),
+      b: other,
+      c: `x${hash}`,
+    });
+    expect(redactKeepingHashes(json, redact, new Set([hash]))).toBe(
+      JSON.stringify({
+        a: "# #",
+        blob: { sha256: hash, size: 3 },
+        text: JSON.stringify({ sha256: hash, note: "#" }),
+        b: "12#ab",
+        c: `x${redact(hash)}`,
+      }),
+    );
+  });
+
+  test("with no hashes it is the redactor itself", () => {
+    const json = JSON.stringify({ sha256: hash });
+    expect(redactKeepingHashes(json, redact, new Set())).toBe(redact(json));
+    expect(redact(json)).not.toContain(hash);
   });
 });
 

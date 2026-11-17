@@ -1840,6 +1840,33 @@ describe("images by reference (decision 0037)", () => {
     expect(JSON.stringify(rebuilt.messages)).toBe(before);
   });
 
+  // A short secret (a vault value) that occurs in the hash of the masked bytes
+  // must not turn the stored reference into one the store cannot find (#137).
+  test("a secret inside a reference's hash: the reference is kept, and a rebuild restores the image", async () => {
+    // A size no other test uses: the model key joins the process-wide registry.
+    const shot = fakeJpeg(1371, 1280, 800);
+    const hash = sha(shot);
+    const secret = hash.slice(20, 32);
+    expect(secret).toMatch(/[a-f]/);
+    const keyed: SecretStore = { ...noSecrets, resolve: async () => new SecretValue(secret) };
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    driver.first.screenshotBytes = () => 1371;
+    const h = await harness({}, { secrets: keyed }, driver);
+    const { runner: first } = await screenshotTurn(h, ["c_shot"]);
+    const before = JSON.stringify(first.messages);
+    expect(before).toContain(shot.toString("base64"));
+    const stored = h.events.all.get("se_a") ?? [];
+    const refs = imageParts(stored).map(([, part]) => part.blob?.sha256);
+    expect(refs.length).toBeGreaterThan(0);
+    expect(new Set(refs)).toEqual(new Set([hash]));
+    // Nowhere else in the events.
+    expect(JSON.stringify(stored).replaceAll(hash, "")).not.toContain(secret);
+    await h.runners.close();
+    const rebuilt = await h.make({}, { secrets: keyed }).runner("se_a");
+    expect(JSON.stringify(rebuilt.messages)).toBe(before);
+  });
+
   test("an image missing from the store comes back as a text part saying so, never an empty image", async () => {
     const driver = new FakeDriver();
     driver.first.navigate("http://127.0.0.1:8000/", "Page");
