@@ -75,9 +75,13 @@ loop are M3.
 A `bash` call's command is parsed with `unbash` into simple commands: lists,
 pipelines, subshells, groups, functions, loops, `$(...)`, backticks, process
 substitutions and unquoted heredocs. Wrappers (`sudo`, `env VAR=x`, `timeout`,
-`nice`, `nohup`, `command`, `exec`, `xargs`, ...) are stripped, and the
-string of `bash -c` / `sh -c` and the words of `eval` are parsed again, up to
-3 levels. Each simple command is matched against `commandRules`:
+`nice`, `nohup`, `command`, `exec`, `xargs`, `setsid`, `chroot`, `flock`,
+`taskset`, `strace`, `unbuffer`, `busybox`, ...) are stripped with their
+options, read the way getopt reads them (clusters such as `-iS'x'`, long
+options and their unambiguous prefixes, `--opt=value`; an unknown long option
+asks). The string of `bash -c` / `sh -c`, `su -c`, `script -c`, `flock -c`,
+the words of `eval` and `watch`, and the command of `sudo -s` are parsed
+again, up to 3 levels. Each simple command is matched against `commandRules`:
 
 ```ts
 { name: "git-push", command: ["git"], subcommand: "push",
@@ -87,16 +91,25 @@ string of `bash -c` / `sh -c` and the words of `eval` are parsed again, up to
 
 `command` names match the basename (`/bin/rm` is `rm`; `mkfs*` is a prefix).
 `flags` groups must all be present, one option of each; `-r` matches inside
-`-fr`. `args` are literal words that must all be present; `pipedFrom` means an
-earlier stage of the same pipeline runs one of those commands. The most
+`-fr`, and `--recursive` matches `--recursive=x` and any GNU prefix (`--rec`).
+`args` are literal words that must all be present; `pipedFrom` means an
+earlier stage of an enclosing pipeline, or a command feeding stdin
+(`sh < <(curl x)`), runs one of those commands. Under `xargs`, words read
+from stdin could hold what `subcommand`, `flags` or `args` look for, so a
+rule that does not match the written words is `ask` (`echo push | xargs git`). The most
 restrictive result wins: `deny` > `ask` > `allow`. The seed list (`rm -rf`,
 `git push`, `git reset --hard`, `curl | sh`, `dd`, `mkfs`, `chmod -R 777 /`)
 is all `ask`.
 
 The verdict is `ask` when the parser cannot see what runs: a parse error, a
-command name that is not a literal (`$X -rf`), `alias`, `source`, a shell
-reading a script or a pipe, `env -S`, nesting deeper than 3, or a
-non-literal argument that could make a rule match (`rm $opts x`).
+command name that is not a literal (`$X -rf`), `alias`, `git -c alias.x=...`,
+`source`, a shell reading a script, a pipe, a stdin redirect, a here-doc or
+here-string (`bash <<<'git push'`), `env -S`, `sudo -e`, `parallel`,
+`runuser`, nesting deeper than 3, a non-literal argument that could make a
+rule match (`rm $opts x`), or a command too large to check: one
+classification has a work budget (`MAX_POLICY_STEPS`) because the hub's
+`tool_call` handler is synchronous; past it the verdict is
+`ask` (`unclear:budget`) after the raw deny-list has been applied.
 
 **Only `deny` blocks today.** There is no approval gate or access-mode setting
 yet, so an `ask` verdict runs exactly as before. Every `bash` step in the
@@ -109,9 +122,13 @@ that is left when parsing fails), then to each parsed command written as its
 words joined by one space, before and after unwrapping, so
 `bash -c "r""m -rf x"` meets a `^rm\s+-rf` rule.
 
-Known gaps: interpreters (`python -c`, `node -e`, `perl -e`), `find -exec`,
-`trap '<string>'`, git aliases set in the box, a script written and then run,
-and network calls (`curl` to a forge API does what `git push` does).
+Known gaps (decision 0044 lists them all): interpreters (`python -c`,
+`node -e`, `perl -e`), `find -exec`, `trap '<string>'`, env variables that
+run code (`PROMPT_COMMAND`, `BASH_ENV`), git aliases set in the box and git
+config that runs a command (`core.sshCommand`), a script written and then
+run, `exec < file` before a shell, wrappers not in the table (`nsenter`,
+`unshare`, `systemd-run`, `ssh host cmd`), and network calls (`curl` to a
+forge API does what `git push` does).
 
 ## Browser tools (decision 0032)
 

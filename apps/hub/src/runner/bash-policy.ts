@@ -3,27 +3,30 @@
  * 0044). The parser (bash-parse.ts) gives simple commands; this layer:
  *
  * - strips wrappers that run their argument (`sudo`, `env` with its `VAR=x`,
- *   `timeout`, `nice`, `nohup`, `command`, `exec`, `xargs`, ...) with their
- *   options, so `sudo timeout 5 git push` is `git push`;
- * - re-parses the string of `bash -c` / `sh -c` and the words of `eval`, up to
- *   `MAX_SHELL_DEPTH` levels;
+ *   `timeout`, `nice`, `nohup`, `command`, `exec`, `xargs`, `setsid`, ...)
+ *   with their options, read like getopt, so `sudo -u root timeout 5 git
+ *   push` is `git push`;
+ * - re-parses the string of `bash -c` / `sh -c`, `su -c`, `script -c`, the
+ *   words of `eval` and `watch`, up to `MAX_SHELL_DEPTH` levels;
  * - asks when it cannot see what runs: a parse error, a command name that is
- *   not a literal (`$X -rf`), `alias`, `source`, a shell reading a script or a
- *   pipe, nesting deeper than the cap;
+ *   not a literal (`$X -rf`), `alias`, `source`, a shell reading a script, a
+ *   pipe, a stdin redirect or here-string, nesting deeper than the cap, or
+ *   more work than `MAX_POLICY_STEPS`;
  * - matches each command against the rules, by command name and argument
  *   pattern, not by the raw string. The most restrictive result wins:
  *   deny > ask > allow (the order of `@pi-kit/permissions`);
  * - tests the config's raw-pattern deny-list (policy.ts) against the raw
  *   command, as before, and against each parsed command as words joined by
  *   one space, so `bash -c "r""m -rf x"` meets an `rm\s+-rf` rule. When
- *   parsing fails, the raw match is what is left.
+ *   parsing fails or the budget runs out, the raw match is what is left.
  *
  * The result is a verdict. Today only `deny` is enforced (the call is blocked);
  * `ask` runs as before, because the approval gate and its UI are not built yet,
  * and it is recorded in the trajectory step of the call. Not a boundary: the
- * box is (decision 0015). Known gaps: interpreters (`python -c`, `node -e`,
- * `perl -e`), `find -exec`, `trap '<string>'`, git aliases, a script written
- * then run, and network calls that do what a rule forbids.
+ * box is (decision 0015). Known gaps are listed in decision 0044:
+ * interpreters (`python -c`), `find -exec`, `trap '<string>'`, env variables
+ * that run code, git aliases in the box's config, a script written then run,
+ * wrappers not in the table, and network calls that do what a rule forbids.
  */
 
 import {
