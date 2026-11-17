@@ -3832,9 +3832,11 @@ secrets at start, before the hub could call its API.
   provider keys again.
 - Bifrost shows a stored key masked (`sk-f****-123`), verified against the
   binary; the research listed this as not verified.
-- Docker's own rules also separate box networks from Bifrost's: in the first
-  CI run a box probe of Bifrost's own address timed out instead of being
-  refused, a drop of Docker's (its isolation or direct-routing rules), not the
-  firewall's `tcp-reset`. The compose e2e therefore also probes an unused address in
+- Docker's own rules also separate box networks from Bifrost's: it drops a
+  packet for a container's address that does not come in on the container's
+  bridge in the raw table (`-A PREROUTING -d 172.29.249.2/32 ! -i
+  hearth-bifrost -j DROP`, seen in CI), before the filter table, so a box probe
+  of Bifrost's own address times out and never reaches the firewall's
+  `tcp-reset`. The compose e2e therefore also probes an unused address in
   Bifrost's subnet, which only the firewall can answer: it must be refused by
   the `tcp-reset` rule, whose counter must move.

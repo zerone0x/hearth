@@ -356,12 +356,13 @@ jobs:
       #   has it, so none of Docker's own rules apply, and the only thing that
       #   can answer is HEARTH-BOX-FWD's tcp-reset REJECT: the connect must be
       #   refused (not time out), and that rule's counter must move.
-      # - Bifrost's own address: never connected. Docker's own rules (its
-      #   isolation or direct-routing drops for a container's address) can
-      #   drop this one first, so it may time out instead of being refused
-      #   (the first CI run did); the first probe is what shows the firewall
-      #   covers the subnet. On a timeout the step prints Docker's raw rules
-      #   for the address and checks our chain is still first in DOCKER-USER.
+      # - Bifrost's own address: never connected. Docker drops a packet for a
+      #   container's address that does not come in on its bridge in the raw
+      #   table (`-A PREROUTING -d 172.29.249.2/32 ! -i hearth-bifrost -j
+      #   DROP`), before the filter table and so before HEARTH-BOX-FWD: this
+      #   one times out instead of being refused. On a timeout the step
+      #   requires that Docker rule and our chain first in DOCKER-USER; the
+      #   first probe is what shows the firewall covers the subnet.
       # - From the host's network (the hub's), Bifrost answers, so neither
       #   result is Bifrost being down.
       - name: A box cannot reach Bifrost (decisions 0012, 0023, 0046)
@@ -405,8 +406,8 @@ jobs:
           case "$got" in
             refused | reset) ;;
             timeout)
-              # Not ours: show the Docker rule that dropped it, and that our chain still precedes Docker's in FORWARD.
-              sudo iptables -w -t raw -S PREROUTING | grep -F 172.29.249.2 || true
+              # Docker's own drop, ahead of the filter table; our chain is still in place behind it.
+              sudo iptables -w -t raw -S PREROUTING | grep -F -- '-d 172.29.249.2/32 ! -i hearth-bifrost -j DROP'
               sudo iptables -w -S DOCKER-USER | grep -m1 -- '^-A' | grep -F -- '-i hbx+ -j HEARTH-BOX-FWD'
               ;;
             *) echo "a box network reached Bifrost" >&2; exit 1 ;;
