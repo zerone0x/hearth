@@ -584,6 +584,7 @@ describe("writes", () => {
       fingerprint: "hmac:000000000000",
       version: 2,
       updatedAt: 5,
+      policyJson: "{}",
     };
     for (const stale of [0, 2, 7]) {
       expect(store.replaceValue("ws_default", id, stale, next)).toBe(false);

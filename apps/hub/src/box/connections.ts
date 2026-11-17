@@ -34,6 +34,7 @@ import {
   type HeartbeatSettings,
   type HelloFrame,
   PROTOCOL_VERSION,
+  type ProtocolVersion,
   type RejectFrame,
   type ReliableFrame,
   type RpcFrame,
@@ -166,6 +167,8 @@ export class BoxConnection {
   binding: BoxBinding | undefined;
   principal: Principal | undefined;
   bootId: string | undefined;
+  /** The protocol version the box's `hello` named. */
+  version: ProtocolVersion | undefined;
   readonly socket: BoxSocket;
   readonly pending = new Map<string, PendingRpc>();
   queue: Promise<void> = Promise.resolve();
@@ -303,6 +306,12 @@ export class BoxConnections {
   bootIdOf(boxId: BoxId): string | undefined {
     const conn = this.#byBox.get(boxId);
     return conn?.state === "open" ? conn.bootId : undefined;
+  }
+
+  /** The protocol version of `boxId`'s open connection, if any (decision 0041). */
+  versionOf(boxId: BoxId): ProtocolVersion | undefined {
+    const conn = this.#byBox.get(boxId);
+    return conn?.state === "open" ? conn.version : undefined;
   }
 
   /**
@@ -585,6 +594,7 @@ export class BoxConnections {
     conn.binding = binding.binding;
     conn.principal = principal;
     conn.bootId = hello.bootId;
+    conn.version = hello.version;
     this.#byBox.set(hello.boxId, conn);
     conn.heartbeat = new Heartbeat({
       ...this.#heartbeat,

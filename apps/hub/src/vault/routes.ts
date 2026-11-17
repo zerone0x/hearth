@@ -7,7 +7,7 @@
  * - `GET /v1/vault/status` -> `{state, reason?, message?, kekCheck?}`
  * - `GET /v1/secrets` -> `{secrets: [...]}`
  * - `POST /v1/secrets {name, kind, scope?, policy?, meta?, fields}` -> 201 `{id, fingerprint, version}`
- * - `PUT /v1/secrets/:id/value {fields}` -> `{fingerprint, version}` (rotate)
+ * - `PUT /v1/secrets/:id/value {fields, use?}` -> `{fingerprint, version}` (rotate; `use` of a token, decision 0041)
  * - `DELETE /v1/secrets/:id` -> 204
  * - `GET /v1/secrets/:id/uses?before=<ms>` -> `{uses: [...]}` (from the audit table)
  */

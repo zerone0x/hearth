@@ -7,6 +7,10 @@
  * CSP (decisions 0017, 0019): `style-src 'self'` blocks the `<style>` Radix's
  * scroll lock injects, so the dialogs are non-modal (`modal={false}`) and the
  * selects are native `<select>`s (Radix Select always locks scrolling).
+ *
+ * A token can be made usable by box commands (decision 0041): a `bash` call
+ * may then pass it to one command as an environment variable. The switch and
+ * the table badge both say it is then visible to commands in the box.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -28,6 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -254,7 +259,7 @@ function SecretsCard({ secrets, vaultOn }: { secrets: Secret[] | undefined; vaul
                       </div>
                     ) : null}
                     {s.policy.use === "box-env" ? (
-                      <Badge variant="destructive">visible to commands in the box</Badge>
+                      <Badge variant="destructive">{BOX_ENV_WARNING}</Badge>
                     ) : null}
                   </TableCell>
                   <TableCell>{KIND_LABEL[s.kind] ?? s.kind}</TableCell>
@@ -278,6 +283,34 @@ function SecretsCard({ secrets, vaultOn }: { secrets: Secret[] | undefined; vaul
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** The warning a token usable by box commands carries, in the table and on the switch. */
+export const BOX_ENV_WARNING = "visible to commands in the box";
+
+/** A token's "Usable by box commands" switch (decision 0041), with its warning. */
+function BoxEnvSwitch({
+  id,
+  checked,
+  onChange,
+}: {
+  id: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <Switch id={id} checked={checked} onCheckedChange={onChange} />
+        <Label htmlFor={id}>Usable by box commands</Label>
+        {checked ? <Badge variant="destructive">{BOX_ENV_WARNING}</Badge> : null}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        The agent can pass it to one bash command as an environment variable (env: GH_TOKEN:
+        vault:name). The model never sees it, but that command and anything it runs can.
+      </p>
+    </div>
   );
 }
 
@@ -330,6 +363,7 @@ function AddSecretForm() {
   const [kind, setKind] = useState<SecretKind>("model-key");
   const [name, setName] = useState("");
   const [origins, setOrigins] = useState("");
+  const [boxEnv, setBoxEnv] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
   const add = useMutation({
     mutationFn: () => {
@@ -346,7 +380,9 @@ function AddSecretForm() {
                   .filter((o) => o !== ""),
               },
             }
-          : {}),
+          : kind === "token" && boxEnv
+            ? { policy: { use: "box-env" as const } }
+            : {}),
         fields,
       });
     },
@@ -414,6 +450,9 @@ function AddSecretForm() {
           </p>
         </div>
       ) : null}
+      {kind === "token" ? (
+        <BoxEnvSwitch id="secret-box-env" checked={boxEnv} onChange={setBoxEnv} />
+      ) : null}
       <FieldInputs
         kind={kind}
         prefix="secret"
@@ -453,11 +492,13 @@ function RotateSecretDialog({ secret, disabled }: { secret: Secret; disabled: bo
 function RotateSecretForm({ secret }: { secret: Secret }) {
   const client = useQueryClient();
   const [values, setValues] = useState<Record<string, string>>({});
+  const [boxEnv, setBoxEnv] = useState(secret.policy.use === "box-env");
   const rotate = useMutation({
     mutationFn: () =>
       api.rotateSecret(
         secret.id,
         Object.fromEntries(KIND_FIELDS[secret.kind].map((f) => [f, values[f] ?? ""])),
+        secret.kind === "token" ? (boxEnv ? "box-env" : "hub") : undefined,
       ),
     onSuccess: () => {
       setValues({});
@@ -480,6 +521,9 @@ function RotateSecretForm({ secret }: { secret: Secret }) {
           key takes effect on the next turn.
         </DialogDescription>
       </DialogHeader>
+      {secret.kind === "token" ? (
+        <BoxEnvSwitch id="rotate-box-env" checked={boxEnv} onChange={setBoxEnv} />
+      ) : null}
       <FieldInputs
         kind={secret.kind}
         prefix="rotate"

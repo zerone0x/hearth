@@ -293,6 +293,14 @@ export class SessionRunner {
       ...(inner.useSecret === undefined
         ? {}
         : { useSecret: inner.useSecret.bind(inner) as NonNullable<RunnerBox["useSecret"]> }),
+      // bash's vault tokens (decision 0041); absent without a vault.
+      ...(inner.useEnvSecret === undefined
+        ? {}
+        : {
+            useEnvSecret: inner.useEnvSecret.bind(inner) as NonNullable<
+              RunnerBox["useEnvSecret"]
+            >,
+          }),
     };
     try {
       const settingsManager = SettingsManager.inMemory({});

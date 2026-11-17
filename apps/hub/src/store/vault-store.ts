@@ -195,11 +195,15 @@ export class SqliteVaultStore implements VaultEntryBackend {
     workspaceId: WorkspaceId,
     id: string,
     fromVersion: number,
-    next: Pick<VaultEntryRecord, "iv" | "ciphertext" | "fingerprint" | "version" | "updatedAt">,
+    next: Pick<
+      VaultEntryRecord,
+      "iv" | "ciphertext" | "fingerprint" | "version" | "updatedAt" | "policyJson"
+    >,
   ): boolean {
     return (
       this.#db.run(
-        `UPDATE secret SET iv = ?, ciphertext = ?, fingerprint = ?, version = ?, updated_at = ?
+        `UPDATE secret SET iv = ?, ciphertext = ?, fingerprint = ?, version = ?, updated_at = ?,
+         policy_json = ?
          WHERE workspace_id = ? AND id = ? AND version = ?`,
         [
           next.iv,
@@ -207,6 +211,7 @@ export class SqliteVaultStore implements VaultEntryBackend {
           next.fingerprint,
           next.version,
           next.updatedAt,
+          next.policyJson,
           workspaceId,
           id,
           fromVersion,

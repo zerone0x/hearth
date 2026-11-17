@@ -51,7 +51,7 @@ import {
   SessionRunner,
   secretStart,
 } from "./runner";
-import type { RunnerBox, SecretUseContext } from "./tools";
+import type { EnvSecretContext, RunnerBox, SecretUseContext } from "./tools";
 
 /**
  * The model the runners talk to: from the environment (`HEARTH_MODEL*`) or
@@ -448,6 +448,15 @@ export class SessionRunners {
                 toolCallId: context.toolCallId,
                 origin: context.origin,
                 kinds: ["login"],
+              }),
+            // bash's `env` (decision 0041): opted-in tokens only, refused before decrypt.
+            useEnvSecret: (ref: string, context: EnvSecretContext) =>
+              (this.#o.vault as Pick<HubVault, "use">).use(ref, {
+                sessionId,
+                tool: "bash",
+                toolCallId: context.toolCallId,
+                env: context.env,
+                kinds: ["token"],
               }),
           }),
     };

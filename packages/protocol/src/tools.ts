@@ -22,6 +22,7 @@ import {
 } from "./browser";
 import { FieldError, Fields, isObj, MAX_ID_LENGTH } from "./fields";
 import type { FailureDisposition, FailureOwner, JsonValue } from "./frames";
+import type { ProtocolVersion } from "./version";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -71,6 +72,105 @@ export const LIVE_OUTPUT_STREAM_BASE = 2 ** 31;
 /** True for a stream id in the live output range. */
 export function isLiveOutputStreamId(id: number): boolean {
   return Number.isInteger(id) && id >= LIVE_OUTPUT_STREAM_BASE && id < 2 ** 32 && id % 2 === 0;
+}
+
+/**
+ * Secret env of one command (protocol 1.6, decision 0041): most variables one
+ * `tool.exec` carries, longest name, and longest value (the vault's own
+ * `MAX_VAULT_FIELD_CHARS`).
+ */
+export const MAX_EXEC_ENV_VARS = 8;
+export const MAX_EXEC_ENV_NAME_LENGTH = 64;
+export const MAX_EXEC_ENV_VALUE_LENGTH = 16_384;
+
+/** The shape of a variable name a command may get from the hub. */
+export const EXEC_ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Names that pass the pattern but would change how the shell, the dynamic
+ * linker, an interpreter or box-agent itself behaves, or that the box sets.
+ */
+export const EXEC_ENV_DENIED_NAMES: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "PWD",
+  "OLDPWD",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "SHELLOPTS",
+  "BASHOPTS",
+  "ENV",
+  "IFS",
+  "PS1",
+  "PS2",
+  "PS4",
+  "PROMPT_COMMAND",
+  "CDPATH",
+  "GLOBIGNORE",
+  "HISTFILE",
+  "TERM",
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  "TMPDIR",
+  "HOSTNAME",
+  "EDITOR",
+  "VISUAL",
+  "PAGER",
+  "BROWSER",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PYTHONPATH",
+  "PYTHONSTARTUP",
+  "PYTHONHOME",
+  "PERL5LIB",
+  "PERL5OPT",
+  "RUBYOPT",
+  "RUBYLIB",
+  "JAVA_TOOL_OPTIONS",
+  "SSH_ASKPASS",
+  "SSH_AUTH_SOCK",
+  "DISPLAY",
+]);
+
+/** Prefixes no secret variable may start with (`LD_PRELOAD`, `BASH_ENV`, `BASH_FUNC_x%%`, …). */
+export const EXEC_ENV_DENIED_PREFIXES: readonly string[] = [
+  "LD_",
+  "DYLD_",
+  "BASH_",
+  "LC_",
+  "GIT_",
+  "XDG_",
+  "HEARTH_",
+];
+
+/**
+ * Why `name` may not carry a secret into a command, or undefined when it may.
+ * The reason never quotes a value.
+ */
+export function execEnvNameProblem(name: string): string | undefined {
+  if (name.length === 0 || name.length > MAX_EXEC_ENV_NAME_LENGTH) {
+    return `must be 1 to ${MAX_EXEC_ENV_NAME_LENGTH} characters`;
+  }
+  if (!EXEC_ENV_NAME_PATTERN.test(name)) return "must match ^[A-Z][A-Z0-9_]*$";
+  if (EXEC_ENV_DENIED_NAMES.has(name)) return "is reserved by the shell or the box";
+  if (EXEC_ENV_DENIED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+    return "starts with a reserved prefix";
+  }
+  return undefined;
+}
+
+/** The first protocol version whose box applies `tool.exec`'s `env` (an older one drops it). */
+export const EXEC_ENV_MIN_VERSION: ProtocolVersion = { major: 1, minor: 6 };
+
+/** True when a box speaking `version` runs a command with the `env` it is sent. */
+export function supportsExecEnv(version: ProtocolVersion | undefined): boolean {
+  return (
+    version !== undefined &&
+    version.major === EXEC_ENV_MIN_VERSION.major &&
+    version.minor >= EXEC_ENV_MIN_VERSION.minor
+  );
 }
 
 /** Prefix of the box-relative directory holding spilled command output. */
@@ -126,8 +226,8 @@ export interface ToolParams extends BrowserParams {
     readonly limit: number;
   };
   /**
-   * `BashOperations.exec`. There is deliberately no `env`: the command runs
-   * with the box's own minimal environment, never the hub's (PRD §8.2.1).
+   * `BashOperations.exec`. The command runs with the box's own minimal
+   * environment, never the hub's (PRD §8.2.1).
    */
   "tool.exec": Base & {
     readonly command: string;
@@ -141,6 +241,15 @@ export interface ToolParams extends BrowserParams {
      * drops the field and answers once, as before.
      */
     readonly outputStream?: number;
+    /**
+     * Since 1.6 (decision 0041): variables added to this one command's
+     * environment, each holding a vault `box-env` token the hub resolved
+     * (`execEnvNameProblem` names none of them). The box adds them under its
+     * own variables, keeps them in no file and no log, writes no spill file
+     * for the call, and replaces each value in the result. A 1.5 box drops
+     * the field, so the hub sends it only to a 1.6 box (`supportsExecEnv`).
+     */
+    readonly env?: Readonly<Record<string, string>>;
   };
   /** Cancel the running call whose `rpc` id is `target` (pi's abort signal). */
   "tool.cancel": Base & { readonly target: string };
@@ -356,6 +465,31 @@ function stringArray(f: Fields, key: string, maxItems: number): string[] {
   });
 }
 
+/** `tool.exec`'s `env`. A failure names the variable, never its value. */
+function execEnv(f: Fields, key: string): Record<string, string> {
+  const value = f.raw(key);
+  if (!isObj(value)) f.fail(key, "expected an object");
+  const names = Object.keys(value);
+  if (names.length === 0) f.fail(key, "must not be empty");
+  if (names.length > MAX_EXEC_ENV_VARS) f.fail(key, `more than ${MAX_EXEC_ENV_VARS} variables`);
+  const env: Record<string, string> = {};
+  for (const name of names) {
+    const problem = execEnvNameProblem(name);
+    if (problem !== undefined) f.fail(key, `variable name ${JSON.stringify(name)} ${problem}`);
+    const item = value[name];
+    if (
+      typeof item !== "string" ||
+      item.length === 0 ||
+      item.length > MAX_EXEC_ENV_VALUE_LENGTH ||
+      item.includes("\u0000")
+    ) {
+      f.fail(key, `${name} must be a non-empty string without NUL, at most ${MAX_EXEC_ENV_VALUE_LENGTH} characters`);
+    }
+    env[name] = item;
+  }
+  return env;
+}
+
 function liveStreamId(f: Fields, key: string): number {
   const value = f.int(key, LIVE_OUTPUT_STREAM_BASE, 2 ** 32 - 2);
   if (!isLiveOutputStreamId(value)) f.fail(key, "must be an even live output stream id");
@@ -401,6 +535,7 @@ const PARAMS: { readonly [M in ToolMethod]: (f: Fields) => ToolParams[M] } = {
     cwd: path(f, "cwd"),
     timeoutMs: f.int("timeoutMs", 1, MAX_EXEC_TIMEOUT_MS),
     ...(f.has("outputStream") ? { outputStream: liveStreamId(f, "outputStream") } : {}),
+    ...(f.has("env") ? { env: execEnv(f, "env") } : {}),
   }),
   "tool.cancel": (f) => ({ ...base(f), target: f.id("target") }),
 };
