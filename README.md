@@ -70,6 +70,7 @@ Hub:
 | `HEARTH_VAULT_KEY_REF` | unset (vault disabled) | `apps/hub/src/main.ts`, `apps/hub/src/trajectory-cli.ts` | SecretStore reference of the vault key, the base64 of 32 bytes; compose: `file:/run/hearth-secrets/vault_key` (0031) |
 | `HEARTH_VAULT_KEY_NEXT_REF` | unset | `apps/hub/src/main.ts`, `apps/hub/src/trajectory-cli.ts` | the key to rotate the vault to; a missing file means no rotation (0031) |
 | `HEARTH_IDLE_MINUTES` | `15` | `apps/hub/src/main.ts` | idle minutes before a session's box is stopped |
+| `HEARTH_APPROVAL_TIMEOUT_MINUTES` | `10` | `apps/hub/src/main.ts` | minutes the owner has to approve a held tool call in `ask` mode before it is denied |
 | `HEARTH_BOX_PROVIDER` | `docker` | `apps/hub/src/main.ts` | `docker`, or `none` for a hub that starts no boxes |
 | `HEARTH_BOX_PORT` | `8788` | `apps/hub/src/main.ts`, `scripts/box-firewall.sh` | box listener port on each box network's gateway (0012) |
 | `HEARTH_BOX_IMAGE` | `hearth-box:local` | `apps/hub/src/main.ts` | image of session boxes |

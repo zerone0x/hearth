@@ -10,19 +10,22 @@
  * It also shows the session's model spend and tokens from Bifrost's request
  * log against its budget (decision 0047), re-read every 10 s and after each
  * message: Bifrost logs a call within about 10 s.
+ * While a tool call waits for the owner (decision 0048) the header says so,
+ * and the call's card has the Approve/Deny buttons (Thread.tsx).
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { type AccessMode, api } from "./api";
 import { DesktopPanel } from "./Desktop";
 import { ErrorAlert } from "./ErrorAlert";
-import { emptyChat, isRunning, projectChat } from "./hearthPi";
+import { emptyChat, hasPendingApproval, isRunning, projectChat } from "./hearthPi";
 import { keys, POLL_SPEND_MS, useChat, useSession } from "./queries";
 import { spendText } from "./spend";
-import { ChatRuntime, Thread } from "./Thread";
+import { type ApprovalActions, ApprovalContext, ChatRuntime, Thread } from "./Thread";
 
 export default function SessionPage({ sessionId }: { sessionId: string }) {
   const client = useQueryClient();
@@ -46,6 +49,18 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
     mutationFn: () => api.interrupt(sessionId),
     onSuccess: refetchChat,
   });
+  const approvals: ApprovalActions = useMemo(
+    () => ({
+      approvals: state.approvals,
+      decide: async (approvalId, decision) => {
+        await api.decideApproval(sessionId, approvalId, decision);
+        await client.refetchQueries({ queryKey: keys.events(sessionId) });
+        void client.invalidateQueries({ queryKey: keys.approvals });
+      },
+    }),
+    [state.approvals, sessionId, client],
+  );
+  const waiting = hasPendingApproval(state);
 
   const error = send.error ?? interrupt.error ?? chat.error ?? session.error;
   return (
@@ -58,6 +73,11 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
           {session.data?.title || sessionId}
         </h1>
         <SpendBadge sessionId={sessionId} />
+        {waiting ? (
+          <Badge variant="destructive" data-testid="approval-pending">
+            Approval needed
+          </Badge>
+        ) : null}
         <AccessModeSelect sessionId={sessionId} />
         <span className="text-muted-foreground text-xs" data-testid="session-state">
           {running ? "working" : (session.data?.state ?? "")}
@@ -78,18 +98,20 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
               <ErrorAlert error={error} />
             </div>
           )}
-          <ChatRuntime
-            messages={messages}
-            isRunning={running}
-            onSend={async (text) => {
-              await send.mutateAsync(text);
-            }}
-            onInterrupt={async () => {
-              await interrupt.mutateAsync();
-            }}
-          >
-            <Thread />
-          </ChatRuntime>
+          <ApprovalContext.Provider value={approvals}>
+            <ChatRuntime
+              messages={messages}
+              isRunning={running}
+              onSend={async (text) => {
+                await send.mutateAsync(text);
+              }}
+              onInterrupt={async () => {
+                await interrupt.mutateAsync();
+              }}
+            >
+              <Thread />
+            </ChatRuntime>
+          </ApprovalContext.Provider>
         </div>
         <aside
           className={`${showDesktop ? "flex" : "hidden"} h-72 flex-col p-3 lg:flex lg:h-auto lg:w-[45%] lg:border-l`}

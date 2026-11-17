@@ -16,10 +16,10 @@
  *   sees it.
  * - `grep` replaces `execute()` as a whole: pi's own grep always runs the
  *   hub's `rg`.
- * - `tool_call` rewrites `~` to the box workspace and applies the deny-list;
- *   a `bash` command is parsed first and matched by command rules
- *   (bash-policy.ts, decision 0044): `deny` blocks, `ask` still runs until
- *   the approval gate exists, and the verdict goes to the trajectory.
+ * - `tool_call` rewrites `~` to the box workspace and applies the path
+ *   deny-list. A `bash` command is judged before this, by the access gate
+ *   (access.ts, `hearth-access`, decisions 0043, 0044, 0048): the raw
+ *   deny-list, then the parsed command rules, then the owner in `ask` mode.
  *   `tool_result` rewrites hub temp paths (policy.ts).
  * - The `browser_*` tools (browser-tools.ts, decision 0032) go to the box the
  *   same way, as `browser.*` methods of the tool RPC, and refuse while the
@@ -56,7 +56,6 @@ import { type BoxToolOperations, NO_SECRET_ENV_IN_BOX, type RpcTrace } from "../
 import { knownSecrets } from "../obs/redaction";
 import type { BoxLease } from "../session/manager";
 import { BASH_ENV_HINT, BASH_ENV_PARAMETER, envRefusal, parseEnvRefs } from "./bash-env";
-import { type BashVerdict, type CommandRule, classifyBash } from "./bash-policy";
 import { registerBrowserTools } from "./browser-tools";
 import {
   type CompiledDenyRule,
@@ -132,12 +131,8 @@ export interface HearthToolsOptions {
   readonly box: RunnerBox;
   /** The box path pi sees as its cwd, `/workspace`. Tests point it at a temp dir. */
   readonly boxCwd: string;
+  /** The deny-list for the tools other than `bash` (the access gate judges `bash`). */
   readonly denyList: readonly CompiledDenyRule[];
-  /**
-   * Command rules for `bash`, matched after parsing (decision 0044); checked
-   * by `compileCommandRules`. Unset: none, only the raw deny-list applies.
-   */
-  readonly commandRules?: readonly CommandRule[];
   /** Where hub temp files land (`os.tmpdir()`); results naming them are rewritten. */
   readonly hubTempDir?: string;
   /**
@@ -146,8 +141,6 @@ export interface HearthToolsOptions {
    * it the call answers once, as before.
    */
   readonly liveOutput?: (toolCallId: string) => LiveOutputSink;
-  /** The verdict on every `bash` call's command, before it runs or is blocked, for the trajectory. */
-  readonly onBashVerdict?: (toolCallId: string, verdict: BashVerdict) => void;
   /** Called after a call was blocked, for the event log. */
   readonly onDenied?: (toolName: string, toolCallId: string, reason: string) => void;
   /** Called after a browser tool was refused for the desktop lock, for the trajectory. */
@@ -355,15 +348,8 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         const input = event.input as { path?: unknown };
         if (typeof input.path === "string") input.path = rewriteHome(input.path, boxCwd);
       }
-      const command = (event.input as { command?: unknown }).command;
-      if (event.toolName === "bash" && typeof command === "string") {
-        const verdict = classifyBash(command, options.commandRules ?? [], options.denyList);
-        options.onBashVerdict?.(event.toolCallId, verdict);
-        // `ask` runs, as before #69: there is no approval gate yet. Only `deny` blocks.
-        if (verdict.action !== "deny") return undefined;
-        options.onDenied?.(event.toolName, event.toolCallId, verdict.reason);
-        return { block: true, reason: verdict.reason };
-      }
+      // `bash` was judged by the access gate, which runs first (access.ts).
+      if (event.toolName === "bash") return undefined;
       const rule = denied(options.denyList, event.toolName, event.input, boxCwd);
       if (rule === undefined) return undefined;
       options.onDenied?.(event.toolName, event.toolCallId, rule.reason);

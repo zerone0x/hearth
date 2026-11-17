@@ -165,6 +165,8 @@ describe.skipIf(!BIN)("per-session virtual keys against the Bifrost binary", () 
       bifrost: { url: bifrostUrl, handoffDir: join(dir, "handoff"), checkEveryMs: 0 },
       runner: { config: { provider: "openai", model: "gpt-4o-mini" }, hubTempDir: dir },
     });
+    // These runs test tools, not the gate: `ask` would hold a risky call (decision 0048).
+    await hub.accessModes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" });
     await hub.bifrostReady;
     await hub.settingsReady;
     await hub.vault.create(LOCAL_PRINCIPAL, {

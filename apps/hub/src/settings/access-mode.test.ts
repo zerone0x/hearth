@@ -13,7 +13,9 @@ import { join } from "node:path";
 import {
   AllowAllAuthorizer,
   type AuditSink,
+  type Authorizer,
   DEFAULT_WORKSPACE_ID,
+  type EventStore,
   type HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
@@ -60,7 +62,13 @@ interface Harness {
   addSession(id: string, state?: string): void;
 }
 
-function start(options: { audit?: (db: Database) => AuditSink } = {}): Harness {
+function start(
+  options: {
+    audit?: (db: Database) => AuditSink;
+    events?: (events: SqliteEventStore) => EventStore;
+    authorizer?: (audit: AuditSink) => Authorizer;
+  } = {},
+): Harness {
   const db = openDatabase(join(dir, "hub.db"));
   dbs.push(db);
   const audit = options.audit?.(db) ?? new SqliteAuditSink(db);
@@ -71,8 +79,8 @@ function start(options: { audit?: (db: Database) => AuditSink } = {}): Harness {
   const modes = new AccessModes({
     settings,
     sessions,
-    events,
-    authorizer: new AllowAllAuthorizer({ audit }),
+    events: options.events?.(events) ?? events,
+    authorizer: options.authorizer?.(audit) ?? new AllowAllAuthorizer({ audit }),
     audit,
     log: (line) => logs.push(line),
   });
@@ -334,6 +342,90 @@ describe("changing a session's override", () => {
     }
     expect(h.sessions.getSession(SCOPE, "se_a")?.accessMode).toBeNull();
     expect(await modeEvents(h, "se_a")).toEqual([]);
+  });
+});
+
+describe("gaps from the #158 verification", () => {
+  test("clearing an override while the global default is yolo records mode yolo", async () => {
+    const h = start();
+    h.addSession("se_a");
+    await h.modes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" });
+    await h.modes.putSession(LOCAL_PRINCIPAL, "se_a", { mode: "ask" });
+    const view = await h.modes.putSession(LOCAL_PRINCIPAL, "se_a", { mode: null });
+    expect(view).toEqual({ sessionId: "se_a", override: null, global: "yolo", mode: "yolo" });
+    const rows = auditRows(h.db, "session.access_mode.update");
+    expect(rows.at(-1)?.detail).toEqual({
+      override: null,
+      mode: "yolo",
+      previous_override: "ask",
+      previous: "ask",
+    });
+    expect((await modeEvents(h, "se_a")).at(-1)).toMatchObject({
+      mode: "yolo",
+      previous: "ask",
+      override: null,
+      global: "yolo",
+      changed: "session",
+    });
+    expect(h.modes.resolve("se_a")).toBe("yolo");
+  });
+
+  test("an event append that throws leaves the override and the default unchanged", async () => {
+    const h = start({
+      events: (inner) => ({
+        append: async (scope, sessionId, event) => {
+          if (event.type === "session.access_mode") throw new Error("disk full");
+          return inner.append(scope, sessionId, event);
+        },
+        read: (...args) => inner.read(...args),
+        lastSeq: (...args) => inner.lastSeq(...args),
+      }),
+    });
+    h.addSession("se_a");
+    await expect(h.modes.putSession(LOCAL_PRINCIPAL, "se_a", { mode: "yolo" })).rejects.toThrow(
+      "disk full",
+    );
+    await expect(h.modes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" })).rejects.toThrow("disk full");
+    expect(h.sessions.getSession(SCOPE, "se_a")?.accessMode).toBeNull();
+    expect(h.settings.get(DEFAULT_WORKSPACE_ID, ACCESS_MODE_KEY)).toBeUndefined();
+    expect(h.modes.resolve("se_a")).toBe("ask");
+  });
+
+  test("a global change and an override at once: each event matches the state it left", async () => {
+    const h = start();
+    h.addSession("se_a");
+    h.addSession("se_b");
+    await Promise.all([
+      h.modes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" }),
+      h.modes.putSession(LOCAL_PRINCIPAL, "se_a", { mode: "ask" }),
+      h.modes.putGlobal(LOCAL_PRINCIPAL, { mode: "ask" }),
+      h.modes.putSession(LOCAL_PRINCIPAL, "se_b", { mode: "yolo" }),
+    ]);
+    for (const id of ["se_a", "se_b"]) {
+      const events = (await modeEvents(h, id)) as Array<{ mode: string; previous: string }>;
+      // Serialized: every event starts where the one before it ended, and the last is the state.
+      for (let i = 1; i < events.length; i++) {
+        expect(events[i]?.previous).toBe(events[i - 1]?.mode as string);
+      }
+      expect(events.at(-1)?.mode).toBe(h.modes.resolve(id));
+    }
+    expect(h.modes.resolve("se_a")).toBe("ask");
+    expect(h.modes.resolve("se_b")).toBe("yolo");
+  });
+
+  test("reading a session's mode authorizes session.read on that session", async () => {
+    const seen: Array<{ action: string; type: string; id: string }> = [];
+    const h = start({
+      authorizer: () => ({
+        authorize: async (_principal, action, resource) => {
+          seen.push({ action, type: resource.type, id: resource.id ?? "" });
+          return { allowed: true, policy: "test" };
+        },
+      }),
+    });
+    h.addSession("se_a");
+    await h.modes.getSession(LOCAL_PRINCIPAL, "se_a");
+    expect(seen).toEqual([{ action: "session.read", type: "session", id: "se_a" }]);
   });
 });
 

@@ -291,8 +291,9 @@ function AccessModeForm({ settings }: { settings: AccessModeSettings }) {
         </NativeSelect>
         <p className="text-xs text-muted-foreground">
           {settings.source === "default" ? "Not saved yet, so sessions use ask. " : ""}
-          Approval prompts for ask are not in this version yet: until they are, both modes run tools
-          as before, and the deny-list blocks in both.
+          In ask, a risky call (such as git push, rm -rf, or a vault secret) waits on its card in
+          the chat until you approve or deny it; no decision in time denies it. Deny rules block in
+          both modes.
         </p>
       </div>
       <ErrorAlert error={save.error} />

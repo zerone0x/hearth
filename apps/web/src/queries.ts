@@ -24,6 +24,7 @@ export const keys = {
   sessionAccessMode: (id: string) => ["session-access-mode", id] as const,
   sessionSpend: (id: string) => ["session-spend", id] as const,
   sessionBudget: ["session-budget"] as const,
+  approvals: ["approvals"] as const,
 };
 
 /** How often an open session re-reads its spend: Bifrost logs a call within about 10 s. */
@@ -65,6 +66,15 @@ export function useAuth() {
 
 export function useSessions() {
   return useQuery({ queryKey: keys.sessions, queryFn: api.sessions });
+}
+
+/** Approvals waiting for the owner (decision 0048), polled for the session list's marker. */
+export function useApprovals() {
+  return useQuery({
+    queryKey: keys.approvals,
+    queryFn: api.approvals,
+    refetchInterval: POLL_IDLE_MS,
+  });
 }
 
 export function useSession(sessionId: string) {

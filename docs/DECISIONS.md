@@ -4073,3 +4073,122 @@ means none), and the UI shows the session's spend from Bifrost's request log.
   for calls through Bifrost.
 - A fresh install whose Bifrost cannot start (no access to `getbifrost.ai`)
   cannot chat until it does; `/healthz` and the refusal say why.
+## 0048: The `ask` gate waits on a hub-side approval record; web approval cards
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #155, with #71 (design: `docs/research/m3-models-access.md`, question 3;
+  PRD v0.5.1 §6.5, §11.3 S3; decisions 0042, 0043, 0044, 0045)
+
+### Context
+
+Decisions 0043-0045 left `ask` recorded but not enforced: the verdict of
+`classifyBash` went to the trajectory and only `deny` blocked. PRD §6.5 makes
+`ask` stop risky calls until the owner approves or denies them in the web UI,
+with a timeout that denies. #71 adds the lifecycle rules: one pending card at
+a time, a new owner message rejects it, every decision audited before it takes
+effect, only the owner decides. The idea of channel-neutral approval batches
+and their lifecycle comes from stakpak/agent (#64, `docs/research/stakpak.md`
+F3); no code was copied. pi's `permission-gate.ts` and `timed-confirm.ts`
+example extensions are the pattern for a blocking `tool_call` with a timeout.
+
+### Decision
+
+- **The gate is `hearth-access`** (`apps/hub/src/runner/access.ts`), the
+  reserved built-in of 0043/0045, registered first. It now owns the `bash`
+  verdict (moved from `hearth-tools`, which keeps `~` rewriting and the path
+  deny-list). `deny` blocks in both modes. In `yolo` an `ask` runs at once; a
+  command the parser cannot read is `ask`, so in `yolo` only the raw
+  deny-list, tested first, can block it (0043). In `ask` mode an `ask` waits.
+  Anything the handler throws blocks the call (pi's `tool_call` rule).
+- **The non-`bash` set is small.** A call that uses a marked secret is at
+  least `ask`: `bash` with a `vault:` env (0041; approved before decrypt) and
+  `browser_fill` (0039). The payment-page rule and other per-tool rules are
+  deferred: there is no URL rule model yet.
+- **The approval record** (`apps/hub/src/approvals`, migration 11's
+  `approval` table): `request` writes an audit row, then
+  `approval.requested {approvalId, toolCallId, tool, summary, command, rule,
+  reason, mode, requestedAt, expiresAt}` (with the turn id), then the row, and
+  waits. `summary` is the part that decided (the matched sub-command),
+  `command` the whole `bash` command. The gate redacts `summary`, `command`
+  and `reason` with the runner's redaction (registered secrets, in every
+  form: raw, URL-encoded, JSON-escaped) before the request, so no event, row,
+  list or trajectory holds a secret the tool step would hide. The parser's
+  display can requote or split a word (an unquoted `&` in a value), leaving a
+  piece of a secret that whole-value redaction misses, so the shown parts
+  come from the redacted command, parsed again (`shownVerdict`); if that reads
+  as another rule, the redacted whole command stands in for the part.
+  It ends once, as `approval.approved | denied | expired | cancelled |
+  interrupted`, each audited (`approval.<verb>`) and logged before the call is
+  released; the row leaves `pending` with a conditional UPDATE. Every end but
+  `approved` returns `{block: true, reason}`, which pi gives the model as the
+  tool error ("Denied: no decision within 10 min. Not run."), so the turn says
+  so. If a system end (timeout, cancel) cannot be recorded, the call is denied
+  anyway (fail-closed). If the request cannot be recorded, the call is blocked.
+- **Timeout** `HEARTH_APPROVAL_TIMEOUT_MINUTES`, default 10.
+- **Cancel.** A stop cancels with `why: "stopped"`, through the held call's
+  abort signal only (pi aborts it on `interrupt`). A stop that lands while the
+  request is still being recorded is seen right after the record, so the
+  approval is cancelled at once and is never approvable. A new owner message while an approval waits
+  is queued into the running turn with pi's `steer` (recorded as
+  `message.user` with `steered: true`), then the approval is cancelled with
+  `why: "new message"`: the model reads the denial and the message before its
+  next call. Without a pending approval a message during a turn is still
+  `runner.busy`.
+- **Restart.** At hub start every row still `pending` becomes `interrupted`
+  with an `approval.interrupted` event (PRD §8.1 principle 7). When the runner
+  is rebuilt, an orphaned call whose approval never reached `approved` gets
+  "Denied: the hub restarted before the owner decided; the command was not
+  run" instead of "outcome unknown": nothing reached the box. An approved call
+  cut off by the restart stays outcome-unknown.
+- **The route** `POST /v1/sessions/:id/approvals/:approvalId {decision:
+  "approve" | "deny"}` sits behind the request guard (Host, Origin, JSON) and
+  the login guard. It authorizes `session.approve` on the session first, then
+  refuses a non-`user` principal, then reads the body, then looks the id up in
+  that session only: an unknown id and another session's id get the same 404
+  `approval.not-found`. The same decision again answers as the first
+  (idempotent); a different one on an ended approval is 409 `approval.closed`.
+  If the audit row cannot be written nothing changes (503) and it stays
+  pending. `GET /v1/approvals` lists the pending ones for the session list.
+- **Clocks.** The tool RPC deadline starts at dispatch, after the decision,
+  and no lease is held while waiting, so the wait is no tool's time. There is
+  no turn deadline in the hub today; the wait is recorded apart, as
+  `approval.waited_ms` on the call and `approval_wait_ms` on the turn end, so
+  a later turn clock or no-progress sweep (§8.1) can leave it out.
+- **Trajectory.** A held call's `tool_call` record gains `approval: {id, rule,
+  decision, decided_by, waited_ms}`, and each `approval.*` event projects as a
+  record of kind `approval` (with its `at`). Added fields and kinds, so the
+  schema stays `hearth.trajectory/2` (0021, 0037).
+- **Web.** The card is a branch of the existing `ToolFallback` card
+  (`Thread.tsx`): the matched sub-command, the rule and its reason, then the
+  full command, all of it, wrapped and never cut (research m3 Q3: the matched
+  part alone could hide `; touch x` or a pipe to `curl`), a countdown and two
+  shadcn `Button`s, inline in the card (no dialog, portal or inline style, so the CSP
+  stays as 0038 left it). After it ends it says who decided and when, or that
+  it expired. The session header and the session list show "Approval needed".
+  The lifecycle module has no web types, so Telegram and Web Push (M6) reuse
+  it with another `channel`.
+
+### Alternatives rejected
+
+- **Events only, no table.** A restart would have to scan every session's log
+  to find pending approvals, and the session list could not show them cheaply.
+- **Reject a new message while an approval waits** (`runner.busy`, as today):
+  #71 asks that the message is kept; `steer` keeps it in the same turn.
+- **Show all risky siblings on one card.** pi preflights siblings one at a
+  time, so one card is pending at a time, which meets #71's one batch; the
+  batch view is optional and deferred.
+- **"Approve all for this session".** Prompt-injected repetition is bounded by
+  one card at a time; an owner who wants no cards switches the session to
+  `yolo`.
+
+### Consequences
+
+- Migration 11 is taken (10 is #157's).
+- An existing install (no saved mode, so `ask`, 0045) now stops on the seed
+  rules (`git push`, `rm -rf`, `curl | sh`, ...) and on marked secrets. The
+  Settings card says so.
+- `hearth-tools` no longer classifies `bash`; a test that builds it without
+  the gate gets no `bash` deny-list.
+- Deferred: the payment-page rule and URL rules for `browser_*`; Telegram and
+  Web Push cards (M6); a batch card for siblings.

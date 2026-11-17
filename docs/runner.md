@@ -114,8 +114,15 @@ classification has a work budget (`MAX_POLICY_STEPS`) because the hub's
 `tool_call` handler is synchronous; past it the verdict is
 `ask` (`unclear:budget`) after the raw deny-list has been applied.
 
-**Only `deny` blocks today.** There is no approval gate or access-mode setting
-yet, so an `ask` verdict runs exactly as before. Every `bash` step in the
+**The access gate acts on the verdict** (`hearth-access`, decisions 0043,
+0048). `deny` blocks in both access modes. `ask` runs at once in `yolo`; in
+`ask` mode the call waits on an approval record until the owner approves or
+denies it on the call's card in the web UI. No decision within
+`HEARTH_APPROVAL_TIMEOUT_MINUTES` (default 10) denies it, and so do a stop and
+a new owner message (which is then read in the same turn). A hub restart turns
+a pending approval into `approval.interrupted`, and the call's result reads
+"denied, not run". A call that uses a marked secret (`bash` with a `vault:`
+env, `browser_fill`) is at least `ask`. Every `bash` step in the
 trajectory records the verdict as `bash_policy: { action, rule, reason,
 command? }`, where `rule` is a rule name, `raw:<n>` for the n-th `denyList`
 rule, `unclear:<why>`, or `none`.

@@ -566,6 +566,8 @@ describe("the hub", () => {
         get: () => '- generic [ref=e1]:\n  - textbox "Password" [ref=e3]',
       });
       const session = await hub.sessions.create(LOCAL_PRINCIPAL, { title: "fill" });
+      // `browser_fill` uses a marked secret: in `ask` it would wait for the owner (0048).
+      await hub.accessModes.putSession(LOCAL_PRINCIPAL, session.id, { mode: "yolo" });
       const { token } = await hub.issueJoinToken("box_fill", session.id);
       agent = new BoxAgent({
         hubUrl: hub.listenForBoxes("127.0.0.1"),

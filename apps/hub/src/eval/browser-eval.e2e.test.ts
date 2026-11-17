@@ -148,6 +148,8 @@ describe.skipIf(!enabled)(
           }),
         },
       });
+      // These runs test tools, not the gate: `ask` would hold a risky call (decision 0048).
+      await hub.accessModes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" });
       const h = hub;
       expect((await h.vaultReady).state).toBe("enabled");
       const cookie = `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`;

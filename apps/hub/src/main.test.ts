@@ -1,7 +1,32 @@
 import { describe, expect, test } from "bun:test";
 import { type SecretStore, SecretValue } from "@hearth/core";
 import { DockerBoxProvider } from "./box/docker";
-import { boxProviderFromEnv, registerStartupSecrets, vaultConfigFromEnv } from "./main";
+import {
+  approvalTimeoutMsFromEnv,
+  boxProviderFromEnv,
+  registerStartupSecrets,
+  vaultConfigFromEnv,
+} from "./main";
+
+describe("approvalTimeoutMsFromEnv (decision 0048)", () => {
+  test("unset or empty: the default (undefined, so Approvals uses 10 min)", () => {
+    expect(approvalTimeoutMsFromEnv({})).toBeUndefined();
+    expect(approvalTimeoutMsFromEnv({ HEARTH_APPROVAL_TIMEOUT_MINUTES: "" })).toBeUndefined();
+  });
+
+  test("minutes become milliseconds, fractions too", () => {
+    expect(approvalTimeoutMsFromEnv({ HEARTH_APPROVAL_TIMEOUT_MINUTES: "10" })).toBe(600_000);
+    expect(approvalTimeoutMsFromEnv({ HEARTH_APPROVAL_TIMEOUT_MINUTES: "0.5" })).toBe(30_000);
+  });
+
+  test("zero, negative and non-numbers are refused, not a silent default", () => {
+    for (const raw of ["0", "-1", "-0.5", "abc", "Infinity", "NaN"]) {
+      expect(() => approvalTimeoutMsFromEnv({ HEARTH_APPROVAL_TIMEOUT_MINUTES: raw })).toThrow(
+        "HEARTH_APPROVAL_TIMEOUT_MINUTES must be a positive number",
+      );
+    }
+  });
+});
 
 describe("boxProviderFromEnv", () => {
   test("defaults to the Docker provider (decision 0012)", () => {

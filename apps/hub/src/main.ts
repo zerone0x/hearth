@@ -53,6 +53,23 @@ export function idleMsFromEnv(env: Readonly<Record<string, string | undefined>>)
 }
 
 /**
+ * Minutes the owner has to decide on a tool call the access gate holds
+ * (`HEARTH_APPROVAL_TIMEOUT_MINUTES`, decision 0048: default 10). Rejects
+ * anything that is not a positive number instead of silently falling back.
+ */
+export function approvalTimeoutMsFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): number | undefined {
+  const raw = env["HEARTH_APPROVAL_TIMEOUT_MINUTES"];
+  if (raw === undefined || raw === "") return undefined;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    throw new Error(`HEARTH_APPROVAL_TIMEOUT_MINUTES must be a positive number, got "${raw}"`);
+  }
+  return Math.round(minutes * 60_000);
+}
+
+/**
  * The runner's model (decision 0015): `HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL`
  * and `HEARTH_MODEL_KEY_REF`, a SecretStore reference such as
  * `env:ANTHROPIC_API_KEY` or `file:/run/secrets/model_key`. Without
@@ -170,6 +187,7 @@ if (import.meta.main) {
   const boxEgress = boxEgressFromEnv(process.env);
   mkdirSync(dataDir, { recursive: true });
   const runnerConfig = runnerConfigFromEnv(process.env);
+  const approvalTimeoutMs = approvalTimeoutMsFromEnv(process.env);
   const webRoot = webRootFromEnv(process.env);
   // The Bifrost gateway (decision 0046); its allow-list check reads the firewall marker (0023).
   const bifrost = bifrostConfigFromEnv(process.env);
@@ -202,6 +220,7 @@ if (import.meta.main) {
     ...(webRoot === undefined ? {} : { webRoot }),
     ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),
     sessions: { idleMs: idleMsFromEnv(process.env) },
+    ...(approvalTimeoutMs === undefined ? {} : { approvalTimeoutMs }),
     // Level, component and ids from each line (obs/hub-log.ts).
     log: hubLines(obs.logger),
   });
