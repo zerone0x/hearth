@@ -2415,6 +2415,24 @@ describe("bash env: vault tokens for one command (decision 0041)", () => {
     expect(execFrames(h).map((f) => f.command)).toEqual(["echo old-box-ok"]);
   }, 20_000);
 
+  test("a vault failure that is not a refusal is passed on as it is; nothing runs", async () => {
+    const vault = {
+      use: async () => {
+        throw new Error("disk I/O error in the vault");
+      },
+    } as unknown as SessionRunnersOptions["vault"];
+    const h = await harness({}, { vault });
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_env", "env", { GH_TOKEN: "vault:github" }),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_env");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("disk I/O error in the vault");
+    expect(result?.text).not.toContain("Nothing was run");
+    expect(execFrames(h)).toHaveLength(0);
+  }, 20_000);
+
   test("without a vault a call with env refuses; a call without env runs as before", async () => {
     const h = await harness();
     const runner = await turn(h, "se_a", "go", [

@@ -43,6 +43,8 @@ describe("tool RPC", () => {
       ok: true,
       value: { ...params, env: eight },
     });
+    const longest = { GH_TOKEN: "v".repeat(MAX_EXEC_ENV_VALUE_LENGTH) };
+    expect(decodeToolParams("tool.exec", { ...params, env: longest }).ok).toBe(true);
     const value = "do-not-echo-this-value";
     const bad: unknown[] = [
       null,
