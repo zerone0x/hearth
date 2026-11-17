@@ -80,6 +80,12 @@ export interface SessionRunnerOptions {
   readonly box: RunnerBox;
   readonly modelRuntime: ModelRuntime;
   readonly model: Model<string>;
+  /**
+   * The model calls go through Bifrost with the session's virtual key
+   * (decision 0047): a call Bifrost refuses with HTTP 402 (budget) or 429
+   * (rate limit) ends the turn with a `runner.gateway` event the chat shows.
+   */
+  readonly gateway?: boolean;
   readonly denyList: readonly CompiledDenyRule[];
   /** Compiled command rules for `bash` (decision 0044). Unset: none. */
   readonly commandRules?: readonly CommandRule[];
@@ -144,6 +150,52 @@ export const MAX_RUNNER_EVENT_BYTES = 1024 * 1024;
 const BULKY_FIELDS = new Set(["partial", "messages", "toolResults"]);
 
 export const REDACTED = "[redacted]";
+
+/** A model call the gateway refused, as the chat shows it (`runner.gateway`). */
+export interface GatewayRefusal {
+  readonly status: 402 | 429;
+  readonly code: "budget_exceeded" | "rate_limited";
+  readonly message: string;
+}
+
+/**
+ * Classify a failed model call by its HTTP status, which pi puts first in the
+ * error text (`402: {"message":"Budget exceeded: ..."}`), never by Bifrost's
+ * own labels. 402 is the session's budget, 429 its rate limit; anything else
+ * is not the gateway's refusal.
+ */
+export function gatewayRefusal(errorMessage: string | undefined): GatewayRefusal | undefined {
+  const m = /^\s*(\d{3})\b[:\s]*([\s\S]*)$/.exec(errorMessage ?? "");
+  if (m === null) return undefined;
+  const status = Number(m[1]);
+  if (status !== 402 && status !== 429) return undefined;
+  let detail = (m[2] ?? "").trim();
+  try {
+    const parsed: unknown = JSON.parse(detail);
+    const inner =
+      parsed !== null && typeof parsed === "object"
+        ? ((parsed as Record<string, unknown>)["message"] ??
+          ((parsed as Record<string, unknown>)["error"] as Record<string, unknown> | undefined)?.[
+            "message"
+          ])
+        : undefined;
+    if (typeof inner === "string") detail = inner;
+  } catch {
+    // Not JSON: the text as it is.
+  }
+  detail = detail.slice(0, 300);
+  return status === 402
+    ? {
+        status,
+        code: "budget_exceeded",
+        message: `This session reached its model budget${detail === "" ? "" : ` (${detail})`}. Raise the session budget in Settings to continue.`,
+      }
+    : {
+        status,
+        code: "rate_limited",
+        message: `The model gateway's rate limit for this session was reached${detail === "" ? "" : ` (${detail})`}. Try again in a minute.`,
+      };
+}
 
 /**
  * `text` with every secret replaced, in each of its forms (`secretForms`:
@@ -262,6 +314,8 @@ export class SessionRunner {
   #failing: Promise<void> = Promise.resolve();
   readonly tracer: TurnTracer;
   #interrupted = false;
+  /** The turn's last model call, when the gateway refused it (decision 0047). */
+  #refusal: GatewayRefusal | undefined;
 
   private constructor(
     options: SessionRunnerOptions,
@@ -527,6 +581,7 @@ export class SessionRunner {
     }
     this.#status = "running";
     this.#interrupted = false;
+    this.#refusal = undefined;
     const start = this.tracer.startTurn();
     const turnId = String(start.payload["turn_id"]);
     try {
@@ -590,6 +645,8 @@ export class SessionRunner {
       await this.#refreshContext();
       await this.#session.prompt(text);
       this.#flushEntries();
+      // The turn ends with the refusal in sight, not as a silent stop (§11.3).
+      if (this.#refusal !== undefined) this.#record("runner.gateway", this.#refusal);
       this.#endTurn(this.#interrupted ? "interrupted" : "done");
       await this.#chain;
       if (this.#status === "running") this.#status = "idle";
@@ -626,6 +683,9 @@ export class SessionRunner {
           usage: m.usage,
           stopReason: m.stopReason,
         });
+        if (this.#o.gateway === true) {
+          this.#refusal = m.stopReason === "error" ? gatewayRefusal(m.errorMessage) : undefined;
+        }
       }
     } catch (error) {
       void this.#fail(error);

@@ -205,6 +205,23 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     expect(failed.notices).toHaveLength(1);
   });
 
+  test("runner.gateway (a 402 budget refusal, decision 0047) shows its message as an error notice", () => {
+    const chat = applyHubEvents(emptyChat(S), [
+      ev("message.user", { text: "go" }),
+      ev("runner.gateway", {
+        status: 402,
+        code: "budget_exceeded",
+        message: "This session reached its model budget (0.04 >= 0.03 dollars).",
+      }),
+    ]);
+    expect(chat.notices).toEqual([
+      expect.objectContaining({
+        tone: "error",
+        text: "This session reached its model budget (0.04 >= 0.03 dollars).",
+      }),
+    ]);
+  });
+
   test("tool errors, outcome unknown, and calls cut off by the end of the turn", () => {
     const step = assistant(
       [

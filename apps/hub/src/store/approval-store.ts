@@ -1,5 +1,5 @@
 /**
- * The `approval` table of migration 10 (#155, decision 0048): the hub-side
+ * The `approval` table of migration 11 (#155, decision 0048): the hub-side
  * record of each tool call the access gate held for the owner. A row leaves
  * `pending` once: `finish` is a conditional UPDATE, so two deciders (a
  * click and the timeout) cannot both win.

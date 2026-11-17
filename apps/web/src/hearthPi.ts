@@ -13,6 +13,8 @@
  *   and then aborts pi, so pi ends the call in flight as an error; a call
  *   that ends with an error after `runner.interrupted` and before the turn
  *   ends shows as interrupted, not as a failure;
+ * - `runner.gateway` (the model gateway refused a call: budget or rate limit,
+ *   decision 0047) shows as an error notice; the session stays usable.
  * - `runner.failed` (an error that ends the turn) and `runner.interrupted`
  *   (a notice), shown as system messages where they happened;
  * - Hearth's tool states (`hearthToolStatus`): done, error, outcome unknown
@@ -174,6 +176,13 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       };
       break;
     }
+    case "runner.gateway":
+      // The model gateway refused a call (402 budget, 429 rate limit; decision 0047).
+      notices = notice(
+        "error",
+        typeof p["message"] === "string" ? p["message"] : "The model gateway refused the call.",
+      );
+      break;
     case "approval.requested": {
       const call = p["toolCallId"];
       const id = p["approvalId"];

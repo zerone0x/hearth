@@ -15,7 +15,13 @@ import {
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
 import { Approvals, mountApprovalRoutes } from "./approvals";
 import { AuthService } from "./auth";
-import { BIFROST_SYSTEM_ENTRIES, BifrostService, type BifrostServiceOptions } from "./bifrost";
+import {
+  BIFROST_SYSTEM_ENTRIES,
+  BifrostService,
+  type BifrostServiceOptions,
+  mountSpendRoutes,
+  SessionVirtualKeys,
+} from "./bifrost";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -57,6 +63,7 @@ import {
   SqliteSessionStore,
   SqliteSettingStore,
   SqliteVaultStore,
+  SqliteVirtualKeyStore,
 } from "./store";
 import { HubVault, mountVaultRoutes } from "./vault";
 
@@ -213,7 +220,8 @@ export interface HubOptions extends HubListenOptions {
   /**
    * The Bifrost gateway service (decision 0046): its address, the tmpfs
    * handoff directory and the box egress allow list. Unset: not configured,
-   * and `/healthz` has no `bifrost` field. Model calls do not use it yet (#157).
+   * and `/healthz` has no `bifrost` field. With it, model calls go through
+   * Bifrost with a virtual key per session (decision 0047).
    */
   readonly bifrost?: Omit<BifrostServiceOptions, "vault" | "vaultStore" | "log">;
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
@@ -296,6 +304,7 @@ export function startHub(options: HubOptions) {
   const blobs = new SqliteBlobStore(db);
   const credentials = new SqliteBoxCredentialStore(db);
   const sessionStore = new SqliteSessionStore(db);
+  const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   // The vault (decision 0031): opened in the background; a `vault:` resolve
   // waits for it. A missing or wrong key disables it and nothing else.
   const vaultStore = new SqliteVaultStore(db);
@@ -549,6 +558,8 @@ export function startHub(options: HubOptions) {
     authorizer,
     events,
     store: sessionStore,
+    // An archived session's virtual key is deactivated (decision 0047).
+    onArchived: (sessionId) => virtualKeys.deactivate(sessionId),
     image: options.boxImage ?? DEFAULT_BOX_IMAGE,
     ...options.sessions,
     ...(options.log === undefined ? {} : { log: options.log }),
@@ -612,6 +623,18 @@ export function startHub(options: HubOptions) {
     log: options.log ?? (() => {}),
   });
   mountAccessModeRoutes(app, accessModes);
+  // Per-session virtual keys and spend (decision 0047): only with Bifrost
+  // configured do model calls go through it; else the direct path (0038).
+  const virtualKeys = new SessionVirtualKeys({
+    bifrost,
+    store: new SqliteVirtualKeyStore(db),
+    settings: settingStore,
+    authorizer,
+    audit,
+    sessionExists: (sessionId) => sessionStore.getSession(scope, sessionId) !== undefined,
+    log: options.log ?? (() => {}),
+  });
+  mountSpendRoutes(app, virtualKeys);
   // The approval records the access gate waits on (decision 0048). A restart
   // turns every approval still pending into `approval.interrupted` first.
   const approvals = new Approvals({
@@ -648,6 +671,7 @@ export function startHub(options: HubOptions) {
           // browser_fill resolves logins through the vault (decision 0039).
           vault,
           accessMode: (sessionId) => accessModes.resolve(sessionId),
+          ...(bifrost === undefined ? {} : { gateway: virtualKeys }),
           approvals,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
@@ -697,7 +721,6 @@ export function startHub(options: HubOptions) {
   });
   mountDesktopRoute(app, desktop, auth, (c) => c.env as Upgrader | undefined);
 
-  const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
   return {
     /** The public listener: UI/API only. */
     server,
@@ -722,6 +745,8 @@ export function startHub(options: HubOptions) {
     /** The Bifrost gateway service (decision 0046), if configured, and its first check. */
     bifrost,
     bifrostReady,
+    /** Per-session Bifrost virtual keys, the session budget and spend (decision 0047). */
+    virtualKeys,
     /** The access mode setting and its resolver (decision 0045). */
     accessModes,
     /** The approval records of the access gate (decision 0048), and the restart recovery. */
