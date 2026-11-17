@@ -114,6 +114,8 @@ describe("rules: command name plus argument pattern", () => {
     }
     expect(verdict("/bin/rm -rf x", DENY_ALL)).toBe("deny rm-recursive-force");
     expect(verdict("rm -r x", DENY_ALL)).toBe("allow none");
+    expect(verdict("rm xrf", DENY_ALL)).toBe("allow none");
+    expect(verdict("rm --rf x", DENY_ALL)).toBe("allow none");
     expect(verdict("rm -- -rf", DENY_ALL)).toBe("allow none");
     expect(verdict("rm $opts x", DENY_ALL)).toBe("ask rm-recursive-force");
     expect(verdict("rm -rf $dir", DENY_ALL)).toBe("deny rm-recursive-force");
@@ -127,6 +129,7 @@ describe("rules: command name plus argument pattern", () => {
     expect(verdict('git commit -m "$(date)"', DENY_ALL)).toBe("allow none");
     expect(verdict("git $sub origin", DENY_ALL)).toBe("ask git-push");
     expect(verdict("git", DENY_ALL)).toBe("allow none");
+    expect(verdict("git - push", DENY_ALL)).toBe("allow none");
     expect(verdict("git --", DENY_ALL)).toBe("allow none");
     expect(verdict("git -- $x", DENY_ALL)).toBe("ask git-push");
   });
@@ -235,6 +238,7 @@ describe("shells and eval are parsed again, up to a depth", () => {
     expect(verdict("bash -o pipefail -c 'git push'", DENY_ALL)).toBe("deny git-push");
     expect(verdict("/bin/sh -e -c 'git push' name", DENY_ALL)).toBe("deny git-push");
     expect(verdict("zsh -c 'echo ok'", DENY_ALL)).toBe("allow none");
+    expect(verdict("bash --norc +x -c 'git push'", DENY_ALL)).toBe("deny git-push");
     expect(verdict('bash -c "r""m -rf x"', DENY_ALL)).toBe("deny rm-recursive-force");
   });
 
@@ -247,6 +251,11 @@ describe("shells and eval are parsed again, up to a depth", () => {
     expect(verdict("source ./x.sh", DENY_ALL)).toBe("ask unclear:script");
     expect(verdict(". ./x.sh", DENY_ALL)).toBe("ask unclear:script");
     expect(verdict("bash --version", DENY_ALL)).toBe("allow none");
+    expect(verdict("bash -e script.sh", DENY_ALL)).toBe("ask unclear:script");
+    expect(classifyBash("bash $opt 'git push'", DENY_ALL).reason).toBe(
+      "a shell option is not a literal",
+    );
+    expect(classifyBash("bash -c", DENY_ALL).reason).toBe("-c without a script");
   });
 
   test("eval joins its literal words; a non-literal word asks", () => {
@@ -345,6 +354,9 @@ describe("compileCommandRules", () => {
     expect(bad({ name: "a", command: [""], action: "ask" })).toThrow("command must be");
     expect(bad({ name: "a", command: ["x"], action: "allow" })).toThrow('"ask" or "deny"');
     expect(bad({ name: "a", command: ["x"], action: "ask", flags: [[]] })).toThrow("flags group");
+    expect(bad({ name: "a", command: ["x"], action: "ask", flags: [["-r"], []] })).toThrow(
+      "flags group",
+    );
   });
 });
 

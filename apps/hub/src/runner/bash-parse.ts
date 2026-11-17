@@ -17,7 +17,14 @@
  *   not a hang); an exception from the parser or the walk is a parse error.
  */
 
-import { forEachChild, type ParsedScript, parse, type SyntaxNode, type Word } from "unbash";
+import {
+  type Assignment,
+  forEachChild,
+  type ParsedScript,
+  parse,
+  type SyntaxNode,
+  type Word,
+} from "unbash";
 
 /** Above this many UTF-16 units the command is not parsed; the policy asks. */
 export const MAX_COMMAND_BYTES = 64 * 1024;
@@ -52,11 +59,10 @@ interface WordPartLike {
 }
 
 function literalPart(part: WordPartLike): boolean {
-  if (LITERAL_PARTS.has(part.type)) return true;
-  if (part.type === "DoubleQuoted") {
-    return (part.parts ?? []).every((child) => child.type === "Literal");
-  }
-  return false;
+  return (
+    LITERAL_PARTS.has(part.type) ||
+    (part.type === "DoubleQuoted" && (part.parts ?? []).every((c) => c.type === "Literal"))
+  );
 }
 
 /** A word's value when it is a literal, else `null`. */
@@ -66,14 +72,11 @@ export function literalWord(word: Word): string | null {
   return parts.every((part) => literalPart(part)) ? word.value : null;
 }
 
-function bashWord(node: SyntaxNode): BashWord {
+function bashWord(node: Word | Assignment): BashWord {
   if (node.type === "Word") return { value: literalWord(node), text: node.text };
-  if (node.type === "Assignment") {
-    // `env FOO=1 cmd` parses as a word; a declaration builtin's argument can be an assignment.
-    const value = node.value.type === "Word" ? literalWord(node.value) : null;
-    return { value: value === null ? null : `${node.name}=${value}`, text: node.text };
-  }
-  return { value: null, text: "" };
+  // `env FOO=1 cmd` parses as a word; a declaration builtin's argument (`export A=1`) is an assignment.
+  const value = node.value.type === "Word" ? literalWord(node.value) : null;
+  return { value: value === null ? null : `${node.name}=${value}`, text: node.text };
 }
 
 interface Frame {
@@ -102,9 +105,10 @@ export function parseBash(
     while (stack.length > 0) {
       const frame = stack.pop() as Frame;
       const node = frame.node;
-      // A nested script starts a fresh pipeline context.
-      const upstream = node.type === "Script" ? [] : frame.upstream;
+      let upstream = frame.upstream;
       if (node.type === "Script") {
+        // A nested script starts a fresh pipeline context and has its own errors.
+        upstream = [];
         for (const e of (node as ParsedScript).errors ?? []) errors.push(e.message);
       }
       if (

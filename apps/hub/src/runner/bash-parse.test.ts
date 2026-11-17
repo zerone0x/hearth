@@ -73,6 +73,9 @@ describe("parseBash: words", () => {
   test("prefix assignments are dropped; an assignment-only command has no command", () => {
     expect(words("GIT_SSH_COMMAND=x git push")).toEqual([["git", "push"]]);
     expect(words("a=1")).toEqual([]);
+    // A declaration builtin's arguments are assignments.
+    expect(words("export A=1 B=$x C='q'")).toEqual([["export", "A=1", null, "C=q"]]);
+    expect(words("declare -a arr=(1 2)")).toEqual([["declare", "-a", null]]);
   });
 
   test("lists, pipelines, subshells, groups, functions and loops each give their commands", () => {
@@ -100,6 +103,8 @@ describe("parseBash: words", () => {
       ["tee", ["curl", "sudo"]],
       ["cat", []],
     ]);
+    // `&&` is a list, not a pipe.
+    expect(parseBash("curl -s x > f && sh").commands.map((c) => c.upstream)).toEqual([[], []]);
   });
 });
 

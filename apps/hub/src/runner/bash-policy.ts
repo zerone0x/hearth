@@ -223,6 +223,11 @@ function nameMatches(patterns: readonly string[], name: string): boolean {
 
 type Match = "yes" | "no" | "unknown";
 
+/** `-x`, `-rf`, `--force`; not `-` (stdin) or a plain word. */
+function isOption(value: string): boolean {
+  return value.length > 1 && value.startsWith("-");
+}
+
 /** The options (before `--`) and whether a non-literal word could hide one. */
 function optionWords(args: readonly BashWord[]): { options: string[]; unknown: boolean } {
   const options: string[] = [];
@@ -233,37 +238,39 @@ function optionWords(args: readonly BashWord[]): { options: string[]; unknown: b
       continue;
     }
     if (word.value === "--") break;
-    if (word.value.startsWith("-") && word.value.length > 1) options.push(word.value);
+    if (isOption(word.value)) options.push(word.value);
   }
   return { options, unknown };
 }
 
+/** `option` is present: exactly, or a one-letter short option inside a cluster (`-r` in `-fr`). */
 function hasOption(options: readonly string[], option: string): boolean {
-  const short = /^-[^-]$/.test(option);
-  return options.some((o) => {
-    if (o === option) return true;
-    if (short) return !o.startsWith("--") && o.slice(1).includes(option.slice(1));
-    return option.startsWith("--") && o.startsWith(`${option}=`);
-  });
+  const letter = /^-[^-]$/.test(option) ? option.slice(1) : undefined;
+  return options.some(
+    (o) => o === option || (letter !== undefined && !o.startsWith("--") && o.includes(letter)),
+  );
 }
 
-/** The first argument that is not an option, skipping option values. */
-function subcommandOf(args: readonly BashWord[], withValue: ReadonlySet<string>): Match | string {
-  for (let i = 0; i < args.length; i++) {
-    const value = args[i]?.value;
-    if (value === null || value === undefined) return "unknown";
-    if (value === "--") {
-      const next = args[i + 1];
-      if (next === undefined) return "no";
-      return next.value ?? "unknown";
-    }
-    if (value.startsWith("-") && value.length > 1) {
-      if (withValue.has(value)) i++;
-      continue;
-    }
-    return value;
-  }
-  return "no";
+/**
+ * The first argument that is not an option, skipping option values: a
+ * string, `null` when a non-literal word comes first, `undefined` for none.
+ */
+function subcommandOf(
+  args: readonly BashWord[],
+  withValue: ReadonlySet<string>,
+): string | null | undefined {
+  let skip = false;
+  return args
+    .map((word) => word.value)
+    .find((value) => {
+      if (skip) {
+        skip = false;
+        return false;
+      }
+      if (value === null) return true;
+      skip = withValue.has(value);
+      return !isOption(value);
+    });
 }
 
 function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): Match {
@@ -272,7 +279,7 @@ function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): M
   const results: Match[] = [];
   if (rule.subcommand !== undefined) {
     const sub = subcommandOf(args, new Set(rule.optionsWithValue ?? []));
-    results.push(sub === "unknown" ? "unknown" : sub === rule.subcommand ? "yes" : "no");
+    results.push(sub === null ? "unknown" : sub === rule.subcommand ? "yes" : "no");
   }
   if (rule.flags !== undefined) {
     const { options, unknown } = optionWords(args);
@@ -287,9 +294,8 @@ function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): M
   if (rule.pipedFrom !== undefined) {
     const from = rule.pipedFrom;
     const piped = command.upstream.some((stage) => {
-      const inner = unwrap(stage);
-      const n = inner.words[0]?.value;
-      return n !== null && n !== undefined && nameMatches(from, basename(n));
+      const n = unwrap(stage).words[0]?.value;
+      return typeof n === "string" && nameMatches(from, basename(n));
     });
     results.push(piped ? "yes" : "no");
   }
@@ -298,10 +304,10 @@ function ruleMatches(rule: CommandRule, command: SimpleCommand, name: string): M
 }
 
 interface Unwrapped {
+  /** The command that runs; empty when nothing does (`command -v git`, `xargs` alone). */
   readonly words: readonly BashWord[];
-  /** Set when a wrapper option means nothing runs (`command -v`) or it cannot be known. */
-  readonly stop?: "none" | "ask";
-  readonly reason?: string;
+  /** Set when a wrapper option hides what runs (`env -S`, `sudo -s`). */
+  readonly unclear?: string;
 }
 
 /** Strips wrappers until the command that runs; `VAR=x` words of `env`/`sudo` too. */
@@ -309,22 +315,19 @@ function unwrap(words: readonly BashWord[]): Unwrapped {
   let rest = words;
   for (;;) {
     const head = rest[0]?.value;
-    if (head === null || head === undefined) return { words: rest };
+    if (typeof head !== "string") return { words: rest };
     const wrapper = WRAPPERS[basename(head)];
     if (wrapper === undefined) return { words: rest };
     const withValue = new Set(wrapper.withValue ?? []);
     let i = 1;
     let positionals = wrapper.positionals ?? 0;
     for (; i < rest.length; i++) {
-      const value = rest[i]?.value;
-      if (value === null || value === undefined) break;
-      if (value === "--") {
-        i++;
-        break;
-      }
-      if (value.startsWith("-") && value.length > 1) {
+      const value = (rest[i] as BashWord).value;
+      if (value === null) break;
+      if (isOption(value)) {
         const stop = wrapper.stop?.[value];
-        if (stop !== undefined) return { words: rest, stop, reason: `${head} ${value}` };
+        if (stop === "none") return { words: [] };
+        if (stop === "ask") return { words: rest, unclear: `${head} ${value}` };
         if (withValue.has(value)) i++;
         continue;
       }
@@ -335,25 +338,19 @@ function unwrap(words: readonly BashWord[]): Unwrapped {
       }
       break;
     }
-    if (i >= rest.length) {
-      // `xargs` alone runs `echo`; `env` alone prints; `nohup` alone fails.
-      return { words: rest, stop: "none" };
-    }
+    // `xargs` alone runs `echo`; `env` alone prints; `nohup` alone fails.
     rest = rest.slice(i);
   }
 }
 
-/** The index of the `-c` script operand of a shell, or -1. */
-function shellScriptIndex(args: readonly BashWord[]): number | "unknown" {
+/** The index of the `-c` script operand of a shell, -1 without `-c`, `null` if a non-literal option hides it. */
+function shellScriptIndex(args: readonly BashWord[]): number | null {
   let sawC = false;
   for (let i = 0; i < args.length; i++) {
-    const value = args[i]?.value;
-    if (value === null || value === undefined) return sawC ? i : "unknown";
-    if (value === "--" || value === "-") {
-      return sawC ? i + 1 : -1;
-    }
-    if (value.startsWith("-") && !value.startsWith("--") && value.length > 1) {
-      if (value.slice(1).includes("c")) sawC = true;
+    const value = (args[i] as BashWord).value;
+    if (value === null) return sawC ? i : null;
+    if (isOption(value) && !value.startsWith("--")) {
+      if (value.includes("c")) sawC = true;
       // `-o opt` / `-O opt` take a value.
       if (/^-[^-]*[oO]$/.test(value)) i++;
       continue;
@@ -408,10 +405,10 @@ function judgeCommand(command: SimpleCommand, ctx: Context): BashVerdict {
   let verdict = rawDeny(command.words, ctx) ?? ALLOW;
   const inner = unwrap(command.words);
   const words = inner.words;
+  if (words.length === 0) return verdict;
   const shown = display(words);
-  if (inner.stop === "none") return verdict;
-  if (inner.stop === "ask") {
-    return stricter(verdict, unclear("wrapper", `cannot see what ${inner.reason} runs`, shown));
+  if (inner.unclear !== undefined) {
+    return stricter(verdict, unclear("wrapper", `cannot see what ${inner.unclear} runs`, shown));
   }
   verdict = stricter(verdict, rawDeny(words, ctx) ?? ALLOW);
   const head = words[0]?.value;
@@ -449,7 +446,7 @@ function judgeCommand(command: SimpleCommand, ctx: Context): BashVerdict {
   }
   if (SHELLS.has(name)) {
     const index = shellScriptIndex(args);
-    if (index === "unknown") {
+    if (index === null) {
       return stricter(verdict, unclear("shell", "a shell option is not a literal", shown));
     }
     if (index === -1) {
