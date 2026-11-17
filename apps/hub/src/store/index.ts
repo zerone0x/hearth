@@ -27,3 +27,8 @@ export {
   type SessionRow,
   SqliteSessionStore,
 } from "./sessions";
+export {
+  type SecretUseRow,
+  SqliteVaultStore,
+  type SqliteVaultStoreOptions,
+} from "./vault-store";

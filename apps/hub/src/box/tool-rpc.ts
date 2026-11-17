@@ -27,10 +27,13 @@ import {
   classifyToolError,
   DEFAULT_EXEC_TIMEOUT_MS,
   decodeToolResult,
+  LIVE_OUTPUT_STREAM_BASE,
   MAX_EXEC_TIMEOUT_MS,
   MUTATING_TOOL_METHODS,
   type RpcFrame,
   type RpcResultFrame,
+  type StreamCloseFrame,
+  type StreamDataFrame,
   type ToolMethod,
   type ToolParams,
   type ToolResults,
@@ -42,7 +45,8 @@ import type { BoxConnections } from "./connections";
 export type CallParams<M extends ToolMethod> = Omit<ToolParams[M], "callId">;
 
 export interface ToolRpcClientOptions {
-  readonly boxes: Pick<BoxConnections, "listen" | "sendRpc">;
+  readonly boxes: Pick<BoxConnections, "listen" | "sendRpc"> &
+    Partial<Pick<BoxConnections, "sendStream">>;
   /** Overrides `toolDeadlineMs`; tests shorten it. */
   readonly deadlineMs?: <M extends ToolMethod>(method: M, params: ToolParams[M]) => number;
   readonly log?: (line: string) => void;
@@ -115,6 +119,14 @@ export interface BoxToolOperations {
         signal?: AbortSignal;
         timeout?: number;
         env?: unknown;
+        /**
+         * Not in pi's `BashOperations`: the command's output as the box
+         * streams it while it runs (decision 0036). Lossy and capped; the
+         * result, through `onData`, stays the answer. Returning `false`
+         * means it wants no more: the hub closes the stream so the box stops
+         * sending it.
+         */
+        onOutput?: (chunk: Uint8Array) => boolean | undefined;
       },
     ): Promise<{ exitCode: number | null }>;
   };
@@ -147,10 +159,13 @@ export interface BoxToolOperations {
 }
 
 export class ToolRpcClient {
-  readonly #boxes: Pick<BoxConnections, "listen" | "sendRpc">;
+  readonly #boxes: ToolRpcClientOptions["boxes"];
   readonly #deadlineMs: <M extends ToolMethod>(method: M, params: ToolParams[M]) => number;
   readonly #log: (line: string) => void;
   readonly #pending = new Map<string, Pending>();
+  /** Live output streams by `<boxId> <streamId>` (decision 0036). */
+  readonly #streams = new Map<string, (chunk: Uint8Array) => boolean | undefined>();
+  #nextStream = 0;
   readonly #unlisten: () => void;
 
   constructor(options: ToolRpcClientOptions) {
@@ -161,7 +176,13 @@ export class ToolRpcClient {
       connected: (boxId, bootId) => this.#onConnected(boxId, bootId),
       dead: (boxId, bootId, death) => this.#onDead(boxId, bootId, death.misses * death.intervalMs),
       rpcResult: (_boxId, frame) => this.#onResult(frame),
+      stream: (boxId, frame) => this.#onStream(boxId, frame),
     });
+  }
+
+  /** Live output streams open now. */
+  get liveStreams(): number {
+    return this.#streams.size;
   }
 
   /** Calls in flight. */
@@ -332,12 +353,27 @@ export class ToolRpcClient {
       },
       bash: {
         // `env` is pi's (the hub's) environment and is dropped here on purpose.
-        exec: async (command, cwd, { onData, signal, timeout }) => {
+        exec: async (command, cwd, { onData, signal, timeout, onOutput }) => {
           const timeoutMs =
             timeout !== undefined && timeout > 0
               ? Math.min(Math.ceil(timeout * 1000), MAX_EXEC_TIMEOUT_MS)
               : DEFAULT_EXEC_TIMEOUT_MS;
-          const result = await call("tool.exec", { command, cwd, timeoutMs }, signal);
+          const stream = onOutput === undefined ? undefined : this.#openStream(boxId, onOutput);
+          let result: ToolResults["tool.exec"];
+          try {
+            result = await call(
+              "tool.exec",
+              {
+                command,
+                cwd,
+                timeoutMs,
+                ...(stream === undefined ? {} : { outputStream: stream.id }),
+              },
+              signal,
+            );
+          } finally {
+            stream?.close();
+          }
           if (result.outcome === "cancelled") throw new Error("aborted");
           if (result.outcome === "timed-out") throw new Error(`timeout:${timeoutMs / 1000}`);
           if (result.output.length > 0) onData(Buffer.from(result.output, "utf8"));
@@ -364,6 +400,51 @@ export class ToolRpcClient {
       },
       browser: { call: (method, params, signal) => call(method, params, signal) },
     };
+  }
+
+  /** A live output stream id for one exec on `boxId`, in the range the desktop bridge never uses. */
+  #openStream(boxId: BoxId, onOutput: (chunk: Uint8Array) => boolean | undefined) {
+    let id: number;
+    let key: string;
+    do {
+      id = LIVE_OUTPUT_STREAM_BASE + this.#nextStream;
+      this.#nextStream = (this.#nextStream + 2) % LIVE_OUTPUT_STREAM_BASE;
+      key = `${boxId} ${id}`;
+    } while (this.#streams.has(key));
+    this.#streams.set(key, onOutput);
+    return { id, close: () => this.#streams.delete(key) };
+  }
+
+  /**
+   * A live output frame. Called in the connection's frame order, before the
+   * `rpc.result` that ends the call; it only hands the bytes on, so a slow
+   * consumer never holds up the box's frames.
+   */
+  #onStream(boxId: BoxId, frame: StreamDataFrame | StreamCloseFrame): boolean {
+    const key = `${boxId} ${frame.streamId}`;
+    const onOutput = this.#streams.get(key);
+    if (onOutput === undefined) return false;
+    if (frame.type === "stream.close") {
+      this.#streams.delete(key);
+      return true;
+    }
+    let more: boolean | undefined;
+    try {
+      more = onOutput(frame.data);
+    } catch (error) {
+      this.#log(`tool rpc: live output consumer failed: ${String(error)}`);
+    }
+    if (more === false) {
+      // The consumer stopped listening (its cap, or a failed store): tell the
+      // box to stop streaming this command. The call itself goes on.
+      this.#streams.delete(key);
+      this.#boxes.sendStream?.(boxId, {
+        type: "stream.close",
+        streamId: frame.streamId,
+        reason: "cancelled",
+      });
+    }
+    return true;
   }
 
   #cancel(boxId: BoxId, callId: string, target: string): void {

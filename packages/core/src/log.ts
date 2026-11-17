@@ -39,15 +39,52 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\b((?:api[_-]?key|token|password|secret)["']?\s*[:=]\s*["']?)[^\s"'&,}]{6,}/gi,
 ];
 
-/** Replace every known secret value, raw and JSON-escaped, and every credential shape. */
-export function redactLine(line: string, secrets: Iterable<string> = []): string {
-  let out = line;
+/**
+ * `text` with every occurrence of every value, raw and JSON-escaped, replaced
+ * by `mask`. All occurrences of all values are found in the original text
+ * first, and each run of overlapping or touching matches becomes one `mask`.
+ * Replacing value by value would let one value cut another: with a username
+ * `admin` replaced before the password `admin-pw-tail`, the tail `-pw-tail`
+ * would stay. The order of `secrets` does not matter.
+ */
+export function redactValues(
+  text: string,
+  secrets: Iterable<string>,
+  mask: string = LOG_REDACTED,
+): string {
+  const needles = new Set<string>();
   for (const secret of secrets) {
     if (secret.length === 0) continue;
-    out = out.split(secret).join(LOG_REDACTED);
-    const escaped = JSON.stringify(secret).slice(1, -1);
-    if (escaped !== secret) out = out.split(escaped).join(LOG_REDACTED);
+    needles.add(secret);
+    needles.add(JSON.stringify(secret).slice(1, -1));
   }
+  const spans: Array<readonly [number, number]> = [];
+  for (const needle of needles) {
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
+      spans.push([at, at + needle.length]);
+    }
+  }
+  const first = spans.sort((a, b) => a[0] - b[0])[0];
+  if (first === undefined) return text;
+  let out = "";
+  let written = 0;
+  let [start, end] = first;
+  for (const [from, to] of spans) {
+    if (from > end) {
+      out += text.slice(written, start) + mask;
+      written = end;
+      start = from;
+      end = to;
+    } else {
+      end = Math.max(end, to);
+    }
+  }
+  return out + text.slice(written, start) + mask + text.slice(end);
+}
+
+/** Replace every known secret value, raw and JSON-escaped, and every credential shape. */
+export function redactLine(line: string, secrets: Iterable<string> = []): string {
+  let out = redactValues(line, secrets);
   for (const pattern of SECRET_PATTERNS) {
     out = out.replace(pattern, (_m, prefix?: string) =>
       typeof prefix === "string" ? `${prefix}${LOG_REDACTED}` : LOG_REDACTED,

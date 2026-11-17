@@ -16,7 +16,13 @@ import {
 } from "@hearth/core";
 import type { Frame, StreamCloseFrame, StreamDataFrame } from "@hearth/protocol";
 import type { BoxConnectionListener } from "../box/connections";
-import { DESKTOP_CLOSE, DesktopBridge, type ViewerSocket, type ViewerTicket } from "./bridge";
+import {
+  DESKTOP_CLOSE,
+  DesktopBridge,
+  nextDesktopStreamId,
+  type ViewerSocket,
+  type ViewerTicket,
+} from "./bridge";
 import { DesktopLocks } from "./lock";
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -151,6 +157,14 @@ function setup(
     },
   };
 }
+
+describe("desktop stream ids", () => {
+  test("are even and wrap below the live output range (decision 0036)", () => {
+    expect(nextDesktopStreamId(0)).toBe(2);
+    expect(nextDesktopStreamId(2 ** 31 - 2)).toBe(0);
+    expect(nextDesktopStreamId(2 ** 31 - 4)).toBe(2 ** 31 - 2);
+  });
+});
 
 describe("DesktopBridge.prepare", () => {
   test("authorizes desktop.view, reads the session, starts the box and releases the lease", async () => {

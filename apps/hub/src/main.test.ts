@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { type SecretStore, SecretValue } from "@hearth/core";
 import { DockerBoxProvider } from "./box/docker";
-import { boxProviderFromEnv } from "./main";
+import { boxProviderFromEnv, registerStartupSecrets, vaultConfigFromEnv } from "./main";
 
 describe("boxProviderFromEnv", () => {
   test("defaults to the Docker provider (decision 0012)", () => {
@@ -30,5 +31,40 @@ describe("boxProviderFromEnv", () => {
     expect(() => boxProviderFromEnv({ HEARTH_BOX_PROVIDER: "podman" })).toThrow(
       'HEARTH_BOX_PROVIDER must be "docker" or "none", got "podman"',
     );
+  });
+});
+
+describe("vaultConfigFromEnv (decision 0031)", () => {
+  test("passes both key references through and leaves unset or empty ones out", () => {
+    expect(
+      vaultConfigFromEnv({
+        HEARTH_VAULT_KEY_REF: "file:/run/hearth-secrets/vault_key",
+        HEARTH_VAULT_KEY_NEXT_REF: "file:/run/hearth-secrets/vault_key.next",
+      }),
+    ).toEqual({
+      keyRef: "file:/run/hearth-secrets/vault_key",
+      nextKeyRef: "file:/run/hearth-secrets/vault_key.next",
+    });
+    expect(vaultConfigFromEnv({ HEARTH_VAULT_KEY_REF: "", HEARTH_VAULT_KEY_NEXT_REF: "" })).toEqual(
+      {},
+    );
+    expect(vaultConfigFromEnv({})).toEqual({});
+  });
+});
+
+describe("registerStartupSecrets", () => {
+  test("leaves a vault: model key to the vault and resolves any other", async () => {
+    const asked: string[] = [];
+    const secrets = {
+      resolve: async (ref: string) => {
+        asked.push(ref);
+        return new SecretValue("startup-probe-value-2c7f");
+      },
+    } as unknown as SecretStore;
+    const warn = { warn: () => {} };
+    await registerStartupSecrets(secrets, { apiKeyRef: "vault:model" }, warn);
+    expect(asked).toEqual([]);
+    await registerStartupSecrets(secrets, { apiKeyRef: "env:MODEL_KEY" }, warn);
+    expect(asked).toEqual(["env:MODEL_KEY"]);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { LOG_REDACTED, Logger, parseLogLevel, redactLine } from "./log";
+import { LOG_REDACTED, Logger, parseLogLevel, redactLine, redactValues } from "./log";
 
 function capture(secrets: string[] = [], level?: "debug" | "info") {
   const lines: string[] = [];
@@ -60,6 +60,45 @@ describe("Logger", () => {
     expect(redactLine("plain plainSecretValue42 here", ["plainSecretValue42"])).toBe(
       `plain ${LOG_REDACTED} here`,
     );
+  });
+
+  test("overlapping secrets leave no tail, in either order of the list", () => {
+    const user = "probeadmin";
+    const password = "probeadmin-Zq9!SuffixLeak";
+    for (const secrets of [
+      [user, password],
+      [password, user],
+    ]) {
+      expect(redactLine(`u=${user} pw=${password} end`, secrets)).toBe(
+        `u=${LOG_REDACTED} pw=${LOG_REDACTED} end`,
+      );
+    }
+    // Two values that overlap without one containing the other: one span.
+    for (const secrets of [
+      ["abc-OVER", "OVER-xyz"],
+      ["OVER-xyz", "abc-OVER"],
+    ]) {
+      expect(redactValues("[abc-OVER-xyz]", secrets, "#")).toBe("[#]");
+    }
+    // The JSON-escaped form overlaps the raw one of another value.
+    const quoted = 'zzpart"q-tail';
+    for (const secrets of [
+      ["zzpart", quoted],
+      [quoted, "zzpart"],
+    ]) {
+      const line = JSON.stringify({ a: quoted, b: "zzpart" });
+      expect(redactLine(line, secrets)).toBe(`{"a":"${LOG_REDACTED}","b":"${LOG_REDACTED}"}`);
+    }
+    expect(redactValues("no secret here", ["absent"], "#")).toBe("no secret here");
+    expect(redactValues("aaaa", ["aa", ""], "#")).toBe("#");
+    expect(redactValues("x-ab-y-ab", ["ab"], "#")).toBe("x-#-y-#");
+    // A value that overlaps its own next occurrence is one span: nothing of it is left.
+    expect(redactValues("x ababab y", ["abab"], "#")).toBe("x # y");
+    expect(redactValues("pw=aaaa", ["aaa"], "#")).toBe("pw=#");
+    expect(redactLine("x ababab y", ["abab"])).toBe(`x ${LOG_REDACTED} y`);
+    // Touching values are one span; a value with a quote is found raw too.
+    expect(redactValues("<abcdef>", ["def", "abc"], "#")).toBe("<#>");
+    expect(redactValues('raw a"b\\c here', ['a"b\\c'], "#")).toBe("raw # here");
   });
 
   test("credential shapes are redacted without being known", () => {

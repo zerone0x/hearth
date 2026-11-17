@@ -53,6 +53,26 @@ export const FS_DEADLINE_MS = FILE_TIMEOUT_MS + TOOL_DEADLINE_GRACE_MS;
 /** Tool calls one box runs at once; more are refused with `tool.busy`. */
 export const MAX_CONCURRENT_TOOL_CALLS = 16;
 
+/**
+ * Live output (protocol 1.4, decision 0036): most bytes of one command's
+ * output the box streams while it runs. The rest is only in the result.
+ */
+export const MAX_LIVE_OUTPUT_BYTES = 64 * 1024;
+/** Live output: the box sends at most one `stream.data` per this many ms per command. */
+export const LIVE_OUTPUT_INTERVAL_MS = 100;
+/** Live output: the box sends a chunk early once this many bytes wait. */
+export const LIVE_OUTPUT_CHUNK_BYTES = 16 * 1024;
+/**
+ * Live output stream ids: even (the hub picks them, decision 0016) with the
+ * top bit set, so they never meet the desktop bridge's ids, which stay below.
+ */
+export const LIVE_OUTPUT_STREAM_BASE = 2 ** 31;
+
+/** True for a stream id in the live output range. */
+export function isLiveOutputStreamId(id: number): boolean {
+  return Number.isInteger(id) && id >= LIVE_OUTPUT_STREAM_BASE && id < 2 ** 32 && id % 2 === 0;
+}
+
 /** Prefix of the box-relative directory holding spilled command output. */
 export const EXEC_SPILL_DIR = ".hearth/exec";
 
@@ -113,6 +133,14 @@ export interface ToolParams extends BrowserParams {
     readonly command: string;
     readonly cwd: string;
     readonly timeoutMs: number;
+    /**
+     * Since 1.4 (decision 0036): stream the command's output while it runs as
+     * `stream.data` frames on this stream id (`isLiveOutputStreamId`), then a
+     * `stream.close`, both before the `rpc.result`. Lossy and capped at
+     * `MAX_LIVE_OUTPUT_BYTES`; the result stays the whole answer. A 1.3 box
+     * drops the field and answers once, as before.
+     */
+    readonly outputStream?: number;
   };
   /** Cancel the running call whose `rpc` id is `target` (pi's abort signal). */
   "tool.cancel": Base & { readonly target: string };
@@ -319,6 +347,12 @@ function stringArray(f: Fields, key: string, maxItems: number): string[] {
   });
 }
 
+function liveStreamId(f: Fields, key: string): number {
+  const value = f.int(key, LIVE_OUTPUT_STREAM_BASE, 2 ** 32 - 2);
+  if (!isLiveOutputStreamId(value)) f.fail(key, "must be an even live output stream id");
+  return value;
+}
+
 const base = (f: Fields): Base => ({ callId: f.id("callId") });
 
 const PARAMS: { readonly [M in ToolMethod]: (f: Fields) => ToolParams[M] } = {
@@ -357,6 +391,7 @@ const PARAMS: { readonly [M in ToolMethod]: (f: Fields) => ToolParams[M] } = {
     command: f.string("command", MAX_EXEC_COMMAND_LENGTH, false),
     cwd: path(f, "cwd"),
     timeoutMs: f.int("timeoutMs", 1, MAX_EXEC_TIMEOUT_MS),
+    ...(f.has("outputStream") ? { outputStream: liveStreamId(f, "outputStream") } : {}),
   }),
   "tool.cancel": (f) => ({ ...base(f), target: f.id("target") }),
 };

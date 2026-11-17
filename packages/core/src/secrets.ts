@@ -25,7 +25,15 @@ export type SecretErrorCode =
   | "secret.unknown-scheme"
   | "secret.not-found"
   | "secret.unreadable"
-  | "secret.empty";
+  | "secret.empty"
+  // The vault (`vault:`, decision 0031).
+  | "vault.disabled"
+  | "vault.entry-corrupt"
+  | "vault.scope-mismatch"
+  | "vault.kind-mismatch"
+  | "vault.field-unknown"
+  | "vault.origin-mismatch"
+  | "vault.audit-failed";
 
 /**
  * How a reference appears in messages. A reference that does not parse, names
@@ -40,6 +48,27 @@ export function redactRef(ref: SecretRef): string {
 
 /** `scheme:body`; the scheme is lowercase letters, digits and `-`. */
 const SECRET_REF = /^([a-z][a-z0-9-]*):(.+)$/s;
+
+/** A vault entry name (decision 0031). Names are not secret: they show in events and audit rows. */
+export const VAULT_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** A field after `#`: lowercase letters and `_`. */
+const VAULT_FIELD = /^[a-z][a-z_]{0,31}$/;
+
+/**
+ * The body of a `vault:` reference, `<name>` or `<name>#<field>`, or
+ * undefined when it is anything else (possibly a pasted value).
+ */
+export function parseVaultRefBody(
+  body: string,
+): { readonly name: string; readonly field?: string } | undefined {
+  const hash = body.indexOf("#");
+  const name = hash === -1 ? body : body.slice(0, hash);
+  if (!VAULT_NAME.test(name)) return undefined;
+  if (hash === -1) return { name };
+  const field = body.slice(hash + 1);
+  return VAULT_FIELD.test(field) ? { name, field } : undefined;
+}
 
 /**
  * The longest `env:` name shown as written, inclusive: a name of exactly this
@@ -91,6 +120,9 @@ export function displayRef(ref: SecretRef): string {
     ) {
       return redactRef(ref);
     }
+  }
+  if (match[1] === "vault" && parseVaultRefBody(match[2]) === undefined) {
+    return redactRef(ref);
   }
   return ref;
 }
@@ -184,6 +216,12 @@ export class SecretValue {
 export interface SecretResolver {
   /** The scheme handled, without the colon, e.g. `env`. */
   readonly scheme: string;
+  /**
+   * `false`: the store neither caches values of this scheme nor shares a read
+   * in flight, so every `resolve` reaches the resolver (the vault audits each
+   * use). Default `true`.
+   */
+  readonly cacheable?: boolean;
   resolve(body: string, ref: SecretRef): Promise<string>;
 }
 
@@ -344,6 +382,10 @@ export class ResolvingSecretStore implements SecretStore {
   }
 
   resolve(ref: SecretRef): Promise<SecretValue> {
+    const scheme = SECRET_REF.exec(ref)?.[1];
+    if (scheme !== undefined && this.#resolvers.get(scheme)?.cacheable === false) {
+      return this.#read(ref);
+    }
     const cached = this.#cache.get(ref);
     if (cached && cached.expiresAt > this.#now()) {
       return Promise.resolve(cached.value);
@@ -442,12 +484,23 @@ export class ResolvingSecretStore implements SecretStore {
   }
 }
 
-/** The personal-edition store: `env:` and `file:` references. */
+/**
+ * The personal-edition store: `env:` and `file:` references, plus any extra
+ * resolvers (the hub adds `vault:`, decision 0031).
+ */
 export function createDefaultSecretStore(
-  options: { env?: Readonly<Record<string, string | undefined>>; ttlMs?: number } = {},
+  options: {
+    env?: Readonly<Record<string, string | undefined>>;
+    ttlMs?: number;
+    resolvers?: readonly SecretResolver[];
+  } = {},
 ): SecretStore {
   return new ResolvingSecretStore({
-    resolvers: [new EnvSecretResolver(options.env), new FileSecretResolver()],
+    resolvers: [
+      new EnvSecretResolver(options.env),
+      new FileSecretResolver(),
+      ...(options.resolvers ?? []),
+    ],
     ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
   });
 }

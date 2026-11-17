@@ -9,6 +9,7 @@ import {
   type HearthChat,
   hearthToolStatus,
   isRunning,
+  liveOutputOf,
   MAX_TOOL_OUTPUT,
   projectChat,
   toolTarget,
@@ -634,5 +635,76 @@ describe("query client", () => {
     expect(retry(1, new ApiError(503, "x", "x"))).toBe(true);
     expect(retry(2, new ApiError(503, "x", "x"))).toBe(false);
     expect(retry(0, new TypeError("network"))).toBe(true);
+  });
+});
+
+describe("live tool output (decision 0036)", () => {
+  const S = "se_live";
+  let seq = 0;
+  const ev = (type: string, payload: unknown): HubEvent => ({ seq: ++seq, ts: 0, type, payload });
+  const call = { type: "toolCall", id: "b1", name: "bash", arguments: { command: "x" } };
+  const step = { role: "assistant", content: [call], stopReason: "toolUse", timestamp: 1 };
+  const start = () => [
+    ev("pi.agent_start", {}),
+    ev("pi.message_start", { message: step }),
+    ev("pi.message_end", { message: step }),
+    ev("pi.tool_execution_start", { toolCallId: "b1", toolName: "bash", args: { command: "x" } }),
+  ];
+  const liveOf = (chat: ReturnType<typeof emptyChat>) => {
+    const part = projectChat(chat).find((m) => m.role === "assistant");
+    return liveOutputOf(part?.metadata?.custom, "b1");
+  };
+
+  test("chunks add up in order on the running call's card", () => {
+    const chat = applyHubEvents(emptyChat(S), [
+      ...start(),
+      ev("tool.output", { toolCallId: "b1", seq: 0, text: "one\n" }),
+      ev("tool.output", { toolCallId: "b1", seq: 1, text: "two\n", truncated: true }),
+    ]);
+    expect(chat.live["b1"]).toEqual({ text: "one\ntwo\n", truncated: true });
+    expect(liveOf(chat)).toEqual({ text: "one\ntwo\n", truncated: true });
+  });
+
+  test("keeps the last MAX_TOOL_OUTPUT characters", () => {
+    const chat = applyHubEvents(emptyChat(S), [
+      ...start(),
+      ev("tool.output", { toolCallId: "b1", seq: 0, text: "a".repeat(MAX_TOOL_OUTPUT) }),
+      ev("tool.output", { toolCallId: "b1", seq: 1, text: "tail" }),
+    ]);
+    const text = chat.live["b1"]?.text ?? "";
+    expect(text.length).toBe(MAX_TOOL_OUTPUT);
+    expect(text.endsWith("tail")).toBe(true);
+  });
+
+  test("the call's end drops it, a late chunk stays dropped, and the result shows instead", () => {
+    const result = {
+      role: "toolResult",
+      toolCallId: "b1",
+      toolName: "bash",
+      content: [{ type: "text", text: "one\nfinal\n" }],
+      isError: false,
+      timestamp: 2,
+    };
+    const chat = applyHubEvents(emptyChat(S), [
+      ...start(),
+      ev("tool.output", { toolCallId: "b1", seq: 0, text: "one\n" }),
+      ev("pi.tool_execution_end", { toolCallId: "b1", toolName: "bash", result, isError: false }),
+      ev("tool.output", { toolCallId: "b1", seq: 1, text: "late\n" }),
+      ev("pi.message_start", { message: result }),
+    ]);
+    expect(chat.live).toEqual({});
+    expect(liveOf(chat)).toBeUndefined();
+  });
+
+  test("agent_end clears every call's live output; junk payloads are ignored", () => {
+    const chat = applyHubEvents(emptyChat(S), [
+      ...start(),
+      ev("tool.output", { toolCallId: 7, seq: 0, text: "bad id" }),
+      ev("tool.output", { toolCallId: "b1", seq: 0, text: 42 }),
+    ]);
+    expect(chat.live["b1"]).toEqual({ text: "", truncated: false });
+    expect(Object.keys(chat.live)).toEqual(["b1"]);
+    const ended = applyHubEvents(chat, [ev("pi.agent_end", {})]);
+    expect(ended.live).toEqual({});
   });
 });

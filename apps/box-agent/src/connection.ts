@@ -147,6 +147,12 @@ export class BoxAgent {
             send: (frame) => {
               if (this.#phase === "open") this.#write(frame);
             },
+            // Live output (decision 0036) is lossy: lost while disconnected,
+            // dropped when the hub socket is backed up.
+            sendStream: (frame) => {
+              if (this.#phase === "open") this.#write(frame);
+            },
+            backlog: () => this.#socket?.bufferedAmount ?? 0,
           });
     this.#heartbeat = new Heartbeat({
       ...options.heartbeat,
@@ -410,6 +416,7 @@ export class BoxAgent {
         }
         return;
       case "stream.close":
+        if (this.#tools?.closeStream(frame.streamId) === true) return;
         this.#vnc.close(frame.streamId);
         return;
       case "session.assign":
