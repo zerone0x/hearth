@@ -3546,3 +3546,83 @@ in-flight #130 PR.
   about Telegram or PWA in M3 do not exist.
 - Telegram pairing and the poller lease (§9) apply from M6; the vault key
   needs no owner password because triggers run in M4 and Telegram in M6.
+
+## 0044: Bash commands are parsed before the command rules (`unbash`), and only `deny` is enforced until the approval gate
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #69 (research: `docs/research/m3-models-access.md`, question 2, #153)
+
+### Context
+
+The deny-list (0015) is a regular expression over the raw `bash` string, so
+`rm -fr`, `X=rm; $X -rf`, `bash -c "r""m -rf"` and `echo $(git push)` all get
+past a rule. PRD §6.5 makes the risky set in `ask` mode "the deny-list after
+bash parsing". The idea of parsing a command into simple commands before
+matching rules comes from stakpak/agent (#64, `docs/research/stakpak.md` F1);
+no code was copied. Number 0043 is reserved for the #153 research PR, which
+also says that in `yolo` an unparseable command is still checked against the
+raw deny rules.
+
+### Decision
+
+- **Parser: `unbash` 6.0.4** (ISC, pure TypeScript, no dependencies, no
+  install script), pinned exactly in `apps/hub`. It is behind one adapter,
+  `apps/hub/src/runner/bash-parse.ts` (`parseBash(source)`: simple commands as
+  word lists, `null` for a word that is not a literal, plus every parse error),
+  so `tree-sitter-bash` can replace it and the same tests prove the swap.
+  The tree is walked with `forEachChild` only: a substitution's nested script
+  (`$(...)`, backticks, `<(...)`, `>(...)`) is a lazy field that a walk over
+  the object's own fields misses (a test pins this). Every nested script's
+  own `errors` count. Input over 64 KiB is not parsed; the parser caps nesting
+  itself (3,000 nested `$(` is an error in about half a second); the walk
+  counts nodes; an exception is a parse error.
+- **A small Hearth policy layer** (`bash-policy.ts`, `classifyBash`) strips the
+  wrappers `sudo`, `doas`, `env` (and its `VAR=x`), `timeout`, `nice`,
+  `ionice`, `nohup`, `time`, `stdbuf`, `builtin`, `command`, `exec` and
+  `xargs` with their options; re-parses the string of `bash|sh|zsh|dash|ksh -c`
+  and the words of `eval`, up to 3 levels; and gives `ask` when it cannot see
+  what runs: a parse error, a command name that is not a literal, `alias`,
+  `source`/`.`, a shell reading a script or a pipe, `env -S`, deeper nesting.
+- **Rules key on the command, not the string**: `{ name, command[],
+  subcommand?, optionsWithValue?, flags?, args?, pipedFrom?, action:
+  ask|deny, reason? }`. A one-letter flag matches inside a cluster (`-r` in
+  `-fr`). A non-literal argument that could decide the match makes the rule
+  `ask`. The most restrictive result over all simple commands wins, deny >
+  ask > allow; that order is credited to `@pi-kit/permissions`.
+- **Seed rules**, `runner.config.commandRules` (unset: the seed; `[]`: none):
+  `rm` with `-r` and `-f`, `git push`, `git reset --hard`, `curl`/`wget` piped
+  into a shell, `dd`, `mkfs*`, `chmod -R 777 /`. All `ask`, so a new install
+  blocks nothing it did not block before; an owner sets `deny` for a hard block.
+- **The raw-pattern deny-list stays.** For `bash` it is tested against the raw
+  command first, as before, which is what is left when parsing fails, and then
+  against each parsed command (before and after unwrapping) as words joined
+  by one space, so `bash -c "r""m -rf x"` meets `^rm\s+-rf`.
+- **Only `deny` is enforced today.** The verdict (`allow` | `ask` | `deny`,
+  the rule, the reason, the command it saw) goes on the call's trajectory
+  step as `bash_policy`. `ask` runs as before until the approval gate and the
+  access mode exist (follow-up issues of #153); they read the same verdict.
+
+### Alternatives rejected
+
+- **`tree-sitter-bash`.** Equally correct on the hostile set, but wasm plus an
+  npm package with a native install script, and an async init.
+- **`sh-syntax`.** The most mature grammar, but a 4 MB Go-wasm blob in the hub,
+  and it overflowed its stack on the deep sample.
+- **`shell-quote` or a tokenizer.** Missed 10 of the 36 hostile samples.
+- **A third-party permission package.** None can be driven from the hub (#153).
+- **Treat a parse error as `deny`.** There is no approval UI to recover with;
+  a typo in a command would fail a turn. It is `ask`, and the raw deny-list
+  still applies.
+
+### Consequences
+
+- Not a boundary; the box is (0015). Known gaps: interpreters (`python -c`,
+  `node -e`, `perl -e`), `find -exec`, `trap '<string>'`, git aliases set in
+  the box, a script written and then run, and network calls that do what a
+  rule forbids (`curl` to a forge API).
+- A rule's `optionsWithValue` must list options that take a value, or their
+  value is read as the subcommand (`git -C dir push`); the seed git rules
+  list git's.
+- `tool_call` trajectory records of `bash` gain `bash_policy`, an added field
+  under schema `/2`.

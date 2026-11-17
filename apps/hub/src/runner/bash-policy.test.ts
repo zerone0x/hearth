@@ -317,6 +317,21 @@ describe("the raw-pattern deny-list (config `denyList`) still applies", () => {
   });
 });
 
+describe("decision 0015's known bypasses of a raw rm -rf rule", () => {
+  test("each is seen by the parsed rules, or asks", () => {
+    const seen: Array<[string, string]> = [
+      ["rm -fr x", "deny rm-recursive-force"],
+      ["rm -r -f x", "deny rm-recursive-force"],
+      ["X=rm; $X -rf x", "ask unclear:name"],
+      ['bash -c "r""m -rf x"', "deny rm-recursive-force"],
+      ["echo cm0gLXJmIHgK | base64 -d | sh", "ask unclear:script"],
+    ];
+    for (const [command, expected] of seen) {
+      expect([command, verdict(command, DENY_ALL)]).toEqual([command, expected]);
+    }
+  });
+});
+
 describe("compileCommandRules", () => {
   test("the seed rules compile", () => {
     expect(compileCommandRules(DEFAULT_COMMAND_RULES)).toEqual(DEFAULT_COMMAND_RULES);

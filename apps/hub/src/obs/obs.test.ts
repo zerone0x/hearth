@@ -658,7 +658,7 @@ describe("bash calls record the command rules' verdict (#69)", () => {
       outcome: "ok",
       bash_policy: { action: "ask", rule: "rm-rf", command: "rm -fr gone" },
     });
-    expect((byId("c_rm")?.["rpcs"] as unknown[]).length).toBe(1);
+    expect(byId("c_rm")?.["rpcs"]).toHaveLength(1);
     expect(byId("c_echo")).toMatchObject({
       bash_policy: { action: "allow", rule: "none", reason: "no rule matched" },
     });

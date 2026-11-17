@@ -52,6 +52,7 @@ curl -s -b jar $HUB/v1/sessions/$SID/runner
 | `HEARTH_MODEL_PROVIDER`, `HEARTH_MODEL` | pi provider and model id |
 | `HEARTH_MODEL_KEY_REF` | SecretStore reference of the provider key |
 | `runner.config.denyList` (`startHub`) | `[{tool, pattern?, reason?}]`: a call whose bash command or path matches never leaves the hub |
+| `runner.config.commandRules` | command rules for `bash`, matched after parsing (below); unset: the seed list, `[]`: none |
 | `runner.config.extensionAllowlist` | `[{name, version}]` of bundled extensions allowed to load; empty by default |
 
 ### The deny-list is best-effort, not a boundary
@@ -64,9 +65,53 @@ collapsed, so `/workspace/../etc/passwd`, `//etc/passwd` and
 `../../etc/passwd` all match `^/etc/`.
 
 A regex over a shell command cannot stop a determined model. These get past
-an `rm\s+-rf` rule and are known: `rm -fr`, `rm -r -f`, `X=rm; $X -rf`,
-`bash -c "r""m -rf"`, `base64 -d | sh`. Write content is not tested, only the
-path. The box is the boundary; approvals with a human in the loop are M3.
+an `rm\s+-rf` rule on the raw string and are known: `rm -fr`, `rm -r -f`,
+`X=rm; $X -rf`, `bash -c "r""m -rf"`, `base64 -d | sh`. Write content is not
+tested, only the path. The box is the boundary; approvals with a human in the
+loop are M3.
+
+### Bash commands are parsed first (decision 0044)
+
+A `bash` call's command is parsed with `unbash` into simple commands: lists,
+pipelines, subshells, groups, functions, loops, `$(...)`, backticks, process
+substitutions and unquoted heredocs. Wrappers (`sudo`, `env VAR=x`, `timeout`,
+`nice`, `nohup`, `command`, `exec`, `xargs`, ...) are stripped, and the
+string of `bash -c` / `sh -c` and the words of `eval` are parsed again, up to
+3 levels. Each simple command is matched against `commandRules`:
+
+```ts
+{ name: "git-push", command: ["git"], subcommand: "push",
+  optionsWithValue: ["-C", "-c", "--git-dir", "--work-tree"], action: "deny" }
+{ name: "rm-rf", command: ["rm"], flags: [["-r", "-R", "--recursive"], ["-f", "--force"]], action: "ask" }
+```
+
+`command` names match the basename (`/bin/rm` is `rm`; `mkfs*` is a prefix).
+`flags` groups must all be present, one option of each; `-r` matches inside
+`-fr`. `args` are literal words that must all be present; `pipedFrom` means an
+earlier stage of the same pipeline runs one of those commands. The most
+restrictive result wins: `deny` > `ask` > `allow`. The seed list (`rm -rf`,
+`git push`, `git reset --hard`, `curl | sh`, `dd`, `mkfs`, `chmod -R 777 /`)
+is all `ask`.
+
+The verdict is `ask` when the parser cannot see what runs: a parse error, a
+command name that is not a literal (`$X -rf`), `alias`, `source`, a shell
+reading a script or a pipe, `env -S`, nesting deeper than 3, or a
+non-literal argument that could make a rule match (`rm $opts x`).
+
+**Only `deny` blocks today.** There is no approval gate or access-mode setting
+yet, so an `ask` verdict runs exactly as before. Every `bash` step in the
+trajectory records the verdict as `bash_policy: { action, rule, reason,
+command? }`, where `rule` is a rule name, `raw:<n>` for the n-th `denyList`
+rule, `unclear:<why>`, or `none`.
+
+The raw `denyList` still applies to `bash`: to the raw command first (all
+that is left when parsing fails), then to each parsed command written as its
+words joined by one space, before and after unwrapping, so
+`bash -c "r""m -rf x"` meets a `^rm\s+-rf` rule.
+
+Known gaps: interpreters (`python -c`, `node -e`, `perl -e`), `find -exec`,
+`trap '<string>'`, git aliases set in the box, a script written and then run,
+and network calls (`curl` to a forge API does what `git push` does).
 
 ## Browser tools (decision 0032)
 
