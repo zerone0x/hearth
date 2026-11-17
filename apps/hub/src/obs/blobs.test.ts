@@ -150,6 +150,7 @@ describe("redactKeepingHashes (#137)", () => {
       text: JSON.stringify({ sha256: hash, note: "c0ffee" }),
       b: other,
       c: `x${hash}`,
+      d: `${hash}c0ffee`,
     });
     expect(redactKeepingHashes(json, redact, new Set([hash]))).toBe(
       JSON.stringify({
@@ -158,6 +159,7 @@ describe("redactKeepingHashes (#137)", () => {
         text: JSON.stringify({ sha256: hash, note: "#" }),
         b: "12#ab",
         c: `x${redact(hash)}`,
+        d: redact(`${hash}c0ffee`),
       }),
     );
   });
