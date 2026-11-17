@@ -2012,6 +2012,36 @@ describe("browser_fill (decision 0039)", () => {
     });
   });
 
+  test("a filled value stays scrubbed after the runner is rebuilt (model switch)", async () => {
+    const driver = new FakeDriver();
+    signIn(driver);
+    const { vault } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    writeFileSync(join(h.root, "dump.txt"), `field=${PASSWORD}\n`);
+    const first = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e3", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(resultsOf(first).get("c_fill")?.isError).toBe(false);
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    let sent = "";
+    const second = await turn(h, "se_a", "look again", [
+      call("browser_snapshot", {}, "c_snap2"),
+      call("bash", { command: "cat dump.txt" }, "c_bash"),
+      (context) => {
+        sent = JSON.stringify(context.messages);
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    expect(second).not.toBe(first);
+    const r = resultsOf(second);
+    expect(r.get("c_snap2")?.text).toContain("[redacted]");
+    expect(r.get("c_bash")?.text).toContain("field=[redacted]");
+    expect(sent).not.toContain(PASSWORD);
+    expect(JSON.stringify(second.messages)).not.toContain(PASSWORD);
+  });
+
   test("a page on another origin: refused before the value is resolved or sent", async () => {
     const driver = new FakeDriver();
     const tab = signIn(driver, "https://evil.example/signin");
@@ -2260,6 +2290,73 @@ describe("bash env: vault tokens for one command (decision 0041)", () => {
       for (const name of new Bun.Glob("*").scanSync(spillDir)) {
         expect(readFileSync(join(spillDir, name), "utf8")).not.toContain(TOKEN);
       }
+    }
+  }, 20_000);
+
+  /** Turn 2 reads what turn 1 wrote; returns its result and the text the model was sent. */
+  async function readBack(h: Harness, runners: SessionRunners, command: string) {
+    let sent = "";
+    h.faux.setResponses([
+      bash("c_read", command),
+      (context) => {
+        sent = JSON.stringify(context.messages);
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "read it back");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    return { result: toolResults(runner.messages).find((r) => r.id === "c_read"), sent, runner };
+  }
+
+  const writeToken = (h: Harness) =>
+    turn(h, "se_a", "write the token", [
+      bash("c_write", 'printf "f:%s\\n" "$GH_TOKEN" > t2.txt; cat t2.txt', {
+        GH_TOKEN: "vault:github",
+      }),
+      fauxAssistantMessage("written"),
+    ]);
+
+  test("a file the command wrote stays scrubbed after a model switch rebuilds the runner", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    const first = await writeToken(h);
+    expect(toolResults(first.messages)[0]?.text).toContain(`f:${REDACTED}`);
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    const { result, sent, runner } = await readBack(h, h.runners, "cat t2.txt");
+    expect(runner).not.toBe(first);
+    expect(result?.text).toContain(`f:${REDACTED}`);
+    expect(sent).toContain(`f:${REDACTED}`);
+    expect(sent).not.toContain(TOKEN);
+    expect(JSON.stringify(runner.messages)).not.toContain(TOKEN);
+  }, 20_000);
+
+  test("a file and a background child's environment stay scrubbed after a hub restart", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    const marker = `bg-${crypto.randomUUID()}`;
+    await turn(h, "se_a", "write the token", [
+      bash(
+        "c_write",
+        `printf "f:%s\\n" "$GH_TOKEN" > t2.txt; (exec -a ${marker} sleep 20) >/dev/null 2>&1 & echo started`,
+        { GH_TOKEN: "vault:github" },
+      ),
+      fauxAssistantMessage("written"),
+    ]);
+    await h.runners.close();
+    const again = h.make({}, { vault });
+    try {
+      const { result, sent } = await readBack(
+        h,
+        again,
+        `cat t2.txt; for p in /proc/[0-9]*; do if grep -q ${marker} $p/cmdline 2>/dev/null; then tr "\\0" "\\n" < $p/environ | grep GH_TOKEN; fi; done`,
+      );
+      expect(result?.text).toContain(`f:${REDACTED}`);
+      // The child started by the env call still holds the value; the model sees it masked.
+      expect(result?.text).toContain(`GH_TOKEN=${REDACTED}`);
+      expect(sent).not.toContain(TOKEN);
+    } finally {
+      Bun.spawnSync(["pkill", "-f", marker]);
     }
   }, 20_000);
 

@@ -367,6 +367,22 @@ describe("exec", () => {
     expect(next.output).toBe("next=unset\n");
   });
 
+  test("env (1.6): a name the box also sets keeps the box's value", async () => {
+    // A name the protocol allows, so the decoder passes it on; the box's own environment wins.
+    const h = harness({ env: { ...DEFAULT_EXEC_ENV, SITE_REGION: "box-region" } });
+    const result = await h.ok("tool.exec", {
+      ...c,
+      command: 'echo "region=$SITE_REGION"; echo "extra=$EXTRA_TOKEN"',
+      cwd: ".",
+      timeoutMs: 5_000,
+      env: { SITE_REGION: "hub-region-9c1f", EXTRA_TOKEN: "extra-value-4d2a" },
+    });
+    expect(result.output).toContain("region=box-region");
+    expect(result.output).toContain("extra=[redacted]");
+    // The hub's value for the shadowed name never reached the command.
+    expect(result.output).not.toContain("hub-region-9c1f");
+  });
+
   test("env (1.6): a call with secrets writes no spill file, even past the output cap", async () => {
     const h = harness();
     const token = "ghp_noSpillToken0a9d4e";

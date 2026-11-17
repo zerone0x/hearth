@@ -23,7 +23,10 @@
  *   owner holds the desktop lock (decision 0035).
  * - Every value `browser_fill` filled (decision 0039) or `bash` passed in its
  *   env (decision 0041) is replaced in the text of every later tool result of
- *   the session, whatever the tool, before the model reads it.
+ *   the session, whatever the tool, before the model reads it. The scrub uses
+ *   every secret the hub knows (`knownSecrets`: the vault registers each stored
+ *   value when it opens) on top of the values this runner used, so it holds
+ *   after the runner is rebuilt (a model switch, decision 0038, or a restart).
  */
 
 import {
@@ -47,6 +50,7 @@ import {
 } from "@hearth/core";
 import { Type } from "typebox";
 import { type BoxToolOperations, NO_SECRET_ENV_IN_BOX, type RpcTrace } from "../box/tool-rpc";
+import { knownSecrets } from "../obs/redaction";
 import type { BoxLease } from "../session/manager";
 import { BASH_ENV_HINT, BASH_ENV_PARAMETER, envRefusal, parseEnvRefs } from "./bash-env";
 import { registerBrowserTools } from "./browser-tools";
@@ -172,7 +176,8 @@ function absolute(path: string | undefined, boxCwd: string): string {
 export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFactory {
   const { box, boxCwd } = options;
   return (pi) => {
-    // The values browser_fill filled in this session: never shown to the model.
+    // The values browser_fill filled or bash passed through this runner: never shown to the
+    // model. The tool_result scrub adds every registered secret, which a rebuilt runner keeps.
     const filled = new Set<string>();
     pi.registerTool({
       ...createReadToolDefinition(boxCwd),
@@ -353,7 +358,7 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
       const content = event.content.map((part) => {
         if (part.type !== "text") return part;
         let text = scrubHubTempPaths(part.text, options.hubTempDir);
-        if (filled.size > 0) text = redactValues(text, filled, LOG_REDACTED);
+        text = redactValues(text, [...filled, ...knownSecrets()], LOG_REDACTED);
         if (text === part.text) return part;
         changed = true;
         return { ...part, text };

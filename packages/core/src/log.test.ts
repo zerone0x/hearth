@@ -109,6 +109,7 @@ describe("Logger", () => {
       "Pw%20d!%40%23x9%26%22q",
       "Pw+d%21%40%23x9%26%22q",
       "Pw%20d!@#x9&%22q",
+      "Pw%20d%21%40%23x9%26%22q",
     ]);
     // A GET form submit writes the value form-urlencoded into the URL.
     expect(redactValues("/landing?u=&p=Pw+d%21%40%23x9%26%22q", [value], "#")).toBe(
@@ -144,6 +145,25 @@ describe("Logger", () => {
     expect(secretForms("abc123")).toEqual(["abc123"]);
     expect(secretForms("x\ud800")).toEqual(["x\ud800", "x\\ud800"]);
     expect(redactValues("x\ud800 y", ["x\ud800"], "#")).toBe("# y");
+  });
+
+  test("a value is found in Python's urllib.parse.quote and quote_plus forms too", () => {
+    // quote() encodes !'()* (encodeURIComponent keeps them); quote_plus keeps ~.
+    const value = "Ab!c'd(e)f*g~h-41xz";
+    const quoted = "Ab%21c%27d%28e%29f%2Ag~h-41xz";
+    expect(secretForms(value)).toContain(quoted);
+    expect(redactValues(`q1:${quoted}`, [value], "#")).toBe("q1:#");
+    expect(redactValues(`q2:${quoted.toLowerCase().replace("ab", "Ab")}`, [value], "#")).toBe(
+      "q2:#",
+    );
+    // A space and a slash: quote(v) keeps `/`, quote(v, safe="") does not, quote_plus writes `+`.
+    const spaced = "a b/c!~";
+    expect(secretForms(spaced)).toEqual(
+      expect.arrayContaining(["a%20b/c%21~", "a%20b%2Fc%21~", "a+b%2Fc%21~"]),
+    );
+    for (const form of ["a%20b/c%21~", "a%20b%2Fc%21~", "a+b%2Fc%21~", "a+b%2fc%21~"]) {
+      expect(redactValues(`x=${form};`, [spaced], "#")).toBe("x=#;");
+    }
   });
 
   test("credential shapes are redacted without being known", () => {

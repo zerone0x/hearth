@@ -41,11 +41,14 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 
 /**
  * The text forms in which `secret` is matched: raw, JSON-escaped (inside a
- * JSON string), and URL-encoded three ways: `encodeURIComponent`, the
- * form-urlencoded form a GET form submit puts in a URL (`+` for a space, as
- * `URLSearchParams` writes it), and `encodeURI`. A form that equals one
+ * JSON string), and URL-encoded: `encodeURIComponent`, the form-urlencoded
+ * form a GET form submit puts in a URL (`+` for a space, as `URLSearchParams`
+ * writes it), `encodeURI`, and Python's `urllib.parse` forms, which also
+ * encode `!'()*`: `quote(v, safe="")`, `quote(v)` (keeps `/`) and
+ * `quote_plus(v)` (`+` for a space, keeps `~`). A form that equals one
  * already listed is left out, so a plain `abc123` has one form. A value no
- * encoder takes (a lone surrogate) keeps its other forms.
+ * encoder takes (a lone surrogate) keeps its other forms. Base64, hex and
+ * other transforms are not matched.
  */
 export function secretForms(secret: string): string[] {
   const forms = new Set<string>([secret, JSON.stringify(secret).slice(1, -1)]);
@@ -59,6 +62,14 @@ export function secretForms(secret: string): string[] {
   forms.add(component);
   forms.add(new URLSearchParams({ v: secret }).toString().slice(2));
   forms.add(encodeURI(secret));
+  // Python's urllib.parse.quote leaves only letters, digits and `_.-~` (and its `safe`) as they are.
+  const strict = component.replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  forms.add(strict);
+  forms.add(strict.replace(/%2F/g, "/"));
+  forms.add(strict.replace(/%20/g, "+"));
   return [...forms];
 }
 
