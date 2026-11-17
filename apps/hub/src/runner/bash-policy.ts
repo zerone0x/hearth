@@ -931,7 +931,8 @@ function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashV
   }
   if (inner.stdinArgs === "replace" && inner.scripts.length > 0) {
     // `xargs -I{} su -c {}`: the string is xargs' input, not what is written.
-    return stricter(
+    // The literal string is still judged below, so a readable deny wins.
+    verdict = stricter(
       verdict,
       unclear("script", "xargs puts its input into a command string", display(command.words)),
     );
@@ -983,7 +984,8 @@ function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashV
   }
   if (inner.stdinArgs === "replace" && (name === "eval" || SHELLS.has(name))) {
     // `xargs -I{} sh -c '{}'`, `xargs -i eval {}`: the script is xargs' input.
-    return stricter(verdict, unclear("script", "xargs puts its input into a script", shown));
+    // The literal script is still judged below, so a readable deny wins.
+    verdict = stricter(verdict, unclear("script", "xargs puts its input into a script", shown));
   }
   if (name === "eval") {
     if (args.some((w) => w.value === null)) {
