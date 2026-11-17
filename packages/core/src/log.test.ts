@@ -134,6 +134,10 @@ describe("Logger", () => {
     ]) {
       expect(redactValues("[a%20b-tail] end", secrets, "#")).toBe("[# end");
     }
+    // An encoded form that overlaps its own next occurrence is one span too (#140):
+    // `x%2Fx` at 0 and at 4, so no `%2Fx` tail is left, in either hex case.
+    expect(redactValues("x%2Fx%2Fx", ["x/x"], "#")).toBe("#");
+    expect(redactValues("[x%2fx%2Fx]", ["x/x"], "#")).toBe("[#]");
     // Regex characters in a value are literal.
     expect(redactValues("a.b%20 axb%20", ["a.b "], "#")).toBe("# axb%20");
     // A plain value has one form; a lone surrogate has no URL form but is still found raw.
