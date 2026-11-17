@@ -3629,9 +3629,9 @@ The deny-list (0015) is a regular expression over the raw `bash` string, so
 past a rule. PRD §6.5 makes the risky set in `ask` mode "the deny-list after
 bash parsing". The idea of parsing a command into simple commands before
 matching rules comes from stakpak/agent (#64, `docs/research/stakpak.md` F1);
-no code was copied. Number 0043 is reserved for the #153 research PR, which
-also says that in `yolo` an unparseable command is still checked against the
-raw deny rules.
+no code was copied. Decision 0043 (the access gate, loaded in both modes)
+says that in `yolo` a command the parser cannot read is still checked against
+the raw-pattern deny-list, and that an exception in the gate blocks the call.
 
 ### Decision
 
@@ -3644,8 +3644,10 @@ raw deny rules.
   (`$(...)`, backticks, `<(...)`, `>(...)`) is a lazy field that a walk over
   the object's own fields misses (a test pins this). Every nested script's
   own `errors` count. Input over 64 KiB is not parsed; the parser caps nesting
-  itself (3,000 nested `$(` is an error in about half a second); the walk
-  counts nodes; an exception is a parse error.
+  itself (3,000 nested `$(` is an error in about half a second). An exception
+  from the parser or the walk is a parse error, so the command is one the
+  parser cannot read (0043); any other exception in `classifyBash` reaches
+  pi's `tool_call` handler and blocks the call (fail-closed, 0043).
 - **A small Hearth policy layer** (`bash-policy.ts`, `classifyBash`) strips the
   wrappers `sudo`, `doas`, `env` (and its `VAR=x`), `timeout`, `nice`,
   `ionice`, `nohup`, `time`, `stdbuf`, `builtin`, `command`, `exec` and
@@ -3664,13 +3666,17 @@ raw deny rules.
   into a shell, `dd`, `mkfs*`, `chmod -R 777 /`. All `ask`, so a new install
   blocks nothing it did not block before; an owner sets `deny` for a hard block.
 - **The raw-pattern deny-list stays.** For `bash` it is tested against the raw
-  command first, as before, which is what is left when parsing fails, and then
+  command first, as before, which is 0043's fallback when parsing fails, and then
   against each parsed command (before and after unwrapping) as words joined
   by one space, so `bash -c "r""m -rf x"` meets `^rm\s+-rf`.
 - **Only `deny` is enforced today.** The verdict (`allow` | `ask` | `deny`,
   the rule, the reason, the command it saw) goes on the call's trajectory
   step as `bash_policy`. `ask` runs as before until the approval gate and the
   access mode exist (follow-up issues of #153); they read the same verdict.
+  That is already 0043's `yolo`: deny rules block, `ask` runs, an unreadable
+  command meets the raw deny-list. Command rules also match the commands a
+  partly parsed tree does show, so a parse error elsewhere does not hide a
+  readable `git push`.
 
 ### Alternatives rejected
 
