@@ -146,6 +146,11 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
           Contains hidden characters (shown as ⟨U+XXXX⟩): read it closely.
         </p>
       ) : null}
+      {card.nonAscii ? (
+        <p className="font-medium text-amber-600 text-xs" data-testid="approval-non-ascii">
+          Contains non-ASCII characters: look-alikes can hide a command, so read the steps below.
+        </p>
+      ) : null}
       <p className="text-muted-foreground text-xs">
         Rule <code className="font-mono">{card.rule}</code>
         {card.reason === "" ? null : `: ${card.reason}`}
@@ -166,6 +171,21 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
           >
             {card.command}
           </pre>
+        </div>
+      )}
+      {card.steps.length === 0 ? null : (
+        // What the hub's parser found, one simple command per line (#169): a
+        // command hidden behind look-alike glyphs shows as its own step.
+        <div className="flex flex-col gap-1">
+          <p className="text-muted-foreground text-xs">Runs:</p>
+          <ol className="list-decimal pl-5 font-mono text-xs" data-testid="approval-steps">
+            {card.steps.map((step, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: a fixed, ordered list
+              <li key={i} className="break-all">
+                {step}
+              </li>
+            ))}
+          </ol>
         </div>
       )}
       <p className="text-muted-foreground text-xs">

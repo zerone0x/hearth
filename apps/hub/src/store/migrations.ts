@@ -367,6 +367,13 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX approval_by_status ON approval (workspace_id, status);
     `,
   },
+  {
+    // The simple commands the parser found in a held command, for the
+    // approval card's "Runs:" list (#169, decision 0048). JSON array of text.
+    version: 12,
+    name: "approval-steps",
+    sql: `ALTER TABLE approval ADD COLUMN steps TEXT NOT NULL DEFAULT '[]';`,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

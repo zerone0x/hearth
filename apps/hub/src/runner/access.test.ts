@@ -49,6 +49,8 @@ describe("the card's text", () => {
       command: verdict.command,
       reason: verdict.reason,
       hiddenChars: false,
+      steps: ["git push origin main"],
+      nonAscii: false,
     });
   });
 
@@ -108,6 +110,8 @@ describe("the card's text", () => {
       command: "",
       reason: "uses a marked secret: vault:[redacted]",
       hiddenChars: false,
+      steps: [],
+      nonAscii: false,
     });
   });
 });
@@ -170,5 +174,43 @@ describe("hidden characters on the card (#165)", () => {
     expect(card.summary).toBe(card.command);
     expect(card.hiddenChars).toBe(false);
     expect(JSON.stringify(card)).not.toContain("tok");
+  });
+});
+
+describe("the steps and the non-ASCII warning (#169)", () => {
+  test("a command hidden behind look-alike glyphs shows as its own step, with the warning", () => {
+    for (const [name, command, glyph] of [
+      ["U+2800", "git push; X=1\u2800#\u2800a note;touch EX", "\u2800"],
+      ["U+FF03", "git push; \uFF03 a note;touch EX", "\uFF03"],
+      ["curly quotes", "git push; echo \u2019safe; touch EX\u2019", "\u2019"],
+    ] as const) {
+      const { shown: card } = shown(command);
+      expect({ name, steps: card.steps.at(-1) }).toEqual({
+        name,
+        steps: name === "curly quotes" ? `touch EX${glyph}` : "touch EX",
+      });
+      expect({ name, ascii: card.nonAscii }).toEqual({ name, ascii: true });
+    }
+    expect(shown("git push; echo ok").shown.nonAscii).toBe(false);
+  });
+
+  test("steps list nested bash -c and substitution commands; the redacted command is parsed, steps are escaped", () => {
+    const { shown: card } = shown("git push && bash -c 'touch A; touch B' && echo $(touch C)");
+    expect(card.steps).toEqual([
+      "git push",
+      "bash -c touch A; touch B",
+      "touch A",
+      "touch B",
+      "echo $(touch C)",
+      "touch C",
+    ]);
+    const secret = shown(`git push https://u:${SECRET}@x.example/r; touch EX`);
+    expect(JSON.stringify(secret.shown.steps)).not.toContain("s3cr3t");
+    expect(shown("git push; touch \u200BEX").shown.steps).toContain("touch ⟨U+200B⟩EX");
+  });
+
+  test("a non-bash tool has no steps; the list is capped", () => {
+    const many = Array.from({ length: 80 }, (_, i) => `echo ${i}`).join("; ");
+    expect(shown(`git push; ${many}`).shown.steps).toHaveLength(50);
   });
 });

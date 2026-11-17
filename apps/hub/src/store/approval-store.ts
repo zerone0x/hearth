@@ -25,6 +25,8 @@ export interface ApprovalRow {
   readonly summary: string;
   /** The whole command (redacted), "" for a tool without one. */
   readonly command: string;
+  /** Each simple command the parser found (escaped), for the card (#169). */
+  readonly steps: readonly string[];
   readonly rule: string;
   readonly mode: "yolo" | "ask";
   readonly status: ApprovalStatus;
@@ -42,6 +44,7 @@ interface Raw {
   tool: string;
   summary: string;
   command: string;
+  steps: string;
   rule: string;
   mode: "yolo" | "ask";
   status: ApprovalStatus;
@@ -52,6 +55,15 @@ interface Raw {
   reason: string | null;
 }
 
+function stepsOf(json: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function rowOf(raw: Raw): ApprovalRow {
   return {
     id: raw.id,
@@ -60,6 +72,7 @@ function rowOf(raw: Raw): ApprovalRow {
     tool: raw.tool,
     summary: raw.summary,
     command: raw.command,
+    steps: stepsOf(raw.steps),
     rule: raw.rule,
     mode: raw.mode,
     status: raw.status,
@@ -90,9 +103,9 @@ export class SqliteApprovalStore {
     row: Omit<ApprovalRow, "status" | "decidedAt" | "decidedBy" | "reason">,
   ): void {
     this.#db.run(
-      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, command, rule,
+      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, command, steps, rule,
          mode, status, requested_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       [
         row.id,
         scope.workspaceId,
@@ -101,6 +114,7 @@ export class SqliteApprovalStore {
         row.tool,
         row.summary,
         row.command,
+        JSON.stringify(row.steps),
         row.rule,
         row.mode,
         row.requestedAt,

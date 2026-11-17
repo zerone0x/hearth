@@ -1271,6 +1271,42 @@ describe("the access gate (decisions 0043, 0048)", () => {
     expect(JSON.stringify(requested)).not.toContain("\u00A0");
   });
 
+  test("look-alike glyphs: the stored, listed and logged card has touch EX as a step and the warning (#169)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 30 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const commands = [
+      "git push origin main; X=1\u2800#\u2800a note;touch EX",
+      "git push origin main; \uFF03 a note;touch EX",
+      "git push origin main; echo \u2019safe; touch EX\u2019",
+      "git push origin main; touch ok",
+    ];
+    h.faux.setResponses([
+      ...commands.map((command, i) => call("bash", { command }, `c_${i}`)),
+      fauxAssistantMessage("x"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const listed: Array<{ steps: readonly string[]; non_ascii: boolean }> = [];
+    for (let i = 0; i < commands.length; i++) {
+      const id = await pendingId(h);
+      listed.push(...(await approvals.list(LOCAL_PRINCIPAL)));
+      await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    }
+    await (await h.runners.runner("se_a")).settled();
+    const requested = h.events.of("se_a", "approval.requested").map((e) => e.payload);
+    const last = (rows: readonly unknown[]) =>
+      rows.map((r) => (r as { steps: string[] }).steps.at(-1));
+    expect(last(requested)).toEqual(["touch EX", "touch EX", "touch EX\u2019", "touch ok"]);
+    expect(last(listed)).toEqual(["touch EX", "touch EX", "touch EX\u2019", "touch ok"]);
+    expect(requested.map((r) => (r as { non_ascii: boolean }).non_ascii)).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+    expect(listed.map((r) => r.non_ascii)).toEqual([true, true, true, false]);
+  });
+
   test("a stop while the request is still being recorded cancels it at once; interrupt returns", async () => {
     const h = await harness({ commandRules: [PUSH_RULE] });
     const recording = Promise.withResolvers<void>();

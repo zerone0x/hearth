@@ -25,7 +25,7 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { escapeHidden, hasHidden } from "@hearth/core";
 import type { ApprovalOutcome } from "../approvals/service";
 import type { AccessMode } from "../settings/access-mode";
-import { type BashVerdict, type CommandRule, classifyBash } from "./bash-policy";
+import { type BashVerdict, type CommandRule, classifyBash, commandSteps } from "./bash-policy";
 import type { CompiledDenyRule } from "./policy";
 
 /** The reserved extension name (`RESERVED_EXTENSION_NAMES`). */
@@ -47,6 +47,10 @@ export interface GateRequest {
   readonly mode: AccessMode;
   /** The shown text held a hidden character, written out as `⟨U+XXXX⟩` (#165). */
   readonly hiddenChars?: boolean;
+  /** Each simple command the parser found in the command, escaped (#169). */
+  readonly steps?: readonly string[];
+  /** The command holds a non-ASCII character (#169). */
+  readonly nonAscii?: boolean;
 }
 
 export interface AccessExtensionOptions {
@@ -158,6 +162,10 @@ export function gateVerdict(
   return verdict;
 }
 
+/** The most steps a card lists; a command with more is cut there (the full command is always shown). */
+export const MAX_CARD_STEPS = 50;
+const NON_ASCII = /\P{ASCII}/u;
+
 /**
  * What the card shows for `verdict`, redacted. The parser's display of the
  * matched part (`summary`, and a `reason` that quotes it) can requote or
@@ -174,7 +182,11 @@ export function shownVerdict(
   commandRules: readonly CommandRule[],
   denyList: readonly CompiledDenyRule[],
   redact: (text: string) => string,
-): Pick<GateVerdict, "summary" | "command" | "reason"> & { hiddenChars: boolean } {
+): Pick<GateVerdict, "summary" | "command" | "reason"> & {
+  hiddenChars: boolean;
+  steps: string[];
+  nonAscii: boolean;
+} {
   const command = redact(verdict.command);
   const again = gateVerdict(toolName, { ...(input as object), command }, commandRules, denyList);
   const same = again.rule === verdict.rule;
@@ -190,6 +202,17 @@ export function shownVerdict(
     command: escapeHidden(shown.command),
     reason: escapeHidden(shown.reason),
     hiddenChars: hasHidden(shown.summary + shown.command + shown.reason),
+    // The parser's own reading of the redacted command, one line per simple
+    // command, whatever glyphs surround it (#169).
+    steps:
+      toolName === "bash" && command !== ""
+        ? commandSteps(command, commandRules, denyList)
+            .slice(0, MAX_CARD_STEPS)
+            .map((step) => escapeHidden(step))
+        : [],
+    // The simple version (#169): any non-ASCII character in the command, in
+    // or out of quotes. A look-alike glyph is read by bash as an ordinary one.
+    nonAscii: NON_ASCII.test(shown.command),
   };
 }
 
