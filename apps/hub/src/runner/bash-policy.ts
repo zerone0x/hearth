@@ -409,15 +409,8 @@ const WRAPPERS: Readonly<Record<string, Wrapper>> = {
     operands: "user",
     shellWhenEmpty: true,
   },
-  runuser: {
-    shortValue: "gGsuw",
-    long: ["--login", "--preserve-environment", "--pty", "--fast"],
-    longValue: ["--group", "--supp-group", "--shell", "--user", "--whitelist-environment"],
-    script: ["-c", "--command", "--session-command"],
-    stop: HELP,
-    operands: "user",
-    shellWhenEmpty: true,
-  },
+  // `runuser -u USER cmd` runs a command, `runuser USER args` a shell: ask.
+  runuser: { opaque: true },
   script: {
     shortValue: "BEImOoT",
     shortOptional: "t",
@@ -857,6 +850,8 @@ function shellScriptIndex(args: readonly BashWord[]): number | null {
       if (/^-[^-]*[oO]$/.test(value)) i++;
       continue;
     }
+    // `--rcfile FILE` / `--init-file FILE` take a value.
+    if (value === "--rcfile" || value === "--init-file") i++;
     if (value.startsWith("+") || value.startsWith("--")) continue;
     return sawC ? i : -1;
   }

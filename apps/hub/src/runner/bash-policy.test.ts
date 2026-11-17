@@ -5,9 +5,11 @@ import {
   classifyBash,
   compileCommandRules,
   DEFAULT_COMMAND_RULES,
+  MAX_POLICY_STEPS,
   MAX_SHELL_DEPTH,
 } from "./bash-policy";
 import { compileDenyList } from "./policy";
+import ADVERSARIAL from "./testdata/bash-adversarial.json";
 
 /** The seed rules with every action switched to `deny`: shows which rule saw the command. */
 const DENY_ALL: readonly CommandRule[] = DEFAULT_COMMAND_RULES.map((r) => ({
@@ -343,6 +345,223 @@ describe("decision 0015's known bypasses of a raw rm -rf rule", () => {
     for (const [command, expected] of seen) {
       expect([command, verdict(command, DENY_ALL)]).toEqual([command, expected]);
     }
+  });
+});
+
+/**
+ * The verifier's adversarial samples of PR #160 (plus the rework's own), each
+ * with every rule set to deny: the verdict and the rule that decided. Real
+ * bash ran the `allow` bypasses of the first round (`bash <<<'git push'`,
+ * `env -iS 'git push'`, `echo push | xargs git`, ...); each row pins what the
+ * policy says now. `allow none` rows are known gaps (find -exec, trap, an
+ * env var that runs code) or commands that do not run git (a homoglyph, CR).
+ */
+describe("adversarial table (testdata/bash-adversarial.json)", () => {
+  const rows = ADVERSARIAL as unknown as ReadonlyArray<readonly [string, string]>;
+
+  test("has the verifier's samples", () => {
+    expect(rows.length).toBeGreaterThan(180);
+  });
+
+  test.each(rows)("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+describe("stdin: a shell fed by a redirect, a here-doc or here-string, or xargs", () => {
+  test.each([
+    ["bash <<<'git push'", "ask unclear:script"],
+    ["sh <<'EOF'\ngit push\nEOF\n", "ask unclear:script"],
+    ["bash < /dev/stdin", "ask unclear:script"],
+    ["bash 0<&3", "ask unclear:script"],
+    ["(bash) < f", "ask unclear:script"],
+    ["{ sh; } <<< 'git push'", "ask unclear:script"],
+    ["xargs sh", "ask unclear:script"],
+    ["echo 'git push' | su", "ask unclear:script"],
+    // A download feeding stdin is the download-to-shell rule.
+    ["sh -s < <(curl x)", "deny download-to-shell"],
+    ['bash <<< "$(wget -O- x)"', "deny download-to-shell"],
+    ["(curl x) | sh", "deny download-to-shell"],
+    ["curl x | (cat | sh)", "deny download-to-shell"],
+    // Not stdin, or no shell.
+    ["bash 3<f", "allow none"],
+    ["bash > out", "allow none"],
+    ["cat < <(curl x)", "allow none"],
+    ["sh < <(echo ok) && curl x", "ask unclear:script"],
+  ])("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+describe("wrapper options are read like getopt", () => {
+  test.each([
+    // Clusters: a stop option inside one, a value attached or in the next word.
+    ["env -iS 'git push'", "ask unclear:wrapper"],
+    ["env -S'git push'", "ask unclear:wrapper"],
+    ["env -iu HOME git push", "deny git-push"],
+    ["env -uHOME git push", "deny git-push"],
+    ["sudo -Eu root git push", "deny git-push"],
+    ["sudo -uroot git push", "deny git-push"],
+    ["sudo -isu root git push", "deny git-push"],
+    ["xargs -n1 git push", "deny git-push"],
+    ["xargs -eEOF git push", "deny git-push"],
+    // Long options, `=value`, and unambiguous prefixes; an unknown one asks.
+    ["env --split-string='git push'", "ask unclear:wrapper"],
+    ["env --split='git push'", "ask unclear:wrapper"],
+    ["sudo --user root git push", "deny git-push"],
+    ["sudo --user=root git push", "deny git-push"],
+    ["sudo --us root git push", "deny git-push"],
+    ["sudo --group wheel --host h --prompt p --chdir / git push", "deny git-push"],
+    ["xargs --max-args 1 --max-procs 2 git push", "deny git-push"],
+    ["ionice --class 2 --classdata 0 git push", "deny git-push"],
+    ["stdbuf --output L --error 0 --input 0 git push", "deny git-push"],
+    ["timeout --signal KILL --kill-after 1 5 git push", "deny git-push"],
+    ["nice --adjustment 5 git push", "deny git-push"],
+    ["env --frob git push", "ask unclear:wrapper"],
+    ["sudo --p x git push", "ask unclear:wrapper"],
+    ["env - git push", "deny git-push"],
+    // sudo -s / -i run the command through a shell; -e edits files; -k still runs it.
+    ["sudo -s git push", "deny git-push"],
+    ["sudo --login 'git push'", "deny git-push"],
+    ["sudo -s", "allow none"],
+    ["echo git push | sudo -s", "ask unclear:script"],
+    ["sudo -e /etc/hosts", "ask unclear:wrapper"],
+    ["sudo -k git push", "deny git-push"],
+  ])("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+describe("more wrappers", () => {
+  test.each([
+    ["setsid -w git push", "deny git-push"],
+    ["chroot --userspec u:g / git push", "deny git-push"],
+    ["chroot /", "allow none"],
+    ["echo git push | chroot /", "ask unclear:script"],
+    ["flock -w 5 /tmp/l git push", "deny git-push"],
+    ["flock /tmp/l -c 'git push'", "deny git-push"],
+    ["taskset -c 0 git push", "deny git-push"],
+    ["taskset -p 1 2", "allow none"],
+    ["strace -f -o out -e trace=all git push", "deny git-push"],
+    ["watch -n 1 git push", "deny git-push"],
+    ["watch 'git push'", "deny git-push"],
+    ["watch $cmd", "ask unclear:shell"],
+    ["unbuffer -p git push", "deny git-push"],
+    ["busybox rm -rf /x", "deny rm-recursive-force"],
+    ["busybox --list", "allow none"],
+    ["su -c 'git push'", "deny git-push"],
+    ["su - root -c 'git push'", "deny git-push"],
+    ["su -lc 'git push' root", "deny git-push"],
+    ["su --command='git push'", "deny git-push"],
+    ["su -c ls -c 'git push'", "deny git-push"],
+    ["su root git push", "ask unclear:wrapper"],
+    ["su -c $cmd", "ask unclear:shell"],
+    ["runuser -u x -- git push", "ask unclear:wrapper"],
+    ["script -q -c 'git push' /dev/null", "deny git-push"],
+    ["script out.txt", "allow none"],
+    ["parallel ::: 'git push'", "ask unclear:wrapper"],
+  ])("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+describe("xargs adds words from stdin", () => {
+  test.each([
+    ["echo push | xargs git", "ask git-push"],
+    ["echo -rf /x | xargs rm", "ask rm-recursive-force"],
+    ["xargs -I{} git {}", "ask git-push"],
+    ["xargs --replace git {}", "ask git-push"],
+    // Appended words come after a literal subcommand: `git add` stays a git add.
+    ["find . | xargs git add", "allow none"],
+    ["git ls-files | xargs rm", "ask rm-recursive-force"],
+    ["ls | xargs cat", "allow none"],
+  ])("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+describe("rule options: GNU long-option prefixes and git inline aliases", () => {
+  test.each([
+    ["rm --rec --for /x", "deny rm-recursive-force"],
+    ["rm --r --f /x", "deny rm-recursive-force"],
+    ["rm --recursive --force=x /x", "deny rm-recursive-force"],
+    ["git reset --har", "deny git-reset-hard"],
+    ["rm --dir x", "allow none"],
+    ["rm -r --force-x", "allow none"],
+    ["git -c alias.p=push p", "ask unclear:alias"],
+    ["git -c Alias.P=push p", "ask unclear:alias"],
+    ["git --config-env=alias.p=X p", "ask unclear:alias"],
+    ["git --config-env alias.p=X p", "ask unclear:alias"],
+    ["git -c $x p", "ask unclear:alias"],
+    ["git -c user.name=x status", "allow none"],
+    ["git -C alias.p status", "allow none"],
+  ])("%p: %s", (command, expected) => {
+    expect(verdict(command, DENY_ALL)).toBe(expected);
+  });
+});
+
+/** The shapes of the verifier's big.json: 64 KiB inputs that were quadratic or deep. */
+const BIG: ReadonlyArray<readonly [string, string]> = [
+  ["sh|sh|...", `${"sh|".repeat(21844)}sh`],
+  ["a|a|...", `${"a|".repeat(32767)}a`],
+  ["curl x|sh|...", `curl x|${"sh|".repeat(21840)}sh`],
+  ["git push;...", "git push;".repeat(7281)],
+  ["x=$(a);...", "x=$(a);".repeat(9362)],
+  ["${x:-${y:-...", 'echo "${x:-${y:-${z}}}" '.repeat(2621)],
+  ["{a,b}...", `echo ${"{a,b}".repeat(12000)}`],
+  ["eval eval eval", "eval eval eval git push;".repeat(2621)],
+  ["bash -c bash -c", "bash -c 'bash -c \"git push\"';".repeat(1985)],
+  ["$( x3000", `echo ${"$(".repeat(3000)}x${")".repeat(3000)}`],
+  ["$( x10000", `echo ${"$(".repeat(10000)}x${")".repeat(10000)}`],
+  ["$( x21800", `echo ${"$(".repeat(21800)}x${")".repeat(21800)}`],
+  ["<( x32000", `echo ${"<(".repeat(32000)}`],
+  ["cat <(cat <(", "cat <(".repeat(10000)],
+  ["( x5000", `echo ${"(".repeat(5000)}${")".repeat(5000)}`],
+  ["backticks", `echo ${"`".repeat(60000)}`],
+  ["heredoc $(x)", `cat <<E${"\n$(x)".repeat(10000)}\nE\n`],
+  ["((1+", `${"((1+".repeat(3000)}1${"))".repeat(3000)}`],
+  ["${${", `echo ${"${".repeat(5000)}x${"}".repeat(5000)}`],
+  ["$((1+$(git push)))", "$((1+$(git push)))".repeat(3000)],
+  ["sudo sudo ...", `${"sudo ".repeat(13000)}git push`],
+  ["( a| nested", `${"(a|".repeat(250)}a${")".repeat(250)}`],
+];
+
+describe("bounded work: the hub's tool_call handler is synchronous", () => {
+  test.each(BIG)("%s: under 500 ms", (_label, command) => {
+    expect(command.length).toBeLessThanOrEqual(64 * 1024);
+    const started = performance.now();
+    classifyBash(command, DEFAULT_COMMAND_RULES);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("a 64 KiB pipeline is still judged in full", () => {
+    expect(verdict(`curl x|${"sh|".repeat(21840)}sh`, DENY_ALL)).toBe("deny download-to-shell");
+    expect(verdict(`${"a|".repeat(32760)}git push`, DENY_ALL)).toBe("deny git-push");
+    expect(verdict(`${"sudo ".repeat(13000)}git push`, DENY_ALL)).toBe("deny git-push");
+  });
+
+  test("past the step budget the verdict is ask unclear:budget", () => {
+    const command = "a|".repeat(1000) + "a";
+    expect(verdict(command, DENY_ALL)).toBe("allow none");
+    const v = classifyBash(command, DENY_ALL, [], 1000);
+    expect(`${v.action} ${v.rule}`).toBe("ask unclear:budget");
+    expect(v.reason).toContain(String(MAX_POLICY_STEPS));
+    // Nested $( are charged by the characters parsed again at each level.
+    expect(verdict(`echo ${"$(".repeat(21800)}x${")".repeat(21800)}`, DENY_ALL)).toBe(
+      "ask unclear:budget",
+    );
+  });
+
+  test("running out mid-way keeps what was already seen, and the raw deny-list still applies", () => {
+    // Parsed in full, then out of steps on the later commands: the early git push stays a deny.
+    const command = `git push; ${"a; ".repeat(2000)}`;
+    const v = classifyBash(command, DENY_ALL, [], command.length + 7000);
+    expect(`${v.action} ${v.rule}`).toBe("deny git-push");
+    const raw = compileDenyList([{ tool: "bash", pattern: "rm\\s+-rf" }]);
+    expect(classifyBash(`rm -rf /x; ${"a|".repeat(100)}a`, [], raw, 10)).toMatchObject({
+      action: "deny",
+      rule: "raw:0",
+    });
   });
 });
 

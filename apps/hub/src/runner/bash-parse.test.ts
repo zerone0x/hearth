@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { type ParsedScript, parse } from "unbash";
-import { MAX_COMMAND_BYTES, parseBash, upstreamCommands } from "./bash-parse";
+import { MAX_COMMAND_BYTES, parseBash, type SimpleCommand, upstreamCommands } from "./bash-parse";
 
 /** The literal word lists of every simple command, `null` for a non-literal word. */
 function words(source: string): (string | null)[][] {
@@ -111,6 +111,63 @@ describe("parseBash: words", () => {
   });
 });
 
+describe("parseBash: pipes and stdin", () => {
+  const names = (parsed: ReturnType<typeof parseBash>, i: number) =>
+    upstreamCommands(parsed, parsed.commands[i] as SimpleCommand).map((c) => c.words[0]?.value);
+
+  test("upstream reaches into compound stages and through nested pipelines", () => {
+    const parsed = parseBash("(curl x; wget y) | { cat | sh; }");
+    expect(parsed.commands.map((c) => c.words[0]?.value)).toEqual(["curl", "wget", "cat", "sh"]);
+    expect(names(parsed, 2)).toEqual(["curl", "wget"]);
+    expect(names(parsed, 3).sort()).toEqual(["cat", "curl", "wget"]);
+    expect(parsed.commands.map((c) => c.piped)).toEqual([false, false, true, true]);
+  });
+
+  test("a stage after one with no simple command still reads a pipe", () => {
+    const parsed = parseBash("[[ -n x ]] | sh");
+    expect(parsed.commands.map((c) => [c.words[0]?.value, c.upstream, c.piped])).toEqual([
+      ["sh", [], true],
+    ]);
+  });
+
+  test("a 20,000-stage pipeline: each stage holds ranges, not copies", () => {
+    const parsed = parseBash(`${"a|".repeat(20000)}a`);
+    expect(parsed.commands).toHaveLength(20001);
+    expect(parsed.commands[20000]?.upstream).toEqual([[0, 20000]]);
+  });
+
+  test("stdin redirections, here-docs and here-strings; their commands feed it", () => {
+    const fed = (source: string) =>
+      parseBash(source).commands.map((c) => [
+        c.words[0]?.value,
+        c.stdin?.commands.map((w) => w[0]?.value) ?? "-",
+      ]);
+    expect(fed("sh < f")).toEqual([["sh", []]]);
+    expect(fed("sh 0<&3")).toEqual([["sh", []]]);
+    expect(fed("sh <<<'git push'")).toEqual([["sh", []]]);
+    expect(fed("sh <<'E'\ngit push\nE\n")).toEqual([["sh", []]]);
+    expect(fed("sh < <(curl x)")).toEqual([
+      ["sh", ["curl"]],
+      ["curl", "-"],
+    ]);
+    expect(fed('sh <<< "$(curl x)"')).toEqual([
+      ["sh", ["curl"]],
+      ["curl", "-"],
+    ]);
+    expect(fed("{ sh; } < <(curl x)")).toEqual([
+      ["sh", ["curl"]],
+      ["curl", "-"],
+    ]);
+    // Not stdin.
+    expect(fed("sh 3< f")).toEqual([["sh", "-"]]);
+    expect(fed("sh > f")).toEqual([["sh", "-"]]);
+    expect(fed("cat <(curl x)")).toEqual([
+      ["cat", "-"],
+      ["curl", "-"],
+    ]);
+  });
+});
+
 describe("parseBash: errors and bounds", () => {
   test("parse errors are reported, a nested script's own errors too", () => {
     expect(parseBash('echo "oops').errors).toEqual(["unterminated double quote"]);
@@ -127,6 +184,18 @@ describe("parseBash: errors and bounds", () => {
     const parsed = parseBash(deep);
     expect(performance.now() - started).toBeLessThan(5000);
     expect(parsed.errors.length).toBeGreaterThan(0);
+  });
+
+  test("the step budget stops the walk; nested scripts are charged by their length", () => {
+    expect(parseBash("a | b | c", undefined, { steps: 5 })).toMatchObject({ exhausted: true });
+    expect(parseBash("a | b | c", undefined, { steps: 1000 }).exhausted).toBeUndefined();
+    const budget = { steps: 10_000 };
+    parseBash("echo $(true)", undefined, budget);
+    expect(10_000 - budget.steps).toBeGreaterThan("echo $(true)".length + "$(true)".length);
+    // 3,000 nested $( parse the rest of the input again at each level.
+    expect(
+      parseBash(`echo ${"$(".repeat(3000)}x${")".repeat(3000)}`, undefined, { steps: 100_000 }),
+    ).toMatchObject({ exhausted: true });
   });
 
   test("input over the cap is not parsed", () => {
