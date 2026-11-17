@@ -481,6 +481,9 @@ describe("secret leaks", () => {
       [encodeURIComponent(SECRET)]: "url",
       [new URLSearchParams({ v: SECRET }).toString().slice(2)]: "url",
       [encodeURI(SECRET)]: "url",
+      // Python's quote(v) keeps "/"; quote_plus(v) keeps "~" (quote(v, safe="") is encodeURIComponent here).
+      "Fx%20pw/7%2BQ%26z%3D41%25%22tail~~~": "url",
+      "Fx+pw%2F7%2BQ%26z%3D41%25%22tail~~~": "url",
       [Buffer.from(SECRET).toString("base64").replace(/=+$/, "")]: "base64",
       [Buffer.from(SECRET).toString("base64url")]: "base64url",
       [Buffer.from(SECRET).toString("hex")]: "hex",
