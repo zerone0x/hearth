@@ -583,6 +583,13 @@ describe("bounded work: the hub's tool_call handler is synchronous", () => {
     );
   });
 
+  test("when the parser runs out, the commands it already read are still judged", () => {
+    // Deep enough that the parser itself exhausts the budget (not a parse error).
+    const tail = `echo ${"$(".repeat(1500)}x${")".repeat(1500)}`;
+    expect(verdict(tail, DENY_ALL)).toBe("ask unclear:budget");
+    expect(verdict(`git push; ${tail}`, DENY_ALL)).toBe("deny git-push");
+  });
+
   test("judging the commands spends the budget too, not only parsing them", () => {
     const command = "a; ".repeat(2000);
     const budget = { steps: 1e9 };
