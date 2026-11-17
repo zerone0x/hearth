@@ -3226,3 +3226,67 @@ field's value, and left screenshots unmasked.
   the field kind (`allow_any_field` is read from the authenticated row only).
 - Screenshots go to the blob store (0037) after capture; masking happens at
   capture, so stored screenshots are masked.
+
+## 0040: Browser eval B1-B6: a fixture site in the box, scripted faux runs, a scorer that reads only the trajectory
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #119
+
+### Context
+
+The browser research (`docs/research/browser.md` §7) names six fixture tasks
+and a score per run, and PRD §11.2 makes S2 an exit criterion: sign in with a
+vault login, fill a form, check the result on the server side, and find the
+password in no event, trajectory line, log line or model request. It leaves
+open where the fixture site runs, how a checker sees the server's record, and
+how the eval runs in CI without a model key.
+
+### Decision
+
+- **Fixture site.** `apps/hub/src/eval/fixtures/browser-fixtures.py`, Python's
+  standard library only (the box image has `python3`), served on the box's
+  own `127.0.0.1`, so the box firewall (0012) needs no exception. It gets only
+  the sha256 of the login, so neither the script nor the command that starts
+  it holds a value. Every page ends with the server's own record of the task
+  ("Server record: successful logins 1, ..."), so the server's view reaches
+  the trajectory through the page text the box returns.
+- **Tasks.** One session, one turn per task, each prompt starting with its
+  id (`B1: ...`), after a setup turn that writes and starts the site. B1 also
+  carries the show-password check: after `browser_fill`, a click turns the
+  field to plain text, and an element screenshot of the field must have the
+  same sha256 as one of a black box of the same size at a whole-pixel
+  position (the mask of 0039). B6 has no approval to wait for before M3, so
+  passing means stopping before the click.
+- **Scorer.** `apps/hub/src/eval/browser-score.ts` reads the JSONL that
+  `trajectory-cli.ts` dumps and decides each task from tool results only:
+  `ok`/`verified`/`outcome` headers, URLs, page text, screenshot hashes, and
+  which snapshot line a ref came from. The model's last words count only to
+  report a false success. It reports per task success, false success, tool
+  and model calls, tokens, cost, wall time, and the `stale_ref`,
+  `not_verified` and `timeout` counts.
+- **Leaks.** The scorer searches the dump, the exported blobs (names and
+  bytes) and any logs given for each vault value in the redactor's forms
+  (raw, JSON-escaped, URL-encoded) plus base64, base64url and hex. The e2e
+  dumps without the vault key (`--unredacted-ok`), so the dump is what the
+  database holds, and adds the hub's log, every stored event and every model
+  request. One hit fails the run.
+- **Runs.** `browser-eval.e2e.test.ts` scripts the tool calls with pi-ai's
+  faux model, reading refs off the latest snapshot as a model would. CI runs
+  it in `box-provider` on the real image under the firewall
+  (`HEARTH_DOCKER_TESTS=1`) and in `web-e2e` with box-agent as a local
+  process on Playwright's headless shell (`HEARTH_CHROMIUM`); the JSONL,
+  blobs and report of the Docker run are kept as an artifact.
+
+### Consequences
+
+- The scorer does not depend on the script: a real model's run of the same
+  prompts scores the same way. That mode (5 runs per model, median and worst,
+  as §7 asks) is not built yet; the setup turn is scripted today.
+- The trajectory redacts `"secret": "vault:..."` as a credential shape, so
+  the scorer tells which field a fill went to from the ref's snapshot line,
+  not from the reference.
+- The hub's credential-shape redaction can cut a JSON escape in half when it
+  runs over a dumped JSONL line (a `token = sha(f"...` in tool arguments
+  broke the line), so the fixture script avoids such text. A fix of the
+  redaction is a separate issue.

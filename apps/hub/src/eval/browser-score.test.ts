@@ -462,9 +462,9 @@ describe("secret leaks", () => {
     const inLog = scoreTrajectory({
       trajectory: GOLDEN,
       secrets: [SECRET],
-      logs: `ok\nfill ${SECRET}\n`,
+      logs: [{ name: "hub.log", text: `ok\nfill ${SECRET}\n` }],
     });
-    expect(inLog.leaks).toContainEqual({ where: "log:2", form: "raw" });
+    expect(inLog.leaks).toContainEqual({ where: "log:hub.log:2", form: "raw" });
     expect(inLog.pass).toBe(false);
   });
 });

@@ -6,7 +6,8 @@
  * trajectory is dumped with `trajectory-cli.ts` (blobs exported) and scored
  * by `browser-score.ts`, both as the owner would run them, so the verdict
  * comes from the trajectory alone. The scorer also searches the dump, the
- * blobs and the hub's log for the vault values.
+ * blobs, the hub's log, every stored event and every model request for the
+ * vault values (PRD §11.2 exit criteria).
  *
  * Two modes:
  * - `HEARTH_DOCKER_TESTS=1`: the real box image under `DockerBoxProvider`
@@ -20,10 +21,11 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxProvider } from "@earendil-works/pi-ai";
+import { type FauxResponseStep, fauxProvider } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   createDefaultSecretStore,
+  DEFAULT_WORKSPACE_ID,
   LOCAL_PRINCIPAL,
   type SecretStore,
   SecretValue,
@@ -33,7 +35,9 @@ import { LocalBoxProvider } from "../../../web/e2e/harness";
 import { SESSION_COOKIE } from "../auth";
 import { DEFAULT_DOCKER_SOCKET } from "../box/docker/config";
 import { DockerBoxProvider } from "../box/docker/provider";
+import { readAllEvents } from "../obs/routes";
 import { DEFAULT_BOX_PORT, type Hub, parsePort, startHub } from "../server";
+import { openDatabase, SqliteEventStore } from "../store";
 import { browserTasks, FIXTURE_SECRET_NAME, type FixtureLogin } from "./browser-tasks";
 
 const docker = process.env["HEARTH_DOCKER_TESTS"] === "1";
@@ -173,8 +177,18 @@ describe.skipIf(!enabled)(
       // One turn per task, in order; each waits for the previous to end.
       let after = 0;
       let ended = 0;
+      // Every request the model got, for the leak check (PRD §11.2: "model request").
+      const requests: string[] = [];
       for (const task of browserTasks(sitePort, LOGIN)) {
-        faux.setResponses([...task.steps]);
+        faux.setResponses(
+          task.steps.map(
+            (step): FauxResponseStep =>
+              (context, ...rest) => {
+                requests.push(JSON.stringify(context));
+                return typeof step === "function" ? step(context, ...rest) : step;
+              },
+          ),
+        );
         const sent = await api(`/v1/sessions/${id}/messages`, { text: task.prompt });
         expect(sent.status).toBe(202);
         const end = Date.now() + 300_000;
@@ -218,6 +232,20 @@ describe.skipIf(!enabled)(
       writeFileSync(secretsFile, JSON.stringify([LOGIN.username, LOGIN.password]), { mode: 0o600 });
       const hubLog = join(out, "hub.log");
       writeFileSync(hubLog, `${logs.join("\n")}\n`);
+      const modelLog = join(out, "model-requests.jsonl");
+      writeFileSync(modelLog, `${requests.join("\n")}\n`);
+      // Every stored event as it is, not only what the trajectory projects.
+      const db = openDatabase(dbPath);
+      const stored = await readAllEvents(
+        new SqliteEventStore(db),
+        { workspaceId: DEFAULT_WORKSPACE_ID },
+        id,
+      );
+      db.close();
+      const eventLog = join(out, "events.jsonl");
+      writeFileSync(eventLog, `${stored.map((e) => JSON.stringify(e)).join("\n")}\n`);
+      // The vault values did reach the box: the fills are in the events, as masks.
+      expect(stored.some((e) => JSON.stringify(e.payload).includes("browser_fill"))).toBe(true);
       const score = Bun.spawnSync(
         [
           process.execPath,
@@ -229,6 +257,10 @@ describe.skipIf(!enabled)(
           secretsFile,
           "--log",
           hubLog,
+          "--log",
+          modelLog,
+          "--log",
+          eventLog,
           "--json",
           join(out, "report.json"),
         ],
