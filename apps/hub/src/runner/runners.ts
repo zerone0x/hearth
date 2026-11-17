@@ -47,6 +47,7 @@ import {
   type RunnerStatus,
   redactSecrets,
   SessionRunner,
+  secretStart,
 } from "./runner";
 import type { RunnerBox } from "./tools";
 
@@ -158,6 +159,11 @@ export class SessionRunners {
     // One pass over both sets: a value in one that overlaps a value in the other
     // is replaced as one span, not cut by whichever pass ran first.
     return redactSecrets(text, [...this.#secretValues, ...knownSecrets()]);
+  }
+
+  /** Where a tail of `text` that could start one of those secrets begins (decision 0036). */
+  secretStart(text: string): number {
+    return secretStart(text, this.#secretValues);
   }
 
   #log(line: string): void {
@@ -291,6 +297,7 @@ export class SessionRunners {
       ...(this.#o.hubTempDir === undefined ? {} : { hubTempDir: this.#o.hubTempDir }),
       log: (line) => this.#log(line),
       redact: (text) => this.redact(text),
+      secretStart: (text) => this.secretStart(text),
       ...(this.#o.telemetry === undefined ? {} : { telemetry: this.#o.telemetry }),
       onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });

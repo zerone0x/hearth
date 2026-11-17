@@ -17,7 +17,9 @@
  *   (a notice), shown as system messages where they happened;
  * - Hearth's tool states (`hearthToolStatus`): done, error, outcome unknown
  *   (PRD §6.3) and interrupted (still running when the turn ended);
- * - the 64 KiB cap on a tool's output.
+ * - the 64 KiB cap on a tool's output;
+ * - live output of a running `bash` call (`tool.output`, decision 0036),
+ *   shown until the call's result replaces it.
  *
  * Pure, so a reload rebuilds the same chat from the log and then continues
  * from the cursor.
@@ -58,6 +60,15 @@ export interface HearthChat {
   readonly interrupting: boolean;
   /** Tool calls the interrupt cut off: they ended with an error while `interrupting`. */
   readonly interruptedCalls: readonly string[];
+  /** Live output of running tool calls by tool call id, until each one ends. */
+  readonly live: Readonly<Record<string, LiveOutput>>;
+}
+
+/** The streamed output of a running call so far (redacted by the hub). */
+export interface LiveOutput {
+  readonly text: string;
+  /** The hub stopped streaming at its cap; the result will have the rest. */
+  readonly truncated: boolean;
 }
 
 export function emptyChat(sessionId: string): HearthChat {
@@ -68,6 +79,7 @@ export function emptyChat(sessionId: string): HearthChat {
     notices: [],
     interrupting: false,
     interruptedCalls: [],
+    live: {},
   };
 }
 
@@ -92,7 +104,7 @@ export function toPiClientEvent(threadId: string, event: HubEvent): PiClientEven
 export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
   if (event.seq <= chat.cursor) return chat;
   const p = record(event.payload);
-  let { pi, pending, notices, interrupting, interruptedCalls } = chat;
+  let { pi, pending, notices, interrupting, interruptedCalls, live } = chat;
   const notice = (tone: Notice["tone"], text: string) => [
     ...notices,
     { seq: event.seq, tone, text, at: pi.messages.length },
@@ -108,6 +120,22 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       notices = notice("info", "Interrupted.");
       interrupting = true;
       break;
+    case "tool.output": {
+      const id = p["toolCallId"];
+      // A late chunk of a call that already ended is dropped: its result is in.
+      const state = typeof id === "string" ? pi.toolExecutions[id]?.status : undefined;
+      if (typeof id !== "string" || (state !== undefined && state !== "running")) break;
+      const before = live[id] ?? { text: "", truncated: false };
+      const text = before.text + (typeof p["text"] === "string" ? p["text"] : "");
+      live = {
+        ...live,
+        [id]: {
+          text: text.length > MAX_TOOL_OUTPUT ? text.slice(text.length - MAX_TOOL_OUTPUT) : text,
+          truncated: before.truncated || p["truncated"] === true,
+        },
+      };
+      break;
+    }
     case "runner.failed":
       notices = notice(
         "error",
@@ -137,10 +165,24 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
       ) {
         interruptedCalls = [...interruptedCalls, piEvent.toolCallId];
       }
+      if (
+        (piEvent.type === "tool_execution_end" && typeof piEvent.toolCallId === "string") ||
+        piEvent.type === "agent_end"
+      ) {
+        live = dropLive(live, piEvent.type === "agent_end" ? null : String(piEvent.toolCallId));
+      }
       pi = reducePiThreadState(pi, piEvent);
     }
   }
-  return { pi, cursor: event.seq, pending, notices, interrupting, interruptedCalls };
+  return { pi, cursor: event.seq, pending, notices, interrupting, interruptedCalls, live };
+}
+
+/** `live` without `toolCallId`'s entry, or empty for `null`. */
+function dropLive(live: HearthChat["live"], toolCallId: string | null): HearthChat["live"] {
+  if (toolCallId === null) return Object.keys(live).length === 0 ? live : {};
+  if (!(toolCallId in live)) return live;
+  const { [toolCallId]: _gone, ...rest } = live;
+  return rest;
 }
 
 export function applyHubEvents(chat: HearthChat, events: readonly HubEvent[]): HearthChat {
@@ -171,6 +213,13 @@ export function projectChat(chat: HearthChat): ThreadMessageLike[] {
     hostUiRequests: chat.pi.hostUiRequests,
   }).map((message): ThreadMessageLike => {
     if (typeof message.content === "string") return message;
+    const streaming: Record<string, LiveOutput> = {};
+    for (const part of message.content) {
+      if (part.type !== "tool-call" || part.toolCallId === undefined) continue;
+      const output = chat.live[part.toolCallId];
+      const final = part.result !== undefined && part.isPreliminary !== true;
+      if (output !== undefined && !final) streaming[part.toolCallId] = output;
+    }
     const cut = message.content.flatMap((part) =>
       part.type === "tool-call" &&
       part.toolCallId !== undefined &&
@@ -185,12 +234,16 @@ export function projectChat(chat: HearthChat): ThreadMessageLike[] {
           ? { ...part, result: clip(part.result) }
           : part,
       ),
-      ...(cut.length === 0
+      ...(cut.length === 0 && Object.keys(streaming).length === 0
         ? {}
         : {
             metadata: {
               ...message.metadata,
-              custom: { ...message.metadata?.custom, [INTERRUPTED_CALLS]: cut },
+              custom: {
+                ...message.metadata?.custom,
+                ...(cut.length === 0 ? {} : { [INTERRUPTED_CALLS]: cut }),
+                ...(Object.keys(streaming).length === 0 ? {} : { [LIVE_OUTPUT]: streaming }),
+              },
             },
           }),
     };
@@ -239,6 +292,18 @@ export const TOOL_STATUS_LABEL: Readonly<Record<HearthToolStatus, string>> = {
  * calls the user interrupted (see `HearthChat.interruptedCalls`).
  */
 export const INTERRUPTED_CALLS = "hearthInterruptedCalls";
+
+/** The key in an assistant message's `metadata.custom` with its running calls' live output. */
+export const LIVE_OUTPUT = "hearthLiveOutput";
+
+/** A running call's live output from its message's `metadata.custom`, if any. */
+export function liveOutputOf(custom: unknown, toolCallId: string): LiveOutput | undefined {
+  const all = record(record(custom)[LIVE_OUTPUT]);
+  const entry = record(all[toolCallId]);
+  return typeof entry["text"] === "string"
+    ? { text: entry["text"], truncated: entry["truncated"] === true }
+    : undefined;
+}
 
 /** Whether a message's `metadata.custom` lists `toolCallId` as interrupted by the user. */
 export function wasInterrupted(custom: unknown, toolCallId: string): boolean {

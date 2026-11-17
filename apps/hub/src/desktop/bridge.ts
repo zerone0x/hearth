@@ -31,7 +31,11 @@ import {
   type Principal,
   type SessionId,
 } from "@hearth/core";
-import type { StreamCloseFrame, StreamDataFrame } from "@hearth/protocol";
+import {
+  LIVE_OUTPUT_STREAM_BASE,
+  type StreamCloseFrame,
+  type StreamDataFrame,
+} from "@hearth/protocol";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import type { SessionManager } from "../session";
 import type { DesktopLocks } from "./lock";
@@ -353,7 +357,7 @@ export class DesktopBridge {
   /** Next free even stream id on this box (decision 0002: the hub opens even ids). */
   #allocate(streams: Map<number, Viewer>): number {
     for (;;) {
-      this.#nextId = (this.#nextId + 2) % 2 ** 32;
+      this.#nextId = nextDesktopStreamId(this.#nextId);
       if (!streams.has(this.#nextId)) return this.#nextId;
     }
   }
@@ -408,4 +412,12 @@ function unavailable(message: string): HearthError {
     disposition: "retry",
     code: "desktop.unavailable",
   });
+}
+
+/**
+ * The even stream id after `id` for a desktop viewer. It wraps below
+ * `LIVE_OUTPUT_STREAM_BASE`, so it never meets a live output stream (0036).
+ */
+export function nextDesktopStreamId(id: number): number {
+  return (id + 2) % LIVE_OUTPUT_STREAM_BASE;
 }

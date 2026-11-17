@@ -43,6 +43,7 @@ import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/t
 import { HUB_VERSION } from "../obs/version";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
+import { liveToolOutput } from "./live-output";
 import type { CompiledDenyRule } from "./policy";
 import { hearthToolsExtension, ROUTED_TOOLS, type RunnerBox } from "./tools";
 
@@ -76,6 +77,11 @@ export interface SessionRunnerOptions {
   /** Removes the secrets the runner uses (the model key) from text it stores or logs. */
   readonly redact?: (text: string) => string;
   /**
+   * Where a tail of the text that could start one of those secrets begins
+   * (`secretStart`); live output holds that tail back. Set with `redact`.
+   */
+  readonly secretStart?: (text: string) => number;
+  /**
    * Called once when the runner fails, after `runner.failed` is recorded: the
    * hub moves the session row to `failed` through the session manager.
    */
@@ -107,6 +113,33 @@ export const REDACTED = "[redacted]";
  */
 export function redactSecrets(text: string, secrets: Iterable<string>): string {
   return redactValues(text, secrets, REDACTED);
+}
+
+/**
+ * Where the longest tail of `text` that could be the start of a secret
+ * begins: the first index whose rest is a proper prefix of a secret, raw or
+ * as it appears inside a JSON string; `text.length` when there is none.
+ * Live output (decision 0036) never emits text from there on, so no secret
+ * is shown in part before the rest of it arrives.
+ */
+export function secretStart(text: string, secrets: Iterable<string>): number {
+  let start = text.length;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    for (const form of escaped === secret ? [secret] : [secret, escaped]) {
+      const first = form.charAt(0);
+      let i = text.indexOf(first, Math.max(0, text.length - form.length + 1));
+      while (i !== -1 && i < start) {
+        if (form.startsWith(text.slice(i))) {
+          start = i;
+          break;
+        }
+        i = text.indexOf(first, i + 1);
+      }
+    }
+  }
+  return start;
 }
 
 /** The text a rebuilt runner gives a tool call that a hub restart cut off. */
@@ -239,6 +272,8 @@ export class SessionRunner {
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
             onRefused: (_name, toolCallId, code) =>
               self?.observe(() => self?.tracer.onRefused(toolCallId, code)),
+            liveOutput: (toolCallId) =>
+              liveToolOutput(options, toolCallId, () => self?.tracer.turnId),
             ...(options.hubTempDir === undefined ? {} : { hubTempDir: options.hubTempDir }),
           }),
         },

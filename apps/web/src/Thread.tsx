@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import {
   type HearthToolStatus,
   hearthToolStatus,
+  liveOutputOf,
   TOOL_STATUS_LABEL,
   toolTarget,
   wasInterrupted,
@@ -51,6 +52,13 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
     wasInterrupted(s.message.metadata.custom, part.toolCallId),
   );
   const status = hearthToolStatus(part, interrupted);
+  // Two primitive selections, so the card re-renders only when they change.
+  const liveText = useAuiState(
+    (s) => liveOutputOf(s.message.metadata.custom, part.toolCallId)?.text,
+  );
+  const liveCapped = useAuiState(
+    (s) => liveOutputOf(s.message.metadata.custom, part.toolCallId)?.truncated === true,
+  );
   const label = TOOL_STATUS_LABEL[status];
   const target = toolTarget(part.toolName, part.args);
   return (
@@ -78,6 +86,19 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
           {label}
         </Badge>
       </div>
+      {status === "running" && liveText !== undefined ? (
+        // Live output (decision 0036): outside the collapsed details, so it shows
+        // while the call runs. The result replaces it when the call ends.
+        <pre
+          role="log"
+          aria-label={`Live output of ${part.toolName}`}
+          data-testid="live-output"
+          className="mb-2 max-h-48 overflow-auto rounded-md bg-muted/50 p-2 font-mono text-foreground/90 text-xs break-words whitespace-pre-wrap"
+        >
+          {liveText}
+          {liveCapped ? "\n… (live output stopped at its cap; the result has the rest)" : null}
+        </pre>
+      ) : null}
       <ToolFallback.Content>
         {status === "outcome-unknown" ? (
           <Alert variant="destructive" data-testid="outcome-unknown">

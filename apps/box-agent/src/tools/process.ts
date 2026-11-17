@@ -43,6 +43,8 @@ export interface RunOptions {
    * the output is not spilled.
    */
   readonly spill?: { readonly path: string; readonly cap: number; readonly open: () => number };
+  /** Every output chunk as it arrives (live output, decision 0036). Must not throw or block. */
+  readonly onOutput?: (chunk: Buffer) => void;
 }
 
 export interface RunResult {
@@ -138,6 +140,7 @@ export function runProcess(options: RunOptions): Promise<RunResult> {
     let finished = false;
 
     const onData = (chunk: Buffer) => {
+      options.onOutput?.(chunk);
       total += chunk.length;
       if (options.spill !== undefined) {
         if (spill === undefined && !spillFailed && total > options.outputCap) {

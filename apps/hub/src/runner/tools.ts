@@ -71,10 +71,23 @@ export interface HearthToolsOptions {
   readonly denyList: readonly CompiledDenyRule[];
   /** Where hub temp files land (`os.tmpdir()`); results naming them are rewritten. */
   readonly hubTempDir?: string;
+  /**
+   * The live output of one `bash` call (decision 0036): gets the command's
+   * output as the box streams it, and `close()` when the call ends. Without
+   * it the call answers once, as before.
+   */
+  readonly liveOutput?: (toolCallId: string) => LiveOutputSink;
   /** Called after a call was blocked, for the event log. */
   readonly onDenied?: (toolName: string, toolCallId: string, reason: string) => void;
   /** Called after a browser tool was refused for the desktop lock, for the trajectory. */
   readonly onRefused?: (toolName: string, toolCallId: string, code: string) => void;
+}
+
+/** Where a running command's streamed output goes (`LiveToolOutput`). */
+export interface LiveOutputSink {
+  /** False once it wants no more output (capped or stopped): the box is told to stop. */
+  write(chunk: Uint8Array): boolean;
+  close(): void;
 }
 
 const GREP_DEFAULT_LIMIT = 100;
@@ -152,12 +165,20 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
           createBashToolDefinition(boxCwd, {
             operations: {
               // pi passes the hub's environment as `env`; it never leaves the hub.
-              exec: (command, cwd, { onData, signal: execSignal, timeout }) =>
-                ops.bash.exec(command, cwd, {
-                  onData,
-                  ...(execSignal === undefined ? {} : { signal: execSignal }),
-                  ...(timeout === undefined ? {} : { timeout }),
-                }),
+              exec: async (command, cwd, { onData, signal: execSignal, timeout }) => {
+                const live = options.liveOutput?.(id);
+                try {
+                  return await ops.bash.exec(command, cwd, {
+                    onData,
+                    ...(execSignal === undefined ? {} : { signal: execSignal }),
+                    ...(timeout === undefined ? {} : { timeout }),
+                    ...(live === undefined ? {} : { onOutput: (chunk) => live.write(chunk) }),
+                  });
+                } finally {
+                  // The result (through onData) is the answer from here on.
+                  live?.close();
+                }
+              },
             },
           }).execute(id, params, signal, onUpdate, ctx),
         ),
