@@ -74,7 +74,12 @@ Hub:
 | `HEARTH_BOX_PORT` | `8788` | `apps/hub/src/main.ts`, `scripts/box-firewall.sh` | box listener port on each box network's gateway (0012) |
 | `HEARTH_BOX_IMAGE` | `hearth-box:local` | `apps/hub/src/main.ts` | image of session boxes |
 | `HEARTH_BOX_EGRESS` | `filtered` | `apps/hub/src/box/egress.ts` | `unrestricted` starts boxes without the firewall (0012) |
-| `HEARTH_BOX_EGRESS_MARKER` | `/run/hearth/box-egress.applied` | `apps/hub/src/box/egress.ts`, `scripts/box-firewall.sh` | firewall marker; trusted only if root-owned (0023, 0024) |
+| `HEARTH_BOX_EGRESS_MARKER` | `/run/hearth/box-egress.applied` | `apps/hub/src/box/egress.ts`, `apps/hub/src/main.ts`, `scripts/box-firewall.sh` | firewall marker; trusted only if root-owned (0023, 0024) |
+| `HEARTH_BIFROST_URL` | unset (no Bifrost) | `apps/hub/src/bifrost/service.ts` | the Bifrost gateway's admin and inference address; compose: `http://172.29.249.2:8080` (0046) |
+| `HEARTH_BIFROST_HANDOFF_DIR` | unset | `apps/hub/src/bifrost/service.ts`, `deploy/bifrost/start.sh` | tmpfs directory the hub writes Bifrost's vault secrets into; compose: `/run/hearth-bifrost` (0046) |
+| `HEARTH_BIFROST_CONFIG` | `/etc/hearth-bifrost/config.json` | `deploy/bifrost/start.sh` | the Bifrost config `start.sh` copies into Bifrost's data directory (0046) |
+| `HEARTH_BIFROST_ADDR` | `172.29.249.2` | `deploy/compose.yaml`, `scripts/box-firewall.sh` | Bifrost's address on its network; the box egress allow list must not cover it (0046) |
+| `HEARTH_BIFROST_SUBNET` | `172.29.249.0/29` | `deploy/compose.yaml` | subnet of Bifrost's bridge network (0046) |
 | `HEARTH_VERSION` | package version + git sha | `apps/hub/src/obs/version.ts` | build stamped on `/healthz`, trajectories and spans (0021) |
 | `HEARTH_LOG_LEVEL` | `info` | `apps/hub/src/obs/setup.ts` | `debug`, `info`, `warn` or `error` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no export) | `apps/hub/src/obs/telemetry.ts` | OTLP endpoint for traces and metrics (0021) |

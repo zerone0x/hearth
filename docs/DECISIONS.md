@@ -3829,3 +3829,140 @@ and the recording; the gate itself (what `ask` stops, the approval cards) is
   renumber theirs on merge.
 - #155 needs no new setting or plumbing: it reads `resolve` in
   `hearth-access` and adds its `approval.*` fields next to `access_mode`.
+
+## 0046: Bifrost as a compose service: vault secrets through a tmpfs handoff, keys pushed from the vault, model traffic in #157
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #156 (design: research #152, `docs/research/m3-models-access.md`,
+  question 4 and the threat notes)
+
+### Context
+
+PRD §6.4 makes Bifrost the default model gateway: provider keys behind it,
+one virtual key per session with a budget and a model allowlist. The research
+for #152 verified Bifrost v2.5.1's admin and governance API from Bun and
+proposed four rules: pinned by digest, internal network only, provider keys
+pushed from the vault (0031 keeps the vault as the source), and Bifrost's
+admin password and `encryption_key` as vault entries, so that a copy of
+Bifrost's volume alone does not give the keys. The hub runs on the host's
+network (0020), so it cannot join a compose network, and Bifrost reads its
+secrets at start, before the hub could call its API.
+
+### Decision
+
+- **Service.** `maximhq/bifrost@sha256:5ec9873a…d3c8`, the multi-arch index
+  digest of `v2.5.1` from the registry API (Apache-2.0). On its own bridge,
+  `hearth-bifrost`, subnet `172.29.249.0/29`, fixed address `172.29.249.2`
+  (`HEARTH_BIFROST_SUBNET`, `HEARTH_BIFROST_ADDR`), no published port. The
+  hub, on the host's network, reaches it at `HEARTH_BIFROST_URL`. Not
+  `internal: true`: Bifrost needs the providers and its price list.
+- **Config.** `deploy/bifrost/config.json`: admin auth on (user `hearth`,
+  password `env.BIFROST_ADMIN_PASSWORD`), `enforce_auth_on_inference`,
+  `allow_direct_keys: false`, `disable_content_logging`, SQLite config and log
+  stores on the `bifrost-data` volume, which neither a box nor the hub mounts,
+  and the MCP catalog sync off.
+- **Secrets.** Two vault entries, `bifrost-admin-password` and
+  `bifrost-encryption-key` (`token`, `use: hub`, 32 random bytes in
+  base64url), created by the hub with the system principal on the first start
+  with the vault open, and audited like any entry. At every start the hub
+  writes them, mode 0440, into `bifrost-handoff`, a tmpfs volume (memory
+  only) it shares with Bifrost; `deploy/bifrost/start.sh` waits for them,
+  exports them and runs Bifrost's own entrypoint. Bifrost encrypts the
+  provider keys in its store with that key; the binary test checks the key is
+  not in `config.db` in plain text.
+- **The two entries are the hub's.** `HubVault` takes a list of system
+  entries; for one that is a global `token` with `use: hub`, the secrets API
+  refuses rotate, a `use` change and delete (409 `secret.system-managed`), and
+  only the system principal may create an entry under those names. The
+  Settings page shows "Managed by the hub" instead of Rotate and Delete
+  (`system: true` in the list). The hub hands over an existing entry only when
+  it is such a token: anything else under those names (made before the names
+  were reserved) is never given to Bifrost, the state is `secrets-unusable`,
+  and the owner may delete it so the hub makes its own.
+- **Keys are pushed, never typed.** Every global `model-key` entry whose
+  `meta.provider` maps to a Bifrost provider (`anthropic`, `google`→`gemini`,
+  `groq`, `mistral`, `openai`, `openrouter`) is pushed through
+  `POST/PUT /api/providers/{p}/keys` with `models: ["*"]` (an empty list
+  supports no model). A key Bifrost has under one of those providers that the
+  vault does not is deleted. Pushed when Bifrost turns healthy and after an
+  entry is added, rotated or deleted (a new `HubVault` `onEntryAdded` hook
+  next to `onValueChange`). Other providers (a `models.json` endpoint) are
+  skipped with a log line. Keys never pass through a box or the compose file.
+- **Health.** The hub checks `GET /health` and one authorized admin call every
+  30 s. `/healthz` has `bifrost`: `ok`, `starting` or `unavailable`, and
+  `bifrostState`, the state behind it (`ok`, `starting`, `unreachable`,
+  `unauthorized`, `vault-disabled`, `secrets-unusable`, `box-reachable`); the
+  reason is in the log, one `bifrost:` line per change (component `bifrost`;
+  `unauthorized` and `box-reachable` at error, the others at warn).
+- **The install does not depend on Bifrost.** No model call uses it yet, so
+  the hub has no `depends_on` on it and its own health never includes it:
+  `docker compose up -d --wait hub` succeeds when Bifrost cannot start (no
+  access to `getbifrost.ai`, the vault disabled or its key mismatched, an
+  allow list that covers it). install.md starts Bifrost with a separate
+  `docker compose up -d bifrost`, without `--wait`, and the systemd unit
+  ignores that step's failure. The hub logs why and `/healthz` says
+  `"bifrost":"unavailable"`. The compose e2e still requires `"bifrost":"ok"`.
+  #157, which sends model calls through Bifrost, decides whether the hub then
+  depends on it.
+- **No box reaches it.** The box firewall already rejects every private range
+  from a box. `scripts/box-firewall.sh` now also takes `HEARTH_BIFROST_ADDR`
+  and refuses (before any rule changes) an address outside those ranges or an
+  allow entry that covers it; `box-firewall.sh check` validates without
+  root. At start the hub reads the marker's `allow=` list and stays
+  `box-reachable`, without creating or handing over any secret, if an entry
+  covers Bifrost's address.
+- **Model traffic switches in #157, not here.** This PR changes no model call:
+  the runner still uses the env or Settings model and its key directly
+  (0038). #157 adds per-session virtual keys (create, rotate per runner build,
+  allowlist `PUT`, deactivate, delete) and points the runner's pi at Bifrost
+  with them; switching before a session has its own virtual key would need a
+  shared one, which §6.4 rules out.
+- **Tests.** The hub's side against a fake admin API (`bifrost.test.ts`) and
+  against the real v2.5.1 binary (`bifrost.binary.test.ts`, gated by
+  `HEARTH_BIFROST_BIN`; CI downloads it with `scripts/fetch-bifrost.sh`,
+  pinned SHA-256, and never commits it). The binary test checks that a model
+  call with no key or an unknown one is 401 and reaches no provider, which is
+  what `enforce_auth_on_inference` holds. The compose-e2e runs install.md's
+  `install:bifrost` block and checks the network, the digest, the volumes and
+  that a container on an `hbx` bridge under the firewall cannot reach Bifrost
+  while the host can.
+
+### Alternatives rejected
+
+- **Publish Bifrost on the host's loopback.** Any process on the host could
+  then reach its inference API; a dedicated bridge needs no published port.
+- **Secrets in `deploy/secrets` files or the compose file.** They would sit on
+  disk next to Bifrost's store, against 0031 and the research's threat note.
+- **Let the hub start Bifrost through the Docker API with the secrets in its
+  environment.** It would not be a compose service the install and `--wait`
+  manage, and `docker inspect` shows a container's environment.
+- **Configure Bifrost's auth through its API after start.** Bifrost would run
+  with an open admin API until the hub got to it.
+- **Switch model calls to Bifrost here with one shared virtual key.** Larger
+  PR, and a shared key gives no per-session budget.
+
+### Consequences
+
+- A new install needs outbound HTTPS to `getbifrost.ai` on Bifrost's first
+  start: v2.5.1 exits when the price list cannot be downloaded and none is
+  stored (probed with an unreachable `pricing_url`). `install.md` says so and
+  names `pricing_url` for a mirror.
+- A changed `encryption_key` over an existing store breaks Bifrost (probed
+  against v2.5.1 in review): `GET /api/providers` answers 500, a provider
+  cannot be added again (409), and the governance plugin fails, so inference
+  auth is off (a call with no key gets 400 `no_key`, not 401). That is why the
+  API refuses to change the two entries. A rotation flow is future work; until
+  then the way out of an unreadable store is to remove the `bifrost-data`
+  volume (install.md, "Bifrost's store"), after which the hub pushes the
+  provider keys again.
+- Bifrost shows a stored key masked (`sk-f****-123`), verified against the
+  binary; the research listed this as not verified.
+- Docker's own rules also separate box networks from Bifrost's: it drops a
+  packet for a container's address that does not come in on the container's
+  bridge in the raw table (`-A PREROUTING -d 172.29.249.2/32 ! -i
+  hearth-bifrost -j DROP`, seen in CI), before the filter table, so a box probe
+  of Bifrost's own address times out and never reaches the firewall's
+  `tcp-reset`. The compose e2e therefore also probes an unused address in
+  Bifrost's subnet, which only the firewall can answer: it must be refused by
+  the `tcp-reset` rule, whose counter must move.

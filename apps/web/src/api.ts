@@ -64,6 +64,8 @@ export interface Secret {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly lastUsedAt: number | null;
+  /** Generated and managed by the hub (Bifrost's secrets, decision 0046): no rotate or delete. */
+  readonly system?: boolean;
 }
 
 /** A new entry. `fields` is write-only: the hub answers with a fingerprint. */
