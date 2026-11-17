@@ -179,6 +179,8 @@ export interface HubVaultOptions {
    * settings rebuild the runtime when it is the model's key (decision 0038).
    */
   readonly onValueChange?: (name: string) => void;
+  /** Called after an entry was added: the Bifrost service pushes a new model key (decision 0046). */
+  readonly onEntryAdded?: (name: string) => void;
   readonly now?: () => EpochMs;
   /** Adds a value to the sink-side redaction set. Default `registerSecret` (decision 0021). */
   readonly register?: (value: string) => void;
@@ -395,6 +397,7 @@ export class HubVault implements VaultReader {
       );
       this.#registerFields(fields);
       this.#log(`vault: secret ${name} added (${kind}, ${fingerprint})`);
+      this.#o.onEntryAdded?.(name);
       return { id: binding.id, fingerprint, version: 1 };
     });
   }

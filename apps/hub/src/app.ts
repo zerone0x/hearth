@@ -3,6 +3,7 @@ import { formatVersion, PROTOCOL_VERSION } from "@hearth/protocol";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
+import type { BifrostStatus } from "./bifrost";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
 import { HUB_VERSION } from "./obs/version";
@@ -37,6 +38,11 @@ export interface AppOptions {
    * hub; `startHub` sets it whenever a box provider is configured.
    */
   readonly boxEgress?: BoxEgressCheck;
+  /**
+   * The Bifrost gateway's state (decision 0046). When set, `/healthz` reports
+   * it as `bifrost`; set whenever Bifrost is configured.
+   */
+  readonly bifrost?: () => BifrostStatus;
   /**
    * Directory of the built web UI (`apps/web/dist`, decision 0017). When set,
    * `GET`/`HEAD` outside `/v1/` are served from it without a login; the
@@ -167,6 +173,7 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   // input and returns no workspace data (docs/DECISIONS.md, 0001).
   // `boxEgress` is the hub's own state, not workspace data.
   const boxEgress = options.boxEgress;
+  const bifrost = options.bifrost;
   app.get("/healthz", (c) =>
     c.json(
       {
@@ -175,6 +182,7 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
         // The build, as stamped on trajectories (decision 0021).
         version: HUB_VERSION,
         ...(boxEgress === undefined ? {} : { boxEgress: boxEgress().state }),
+        ...(bifrost === undefined ? {} : { bifrost: bifrost().state }),
       },
       200,
     ),

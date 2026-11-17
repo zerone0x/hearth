@@ -14,6 +14,7 @@ import {
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
 import { AuthService } from "./auth";
+import { BifrostService, type BifrostServiceOptions } from "./bifrost";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -207,6 +208,12 @@ export interface HubOptions extends HubListenOptions {
     /** Resolves the key references. Default `createDefaultSecretStore()`. */
     readonly keySecrets?: SecretStore;
   };
+  /**
+   * The Bifrost gateway service (decision 0046): its address, the tmpfs
+   * handoff directory and the box egress allow list. Unset: not configured,
+   * and `/healthz` has no `bifrost` field. Model calls do not use it yet (#157).
+   */
+  readonly bifrost?: Omit<BifrostServiceOptions, "vault" | "vaultStore" | "log">;
   /** Observes every applied box delivery before its ack (see `BoxConnections`). */
   readonly onApplied?: (applied: AppliedDelivery) => void;
   /** Deadline of the `echo` RPC (see `BoxConnections`). Only tests change it. */
@@ -293,10 +300,26 @@ export function startHub(options: HubOptions) {
     ...(options.vault?.nextKeyRef === undefined ? {} : { nextKeyRef: options.vault.nextKeyRef }),
     // Its state goes to the hub's log; a hub without one (tests) stays quiet.
     log: options.log ?? (() => {}),
-    // A rotated or deleted model key is resolved again for the next turn (0038).
-    onValueChange: (name) => modelSettings.keyChanged(name),
+    // A rotated or deleted model key is resolved again for the next turn (0038),
+    // and pushed to Bifrost again (0046).
+    onValueChange: (name) => {
+      modelSettings.keyChanged(name);
+      bifrost?.entryChanged(name);
+    },
+    onEntryAdded: (name) => bifrost?.entryChanged(name),
   });
   const vaultReady = vault.open();
+  // Bifrost (decision 0046): its secrets come from the vault, so it starts once the vault opened.
+  const bifrost =
+    options.bifrost === undefined
+      ? undefined
+      : new BifrostService({
+          ...options.bifrost,
+          vault,
+          vaultStore,
+          log: options.log ?? (() => {}),
+        });
+  const bifrostReady = vaultReady.then(() => bifrost?.start());
   /** The hub's SecretStore: `env:`, `file:` and `vault:` (E7). */
   const secrets = createDefaultSecretStore({ resolvers: [new VaultSecretResolver(vault)] });
   const boxes = new BoxConnections({
@@ -323,6 +346,7 @@ export function startHub(options: HubOptions) {
     {
       allowedHosts: [...LOOPBACK_HOSTS, hostname],
       ...(options.provider === undefined ? {} : { boxEgress }),
+      ...(bifrost === undefined ? {} : { bifrost: () => bifrost.status }),
       ...(options.publicOrigin === undefined ? {} : { publicOrigin: options.publicOrigin }),
       ...(options.webRoot === undefined ? {} : { webRoot: options.webRoot }),
     },
@@ -656,6 +680,9 @@ export function startHub(options: HubOptions) {
     /** The vault (decision 0031) and its first open. */
     vault,
     vaultReady,
+    /** The Bifrost gateway service (decision 0046), if configured, and its first check. */
+    bifrost,
+    bifrostReady,
     /** The model settings (decision 0038), loaded (and imported) once the vault opened. */
     modelSettings,
     settingsReady,
@@ -735,6 +762,7 @@ export function startHub(options: HubOptions) {
     stop(): Promise<void> {
       if (stopped !== undefined) return stopped;
       sessions.stop();
+      bifrost?.stop();
       toolRpc?.close();
       void runners?.close();
       desktop?.shutdown();
