@@ -1,10 +1,16 @@
 # Hearth PRD
 
-> Status: draft v0.4 · 2026-11-16 · Owner: @zerone0x
+> Status: draft v0.5 · 2026-11-17 · Owner: @zerone0x
+
+**What changed in v0.5** (decision 0042, issue #148): M3 drops the phone
+channels (PWA, Web Push, Telegram), which move to a new **M6 Anywhere** between
+M5 and v1.0. Approvals (§6.5) become an **access mode** the owner chooses: `yolo`
+or `ask`. M3 is now "Models & access". Sections touched: §1 scenario S3, §3 G5,
+§6.5, §6.6, §6.10, §11.
 
 **What changed in v0.4** (decision 0030, issue #106): the **stage plan**. M1
 Prototype is done (§11.1). §11 now says, for each milestone, what you can do
-after it and how that is tested: M2 Browser & vault, M3 Anywhere, M4
+after it and how that is tested: M2 Browser & vault, M3 Models & access, M4
 Connections & automation, M5 Retro & router, then v1.0. The old M2 "Hardening
 & desktop" is split up: takeover, live shell output and desktop supervision go
 to M2; image slimming, hibernate polish and resource limits go to v1.0. A new
@@ -14,6 +20,8 @@ to M2; image slimming, hibernate polish and resource limits go to v1.0. A new
 
 Changelog:
 
+- v0.5 · 2026-11-17 · decision 0042, #148: M3 without phone channels; access
+  mode `yolo` / `ask`; phone work moves to M6.
 - v0.4 · 2026-11-16 · decision 0030, #106: stage plan by user-visible
   features; vault (§6.10); M1 marked done.
 - v0.3 · 2026-11-15 · decision 0009, #29: brain/hands split; M1 Prototype.
@@ -56,9 +64,10 @@ Differentiators:
 |---|---|---|
 | S1 | Drop "fix this issue and open a PR" at night, review the result in the morning | Local agents die when the laptop closes |
 | S2 | Have the agent drive web pages (log into an admin panel, fill forms, compare screenshots) | Ties up and endangers your own browser |
-| S3 | Check progress or approve a risky action from your phone on the train | Have to get back to the computer |
+| S3 | Choose whether the agent may act freely or must ask first, and approve a risky action when it asks (in the web UI; from your phone later, M6) | Agents either run unchecked or can't run unattended |
 | S4 | Run a check every day at 9:00, or handle a webhook automatically | Hand-rolled cron + scripts |
 | S5 | "How did we fix auth last week?" / "Where does the agent keep failing?" | Sessions aren't searchable; nothing is learned |
+| S6 | Check progress or approve a risky action from your phone on the train | Have to get back to the computer |
 
 ## 4. Goals and non-goals
 
@@ -68,7 +77,7 @@ Differentiators:
 - G2: Sessions run in the background, independent of client connections.
 - G3: Each session has its own box; its desktop can be watched and taken over live in the browser.
 - G4: Idle sessions hibernate automatically and wake on the next message, with no file loss.
-- G5: Two entry points: Web (PWA) and Telegram.
+- G5: Web is the entry point first; PWA, Web Push and Telegram follow in M6 (§6.6).
 - G6: Scheduled and webhook triggers.
 - G7: Automatic retro when a session ends; lessons can be injected into later sessions.
 - G8: Code structure leaves extension points for multi-tenant and multi-node (see §7) without implementing them.
@@ -79,8 +88,8 @@ Differentiators:
 - Multiple users, orgs, teams, RBAC, SSO.
 - Multi-node / cluster scheduling, rolling upgrades.
 - A home-grown model gateway or billing (Bifrost is used instead).
-- Native iOS / Android apps (PWA first).
-- 20+ chat channels; Telegram only.
+- Native iOS / Android apps (PWA first, in M6).
+- 20+ chat channels; Telegram only (M6).
 - Controlling the user's own computer (local computer use).
 
 ## 5. Core concepts
@@ -165,17 +174,21 @@ Model calls are made by the runner, in the hub. **The box holds no model credent
 - Subscriptions: a subscription token is a hub-side secret like any other, used by the runner. Since nothing model-related runs in the box, a subscription no longer puts a token in the box.
 - A model the provider has retired is refused with a message naming a replacement — never silently rerouted to another model.
 
-### 6.5 Approvals
+### 6.5 Access mode and approvals
 
-- **P0** Configurable tools / command patterns that need approval (e.g. `git push`, `rm -rf`, a payment page on the desktop).
-- **P0** Approval cards pushed to Web and Telegram, one tap to approve / deny; timeout defaults to deny.
+- **P0 (M3)** The owner chooses an **access mode**: `yolo` (the agent runs every tool without asking; today's behaviour) or `ask` (risky actions stop and wait for approve / deny; a timeout denies). A global default lives in Settings and a session can override it. A new install defaults to `ask`.
+- **P0 (M3)** In `ask` mode the risky set is the configurable deny-list of tools and command patterns, matched after bash parsing (#69): for example `git push`, `rm -rf`, a payment page on the desktop, and marked secrets (§6.10).
+- **P0 (M3)** The mode in force is shown on the session and recorded in the trajectory on every tool call; changing the global default or a session's mode is audited.
+- **P0 (M3)** Built on pi, not hand-rolled. pi 1.5.2 has no approval system of its own (its docs/security.md: it does not ask before every tool call), but its extension API has a blocking `tool_call` event (`return { block: true, reason }`, docs/extensions.md). `ask` is a hub-side pi extension on `tool_call` that blocks until the owner decides in the web UI, following pi's example extensions `permission-gate.ts`, `timed-confirm.ts`, `confirm-destructive.ts` and `protected-paths.ts` (`examples/extensions` in `@earendil-works/pi-coding-agent`). `yolo` simply does not load it. The extension goes through the extension allowlist (#56).
+- **P0 (M3)** Approval cards are web-only until M6; their lifecycle is channel-neutral (#71), so Telegram and Web Push reuse it later (§6.6).
 - With the brain in the hub, the gate runs hub-side before a tool call is dispatched to the box: pi's `tool_call` extension event fires before a tool executes and can block it. A denied or timed-out call never reaches the box.
 
 ### 6.6 Entry points
 
-- **P0** Web: session list, chat, desktop, settings. Installable PWA, usable on mobile.
-- **P1** Telegram bot: one session per topic / reply thread; send messages, receive results, approve, `/new`, `/list`.
-- **P1** Web Push notifications (turn finished, approval needed, failure).
+- **P0** Web: session list, chat, desktop, settings, approval cards (§6.5). Usable on mobile in a browser.
+- **P1 (M6)** Installable PWA.
+- **P1 (M6)** Telegram bot: one session per topic / reply thread; send messages, receive results, approve, `/new`, `/list`.
+- **P1 (M6)** Web Push notifications (turn finished, approval needed, failure).
 
 ### 6.7 Triggers
 
@@ -217,7 +230,7 @@ resolvers. Research #108 ([research/vault.md](research/vault.md)) decided the de
 - **P0 (M2)** Every use is audited before it happens (E10): which secret (name and fingerprint), which session and tool call. If the audit record cannot be written, the value is not used.
 - **P0 (M2)** A site login is a username and a password for a stated origin; the agent may use it only on that origin. TOTP codes are computed in the hub from a `#totp` field with `otpauth`; the seed never leaves the hub (decided in [research/vault.md](research/vault.md); implementation is #129, on top of #114).
 - **P1** Scope: a secret is global or limited to chosen sessions; a session cannot use a secret outside its scope.
-- **P1** Per-secret approval: using a marked secret asks the owner first (§6.5, M3).
+- **P1** Per-secret approval: using a marked secret asks the owner first when the session is in `ask` mode (§6.5, M3).
 - **P1** Backup and restore include the vault (v1.0). A restore without the master key gives an unreadable vault and says so, never a silent empty one.
 - **P2** Read from an existing password manager (for example Bitwarden / Vaultwarden or the 1Password CLI) instead of, or next to, the built-in store. Compared in [research/vault.md](research/vault.md) (#108, "Integration option"): it stays P2, not P1, as optional read-only `bw:` / `op:` resolvers, because each needs a long-lived unlock credential in the hub that opens the owner's whole vault. OpenBao is likewise an optional later backend behind the vault's key-provider and entry-backend interfaces, not part of M2.
 
@@ -246,7 +259,7 @@ Principle: **implement only the personal-edition variant now, but design each in
 | E6 | **EventStore**: append-only log + cursor reads | SQLite | Postgres, object-storage archive |
 | E7 | **SecretStore**: secrets are stored as *references* (`env:`, `file:`) resolved at use, with a short cache; UI shows fingerprints, never values | `env:` / `file:` resolvers; the vault's own encrypted store (§6.10, M2) | External password managers, KMS |
 | E8 | **ModelGateway**: issues and revokes per-session credentials, reports usage. Credentials go to the hub-side runner, never to a box | `direct` with an API key from the SecretStore (prototype); then Bifrost (one virtual key per session); magpie as an alternative | Bifrost Enterprise or another gateway; team / org budget layers |
-| E9 | **Channel**: message entry adapters | Web, Telegram | Slack, Teams, Lark, etc. |
+| E9 | **Channel**: message entry adapters | Web (M3); Telegram (M6) | Slack, Teams, Lark, etc. |
 | E10 | **Audit**: every `authorize` decision and admin action is written to the event stream | Written, no UI | Audit log UI, compliance export |
 
 Hard rules:
@@ -371,7 +384,7 @@ Stack (can change before implementation):
 |---|---|---|
 | hub | Bun + Hono + bun:sqlite; runners on the `@earendil-works/pi-coding-agent` SDK (`createAgentSession`) | Same TS ecosystem as pi; pi-native, in-process; see §8.4 |
 | box-agent | Bun; tool executor and VNC relay, no agent loop | Small, holds no model credentials; see §8.2.1 |
-| Web | React + Vite + Tailwind, PWA; noVNC | Conventional, works on mobile |
+| Web | React + Vite + Tailwind (PWA in M6); noVNC | Conventional, works on mobile |
 | Box image | Debian slim + TigerVNC + Openbox + Chromium | Light and stable |
 | Gateway | `direct` with an API key from the SecretStore (prototype); then Bifrost (Go, self-hosted) | Bifrost: virtual keys, budgets, request log; small footprint; has an enterprise path |
 | Deploy | docker compose (hub, later bifrost, reverse proxy); hub manages boxes via the Docker socket | One command |
@@ -453,7 +466,7 @@ v0.3 changes (decision 0009):
 - Desktop takeovers, approvals and settings changes are written to the event stream (E10). **The audit record is written before the action**; if it cannot be written, the action does not happen. The audit table is append-only, enforced in the database (SQLite triggers), not just by convention.
 - Secrets are references resolved at use; a preflight at startup checks every reference resolves. Logs and UI show only fingerprints.
 - Vault values (§6.10) are encrypted at rest, never returned by the API or UI, never shown to the model, and every use is audited first. See §6.10 for the threat model.
-- Telegram: only paired chats are served. A stranger gets one pairing prompt and then silence. Display names in chats are labels, not identity.
+- Telegram (M6): only paired chats are served. A stranger gets one pairing prompt and then silence. Display names in chats are labels, not identity.
 - Every external poller (Telegram, trigger scheduler) runs under a single lease, so a restart or a second hub instance never sends duplicate replies.
 - Retro runs locally or against a model the user configured; no data is sent to third parties by default.
 
@@ -475,17 +488,18 @@ session, have the agent edit files and run commands in the box's `/workspace`,
 watch the box's desktop, close the page and come back to the same session, and
 download the session's trajectory (`GET /v1/sessions/:id/trajectory`). Not yet:
 the agent cannot drive the browser, you cannot type into the desktop, keys are
-not managed in the UI, and there is no phone, Telegram or trigger entry point.
+not managed in the UI, and there is no approvals, phone, Telegram or trigger entry point.
 
 | Milestone | What you can do after it | Exit criteria |
 |---|---|---|
 | **M0 Skeleton** (done) | Nothing user-facing: repo layout, empty hub, box image, BoxProvider (Docker), hub↔box connection (#1–#7) | Hub creates a box, box connects, hub can send `echo` |
 | **M1 Prototype** (done) | Chat with a pi agent in the web UI; its tools run in the session's own box; watch the box's desktop; every session has a trajectory. See §11.1 | Met; §11.1 |
 | **M2 Browser & vault** | Have the agent work on websites in the box's Chromium while you watch, take over the desktop, keep keys and logins in a vault the model never reads, see command output live. See §11.2 | S2 works; §11.2 |
-| **M3 Anywhere** | Use several models with per-session budgets and spend, follow and approve work from your phone (PWA, Web Push, Telegram). See §11.3 | S3 works; §11.3 |
+| **M3 Models & access** | Use several models with per-session budgets and spend, choose an access mode (`yolo` or `ask`) and approve risky actions in the web UI. See §11.3 | S3 works; §11.3 |
 | **M4 Connections & automation** | Connect external accounts through MCP, run sessions on a schedule or from a webhook, let the agent remember across sessions. See §11.4 | S4 works; §11.4 |
 | **M5 Retro & router** | Search past sessions, get lessons from finished work, get a model suggested per task type from past outcomes, keep trajectories for a set period. See §11.5 | S5 works; §11.5 |
-| **v1.0** | Install on a fresh VPS in 10 minutes, back up and restore, run many hibernated sessions cheaply on a slim image. See §11.6 | §11.6 |
+| **M6 Anywhere** | Follow and approve work from your phone: installable PWA, Web Push, Telegram. See §11.6 | S6 works; §11.6 |
+| **v1.0** | Install on a fresh VPS in 10 minutes, back up and restore, run many hibernated sessions cheaply on a slim image. See §11.7 | §11.7 |
 
 ### 11.1 M1 Prototype (done)
 
@@ -538,19 +552,20 @@ Exit criteria:
 - Killing Xvnc in a running box ends in a visible box failure event within a named deadline (box smoke test).
 - A `bash` command that prints a line every second for 10 seconds shows its first line in the chat before the command exits.
 
-### 11.3 M3 Anywhere
+### 11.3 M3 Models & access
 
 What you can do after M3:
 
 - **Several models with budgets.** Models go through Bifrost with one virtual key per session, a budget and an explicit model allowlist; you can switch a session's model, and the UI shows per-session spend and tokens (§6.4).
-- **Your phone.** Install the web UI as a PWA and get Web Push when a turn finishes, an approval waits or a session fails; or use Telegram: one session per thread, send messages, get results, `/new`, `/list` (§6.6).
-- **Approvals.** Risky actions (for example `git push`, `rm -rf`, a payment page) stop and wait for you; approve or deny from the web or Telegram with one tap; a timeout denies (§6.5). Bash commands are parsed before the deny-list applies (#69); approval cards follow one lifecycle on every channel (#71).
+- **Access mode, your choice.** `yolo` runs every tool without asking; `ask` stops risky actions (for example `git push`, `rm -rf`, a payment page, marked secrets) and waits for approve or deny in the web UI; a timeout denies. Set a global default in Settings (a new install starts in `ask`) and override it per session. The session shows its mode, every tool call records the mode in force in the trajectory, and a change is audited (§6.5). Bash commands are parsed before the deny-list applies (#69); the approval lifecycle is channel-neutral (#71).
+
+M3 starts with a short research doc (like [research/browser.md](research/browser.md) and [research/vault.md](research/vault.md) for M2) on open-source pieces to reuse: bash command parsing for #69 (for example tree-sitter-bash or similar) and Bifrost's budget and spend API.
 
 Exit criteria:
 
-- **S3 works** (CI e2e): with no web client connected, an agent's `git push` creates an approval; the approval reaches the push and Telegram test doubles; approving on one channel runs the push and updates the card on the other; a second approval left alone is denied at its timeout and the turn says so.
+- **S3 works** (CI e2e, web only): in `ask` mode an agent's `git push` creates an approval; approving it in the web runs the push; a second approval left alone is denied at its timeout and the turn says so. The same call in `yolo` runs at once, and the trajectory records the mode on both.
 - A session's spend in the UI equals the sum of its rows in Bifrost's request log; a session over its budget is refused with a visible message, not a silent stop.
-- The web UI is installable as a PWA (valid manifest and service worker, checked in the e2e's Chromium) and a Web Push arrives when a turn finishes.
+- A new install is in `ask`; a per-session override wins over the global default; changing either writes an audit entry.
 
 ### 11.4 M4 Connections & automation
 
@@ -581,7 +596,18 @@ Exit criteria:
 - With a seeded set of sessions (task type × model × outcome), the router suggests the model with the best outcome per cost for each task type, and nothing changes until it is accepted.
 - With a retention period set, data older than it is gone after the next sweep and newer data is untouched (test on a copy of the database).
 
-### 11.6 v1.0
+### 11.6 M6 Anywhere
+
+Moved out of M3 by decision 0042. What you can do after M6:
+
+- **Your phone.** Install the web UI as a PWA and get Web Push when a turn finishes, an approval waits or a session fails; or use Telegram: one session per thread, send messages, get results, approve, `/new`, `/list` (§6.6).
+
+Exit criteria:
+
+- **S6 works** (CI e2e): with no web client connected, an agent's `git push` in `ask` mode creates an approval; it reaches the Web Push and Telegram test doubles; approving on one channel runs the push and updates the card on the other (#71).
+- The web UI is installable as a PWA (valid manifest and service worker, checked in the e2e's Chromium) and a Web Push arrives when a turn finishes.
+
+### 11.7 v1.0
 
 What you can do at v1.0:
 

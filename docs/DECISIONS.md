@@ -3402,3 +3402,59 @@ how the eval runs in CI without a model key.
   runs over a dumped JSONL line (a `token = sha(f"...` in tool arguments
   broke the line), so the fixture script avoids such text. The fix of the
   redaction is #144.
+
+## 0042: M3 without phone channels; access mode `yolo` or `ask`
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #148
+
+### Context
+
+PRD v0.4 put "Anywhere" in M3: PWA, Web Push and Telegram next to approvals.
+The owner (@zerone0x) wants M3 to ship the part that changes what the agent may
+do, and to leave the phone work for later. Number 0041 is reserved for the
+in-flight #130 PR.
+
+### Decision
+
+- **PRD v0.5.** M3 is "Models & access": several models with budgets (§6.4) and
+  an **access mode** (§6.5). `yolo` runs every tool without asking; `ask` stops
+  risky actions (deny-list after bash parsing, #69) and waits for approve or
+  deny in the web UI; a timeout denies. A global default in Settings, a
+  per-session override, the mode shown on the session and recorded on every tool
+  call in the trajectory, every change audited. A new install defaults to `ask`.
+- **S3 becomes web-only** (`git push` in `ask` creates an approval, approving
+  in the web runs it, a second one left alone is denied at its timeout; the
+  same call in `yolo` runs at once with the mode recorded). The spend and
+  budget criterion is unchanged.
+- **PWA, Web Push and Telegram move to a new M6 Anywhere**, between M5 and
+  v1.0, with their own scenario S6 and exit criteria. Approval cards are
+  web-only until then; the lifecycle stays channel-neutral (#71).
+- **`ask` is built on pi.** pi 1.5.2 has no approval system (its docs/security.md
+  says it does not ask before every tool call), but its extension API has a
+  blocking `tool_call` event (`return { block: true, reason }`, docs/extensions.md)
+  and ships examples `permission-gate.ts`, `timed-confirm.ts`,
+  `confirm-destructive.ts` and `protected-paths.ts`. `ask` is a hub-side
+  extension on `tool_call` that blocks until the owner decides in the web UI;
+  `yolo` does not load it; it goes through the extension allowlist (#56).
+- M3 starts with a short research doc on open-source pieces to reuse (bash
+  parsing for #69, Bifrost budget and spend API).
+- P1 per-secret approval (§6.10) now reads: a marked secret asks first when the
+  session is in `ask` mode.
+
+### Alternatives rejected
+
+- **Fold the phone work into v1.0.** v1.0 is install, backup and cost work with
+  a timed install test; a channel feature with its own e2e would blur it.
+- **Keep approvals always on.** Some owners run unattended work in a box they
+  trust; `yolo` is today's behaviour, so it stays available.
+- **Default `yolo`.** A fresh install should not run `git push` or `rm -rf`
+  unasked; the owner opts out.
+
+### Consequences
+
+- Docs only. Code comments that say "approvals are M3" stay true; comments
+  about Telegram or PWA in M3 do not exist.
+- Telegram pairing and the poller lease (§9) apply from M6; the vault key
+  needs no owner password because triggers run in M4 and Telegram in M6.
