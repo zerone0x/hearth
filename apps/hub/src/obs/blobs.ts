@@ -78,6 +78,36 @@ export function imagesToRefs(key: string, value: unknown, pending?: PendingBlob[
   });
 }
 
+/** A quoted 64-digit hex string in JSON text: a JSON string, or one escaped inside another. */
+const QUOTED_SHA256 = /(\\?")([0-9a-f]{64})\1/g;
+
+/**
+ * `redact(json)`, except that each quoted hash in `hashes` is kept as is
+ * (#137). Those are the hashes of image bytes the caller just turned into
+ * references (`pending`): a reference's `sha256`, or the same hash in the
+ * text of the screenshot's result header. A hash of bytes is not text a
+ * secret was typed into, and a short vault value that happens to occur in its
+ * hex must not turn the reference into one the store cannot find. Everything
+ * else is redacted as before, a 64-digit hex string that is not one of
+ * `hashes` too. A secret's occurrence would have to contain the whole quoted
+ * hash to span a kept one; the parts on either side are still redacted.
+ */
+export function redactKeepingHashes(
+  json: string,
+  redact: (text: string) => string,
+  hashes: ReadonlySet<string>,
+): string {
+  if (hashes.size === 0) return redact(json);
+  let out = "";
+  let from = 0;
+  for (const quoted of json.matchAll(QUOTED_SHA256)) {
+    if (!hashes.has(quoted[2] ?? "")) continue;
+    out += redact(json.slice(from, quoted.index)) + quoted[0];
+    from = quoted.index + quoted[0].length;
+  }
+  return out + redact(json.slice(from));
+}
+
 /** The references of the image parts of a tool result's `content`, in order. */
 export function imageRefs(content: unknown): BlobRef[] {
   if (!Array.isArray(content)) return [];
