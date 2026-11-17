@@ -82,7 +82,10 @@ export type ApprovalStatus =
 export interface ApprovalCard {
   readonly id: string;
   readonly toolCallId: string;
+  /** The part that decided (the matched sub-command), redacted by the hub. */
   readonly summary: string;
+  /** The whole command (redacted by the hub), always shown; "" for a tool without one. */
+  readonly command: string;
   readonly rule: string;
   readonly reason: string;
   readonly expiresAt: number;
@@ -194,6 +197,7 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
           id,
           toolCallId: call,
           summary: text("summary"),
+          command: text("command"),
           rule: text("rule"),
           reason: text("reason"),
           expiresAt: typeof p["expiresAt"] === "number" ? p["expiresAt"] : event.ts,

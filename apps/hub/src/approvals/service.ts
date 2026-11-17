@@ -65,8 +65,14 @@ export interface ApprovalRequest {
   readonly sessionId: SessionId;
   readonly toolCallId: string;
   readonly tool: string;
-  /** What the call does, built from the parsed command, never from model text. */
+  /**
+   * The part that decided (the matched sub-command), from the parsed command.
+   * Redacted by the caller, as `command` and `reason`: they are stored and
+   * shown as given.
+   */
   readonly summary: string;
+  /** The whole command, shown under `summary` ("" for a tool without one). */
+  readonly command: string;
   /** The rule that asked (`git-push`, `unclear:name`, ...). */
   readonly rule: string;
   /** The rule's reason, shown on the card. */
@@ -94,6 +100,7 @@ export interface ApprovalView {
   readonly toolCallId: string;
   readonly tool: string;
   readonly summary: string;
+  readonly command: string;
   readonly rule: string;
   readonly mode: "yolo" | "ask";
   readonly status: ApprovalStatus;
@@ -139,6 +146,7 @@ function viewOf(row: ApprovalRow): ApprovalView {
     toolCallId: row.toolCallId,
     tool: row.tool,
     summary: row.summary,
+    command: row.command,
     rule: row.rule,
     mode: row.mode,
     status: row.status,
@@ -147,6 +155,11 @@ function viewOf(row: ApprovalRow): ApprovalView {
     decidedAt: row.decidedAt,
     decidedBy: row.decidedBy,
   };
+}
+
+/** Read through a call, so TypeScript does not keep an earlier check's narrowing across awaits. */
+function aborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
 }
 
 /** `{decision: "approve" | "deny"}` and nothing else. */
@@ -194,6 +207,7 @@ export class Approvals {
       toolCallId: req.toolCallId,
       tool: req.tool,
       summary: req.summary,
+      command: req.command,
       rule: req.rule,
       mode: req.mode,
       status: "pending",
@@ -218,6 +232,7 @@ export class Approvals {
         toolCallId: row.toolCallId,
         tool: row.tool,
         summary: row.summary,
+        command: row.command,
         rule: row.rule,
         reason: req.reason,
         mode: row.mode,
@@ -240,7 +255,12 @@ export class Approvals {
       void this.#close(waiter, "cancelled", null, "Cancelled: the turn was stopped. Not run.", {
         why: "stopped",
       });
-    signal?.addEventListener("abort", onAbort, { once: true });
+    // A stop that landed while the request was being recorded (the awaits
+    // above) has already fired: cancel now, so the stop does not wait for the
+    // timeout and the card is never approvable. No await between this check
+    // and the listener, so no abort falls between them.
+    if (aborted(signal)) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
     try {
       return await promise;
     } finally {

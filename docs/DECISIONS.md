@@ -4107,8 +4107,13 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   deferred: there is no URL rule model yet.
 - **The approval record** (`apps/hub/src/approvals`, migration 11's
   `approval` table): `request` writes an audit row, then
-  `approval.requested {approvalId, toolCallId, tool, summary, rule, reason,
-  mode, requestedAt, expiresAt}` (with the turn id), then the row, and waits.
+  `approval.requested {approvalId, toolCallId, tool, summary, command, rule,
+  reason, mode, requestedAt, expiresAt}` (with the turn id), then the row, and
+  waits. `summary` is the part that decided (the matched sub-command),
+  `command` the whole `bash` command. The runner redacts `summary`, `command`
+  and `reason` with the hub's redaction (registered secrets, in every form:
+  raw, URL-encoded, JSON-escaped) before the request, so no event, row, list
+  or trajectory holds a secret the tool step would hide.
   It ends once, as `approval.approved | denied | expired | cancelled |
   interrupted`, each audited (`approval.<verb>`) and logged before the call is
   released; the row leaves `pending` with a conditional UPDATE. Every end but
@@ -4117,8 +4122,10 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   so. If a system end (timeout, cancel) cannot be recorded, the call is denied
   anyway (fail-closed). If the request cannot be recorded, the call is blocked.
 - **Timeout** `HEARTH_APPROVAL_TIMEOUT_MINUTES`, default 10.
-- **Cancel.** A stop (the call's abort signal, and `interrupt` as a backstop)
-  cancels with `why: "stopped"`. A new owner message while an approval waits
+- **Cancel.** A stop cancels with `why: "stopped"`, through the held call's
+  abort signal only (pi aborts it on `interrupt`). A stop that lands while the
+  request is still being recorded is seen right after the record, so the
+  approval is cancelled at once and is never approvable. A new owner message while an approval waits
   is queued into the running turn with pi's `steer` (recorded as
   `message.user` with `steered: true`), then the approval is cancelled with
   `why: "new message"`: the model reads the denial and the message before its
@@ -4149,8 +4156,10 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   record of kind `approval` (with its `at`). Added fields and kinds, so the
   schema stays `hearth.trajectory/2` (0021, 0037).
 - **Web.** The card is a branch of the existing `ToolFallback` card
-  (`Thread.tsx`): the parsed command, the rule, a countdown and two shadcn
-  `Button`s, inline in the card (no dialog, portal or inline style, so the CSP
+  (`Thread.tsx`): the matched sub-command, the rule and its reason, then the
+  full command, all of it, wrapped and never cut (research m3 Q3: the matched
+  part alone could hide `; touch x` or a pipe to `curl`), a countdown and two
+  shadcn `Button`s, inline in the card (no dialog, portal or inline style, so the CSP
   stays as 0038 left it). After it ends it says who decided and when, or that
   it expired. The session header and the session list show "Approval needed".
   The lifecycle module has no web types, so Telegram and Web Push (M6) reuse

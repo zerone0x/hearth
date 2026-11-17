@@ -39,6 +39,8 @@ export interface GateRequest {
   readonly toolCallId: string;
   readonly tool: string;
   readonly summary: string;
+  /** The full command (`bash`), all of it, shown under `summary`; "" for other tools. */
+  readonly command: string;
   readonly rule: string;
   readonly reason: string;
   readonly mode: AccessMode;
@@ -74,7 +76,14 @@ export interface GateVerdict {
   readonly action: "allow" | "ask" | "deny";
   readonly rule: string;
   readonly reason: string;
+  /** The part that decided: the matched sub-command (`bash`), or what a call does. */
   readonly summary: string;
+  /**
+   * The whole `bash` command as the box would run it ("" for other tools).
+   * The card always shows it under `summary` (research m3 Q3): the matched
+   * part alone could hide what else the command does.
+   */
+  readonly command: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -103,7 +112,13 @@ export function gateVerdict(
   denyList: readonly CompiledDenyRule[],
   onBashVerdict?: (verdict: BashVerdict) => void,
 ): GateVerdict {
-  let verdict: GateVerdict = { action: "allow", rule: "none", reason: "", summary: "" };
+  let verdict: GateVerdict = {
+    action: "allow",
+    rule: "none",
+    reason: "",
+    summary: "",
+    command: "",
+  };
   const command = isRecord(input) ? input["command"] : undefined;
   if (toolName === "bash" && typeof command === "string") {
     const bash = classifyBash(command, commandRules, denyList);
@@ -114,6 +129,7 @@ export function gateVerdict(
       reason: bash.reason,
       // From the parsed command, never from model text (card spoofing, research doc).
       summary: bash.command ?? command,
+      command,
     };
     if (verdict.action === "deny") return verdict;
   }
@@ -127,6 +143,7 @@ export function gateVerdict(
         toolName === "bash" && typeof command === "string"
           ? command
           : `${toolName} with ${secrets.join(", ")}`,
+      command: verdict.command,
     };
   }
   return verdict;
@@ -160,6 +177,7 @@ export function accessExtension(options: AccessExtensionOptions): ExtensionFacto
           toolCallId: event.toolCallId,
           tool: event.toolName,
           summary: verdict.summary,
+          command: verdict.command,
           rule: verdict.rule,
           reason: verdict.reason,
           mode,

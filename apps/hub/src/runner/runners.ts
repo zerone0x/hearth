@@ -79,7 +79,8 @@ export interface RunnerConfig extends ModelChoice {
   readonly denyList?: readonly DenyRule[];
   /**
    * Command rules for `bash`, matched after parsing (decision 0044). Unset:
-   * `DEFAULT_COMMAND_RULES`; `[]` turns them off. Only `deny` blocks today.
+   * `DEFAULT_COMMAND_RULES`; `[]` turns them off. `deny` blocks in both access
+   * modes; `ask` waits for the owner in `ask` mode (access.ts, decision 0048).
    */
   readonly commandRules?: readonly CommandRule[];
   /** Allowlisted pinned extensions (#56). Empty by default. */

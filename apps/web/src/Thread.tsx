@@ -135,9 +135,36 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
       <p className="font-medium">
         Approve this {card.rule === "marked-secret" ? "use" : "command"}?
       </p>
-      <code className="break-all font-mono text-xs">{card.summary}</code>
+      <code
+        className="break-all rounded-sm bg-amber-500/15 px-1 font-mono text-xs"
+        data-testid="approval-summary"
+      >
+        {card.summary}
+      </code>
       <p className="text-muted-foreground text-xs">
-        Rule <code className="font-mono">{card.rule}</code> · Denied automatically in{" "}
+        Rule <code className="font-mono">{card.rule}</code>
+        {card.reason === "" ? null : `: ${card.reason}`}
+      </p>
+      {card.command === "" ? null : (
+        // The whole command, never cut (research m3 Q3): the matched part
+        // alone could hide `; touch x` or a pipe to `curl`. Wrapped, not
+        // scrolled or clipped, so nothing is out of sight.
+        <div className="flex flex-col gap-1">
+          <p className="text-muted-foreground text-xs">
+            {card.command === card.summary
+              ? "Full command:"
+              : "Full command (Approve runs all of it, not only the part above):"}
+          </p>
+          <pre
+            className="whitespace-pre-wrap break-all rounded-sm border bg-muted/40 p-1 font-mono text-xs"
+            data-testid="approval-command"
+          >
+            {card.command}
+          </pre>
+        </div>
+      )}
+      <p className="text-muted-foreground text-xs">
+        Denied automatically in{" "}
         <span data-testid="approval-countdown">{countdown(card.expiresAt - now)}</span>
       </p>
       <div className="flex gap-2">

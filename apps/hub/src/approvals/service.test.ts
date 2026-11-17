@@ -15,15 +15,17 @@ import {
   type AuditSink,
   type Authorizer,
   DEFAULT_WORKSPACE_ID,
+  type EventStore,
   type HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
 } from "@hearth/core";
-import { SESSION_COOKIE } from "../auth";
+import { Hono } from "hono";
+import { type HubEnv, SESSION_COOKIE } from "../auth";
 import { RequestBody } from "../request-body";
 import { startHub } from "../server";
 import { openDatabase, SqliteApprovalStore, SqliteAuditSink, SqliteEventStore } from "../store";
-import { APPROVAL_INTERRUPTED, type ApprovalRequest, Approvals } from ".";
+import { APPROVAL_INTERRUPTED, type ApprovalRequest, Approvals, mountApprovalRoutes } from ".";
 
 const SCOPE = { workspaceId: DEFAULT_WORKSPACE_ID };
 const BOX: Principal = Object.freeze({
@@ -59,6 +61,8 @@ function start(
     audit?: (db: Database) => AuditSink;
     authorizer?: (audit: AuditSink) => Authorizer;
     db?: Database;
+    now?: () => number;
+    events?: (events: SqliteEventStore) => EventStore;
   } = {},
 ): Harness {
   const db = options.db ?? openDatabase(join(dir, "hub.db"));
@@ -70,12 +74,13 @@ function start(
   let n = 0;
   const approvals = new Approvals({
     store,
-    events,
+    events: options.events?.(events) ?? events,
     audit,
     authorizer: options.authorizer?.(audit) ?? new AllowAllAuthorizer({ audit }),
     timeoutMs: options.timeoutMs ?? 60_000,
     newId: () => `ap_${++n}`,
     log: (line) => logs.push(line),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   return { db, approvals, store, events, logs };
 }
@@ -86,6 +91,7 @@ function request(toolCallId = "c_1", sessionId = "se_a"): ApprovalRequest {
     toolCallId,
     tool: "bash",
     summary: "git push",
+    command: "git push",
     rule: "git-push",
     reason: "git push needs the owner",
     mode: "ask",
@@ -199,6 +205,66 @@ describe("a request", () => {
       status: "cancelled",
     });
     expect(await types(h)).toEqual([]);
+  });
+
+  test("a stop while the request is still being recorded cancels it at once; it is never approvable", async () => {
+    const recording = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const h = start({
+      events: (events) => ({
+        append: async (scope, sessionId, event) => {
+          if (event.type === "approval.requested") {
+            recording.resolve();
+            await release.promise;
+          }
+          return events.append(scope, sessionId, event);
+        },
+        read: (scope, sessionId, after, limit) => events.read(scope, sessionId, after, limit),
+        lastSeq: (scope, sessionId) => events.lastSeq(scope, sessionId),
+      }),
+    });
+    const controller = new AbortController();
+    const waiting = h.approvals.request(request(), controller.signal);
+    await recording.promise;
+    // The stop lands between the start of the record and the wait.
+    controller.abort();
+    release.resolve();
+    const started = Date.now();
+    const outcome = await waiting;
+    // At once, not at the 60 s timeout.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(outcome).toMatchObject({ status: "cancelled", approved: false });
+    expect(h.approvals.hasPending("se_a")).toBe(false);
+    expect(h.store.pending(SCOPE)).toEqual([]);
+    expect(await types(h)).toEqual(["approval.requested", "approval.cancelled"]);
+    expect(
+      await codeOf(h.approvals.decide(LOCAL_PRINCIPAL, "se_a", "ap_1", { decision: "approve" })),
+    ).toBe("approval.closed");
+  });
+
+  test("hasPending is per session: another session's approval is not this one's", async () => {
+    const h = start();
+    const waiting = h.approvals.request(request("c_1", "se_a"));
+    await until(() => h.approvals.hasPending("se_a"));
+    expect(h.approvals.hasPending("se_b")).toBe(false);
+    await h.approvals.cancel("se_a", "stopped");
+    await waiting;
+    expect(h.approvals.hasPending("se_a")).toBe(false);
+  });
+
+  test("close() (hub stop) denies every waiting call as interrupted, never approved", async () => {
+    const h = start();
+    const waiting = h.approvals.request(request());
+    await until(() => h.approvals.hasPending("se_a"));
+    h.approvals.close();
+    expect(await waiting).toMatchObject({
+      status: "interrupted",
+      approved: false,
+      reason: APPROVAL_INTERRUPTED,
+    });
+    expect(h.approvals.hasPending("se_a")).toBe(false);
+    // The row stays pending for the next hub's recover().
+    expect(h.store.pending(SCOPE).map((r) => r.id)).toEqual(["ap_1"]);
   });
 
   test("a request that cannot be audited rejects, and nothing is pending", async () => {
@@ -342,6 +408,49 @@ describe("the owner's decision", () => {
   });
 });
 
+describe("the pending list", () => {
+  test("authorizes session.list on the workspace first; a denial lists nothing", async () => {
+    const seen: string[] = [];
+    const h = start({
+      authorizer: () => ({
+        authorize: async (_p, action, resource) => {
+          seen.push(`${action} ${resource.type}:${resource.id}`);
+          return { allowed: false, reason: "no", policy: "test" };
+        },
+      }),
+    });
+    expect(await codeOf(h.approvals.list(LOCAL_PRINCIPAL))).toBe("authz.denied");
+    expect(seen).toEqual([`session.list workspace:${DEFAULT_WORKSPACE_ID}`]);
+  });
+});
+
+describe("the owner's decision past the deadline", () => {
+  test("an approve whose audit fails after the approval's time ends it as expired, not pending", async () => {
+    let clock = 1_000;
+    const h = start({
+      now: () => clock,
+      audit: (db) => {
+        const sink = new SqliteAuditSink(db);
+        return {
+          write: async (record) => {
+            if (record.action === "approval.approve") throw new Error("disk full");
+            await sink.write(record);
+          },
+        };
+      },
+    });
+    const waiting = h.approvals.request(request());
+    await until(() => h.approvals.hasPending("se_a"));
+    // Past `expiresAt`, but the 60 s timer has not fired yet.
+    clock += 61_000;
+    expect(
+      await codeOf(h.approvals.decide(LOCAL_PRINCIPAL, "se_a", "ap_1", { decision: "approve" })),
+    ).toBe("audit.write-failed");
+    expect(await waiting).toMatchObject({ status: "expired", approved: false });
+    expect(await types(h)).toEqual(["approval.requested", "approval.expired"]);
+  });
+});
+
 describe("the store", () => {
   test("a row leaves pending once: a second end does not overwrite the first", () => {
     const h = start();
@@ -351,6 +460,7 @@ describe("the store", () => {
       toolCallId: "c",
       tool: "bash",
       summary: "git push",
+      command: "git push",
       rule: "git-push",
       mode: "ask",
       requestedAt: 1,
@@ -395,6 +505,66 @@ describe("a hub restart", () => {
     ).toBe("approval.closed");
     expect(await after.approvals.recover()).toBe(0);
     before.approvals.close();
+  });
+
+  test("recover() leaves an approval this hub is still waiting on alone", async () => {
+    const h = start();
+    const waiting = h.approvals.request(request());
+    await until(() => h.approvals.hasPending("se_a"));
+    expect(await h.approvals.recover()).toBe(0);
+    expect(h.store.pending(SCOPE).map((r) => r.id)).toEqual(["ap_1"]);
+    expect(await types(h)).toEqual(["approval.requested"]);
+    await h.approvals.decide(LOCAL_PRINCIPAL, "se_a", "ap_1", { decision: "approve" });
+    expect((await waiting).status).toBe("approved");
+  });
+});
+
+describe("the routes' status codes", () => {
+  function app(approvals: Approvals) {
+    const routes = new Hono<HubEnv>();
+    routes.use(async (c, next) => {
+      c.set("principal", LOCAL_PRINCIPAL);
+      await next();
+    });
+    mountApprovalRoutes(routes, approvals);
+    return routes;
+  }
+
+  test("503 when the owner's audit row cannot be written; the approval stays pending", async () => {
+    const h = start({
+      audit: (db) => {
+        const sink = new SqliteAuditSink(db);
+        return {
+          write: async (record) => {
+            if (record.action === "approval.approve") throw new Error("disk full");
+            await sink.write(record);
+          },
+        };
+      },
+    });
+    const waiting = h.approvals.request(request());
+    await until(() => h.approvals.hasPending("se_a"));
+    const res = await app(h.approvals).request("/v1/sessions/se_a/approvals/ap_1", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"decision":"approve"}',
+    });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ ok: false, error: { code: "audit.write-failed" } });
+    expect(h.approvals.hasPending("se_a")).toBe(true);
+    await h.approvals.cancel("se_a", "stopped");
+    await waiting;
+  });
+
+  test("403 authz.denied on the list when session.list is denied", async () => {
+    const h = start({
+      authorizer: () => ({
+        authorize: async () => ({ allowed: false, reason: "no", policy: "test" }),
+      }),
+    });
+    const res = await app(h.approvals).request("/v1/approvals");
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ ok: false, error: { code: "authz.denied" } });
   });
 });
 

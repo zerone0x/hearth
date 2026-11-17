@@ -353,6 +353,7 @@ export const MIGRATIONS: readonly Migration[] = [
         tool_call_id TEXT NOT NULL,
         tool TEXT NOT NULL,
         summary TEXT NOT NULL,
+        command TEXT NOT NULL,
         rule TEXT NOT NULL,
         mode TEXT NOT NULL CHECK (mode IN ('yolo', 'ask')),
         status TEXT NOT NULL CHECK (status IN

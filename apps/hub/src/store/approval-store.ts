@@ -21,7 +21,10 @@ export interface ApprovalRow {
   readonly sessionId: SessionId;
   readonly toolCallId: string;
   readonly tool: string;
+  /** The matched part (redacted). */
   readonly summary: string;
+  /** The whole command (redacted), "" for a tool without one. */
+  readonly command: string;
   readonly rule: string;
   readonly mode: "yolo" | "ask";
   readonly status: ApprovalStatus;
@@ -38,6 +41,7 @@ interface Raw {
   tool_call_id: string;
   tool: string;
   summary: string;
+  command: string;
   rule: string;
   mode: "yolo" | "ask";
   status: ApprovalStatus;
@@ -55,6 +59,7 @@ function rowOf(raw: Raw): ApprovalRow {
     toolCallId: raw.tool_call_id,
     tool: raw.tool,
     summary: raw.summary,
+    command: raw.command,
     rule: raw.rule,
     mode: raw.mode,
     status: raw.status,
@@ -85,9 +90,9 @@ export class SqliteApprovalStore {
     row: Omit<ApprovalRow, "status" | "decidedAt" | "decidedBy" | "reason">,
   ): void {
     this.#db.run(
-      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, rule, mode,
-         status, requested_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, command, rule,
+         mode, status, requested_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       [
         row.id,
         scope.workspaceId,
@@ -95,6 +100,7 @@ export class SqliteApprovalStore {
         row.toolCallId,
         row.tool,
         row.summary,
+        row.command,
         row.rule,
         row.mode,
         row.requestedAt,
