@@ -401,23 +401,16 @@ export class SessionRunner {
               : {
                   approve: (request: GateRequest, signal: AbortSignal | undefined) => {
                     const turnId = self?.tracer.turnId;
-                    // The card's text is stored and shown: redacted like every
-                    // event (a key in a URL, a vault value), in all its forms.
-                    const redact = options.redact ?? identity;
-                    const shown: GateRequest = {
-                      ...request,
-                      summary: redact(request.summary),
-                      command: redact(request.command),
-                      reason: redact(request.reason),
-                    };
                     return (options.approve as NonNullable<SessionRunnerOptions["approve"]>)(
-                      turnId === undefined ? shown : { ...shown, turnId },
+                      turnId === undefined ? request : { ...request, turnId },
                       signal,
                     );
                   },
                 }),
             onApproval: (toolCallId, rule, outcome) =>
               self?.observe(() => self?.tracer.onApproval(toolCallId, rule, outcome)),
+            // The card's text is stored and shown: redacted like every event.
+            ...(options.redact === undefined ? {} : { redact: options.redact }),
           }),
         },
         {

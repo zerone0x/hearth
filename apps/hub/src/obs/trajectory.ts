@@ -25,9 +25,10 @@
  * Built at read time, so older sessions get the current projection and the
  * log stays the only source of truth. Payloads were redacted when written:
  * the runner's events by the runner, and an `approval.requested` event's
- * `summary`, `command` and `reason` by the runner before `Approvals.request`
- * records them (runner.ts); the other `approval.*` events hold ids, times and
- * fixed reasons only.
+ * `summary`, `command` and `reason` by the access gate, with the runner's
+ * redaction, before `Approvals.request` records them (access.ts
+ * `shownVerdict`); the other `approval.*` events hold ids, times and fixed
+ * reasons only.
  */
 
 import type { StoredEvent } from "@hearth/core";

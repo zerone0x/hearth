@@ -67,8 +67,8 @@ export interface ApprovalRequest {
   readonly tool: string;
   /**
    * The part that decided (the matched sub-command), from the parsed command.
-   * Redacted by the caller, as `command` and `reason`: they are stored and
-   * shown as given.
+   * Redacted by the caller (the access gate), as `command` and `reason`:
+   * they are stored and shown as given.
    */
   readonly summary: string;
   /** The whole command, shown under `summary` ("" for a tool without one). */

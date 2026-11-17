@@ -4110,10 +4110,14 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   `approval.requested {approvalId, toolCallId, tool, summary, command, rule,
   reason, mode, requestedAt, expiresAt}` (with the turn id), then the row, and
   waits. `summary` is the part that decided (the matched sub-command),
-  `command` the whole `bash` command. The runner redacts `summary`, `command`
-  and `reason` with the hub's redaction (registered secrets, in every form:
-  raw, URL-encoded, JSON-escaped) before the request, so no event, row, list
-  or trajectory holds a secret the tool step would hide.
+  `command` the whole `bash` command. The gate redacts `summary`, `command`
+  and `reason` with the runner's redaction (registered secrets, in every
+  form: raw, URL-encoded, JSON-escaped) before the request, so no event, row,
+  list or trajectory holds a secret the tool step would hide. The parser's
+  display can requote or split a word (an unquoted `&` in a value), leaving a
+  piece of a secret that whole-value redaction misses, so when the command
+  holds a secret the shown parts come from the redacted command, parsed again
+  (`shownVerdict`).
   It ends once, as `approval.approved | denied | expired | cancelled |
   interrupted`, each audited (`approval.<verb>`) and logged before the call is
   released; the row leaves `pending` with a conditional UPDATE. Every end but

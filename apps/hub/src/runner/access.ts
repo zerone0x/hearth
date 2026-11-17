@@ -69,6 +69,12 @@ export interface AccessExtensionOptions {
   ) => Promise<ApprovalOutcome>;
   /** How an approval ended, for the trajectory. */
   readonly onApproval?: (toolCallId: string, rule: string, outcome: ApprovalOutcome) => void;
+  /**
+   * The hub's redaction (registered secrets, in every form). The card's
+   * `summary`, `command` and `reason` go through it before `approve`: they
+   * are stored, listed and shown. Unset: shown as they are (tests).
+   */
+  readonly redact?: (text: string) => string;
 }
 
 /** The gate's view of one call: what decided and what the card says. */
@@ -149,6 +155,35 @@ export function gateVerdict(
   return verdict;
 }
 
+/**
+ * What the card shows for `verdict`, redacted. The parser's display of the
+ * matched part (`summary`, and a `reason` that quotes it) can requote or
+ * split a word, so a secret in it may no longer be whole and whole-value
+ * redaction could miss a piece. When the command holds a secret, the shown
+ * parts are taken from the redacted command, parsed again; if that reads as
+ * another rule, the redacted whole command stands in for the part.
+ */
+export function shownVerdict(
+  verdict: GateVerdict,
+  toolName: string,
+  input: unknown,
+  commandRules: readonly CommandRule[],
+  denyList: readonly CompiledDenyRule[],
+  redact: (text: string) => string,
+): Pick<GateVerdict, "summary" | "command" | "reason"> {
+  const command = redact(verdict.command);
+  if (command === verdict.command) {
+    return { summary: redact(verdict.summary), command, reason: redact(verdict.reason) };
+  }
+  const again = gateVerdict(toolName, { ...(input as object), command }, commandRules, denyList);
+  const same = again.rule === verdict.rule;
+  return {
+    summary: redact(same ? again.summary : command),
+    command,
+    reason: redact(same ? again.reason : verdict.reason),
+  };
+}
+
 export function accessExtension(options: AccessExtensionOptions): ExtensionFactory {
   return (pi) => {
     pi.on("tool_call", async (event, ctx) => {
@@ -172,14 +207,20 @@ export function accessExtension(options: AccessExtensionOptions): ExtensionFacto
         options.onDenied?.(event.toolName, event.toolCallId, NO_APPROVAL_CHANNEL);
         return { block: true, reason: NO_APPROVAL_CHANNEL };
       }
+      const shown = shownVerdict(
+        verdict,
+        event.toolName,
+        event.input,
+        options.commandRules ?? [],
+        options.denyList ?? [],
+        options.redact ?? ((text) => text),
+      );
       const outcome = await options.approve(
         {
           toolCallId: event.toolCallId,
           tool: event.toolName,
-          summary: verdict.summary,
-          command: verdict.command,
+          ...shown,
           rule: verdict.rule,
-          reason: verdict.reason,
           mode,
         },
         ctx.signal,

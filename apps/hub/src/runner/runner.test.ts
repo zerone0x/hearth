@@ -1134,26 +1134,52 @@ describe("the access gate (decisions 0043, 0048)", () => {
     const KEY = "faux-key-not-a-secret";
     const VAULT = "vault/val ue+&=4f1c9a";
     registerSecret(VAULT);
-    const h = await harness({ commandRules: [PUSH_RULE] });
+    // A rule without a reason: its default reason quotes the command (bash-policy.ts).
+    const CURL_RULE: CommandRule = { name: "curl-ask", command: ["curl"], action: "ask" };
+    const h = await harness({ commandRules: [PUSH_RULE, CURL_RULE] });
     const { approvals, db } = approvalsFor(h.events);
     h.runners = h.make({}, { accessMode: () => "ask", approvals });
-    const command =
-      `git push https://u:${KEY}@example.com/r main && ` +
-      `curl -H "x-token: ${encodeURIComponent(VAULT)}" https://example.com/?k=${VAULT}`;
-    h.faux.setResponses([call("bash", { command }, "c_s"), fauxAssistantMessage("x")]);
+    const push = `git push https://u:${KEY}@example.com/r main && echo ${KEY}`;
+    const curl = `curl -H "x-token: ${encodeURIComponent(VAULT)}" https://example.com/?k=${VAULT}`;
+    h.faux.setResponses([
+      call("bash", { command: push }, "c_s"),
+      call("bash", { command: curl }, "c_c"),
+      fauxAssistantMessage("x"),
+    ]);
     await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push");
-    const id = await pendingId(h);
-    const requested = h.events.of("se_a", "approval.requested")[0]?.payload as {
-      summary: string;
-      command: string;
-    };
-    expect(requested.summary).toBe(`git push https://u:${REDACTED}@example.com/r main`);
-    expect(requested.command).toContain("curl -H");
-    expect(requested.command).toContain(REDACTED);
-    const listed = await approvals.list(LOCAL_PRINCIPAL);
-    const row = db.query("SELECT * FROM approval").all();
-    await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    const listed: unknown[] = [];
+    for (let i = 0; i < 2; i++) {
+      const id = await pendingId(h);
+      listed.push(await approvals.list(LOCAL_PRINCIPAL));
+      await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    }
     await (await h.runners.runner("se_a")).settled();
+    const requested = h.events.of("se_a", "approval.requested").map(
+      (e) =>
+        e.payload as {
+          summary: string;
+          command: string;
+          reason: string;
+        },
+    );
+    expect(requested.map((r) => r.summary)).toEqual([
+      `git push https://u:${REDACTED}@example.com/r main`,
+      // The parser's display (quotes dropped). Of the raw command it would be
+      // `...?k=vault/val ue+`: the unquoted `&` splits the value, so a piece
+      // of it would get past whole-value redaction (access.ts shownVerdict).
+      `curl -H x-token: ${REDACTED} https://example.com/?k=${REDACTED}`,
+    ]);
+    expect(requested.map((r) => r.summary).join()).not.toContain("val ue");
+    expect(requested[0]?.command).toBe(
+      `git push https://u:${REDACTED}@example.com/r main && echo ${REDACTED}`,
+    );
+    expect(requested[1]?.command).toBe(
+      `curl -H "x-token: ${REDACTED}" https://example.com/?k=${REDACTED}`,
+    );
+    expect(requested[1]?.reason).toContain(`x-token: ${REDACTED}`);
+    expect(listed.flat()).toHaveLength(2);
+    const row = db.query("SELECT * FROM approval").all();
+    expect(row).toHaveLength(2);
     const trajectory = toJsonl(
       buildTrajectory(h.events.all.get("se_a") ?? [], {
         sessionId: "se_a",
