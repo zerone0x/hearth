@@ -154,11 +154,13 @@ function originOf(raw: string): string | undefined {
 /** True for a token entry whose policy opts in to box commands (`use: box-env`). */
 function boxEnvAllowed(kind: VaultKind, policyJson: string): boolean {
   if (kind !== "token") return false;
+  let use: unknown;
   try {
-    return (JSON.parse(policyJson) as { use?: unknown }).use === "box-env";
+    use = (JSON.parse(policyJson) as { use?: unknown }).use;
   } catch {
-    return false;
+    // A stored policy that does not parse (an edited row) allows nothing.
   }
+  return use === "box-env";
 }
 
 export interface HubVaultOptions {

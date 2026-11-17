@@ -36,8 +36,17 @@ describe("tool RPC", () => {
       value: { ...params, env: { GH_TOKEN: "tok-1" } },
     });
     expect(decodeToolParams("tool.exec", params)).toEqual({ ok: true, value: params });
+    const eight = Object.fromEntries(
+      Array.from({ length: MAX_EXEC_ENV_VARS }, (_, i) => [`TOKEN_${i}`, "v"]),
+    );
+    expect(decodeToolParams("tool.exec", { ...params, env: eight })).toEqual({
+      ok: true,
+      value: { ...params, env: eight },
+    });
     const value = "do-not-echo-this-value";
     const bad: unknown[] = [
+      null,
+      { GH_TOKEN: "fine", PATH: value },
       {},
       [],
       "GH_TOKEN=x",
@@ -67,6 +76,8 @@ describe("tool RPC", () => {
   });
 
   test("execEnvNameProblem: the pattern minus the reserved names and prefixes", () => {
+    expect(execEnvNameProblem(`A${"B".repeat(MAX_EXEC_ENV_NAME_LENGTH - 1)}`)).toBeUndefined();
+    expect(execEnvNameProblem(`A${"B".repeat(MAX_EXEC_ENV_NAME_LENGTH)}`)).toBeDefined();
     for (const ok of ["GH_TOKEN", "NPM_TOKEN", "AWS_SECRET_ACCESS_KEY", "A", "X1"]) {
       expect(execEnvNameProblem(ok)).toBeUndefined();
     }

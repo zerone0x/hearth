@@ -2401,13 +2401,18 @@ describe("bash env: vault tokens for one command (decision 0041)", () => {
     h.boxes.version = { major: 1, minor: 5 };
     const runner = await turn(h, "se_a", "go", [
       bash("c_old", "env", { GH_TOKEN: "vault:github" }),
+      bash("c_plain", "echo old-box-ok"),
       fauxAssistantMessage("done"),
     ]);
     const result = toolResults(runner.messages).find((r) => r.id === "c_old");
     expect(result?.isError).toBe(true);
     expect(result?.text).toContain(NO_SECRET_ENV_IN_BOX);
-    expect(execFrames(h)).toHaveLength(0);
     expect(uses()).toHaveLength(0);
+    // A command without env still runs on the old box.
+    expect(toolResults(runner.messages).find((r) => r.id === "c_plain")?.text).toContain(
+      "old-box-ok",
+    );
+    expect(execFrames(h).map((f) => f.command)).toEqual(["echo old-box-ok"]);
   }, 20_000);
 
   test("without a vault a call with env refuses; a call without env runs as before", async () => {

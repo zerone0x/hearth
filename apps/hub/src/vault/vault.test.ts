@@ -903,6 +903,26 @@ describe("box-env uses (decision 0041)", () => {
     expect(auditRows(h.db, "secret.use")).toHaveLength(0);
   });
 
+  test("stored columns edited in SQL: a login claiming box-env or a null policy is refused before decrypt", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "site",
+      kind: "login",
+      policy: { origins: ["https://github.com"] },
+      fields: LOGIN,
+    });
+    await h.vault.create(LOCAL_PRINCIPAL, { name: "t", kind: "token", fields: { value: TOKEN } });
+    h.db.run(`UPDATE secret SET policy_json = '{"use":"box-env"}' WHERE name = 'site'`);
+    h.db.run(`UPDATE secret SET policy_json = 'null' WHERE name = 't'`);
+    for (const ref of ["vault:site", "vault:t"]) {
+      expect(`${ref}: ${(await errorOf(h.vault.use(ref, bash("ses_1")))).code}`).toBe(
+        `${ref}: vault.kind-mismatch`,
+      );
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+  });
+
   test("a tool gets a token only for a box command: without a variable even an opted-in one is refused", async () => {
     const h = await start({ env: { VAULT_KEY: KEY_A } });
     addSession(h.db, "ses_1");
