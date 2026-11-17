@@ -3211,13 +3211,25 @@ and where it deviates.
   A taken name, a disabled vault or an unresolvable key skips the import with a
   log line; it is retried at the next start.
 - **UI.** `#/settings` (its own lazy chunk), linked from the header: a vault
-  Alert when it is off, the model card (provider and model inputs, key Select
+  Alert when it is off, the model card (provider and model inputs, key select
   of global model keys with their fingerprints) and the secrets table (name,
   origins, kind, scope, fingerprint and version, last use; Rotate in a Dialog,
-  Delete behind an AlertDialog; Add in a Dialog). Value fields are
-  `type="password"` with `autoComplete="off"`; they are cleared after a save
-  and dropped when the dialog closes. shadcn `table`, `select` and
-  `alert-dialog` were added with the shadcn CLI (0019).
+  Delete behind a confirm Dialog in the `alertdialog` role; Add in a Dialog).
+  Value fields are `type="password"` with `autoComplete="off"`; they are
+  cleared after a save and dropped when the dialog closes. shadcn `table` and
+  `native-select` were added with the shadcn CLI (0019).
+- **CSP unchanged (0017, 0019).** Radix's scroll lock injects a `<style>`,
+  which `style-src 'self'` blocks: the dialogs are non-modal
+  (`modal={false}`; the Delete confirm is a Dialog, since Radix's AlertDialog
+  is always modal, and ignores clicks outside it), and the selects are native
+  `<select>`s (shadcn `native-select`; Radix Select always locks scrolling).
+  The web e2e opens every dialog and select on `#/settings` (add a model key,
+  save the model with it, rotate it, delete a secret) and fails on any
+  violation.
+- **No key value read back.** `GET /v1/settings/model` shows the key
+  reference as `displayRef` does, so a value pasted into
+  `HEARTH_MODEL_KEY_REF` (or a token-shaped `env:` name) appears only as a
+  fingerprint.
 
 ### Not in this change (follow-ups)
 

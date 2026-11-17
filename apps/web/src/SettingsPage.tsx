@@ -3,27 +3,21 @@
  * The model's key is picked from the vault; secrets are added, rotated and
  * deleted here. No value is ever read back: the page shows keyed fingerprints,
  * and a dialog's typed values are dropped when it closes.
+ *
+ * CSP (decisions 0017, 0019): `style-src 'self'` blocks the `<style>` Radix's
+ * scroll lock injects, so the dialogs are non-modal (`modal={false}`) and the
+ * selects are native `<select>`s (Radix Select always locks scrolling).
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -33,13 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
   Table,
   TableBody,
@@ -190,19 +178,19 @@ function ModelForm({ settings, keys: modelKeys }: { settings: ModelSettings; key
       </div>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="model-key">Key</Label>
-        <Select value={keyRef} onValueChange={setKeyRef} disabled={locked}>
-          <SelectTrigger id="model-key" className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={NO_KEY}>No key</SelectItem>
-            {options.map((o) => (
-              <SelectItem key={o.ref} value={o.ref}>
-                {o.label} <span className="font-mono text-muted-foreground">{o.fp}</span>
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <NativeSelect
+          id="model-key"
+          value={keyRef}
+          onChange={(e) => setKeyRef(e.target.value)}
+          disabled={locked}
+        >
+          <NativeSelectOption value={NO_KEY}>No key</NativeSelectOption>
+          {options.map((o) => (
+            <NativeSelectOption key={o.ref} value={o.ref}>
+              {`${o.label} (${o.fp})`}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
         <p className="text-xs text-muted-foreground">
           Add a model key under Secrets first; only global model keys are listed.
         </p>
@@ -323,7 +311,7 @@ function FieldInputs({
 function AddSecretDialog({ disabled }: { disabled: boolean }) {
   const [open, setOpen] = useState(false);
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={setOpen} modal={false}>
       <DialogTrigger asChild>
         <Button size="sm" disabled={disabled}>
           Add secret
@@ -383,24 +371,20 @@ function AddSecretForm() {
       </DialogHeader>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="secret-kind">Kind</Label>
-        <Select
+        <NativeSelect
+          id="secret-kind"
           value={kind}
-          onValueChange={(v) => {
-            setKind(v as SecretKind);
+          onChange={(e) => {
+            setKind(e.target.value as SecretKind);
             setValues({});
           }}
         >
-          <SelectTrigger id="secret-kind" className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {(Object.keys(KIND_FIELDS) as SecretKind[]).map((k) => (
-              <SelectItem key={k} value={k}>
-                {KIND_LABEL[k]}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+          {(Object.keys(KIND_FIELDS) as SecretKind[]).map((k) => (
+            <NativeSelectOption key={k} value={k}>
+              {KIND_LABEL[k]}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
       </div>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="secret-name">Name</Label>
@@ -453,7 +437,7 @@ function AddSecretForm() {
 
 function RotateSecretDialog({ secret, disabled }: { secret: Secret; disabled: boolean }) {
   return (
-    <Dialog>
+    <Dialog modal={false}>
       <DialogTrigger asChild>
         <Button variant="ghost" size="sm" disabled={disabled}>
           Rotate
@@ -529,25 +513,34 @@ function DeleteSecretDialog({ secret }: { secret: Secret }) {
   });
   return (
     <>
-      <AlertDialog>
-        <AlertDialogTrigger asChild>
+      {/* A non-modal Dialog in the alert dialog's role: Radix's AlertDialog is always modal. */}
+      <Dialog modal={false}>
+        <DialogTrigger asChild>
           <Button variant="ghost" size="sm">
             Delete
           </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete {secret.name}?</AlertDialogTitle>
-            <AlertDialogDescription>
+        </DialogTrigger>
+        <DialogContent
+          role="alertdialog"
+          showCloseButton={false}
+          onInteractOutside={(e) => e.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle>Delete {secret.name}?</DialogTitle>
+            <DialogDescription>
               Anything that uses vault:{secret.name} will fail. The value cannot be recovered.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => remove.mutate()}>Delete</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline">Cancel</Button>
+            </DialogClose>
+            <DialogClose asChild>
+              <Button onClick={() => remove.mutate()}>Delete</Button>
+            </DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <ErrorAlert error={remove.error} />
     </>
   );

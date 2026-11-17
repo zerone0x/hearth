@@ -230,7 +230,8 @@ describe("settings page in a DOM", () => {
     const first = within(table).getAllByTestId("secret-row")[0] as HTMLElement;
     fireEvent.click(within(first).getByRole("button", { name: "Rotate" }));
     const form = await screen.findByRole("form", { name: "Rotate secret" });
-    fireEvent.change(within(form).getByLabelText("Value"), { target: { value: "sk-dom-new" } });
+    const value = within(form).getByLabelText("Value") as HTMLInputElement;
+    fireEvent.change(value, { target: { value: "sk-dom-new" } });
     await act(async () => {
       fireEvent.click(within(form).getByRole("button", { name: "Rotate" }));
     });
@@ -240,6 +241,9 @@ describe("settings page in a DOM", () => {
       path: "/v1/secrets/sec_1/value",
       body: { fields: { value: "sk-dom-new" } },
     });
+    // Cleared after the save while the dialog is still open, and nowhere on the page.
+    expect(value.value).toBe("");
+    expect(document.body.innerHTML).not.toContain("sk-dom-new");
     fireEvent.keyDown(form, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("form", { name: "Rotate secret" })).toBeNull());
 
@@ -266,7 +270,9 @@ describe("settings page in a DOM", () => {
     });
     renderApp("#/settings");
     const form = await screen.findByRole("form", { name: "Model" });
-    expect(within(form).getByRole("combobox").textContent).toContain("anthropic-key");
+    const key = within(form).getByLabelText("Key") as HTMLSelectElement;
+    expect(key.value).toBe("vault:anthropic-key");
+    expect(key.selectedOptions[0]?.textContent).toBe(`anthropic-key (${KEY.fingerprint})`);
     fireEvent.change(within(form).getByLabelText("Model"), { target: { value: "claude-new" } });
     await act(async () => {
       fireEvent.click(within(form).getByRole("button", { name: "Save" }));
