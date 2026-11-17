@@ -33,3 +33,4 @@ export {
   SqliteVaultStore,
   type SqliteVaultStoreOptions,
 } from "./vault-store";
+export { SqliteVirtualKeyStore, type VirtualKeyRow } from "./virtual-key-store";

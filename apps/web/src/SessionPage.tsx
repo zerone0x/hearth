@@ -6,6 +6,10 @@
  * The header shows the session's access mode (decision 0045) as a native
  * select (CSP: no Radix scroll lock): follow the global default, or `ask` /
  * `yolo` for this session only. A change applies from the next tool call.
+ *
+ * It also shows the session's model spend and tokens from Bifrost's request
+ * log against its budget (decision 0047), re-read every 10 s and after each
+ * message: Bifrost logs a call within about 10 s.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -16,7 +20,8 @@ import { type AccessMode, api } from "./api";
 import { DesktopPanel } from "./Desktop";
 import { ErrorAlert } from "./ErrorAlert";
 import { emptyChat, isRunning, projectChat } from "./hearthPi";
-import { keys, useChat, useSession } from "./queries";
+import { keys, POLL_SPEND_MS, useChat, useSession } from "./queries";
+import { spendText } from "./spend";
 import { ChatRuntime, Thread } from "./Thread";
 
 export default function SessionPage({ sessionId }: { sessionId: string }) {
@@ -29,7 +34,10 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
   const running = isRunning(state);
 
   // The reply arrives through the event log: poll it now rather than at the next tick.
-  const refetchChat = () => client.refetchQueries({ queryKey: keys.events(sessionId) });
+  const refetchChat = () => {
+    void client.invalidateQueries({ queryKey: keys.sessionSpend(sessionId) });
+    return client.refetchQueries({ queryKey: keys.events(sessionId) });
+  };
   const send = useMutation({
     mutationFn: (text: string) => api.send(sessionId, text),
     onSuccess: refetchChat,
@@ -49,6 +57,7 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
         <h1 className="min-w-32 flex-1 truncate font-semibold">
           {session.data?.title || sessionId}
         </h1>
+        <SpendBadge sessionId={sessionId} />
         <AccessModeSelect sessionId={sessionId} />
         <span className="text-muted-foreground text-xs" data-testid="session-state">
           {running ? "working" : (session.data?.state ?? "")}
@@ -145,5 +154,26 @@ export function AccessModeSelect({ sessionId }: { sessionId: string }) {
         </span>
       )}
     </div>
+  );
+}
+
+/** The session's spend through Bifrost (decision 0047); nothing on the direct path. */
+export function SpendBadge({ sessionId }: { sessionId: string }) {
+  const spend = useQuery({
+    queryKey: keys.sessionSpend(sessionId),
+    queryFn: () => api.sessionSpend(sessionId),
+    refetchInterval: POLL_SPEND_MS,
+  });
+  const text = spendText(spend.data);
+  if (text === null) return null;
+  const reached = spend.data?.spend != null && spend.data.spend.costUsd >= spend.data.budgetUsd;
+  return (
+    <span
+      className={`shrink-0 text-xs ${reached ? "text-destructive" : "text-muted-foreground"}`}
+      data-testid="session-spend"
+      title={`Model spend from the gateway's request log; a call shows within about ${spend.data?.flushSeconds ?? 10} s`}
+    >
+      {text}
+    </span>
   );
 }

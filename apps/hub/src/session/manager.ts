@@ -102,6 +102,11 @@ export interface SessionManagerOptions {
   readonly stableMs?: number;
   readonly now?: () => EpochMs;
   readonly log?: (line: string) => void;
+  /**
+   * Called after a session is archived (its virtual key is deactivated,
+   * decision 0047). A failure is logged; the archive stands.
+   */
+  readonly onArchived?: (sessionId: SessionId) => Promise<unknown>;
 }
 
 export interface CreateSessionInput {
@@ -200,6 +205,7 @@ export class SessionManager {
   readonly #stableMs: number;
   readonly #now: () => EpochMs;
   readonly #log: (line: string) => void;
+  readonly #onArchived: ((sessionId: SessionId) => Promise<unknown>) | undefined;
   readonly #scope: WorkspaceScope = { workspaceId: DEFAULT_WORKSPACE_ID };
   readonly #runtimes = new Map<SessionId, Runtime>();
   readonly #sweep: ReturnType<typeof setInterval> | undefined;
@@ -231,6 +237,7 @@ export class SessionManager {
     this.#stableMs = options.stableMs ?? DEFAULT_STABLE_MS;
     this.#now = options.now ?? Date.now;
     this.#log = options.log ?? ((line) => console.error(line));
+    this.#onArchived = options.onArchived;
     this.ready = this.#recover();
     const interval = options.superviseIntervalMs ?? DEFAULT_SUPERVISE_INTERVAL_MS;
     if (interval > 0 && this.#boxes !== undefined) {
@@ -302,6 +309,11 @@ export class SessionManager {
         } catch (error) {
           this.#log(`session ${sessionId}: could not stop box ${box.id}: ${String(error)}`);
         }
+      }
+      try {
+        await this.#onArchived?.(sessionId);
+      } catch (error) {
+        this.#log(`session ${sessionId}: after the archive: ${String(error)}`);
       }
       return view(row);
     });

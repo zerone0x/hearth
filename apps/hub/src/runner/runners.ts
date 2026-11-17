@@ -8,6 +8,10 @@
  *   `ModelRuntime.setRuntimeApiKey`: the `direct` model gateway of PRD §6.4.
  *   No auth file, no hub environment variable reaches pi. The key is
  *   redacted from everything the runners store or log.
+ * - With Bifrost configured (decision 0047), each runner build asks the
+ *   `gateway` for the session's route: pi gets a runtime of its own with one
+ *   OpenAI-compatible provider at Bifrost and the session's virtual key, set
+ *   in memory the same way. No provider key is resolved for it.
  * - AGENTS.md: the hub keeps the last copy read from the box (`runner.context`
  *   in the event log) and refreshes it on the first box lease of each turn. It
  *   never starts a box just to read it.
@@ -34,6 +38,7 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
+import type { GatewayRoute } from "../bifrost/virtual-keys";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { DesktopLockCheck } from "../desktop/lock";
 import { knownSecrets, registerSecret } from "../obs/redaction";
@@ -135,7 +140,21 @@ export interface SessionRunnersOptions {
    * per tool call. Unset (tests), every call is recorded as the default `ask`.
    */
   readonly accessMode?: (sessionId: SessionId) => AccessMode;
+  /**
+   * The model gateway (Bifrost, decision 0047): the session's route for one
+   * runner build (a rotated virtual key), or undefined for the direct path.
+   * Unset: every call is direct.
+   */
+  readonly gateway?: {
+    route(
+      sessionId: SessionId,
+      choice: { provider: string; model: string },
+    ): Promise<GatewayRoute | undefined>;
+  };
 }
+
+/** The pi provider id of a runner's Bifrost route (one per runner runtime). */
+export const GATEWAY_PROVIDER = "hearth-bifrost";
 
 export interface RunnerOptionsInput {
   /** pi's codemode tool, off by default (decision 0015). */
@@ -376,14 +395,12 @@ export class SessionRunners {
     if (choice === undefined) {
       throw failure("runner.no-model", "no model is set: choose one on the Settings page");
     }
-    const runtime = await this.#modelRuntime(choice);
-    const model = runtime.getModel(choice.provider, choice.model);
-    if (model === undefined) {
-      throw failure(
-        "runner.unknown-model",
-        `model ${choice.provider}/${choice.model} is not known to pi`,
-      );
-    }
+    const route = await this.#o.gateway?.route(sessionId, {
+      provider: choice.provider,
+      model: choice.model,
+    });
+    const { runtime, model } =
+      route === undefined ? await this.#direct(choice) : await this.#throughGateway(choice, route);
     const resolveMode = this.#o.accessMode;
     return SessionRunner.create({
       sessionId,
@@ -393,6 +410,7 @@ export class SessionRunners {
       box: this.#box(sessionId),
       modelRuntime: runtime,
       model: model as Model<string>,
+      gateway: route !== undefined,
       denyList: this.#denyList,
       commandRules: this.#commandRules,
       ...(resolveMode === undefined ? {} : { accessMode: () => resolveMode(sessionId) }),
@@ -408,6 +426,68 @@ export class SessionRunners {
       ...(this.#o.telemetry === undefined ? {} : { telemetry: this.#o.telemetry }),
       onFailure: (message) => this.#o.sessions.fail(sessionId, `runner failed: ${message}`),
     });
+  }
+
+  async #direct(choice: ModelChoice): Promise<{ runtime: ModelRuntime; model: Model<string> }> {
+    const runtime = await this.#modelRuntime(choice);
+    const model = runtime.getModel(choice.provider, choice.model);
+    if (model === undefined) {
+      throw failure(
+        "runner.unknown-model",
+        `model ${choice.provider}/${choice.model} is not known to pi`,
+      );
+    }
+    return { runtime, model: model as Model<string> };
+  }
+
+  /**
+   * A runtime of this runner's own (the key is per session) with one
+   * OpenAI-compatible provider at Bifrost; the model keeps the limits and
+   * prices pi knows for `choice`.
+   */
+  async #throughGateway(
+    choice: ModelChoice,
+    route: GatewayRoute,
+  ): Promise<{ runtime: ModelRuntime; model: Model<string> }> {
+    this.#secretValues.add(route.apiKey);
+    registerSecret(route.apiKey);
+    this.#catalog ??= this.#newRuntime();
+    this.#catalog.catch(() => {
+      this.#catalog = undefined;
+    });
+    const known = (await this.#catalog).getModel(choice.provider, choice.model);
+    if (known === undefined) {
+      throw failure(
+        "runner.unknown-model",
+        `model ${choice.provider}/${choice.model} is not known to pi`,
+      );
+    }
+    const runtime = await ModelRuntime.create({
+      authPath: join(mkdtempSync(join(tmpdir(), "hearth-auth-")), "auth.json"),
+      modelsPath: null,
+      refreshOnCreate: false,
+    });
+    runtime.registerProvider(GATEWAY_PROVIDER, {
+      baseUrl: route.baseUrl,
+      api: "openai-completions",
+      models: [
+        {
+          id: route.modelId,
+          name: known.name,
+          reasoning: known.reasoning,
+          input: [...known.input],
+          cost: { ...known.cost },
+          contextWindow: known.contextWindow,
+          maxTokens: known.maxTokens,
+        },
+      ],
+    });
+    await runtime.setRuntimeApiKey(GATEWAY_PROVIDER, route.apiKey);
+    const model = runtime.getModel(GATEWAY_PROVIDER, route.modelId);
+    if (model === undefined) {
+      throw failure("runner.unknown-model", `model ${route.modelId} is not known to pi`, "hub");
+    }
+    return { runtime, model: model as Model<string> };
   }
 
   async #newRuntime(): Promise<ModelRuntime> {

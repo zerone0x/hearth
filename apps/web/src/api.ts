@@ -105,6 +105,37 @@ export interface SessionAccessMode {
   readonly mode: AccessMode;
 }
 
+/** Bifrost's request-log totals (decision 0047). */
+export interface SpendStats {
+  readonly requests: number;
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly costUsd: number;
+}
+
+/** A session's spend: `gateway` is `bifrost` once it has a virtual key. */
+export interface SessionSpend {
+  readonly sessionId: string;
+  readonly gateway: "bifrost" | "direct" | "none";
+  readonly bifrostState: string | null;
+  readonly budgetUsd: number;
+  readonly spend: SpendStats | null;
+  readonly active: boolean | null;
+  /** About how long Bifrost takes to log a call. */
+  readonly flushSeconds: number;
+}
+
+/** The default budget of every session, and all sessions' spend together. */
+export interface SessionBudget {
+  readonly budgetUsd: number;
+  readonly source: "default" | "settings";
+  readonly updatedAt: number | null;
+  readonly bifrostState: string | null;
+  readonly total: SpendStats | null;
+  readonly flushSeconds: number;
+}
+
 export interface AuthStatus {
   readonly setupRequired: boolean;
   readonly authenticated: boolean;
@@ -218,6 +249,11 @@ export const api = {
   /** `null` follows the global default again. */
   saveSessionAccessMode: (sessionId: string, mode: AccessMode | null) =>
     call<SessionAccessMode>("PUT", `/v1/sessions/${id(sessionId)}/access-mode`, { mode }),
+  sessionSpend: (sessionId: string) =>
+    call<SessionSpend>("GET", `/v1/sessions/${id(sessionId)}/spend`),
+  sessionBudget: () => call<SessionBudget>("GET", "/v1/settings/session-budget"),
+  saveSessionBudget: (budgetUsd: number) =>
+    call<SessionBudget>("PUT", "/v1/settings/session-budget", { budgetUsd }),
 };
 
 /** The desktop WebSocket of a session (decision 0016), on the page's own origin. */

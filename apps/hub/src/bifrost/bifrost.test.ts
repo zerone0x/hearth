@@ -496,6 +496,49 @@ describe("Bifrost service", () => {
     expect(handoff("encryption_key")).not.toBe("owner-typed-box-env-value-1d3f");
   });
 
+  // #157, from the #159 verification: the refusal checks the scope too.
+  test("a session-scoped `use: hub` token under a Bifrost name (pre-0046 data) is refused, not handed over", async () => {
+    const before = startHub({
+      dbPath: join(dir, "hub.db"),
+      port: 0,
+      boxPort: 0,
+      log: () => {},
+      vault: {
+        keyRef: "env:VAULT_KEY",
+        keySecrets: createDefaultSecretStore({ env: { VAULT_KEY } }),
+      },
+    });
+    await before.vaultReady;
+    const session = await before.sessions.create(LOCAL_PRINCIPAL, { title: "old" });
+    await before.vault.create(SYSTEM_PRINCIPAL, {
+      name: BIFROST_ADMIN_ENTRY,
+      kind: "token",
+      policy: { use: "hub" },
+      scope: { sessionId: session.id },
+      fields: { value: "session-scoped-hub-token-value-5e2a" },
+    });
+    await before.stop();
+    const { hub, fake, logs } = start();
+    await hub.bifrostReady;
+    expect(hub.bifrost?.status.state).toBe("secrets-unusable");
+    expect(hub.bifrost?.status.detail).toContain(
+      `vault:${BIFROST_ADMIN_ENTRY} is not a global token with use hub`,
+    );
+    expect(() => handoff("admin_password")).toThrow();
+    expect(fake.calls).toEqual([]);
+    expect(logs.join("\n")).not.toContain("session-scoped-hub-token-value-5e2a");
+  });
+
+  test("the hub's own first creation of its two entries is not logged as a change", async () => {
+    const { hub, logs } = start();
+    await hub.bifrostReady;
+    expect(hub.bifrost?.status.state).toBe("ok");
+    expect(logs.filter((l) => l.includes("Bifrost keeps the old value"))).toEqual([]);
+    // A later change still is (an entry's value changing under Bifrost).
+    hub.bifrost?.entryChanged(BIFROST_ADMIN_ENTRY);
+    expect(logs.filter((l) => l.includes("Bifrost keeps the old value"))).toHaveLength(1);
+  });
+
   test("without Bifrost configured /healthz has no bifrost field", async () => {
     const hub = startHub({ dbPath: join(dir, "plain.db"), port: 0, boxPort: 0, log: () => {} });
     hubs.push(hub);
@@ -576,7 +619,7 @@ describe("Bifrost config and box egress (decisions 0012, 0023, 0046)", () => {
     return { addrs, subnet, url };
   }
 
-  test("compose: the hub does not depend on Bifrost (model calls do not use it yet)", () => {
+  test("compose: the hub does not depend on Bifrost (a model call waits for it, decision 0047)", () => {
     const compose = Bun.YAML.parse(readFileSync(join(REPO, "deploy/compose.yaml"), "utf8")) as {
       services: Record<string, { depends_on?: Record<string, unknown> }>;
     };

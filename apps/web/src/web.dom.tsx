@@ -859,3 +859,83 @@ describe("desktop panel in a DOM", () => {
     }
   });
 });
+
+describe("spend and the session budget in a DOM (decision 0047)", () => {
+  const SPEND = {
+    sessionId: "se_1",
+    gateway: "bifrost",
+    bifrostState: "ok",
+    budgetUsd: 0.03,
+    spend: {
+      requests: 3,
+      promptTokens: 200,
+      completionTokens: 100,
+      totalTokens: 300,
+      costUsd: 0.04,
+    },
+    active: true,
+    flushSeconds: 10,
+  };
+
+  test("the session header shows spend, tokens and the budget, and says when it is reached", async () => {
+    hub((_method, path) => (path === "/v1/sessions/se_1/spend" ? ok(SPEND) : undefined));
+    renderApp("#/s/se_1");
+    const badge = await screen.findByTestId("session-spend");
+    expect(badge.textContent).toBe("$0.04 of $0.03, 300 tokens - budget reached");
+    expect(badge.className).toContain("text-destructive");
+  });
+
+  test("on the direct path the header shows no spend", async () => {
+    hub((_method, path) =>
+      path === "/v1/sessions/se_1/spend"
+        ? ok({ ...SPEND, gateway: "direct", bifrostState: null, spend: null })
+        : undefined,
+    );
+    renderApp("#/s/se_1");
+    await screen.findByLabelText("Access");
+    expect(screen.queryByTestId("session-spend")).toBeNull();
+  });
+
+  test("the Settings card shows the total and saves the budget", async () => {
+    const sent: unknown[] = [];
+    let budgetUsd = 5;
+    hub((method, path, body) => {
+      if (path === "/v1/vault/status")
+        return ok({ state: "enabled", kekCheck: "a", key: "current" });
+      if (path === "/v1/secrets") return ok({ secrets: [] });
+      if (path === "/v1/settings/model")
+        return ok({ source: "none", provider: null, model: null, keyRef: null });
+      if (path === "/v1/settings/session-budget") {
+        if (method === "PUT") {
+          sent.push(body);
+          budgetUsd = (body as { budgetUsd: number }).budgetUsd;
+        }
+        return ok({
+          budgetUsd,
+          source: method === "PUT" ? "settings" : "default",
+          updatedAt: null,
+          bifrostState: "ok",
+          total: SPEND.spend,
+          flushSeconds: 10,
+        });
+      }
+      return undefined;
+    });
+    renderApp("#/settings");
+    const form = await screen.findByRole("form", { name: "Session budget" });
+    expect(within(form).getByTestId("total-spend").textContent).toBe(
+      "All sessions: $0.04, 300 tokens in 3 calls (Bifrost logs a call within about 10 s).",
+    );
+    expect(within(form).getByTestId("gateway-state").textContent).toContain("go through Bifrost");
+    const input = within(form).getByLabelText(
+      "Budget per session (US dollars)",
+    ) as HTMLInputElement;
+    expect(input.value).toBe("5");
+    fireEvent.change(input, { target: { value: "12.5" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    });
+    expect(await within(form).findByText("Saved. Every session's budget is $12.50.")).toBeTruthy();
+    expect(sent).toEqual([{ budgetUsd: 12.5 }]);
+  });
+});
