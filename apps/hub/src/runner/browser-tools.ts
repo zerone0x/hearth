@@ -20,12 +20,26 @@
  *   session's desktop, every browser tool refuses at once with
  *   `desktop.locked`, before it takes a box lease or sends anything to the
  *   box. The model reads that the user is in control and can wait or ask.
+ * - **`browser_fill`** (decision 0039) takes a `vault:` reference, never a
+ *   value. It asks the box for the field's kind and owner-frame origin
+ *   (`browser.field`), resolves the login through the vault with that origin
+ *   (bound, audited before use, registered for redaction), checks the field
+ *   kind, and only then sends the value in `browser.fill`, which the box
+ *   checks again. The value joins the session's scrub set before it is sent.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { HearthError } from "@hearth/core";
+import {
+  HearthError,
+  LOG_REDACTED,
+  type LoginPolicy,
+  parseVaultRefBody,
+  redactValues,
+} from "@hearth/core";
 import {
   type BrowserActionResult,
+  type BrowserExpect,
+  type BrowserFieldKind,
   type BrowserMethod,
   type BrowserSnapshot,
   DEFAULT_EXPECT_TIMEOUT_MS,
@@ -53,9 +67,32 @@ export const BROWSER_TOOLS = [
   "browser_wait",
   "browser_screenshot",
   "browser_tabs",
+  "browser_fill",
 ] as const;
 
 export type BrowserToolName = (typeof BROWSER_TOOLS)[number];
+
+/** The browser tools that map one-to-one to a `browser.*` method. */
+type PlainBrowserTool = Exclude<BrowserToolName, "browser_fill">;
+
+/** What the model reads when the box is older than protocol 1.5 and cannot fill. */
+export const NO_FILL_IN_BOX =
+  "This box cannot fill secrets: its box-agent is older than protocol 1.5. " +
+  "Ask the owner to update the box image; do not type the secret yourself.";
+
+/** What the model reads when the hub has no vault to resolve a secret from. */
+export const NO_VAULT_FOR_FILL =
+  "browser_fill is not available: the hub has no vault. Ask the owner to set one up.";
+
+/**
+ * The field kinds a login field may go into (decision 0039), unless the
+ * entry's policy sets `allow_any_field`.
+ */
+export const FILL_FIELDS: Readonly<Record<string, readonly BrowserFieldKind[]>> = {
+  password: ["password"],
+  username: ["username"],
+  totp: ["one-time-code"],
+};
 
 /** The code of a call refused because the owner holds the desktop lock (decision 0033). */
 export const DESKTOP_LOCKED = "desktop.locked";
@@ -111,7 +148,7 @@ interface Spec {
   readonly parameters: TSchema;
 }
 
-const SPECS: Readonly<Record<BrowserToolName, Spec>> = {
+const SPECS: Readonly<Record<PlainBrowserTool, Spec>> = {
   browser_navigate: {
     method: "browser.navigate",
     label: "Browser: open URL",
@@ -253,6 +290,22 @@ const SPECS: Readonly<Record<BrowserToolName, Spec>> = {
   },
 };
 
+const FILL_PARAMETERS = Type.Object({
+  ref: ref("the field"),
+  element,
+  secret: Type.String({
+    description:
+      "A vault reference such as vault:github#password or vault:github#username. Never a value: you do not know it and never see it.",
+  }),
+  submit: Type.Optional(Type.Boolean({ description: "Press Enter after the fill" })),
+  ...verify,
+});
+
+const FILL_DESCRIPTION =
+  "Fill a login field (password, username or one-time code) with a secret from the vault, by reference. " +
+  "The value goes only to the browser: it is never shown to you, and filled fields are masked in screenshots. " +
+  "Refused when the page's origin is not one the secret is bound to, or when the field is not the right kind.";
+
 /**
  * Page text made safe to put in or next to a `<page-content>` block: every
  * `<page-content` or `</page-content` (any case, spaces allowed) has its `<`
@@ -387,8 +440,10 @@ export function registerBrowserTools(
   pi: ExtensionAPI,
   box: RunnerBox,
   onRefused?: OnRefused,
+  filled: Set<string> = new Set(),
 ): void {
   for (const name of BROWSER_TOOLS) {
+    if (name === "browser_fill") continue;
     const spec = SPECS[name];
     pi.registerTool({
       name,
@@ -426,4 +481,135 @@ export function registerBrowserTools(
       },
     });
   }
+  registerFillTool(pi, box, onRefused, filled);
+}
+
+interface FillParams {
+  readonly ref: string;
+  readonly element: string;
+  readonly secret: string;
+  readonly submit?: boolean;
+  readonly expect?: BrowserExpect;
+  readonly expectTimeoutMs?: number;
+}
+
+/** A refusal of `browser_fill`, as the model reads it: a code, then why. */
+function fillRefusal(code: string, message: string): Error {
+  return new Error(`${code}: ${message}`);
+}
+
+/**
+ * `browser_fill` (decision 0039). The value is revealed only to build the
+ * `browser.fill` params, after it joined `filled`; every text the tool returns
+ * or throws is scrubbed of it.
+ */
+function registerFillTool(
+  pi: ExtensionAPI,
+  box: RunnerBox,
+  onRefused: OnRefused | undefined,
+  filled: Set<string>,
+): void {
+  const name = "browser_fill";
+  const scrub = (text: string) =>
+    filled.size === 0 ? text : redactValues(text, filled, LOG_REDACTED);
+  pi.registerTool({
+    name,
+    label: "Browser: fill secret",
+    description: FILL_DESCRIPTION,
+    parameters: FILL_PARAMETERS,
+    executionMode: "sequential",
+    execute: async (id, raw, signal) => {
+      const params = raw as FillParams;
+      assertDesktopFree(box, name, id, onRefused);
+      // Only a reference is accepted; whatever else was given is not echoed.
+      const body = params.secret.startsWith("vault:")
+        ? parseVaultRefBody(params.secret.slice("vault:".length))
+        : undefined;
+      if (body === undefined) {
+        throw fillRefusal(
+          "secret.malformed-ref",
+          "secret must be a vault reference such as vault:github#password",
+        );
+      }
+      const useSecret = box.useSecret;
+      if (useSecret === undefined) throw new Error(NO_VAULT_FOR_FILL);
+      const lease = await box.ensureBox(id);
+      try {
+        await box.prepare?.(lease);
+        // Again after the wake, as the other browser tools (#133).
+        assertDesktopFree(box, name, id, onRefused);
+        const ops = box.operations(lease.boxId, id);
+        const call = async <M extends "browser.field" | "browser.fill">(
+          method: M,
+          p: CallParams<M>,
+        ): Promise<ToolResults[M]> => {
+          try {
+            return await ops.browser.call(method, p, signal);
+          } catch (error) {
+            if (error instanceof HearthError && error.code === "unknown-method") {
+              throw new Error(NO_FILL_IN_BOX);
+            }
+            throw error;
+          }
+        };
+        const field = await call("browser.field", { ref: params.ref });
+        if (field.origin === null) {
+          throw fillRefusal(
+            "vault.origin-mismatch",
+            "the field is not on a web origin, so no secret is bound to it. Nothing was filled.",
+          );
+        }
+        // Bound to the origin, audited, registered for redaction; refuses with a
+        // SecretError naming the reference only.
+        const secret = await useSecret(params.secret, {
+          toolCallId: id,
+          origin: field.origin,
+        }).catch((error: unknown) => {
+          // The model reads the vault's code first (vault.origin-mismatch, …).
+          if (error instanceof HearthError && error.code !== undefined) {
+            throw fillRefusal(error.code, `${error.message}. Nothing was filled.`);
+          }
+          throw error;
+        });
+        const policy = secret.policy as Partial<LoginPolicy>;
+        if (secret.kind !== "login" || policy.origins === undefined) {
+          throw fillRefusal("vault.kind-mismatch", "only a login can be filled into a page");
+        }
+        const fields: readonly BrowserFieldKind[] =
+          policy.allow_any_field === true ? [] : (FILL_FIELDS[secret.field] ?? []);
+        if (policy.allow_any_field !== true && !fields.includes(field.field)) {
+          throw fillRefusal(
+            "browser.field-mismatch",
+            `the field is a ${field.field} field; ${params.secret} may go only into a ${fields.join(" or ") || "matching"} field. Nothing was filled.`,
+          );
+        }
+        // Before the value leaves the hub: the result and anything after it are scrubbed.
+        const value = secret.value.reveal();
+        filled.add(value);
+        const result = await call("browser.fill", {
+          ref: params.ref,
+          element: params.element,
+          value,
+          origins: policy.origins,
+          fields,
+          ...(params.submit === undefined ? {} : { submit: params.submit }),
+          ...(params.expect === undefined ? {} : { expect: params.expect }),
+          ...(params.expectTimeoutMs === undefined
+            ? {}
+            : { expectTimeoutMs: params.expectTimeoutMs }),
+        });
+        const content = browserContent(name, "browser.fill", result).map((part) =>
+          part.type === "text" ? { ...part, text: scrub(part.text) } : part,
+        );
+        return { content, details: undefined };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const clean = scrub(message);
+        // Rethrown as is (its code kept) unless it held the value.
+        throw clean === message ? error : new Error(clean);
+      } finally {
+        lease.release();
+      }
+    },
+  });
 }

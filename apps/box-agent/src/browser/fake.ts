@@ -4,17 +4,25 @@
  * recorded, so a test can prove an action was refused before dispatch.
  */
 
+import type { BrowserFieldKind } from "@hearth/protocol";
 import {
   type BrowserDriver,
   type DriverDialog,
   DriverError,
   type DriverTab,
+  type FieldInfo,
   type TargetState,
 } from "./driver";
 
 export interface FakeTarget extends Partial<TargetState> {
   /** What a click does, if anything (navigate, show text, open a dialog). */
   readonly onClick?: (tab: FakeTab) => void;
+  /** Its field kind; default `other`. */
+  readonly field?: BrowserFieldKind;
+  /** Its owner frame's origin; default the page URL's. */
+  readonly origin?: string | null;
+  /** What the field shows once filled, e.g. a snapshot line; set by `fill`. */
+  value?: string;
 }
 
 export class FakeTab implements DriverTab {
@@ -34,6 +42,8 @@ export class FakeTab implements DriverTab {
   /** JPEG sizes the screenshot returns, per quality. */
   screenshotBytes: (quality: number, fullPage: boolean) => number = () => 1000;
   closed = false;
+  /** Refs marked by `mark`, until the page navigates. */
+  marks: string[] = [];
   /** A failure the next snapshot throws. */
   failSnapshot: DriverError | undefined;
   #navigations = 0;
@@ -59,6 +69,8 @@ export class FakeTab implements DriverTab {
     this.pageUrl = url;
     this.pageTitle = title;
     this.#navigations++;
+    // The document that held the filled values is gone.
+    this.marks = [];
   }
 
   dialog(type: string, message: string): void {
@@ -136,6 +148,27 @@ export class FakeTab implements DriverTab {
   async fill(ref: string, text: string): Promise<void> {
     this.actions.push(`fill ${ref} ${text}`);
     this.#fail();
+    const target = this.targets.get(ref);
+    if (target !== undefined) target.value = text;
+  }
+
+  async field(ref: string): Promise<FieldInfo> {
+    this.actions.push(`field ${ref}`);
+    const target = this.targets.get(ref);
+    if (target === undefined || target.found === false) {
+      return { found: false, field: "none", origin: null };
+    }
+    const origin = URL.canParse(this.pageUrl) ? new URL(this.pageUrl).origin : "null";
+    return {
+      found: true,
+      field: target.field ?? "other",
+      origin: target.origin === undefined ? (origin === "null" ? null : origin) : target.origin,
+    };
+  }
+
+  async mark(ref: string): Promise<void> {
+    this.actions.push(`mark ${ref}`);
+    this.marks.push(ref);
   }
 
   async select(ref: string, values: readonly string[]): Promise<void> {
@@ -153,8 +186,16 @@ export class FakeTab implements DriverTab {
   }
 
   async screenshot(options: { ref?: string; fullPage: boolean; quality: number }): Promise<Buffer> {
+    const missing = this.marks.filter((ref) => {
+      const target = this.targets.get(ref);
+      return target === undefined || target.found === false;
+    });
+    if (missing.length > 0) {
+      this.actions.push("screenshot refused");
+      throw new DriverError("mask", `${missing.length} filled field is no longer on the page`);
+    }
     this.actions.push(
-      `screenshot${options.ref === undefined ? "" : ` ${options.ref}`} q${options.quality}${options.fullPage ? " full" : ""}`,
+      `screenshot${options.ref === undefined ? "" : ` ${options.ref}`} q${options.quality}${options.fullPage ? " full" : ""}${this.marks.length > 0 ? ` masks=${this.marks.join(",")}` : ""}`,
     );
     return fakeJpeg(this.screenshotBytes(options.quality, options.fullPage), 1280, 800);
   }

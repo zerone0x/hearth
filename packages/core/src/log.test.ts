@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { LOG_REDACTED, Logger, parseLogLevel, redactLine, redactValues } from "./log";
+import { LOG_REDACTED, Logger, parseLogLevel, redactLine, redactValues, secretForms } from "./log";
 
 function capture(secrets: string[] = [], level?: "debug" | "info") {
   const lines: string[] = [];
@@ -99,6 +99,47 @@ describe("Logger", () => {
     // Touching values are one span; a value with a quote is found raw too.
     expect(redactValues("<abcdef>", ["def", "abc"], "#")).toBe("<#>");
     expect(redactValues('raw a"b\\c here', ['a"b\\c'], "#")).toBe("raw # here");
+  });
+
+  test("a value is found URL-encoded too, in each encoding and either hex case", () => {
+    const value = 'Pw d!@#x9&"q';
+    expect(secretForms(value)).toEqual([
+      value,
+      'Pw d!@#x9&\\"q',
+      "Pw%20d!%40%23x9%26%22q",
+      "Pw+d%21%40%23x9%26%22q",
+      "Pw%20d!@#x9&%22q",
+    ]);
+    // A GET form submit writes the value form-urlencoded into the URL.
+    expect(redactValues("/landing?u=&p=Pw+d%21%40%23x9%26%22q", [value], "#")).toBe(
+      "/landing?u=&p=#",
+    );
+    expect(redactValues("?p=Pw%20d!%40%23x9%26%22q&n=1", [value], "#")).toBe("?p=#&n=1");
+    expect(redactValues("/go/Pw%20d!@#x9&%22q/end", [value], "#")).toBe("/go/#/end");
+    // Lower-case hex is the same URL.
+    expect(redactValues("?p=Pw+d%21%40%23x9%26%22q", [value], "#")).toBe("?p=#");
+    expect(redactValues("?p=pw+d%21%40%23x9%26%22q", [value], "#")).toBe(
+      "?p=pw+d%21%40%23x9%26%22q",
+    );
+    expect(redactValues("?p=Pw+d%21%40%23x9%26%22Q", [value], "#")).toBe(
+      "?p=Pw+d%21%40%23x9%26%22Q",
+    );
+    expect(redactLine("a=x%2fy%20z b=x%2Fy+z", ["x/y z"])).toBe(
+      `a=${LOG_REDACTED} b=${LOG_REDACTED}`,
+    );
+    // An encoded form overlapping another value's raw form is one span.
+    for (const secrets of [
+      ["a b", "b-tail]"],
+      ["b-tail]", "a b"],
+    ]) {
+      expect(redactValues("[a%20b-tail] end", secrets, "#")).toBe("[# end");
+    }
+    // Regex characters in a value are literal.
+    expect(redactValues("a.b%20 axb%20", ["a.b "], "#")).toBe("# axb%20");
+    // A plain value has one form; a lone surrogate has no URL form but is still found raw.
+    expect(secretForms("abc123")).toEqual(["abc123"]);
+    expect(secretForms("x\ud800")).toEqual(["x\ud800", "x\\ud800"]);
+    expect(redactValues("x\ud800 y", ["x\ud800"], "#")).toBe("# y");
   });
 
   test("credential shapes are redacted without being known", () => {

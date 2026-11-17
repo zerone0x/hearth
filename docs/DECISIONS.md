@@ -3149,3 +3149,80 @@ The trajectory (0021) recorded only `images: 1`.
   (`deploy/e2e/prototype.ts` step 5f: a real screenshot reaches the faux
   model, the trajectory and event log name it and hold no base64, the blob
   API serves its bytes, and again after the upgrade).
+
+## 0039: `browser_fill` with vault refs: origin bound twice, value scrubbed, filled fields masked (protocol 1.5)
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #118
+
+### Context
+
+The browser tools (0032) type only text the model gives. Signing in needs a
+password the model must never see. The vault (0031) already has the hook:
+`HubVault.use` hands out a login only on an origin its policy names, audits
+the use first and registers the value for redaction. The browser research
+(`docs/research/browser.md` §5) found the aria snapshot prints a password
+field's value, and left screenshots unmasked.
+
+### Decision
+
+- **Tool.** `browser_fill({ref, element, secret, submit?, expect?})`. `secret`
+  is a `vault:<name>#field` reference; anything else is refused without being
+  echoed, before a lease.
+- **Two RPCs (protocol 1.5).** `browser.field` returns the field's kind and the
+  origin of the frame that owns it, from the URL the browser committed for
+  that frame (not page script). The hub passes that origin to `HubVault.use`
+  (kinds: `login`, scoped to the session), so a page on another origin, or a
+  login field in a foreign iframe, is refused before the value is decrypted
+  or sent. Only then does `browser.fill` carry the value, the policy's
+  origins and the accepted field kinds; the box checks origin and kind again
+  on the owner frame just before it fills.
+- **Field kinds.** `password` (`input type=password`), `username`
+  (`autocomplete=username` or `email`, `input type=email`), `one-time-code`
+  (`autocomplete=one-time-code`), `other`, `none`. `#password` goes only into
+  a password field and `#username` only into a username field
+  (`browser.field-mismatch` otherwise), unless the entry sets
+  `allow_any_field`, which allows any text field but never a non-field.
+- **Never echoed.** The box keeps every filled value for the life of the
+  process and replaces it (`[redacted]`) in every later result string, error
+  and spilled snapshot. The hub adds it to the session's set before it sends
+  it, scrubs the fill result and error, and scrubs the text of every later
+  tool result of the session, whatever the tool, before the model reads it.
+  The vault's registration (0031) covers events, logs and the trajectory.
+  Every scrub (box, hub, vault, model key, live output) is the shared
+  `redactValues`/`secretStart` of `@hearth/core`, which matches each value in
+  these text forms only: raw, JSON-escaped, and URL-encoded
+  (`encodeURIComponent`, form-urlencoded with `+` for a space as a GET form
+  submit writes it, and `encodeURI`), with `%XX` hex in either case. A GET
+  form that carries the value into the URL is therefore scrubbed in the fill
+  result, `browser.tabs` and snapshots.
+- **Masks.** The box marks the element before the fill: a
+  `data-hearth-mask` attribute with a fresh token, and an element handle it
+  keeps. Every screenshot masks each element with the attribute in every
+  frame (a page restored from the back-forward cache included), and first
+  checks each kept handle. A handle whose document is gone (navigation, a
+  closed frame) is dropped. An element that left a loaded document, or lost
+  its token, refuses the screenshot with `browser.mask-missing`.
+- **Errors.** `browser.origin-mismatch`, `browser.field-mismatch`,
+  `browser.mask-missing`: owner `user`, `give-up`. A 1.4 box answers the new
+  methods `unknown-method`; the tool says the box is too old.
+
+### Consequences
+
+- Known limit of "never echoed": string scrubbing finds only the forms
+  above. A page that transforms the value (base64, a hash, another encoding
+  or charset, a substring) and shows it gets it to the model unscrubbed, and
+  a page that draws the value outside the filled field (a "hello
+  <username>" heading, a canvas) shows it in screenshot pixels, since only
+  the filled elements are masked. Neither is caught; a page under the owner's
+  allowed origins is trusted not to do this.
+- The value enters the box's Chromium and nothing else the model reads. Any
+  box command can still read it over CDP (0026: CDP has no auth): the box is
+  the trust domain the owner accepted, as the research says.
+- A single-page app that drops the filled form without navigating refuses
+  screenshots of that tab until it navigates. Fail closed, by design.
+- The audit records a hand-out to the tool even when the hub then refuses
+  the field kind (`allow_any_field` is read from the authenticated row only).
+- Screenshots go to the blob store (0037) after capture; masking happens at
+  capture, so stored screenshots are masked.

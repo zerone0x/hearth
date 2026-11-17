@@ -79,6 +79,14 @@ older than protocol 1.3 answers that it has no browser tools. While the owner
 holds the desktop lock they refuse at once with `desktop.locked` (below,
 decision 0035).
 
+`browser_fill` (decision 0039) fills a login field from the vault by
+reference (`secret: "vault:github#password"`). The hub resolves the login
+only on an origin its policy names (the field's own frame, as the box reports
+it), audits the use, and sends the value to the box alone. The model never
+sees it: every later tool result of the session has it replaced, and every
+later screenshot masks the filled field (or is refused while that field is
+gone from the page). It needs a box on protocol 1.5 and an enabled vault.
+
 ## Desktop lock: agent desktop and browser tools (decision 0033)
 
 While the owner holds a session's desktop lock (the Take over button), the

@@ -37,6 +37,7 @@ import {
   type JsonValue,
   redactValues,
   type SessionId,
+  secretForms,
   type WorkspaceScope,
 } from "@hearth/core";
 import { imagesToRefs, type PendingBlob, restoreImages, storeBlobs } from "../obs/blobs";
@@ -113,8 +114,8 @@ const BULKY_FIELDS = new Set(["partial", "messages", "toolResults"]);
 export const REDACTED = "[redacted]";
 
 /**
- * `text` with every secret replaced, raw and as it appears inside a JSON
- * string. Provider errors can echo the key (`invalid x-api-key sk-...`).
+ * `text` with every secret replaced, in each of its forms (`secretForms`:
+ * raw, JSON-escaped, URL-encoded). Provider errors can echo the key (`invalid x-api-key sk-...`).
  * Overlapping secrets (a password that contains the username) are replaced
  * as one span, whatever their order (`redactValues`).
  */
@@ -124,29 +125,35 @@ export function redactSecrets(text: string, secrets: Iterable<string>): string {
 
 /**
  * Where the longest tail of `text` that could be the start of a secret
- * begins: the first index whose rest is a proper prefix of a secret, raw or
- * as it appears inside a JSON string; `text.length` when there is none.
- * Live output (decision 0036) never emits text from there on, so no secret
- * is shown in part before the rest of it arrives.
+ * begins: the first index whose rest is a proper prefix of a secret, in any
+ * of its forms (`secretForms`: raw, JSON-escaped, URL-encoded, with `%XX`
+ * hex in either case); `text.length` when there is none. Live output
+ * (decision 0036) never emits text from there on, so no secret is shown in
+ * part before the rest of it arrives.
  */
 export function secretStart(text: string, secrets: Iterable<string>): number {
   let start = text.length;
   for (const secret of secrets) {
     if (secret.length === 0) continue;
-    const escaped = JSON.stringify(secret).slice(1, -1);
-    for (const form of escaped === secret ? [secret] : [secret, escaped]) {
+    for (const form of secretForms(secret)) {
+      const encoded = form.includes("%");
       const first = form.charAt(0);
-      let i = text.indexOf(first, Math.max(0, text.length - form.length + 1));
-      while (i !== -1 && i < start) {
-        if (form.startsWith(text.slice(i))) {
+      for (let i = Math.max(0, text.length - form.length + 1); i < start; i++) {
+        if (text.charAt(i) !== first) continue;
+        const tail = text.slice(i);
+        if (form.startsWith(encoded ? upperHex(tail) : tail)) {
           start = i;
           break;
         }
-        i = text.indexOf(first, i + 1);
       }
     }
   }
   return start;
+}
+
+/** `text` with the hex digits of each `%XX` escape (or a cut `%X`) in upper case, as encoders write them. */
+function upperHex(text: string): string {
+  return text.replace(/%[0-9a-f]{1,2}/gi, (hex) => hex.toUpperCase());
 }
 
 /** The text a rebuilt runner gives a tool call that a hub restart cut off. */
@@ -274,6 +281,10 @@ export class SessionRunner {
       },
       // The desktop lock check of the browser tools (decision 0035).
       assertDesktopUnlocked: () => inner.assertDesktopUnlocked?.(),
+      // browser_fill's vault use (decision 0039); absent without a vault.
+      ...(inner.useSecret === undefined
+        ? {}
+        : { useSecret: inner.useSecret.bind(inner) as NonNullable<RunnerBox["useSecret"]> }),
     };
     try {
       const settingsManager = SettingsManager.inMemory({});

@@ -40,6 +40,7 @@ import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
+import type { HubVault } from "../vault/service";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
 import {
@@ -50,7 +51,7 @@ import {
   SessionRunner,
   secretStart,
 } from "./runner";
-import type { RunnerBox } from "./tools";
+import type { RunnerBox, SecretUseContext } from "./tools";
 
 /** The runner's config (hub config; see docs/runner.md). */
 export interface RunnerConfig {
@@ -104,6 +105,11 @@ export interface SessionRunnersOptions {
    * without a desktop), nothing is locked.
    */
   readonly desktopLocks?: DesktopLockCheck;
+  /**
+   * The vault's tool use (decision 0039): `browser_fill` resolves logins
+   * through it, bound to the session and the page origin. Unset, it refuses.
+   */
+  readonly vault?: Pick<HubVault, "use">;
 }
 
 export interface RunnerOptionsInput {
@@ -346,6 +352,18 @@ export class SessionRunners {
       operations: (boxId, callId, trace) => this.#o.tools.operations(boxId, callId, trace),
       // The browser tools refuse while the owner holds the desktop (decisions 0033, 0035).
       assertDesktopUnlocked: () => this.#o.desktopLocks?.assertUnlocked(sessionId),
+      ...(this.#o.vault === undefined
+        ? {}
+        : {
+            useSecret: (ref: string, context: SecretUseContext) =>
+              (this.#o.vault as Pick<HubVault, "use">).use(ref, {
+                sessionId,
+                tool: "browser_fill",
+                toolCallId: context.toolCallId,
+                origin: context.origin,
+                kinds: ["login"],
+              }),
+          }),
     };
   }
 

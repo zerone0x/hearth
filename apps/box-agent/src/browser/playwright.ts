@@ -10,17 +10,77 @@
  *   owns Chromium.
  * - **Dialogs.** A JavaScript dialog would block the page; it is dismissed
  *   (an `alert` accepted) and reported with the call's result.
+ * - **Masks** (decision 0039). An element `browser.fill` filled gets a
+ *   `data-hearth-mask` attribute with a fresh token, and the tab keeps a
+ *   handle to it. Every screenshot masks each element carrying the attribute
+ *   in any frame, and first checks each kept handle: still connected and still
+ *   carrying its token, or the screenshot is refused. A handle whose document
+ *   is gone (navigation, closed frame) is dropped: the value went with it.
  */
 
-import { type Browser, type BrowserContext, chromium, errors, type Page } from "playwright-core";
+import { randomUUID } from "node:crypto";
+import type { BrowserFieldKind } from "@hearth/protocol";
+
+import {
+  type Browser,
+  type BrowserContext,
+  chromium,
+  type ElementHandle,
+  errors,
+  type Frame,
+  type Page,
+} from "playwright-core";
 import { ToolCallError } from "../tools/errors";
 import {
   type BrowserDriver,
   type DriverDialog,
   DriverError,
   type DriverTab,
+  type FieldInfo,
   type TargetState,
 } from "./driver";
+
+/** The attribute that marks a filled element for the screenshot mask. */
+export const MASK_ATTRIBUTE = "data-hearth-mask";
+/** What a masked element looks like in a screenshot. */
+const MASK_COLOR = "#000000";
+
+/** A kept handle's document is gone: its frame navigated or closed. */
+const GONE_DOCUMENT = /context was destroyed|has been closed|disposed|not attached|detached/i;
+
+/** `scheme://host[:port]` of an http(s) URL, or null. */
+export function httpOrigin(url: string): string | null {
+  if (!URL.canParse(url)) return null;
+  const parsed = new URL(url);
+  return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : null;
+}
+
+/**
+ * Runs in the page: the field kind of an element (decision 0039). Typed
+ * structurally; box-agent has no DOM types.
+ */
+function fieldKindInPage(node: unknown): string {
+  const element = node as {
+    tagName: string;
+    isContentEditable?: boolean;
+    getAttribute(name: string): string | null;
+  };
+  const tag = element.tagName.toLowerCase();
+  const tokens = (element.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/);
+  if (tag === "input") {
+    const type = (element.getAttribute("type") ?? "text").toLowerCase();
+    const text = ["", "text", "email", "tel", "search", "url", "number", "password"];
+    if (!text.includes(type)) return "none";
+    if (tokens.includes("one-time-code")) return "one-time-code";
+    if (type === "password") return "password";
+    if (type === "email" || tokens.includes("username") || tokens.includes("email")) {
+      return "username";
+    }
+    return "other";
+  }
+  if (tag === "textarea" || element.isContentEditable === true) return "other";
+  return "none";
+}
 
 /** Pause between dials while the browser's CDP port is not up. */
 const DIAL_RETRY_MS = 250;
@@ -63,10 +123,17 @@ function connected(page: Page): boolean {
   return page.context().browser()?.isConnected() ?? true;
 }
 
+interface Mark {
+  readonly token: string;
+  readonly handle: ElementHandle;
+  readonly frame: Frame;
+}
+
 class PlaywrightTab implements DriverTab {
   readonly #page: Page;
   #navigations = 0;
   #dialogs: DriverDialog[] = [];
+  #marks: Mark[] = [];
 
   constructor(page: Page) {
     this.#page = page;
@@ -188,6 +255,79 @@ class PlaywrightTab implements DriverTab {
     return this.#run(() => this.#page.getByRef(ref).fill(text, { timeout: timeoutMs }));
   }
 
+  field(ref: string, timeoutMs: number): Promise<FieldInfo> {
+    return this.#run(async () => {
+      const target = this.#page.getByRef(ref);
+      if ((await target.count()) === 0) return { found: false, field: "none", origin: null };
+      const handle = await target.elementHandle({ timeout: timeoutMs });
+      try {
+        const field = (await handle.evaluate(fieldKindInPage)) as BrowserFieldKind;
+        // The URL the browser committed for the owner frame, not one page script reports.
+        const frame = await handle.ownerFrame();
+        return { found: true, field, origin: frame === null ? null : httpOrigin(frame.url()) };
+      } finally {
+        await handle.dispose().catch(() => {});
+      }
+    });
+  }
+
+  mark(ref: string, timeoutMs: number): Promise<void> {
+    return this.#run(async () => {
+      const handle = await this.#page.getByRef(ref).elementHandle({ timeout: timeoutMs });
+      const frame = await handle.ownerFrame();
+      if (frame === null) {
+        await handle.dispose().catch(() => {});
+        throw new DriverError("failed", "the element has no frame to mark it in");
+      }
+      const token = randomUUID();
+      await handle.evaluate(
+        (node: unknown, [name, value]: [string, string]) =>
+          (node as { setAttribute(n: string, v: string): void }).setAttribute(name, value),
+        [MASK_ATTRIBUTE, token] as [string, string],
+      );
+      this.#marks.push({ token, handle, frame });
+    });
+  }
+
+  /**
+   * Checks every kept mark before a screenshot: a mark whose document is gone
+   * is dropped; one whose element left a loaded document, or lost its token,
+   * refuses the screenshot.
+   */
+  async #checkMarks(): Promise<void> {
+    const kept: Mark[] = [];
+    let missing = 0;
+    for (const mark of this.#marks) {
+      if (mark.frame.isDetached()) continue;
+      let present: boolean;
+      try {
+        present = await mark.handle.evaluate(
+          (node: unknown, [name, value]: [string, string]) => {
+            const element = node as {
+              isConnected: boolean;
+              getAttribute(n: string): string | null;
+            };
+            return element.isConnected && element.getAttribute(name) === value;
+          },
+          [MASK_ATTRIBUTE, mark.token] as [string, string],
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (GONE_DOCUMENT.test(message)) continue;
+        present = false;
+      }
+      kept.push(mark);
+      if (!present) missing++;
+    }
+    this.#marks = kept;
+    if (missing > 0) {
+      throw new DriverError(
+        "mask",
+        `${missing} filled field${missing === 1 ? " is" : "s are"} no longer on the page where it was filled, so it cannot be masked`,
+      );
+    }
+  }
+
   select(ref: string, values: readonly string[], timeoutMs: number): Promise<void> {
     return this.#run(async () => {
       await this.#page.getByRef(ref).selectOption([...values], { timeout: timeoutMs });
@@ -216,16 +356,20 @@ class PlaywrightTab implements DriverTab {
     quality: number;
     timeoutMs: number;
   }): Promise<Buffer> {
-    const settings = {
-      type: "jpeg" as const,
-      quality: options.quality,
-      timeout: options.timeoutMs,
-    };
-    return this.#run(() =>
-      options.ref === undefined
-        ? this.#page.screenshot({ ...settings, fullPage: options.fullPage })
-        : this.#page.getByRef(options.ref).screenshot(settings),
-    );
+    return this.#run(async () => {
+      await this.#checkMarks();
+      const settings = {
+        type: "jpeg" as const,
+        quality: options.quality,
+        timeout: options.timeoutMs,
+        // Every marked element in every frame, a page restored from the back-forward cache included.
+        mask: this.#page.frames().map((frame) => frame.locator(`[${MASK_ATTRIBUTE}]`)),
+        maskColor: MASK_COLOR,
+      };
+      return options.ref === undefined
+        ? await this.#page.screenshot({ ...settings, fullPage: options.fullPage })
+        : await this.#page.getByRef(options.ref).screenshot(settings);
+    });
   }
 
   bringToFront(): Promise<void> {

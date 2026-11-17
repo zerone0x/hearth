@@ -534,8 +534,12 @@ approvals (M3) and shown on the live desktop, and the optional `expect`.
     `[secret]` in all later snapshot, find and error texts of the session;
   - the hub adds the value to the session's redaction set (0015, 0021), so
     the trajectory and logs redact it a second time;
-  - screenshots are not redacted, since a password field shows dots, but the
-    eval checks that.
+  - screenshots mask every filled element (adopted in decision 0039): the
+    box marks the element with a `data-hearth-mask` token and keeps a handle
+    to it at fill time, masks every marked element in every later
+    screenshot, and refuses the screenshot while a filled element is gone
+    from a loaded page. A username field shows its value, and a page can
+    copy a value elsewhere, so dots alone were not enough.
 - **What remains.** The value does enter the box, and any box command can read
   the page (CDP has no auth, 0026). That is the box trust domain the owner
   accepted: do not give the agent a credential it may not use. Whether site
@@ -628,8 +632,9 @@ key.
 
    Leave the closed browser, the hosted decider and the code-mode SDK.
 4. **Credentials.** Fill from a `secret` vault ref resolved at the RPC
-   boundary, then redact the filled value from every later snapshot. The aria
-   snapshot shows password values.
+   boundary, then redact the filled value from every later snapshot, and
+   mask the filled element in every later screenshot (decision 0039). The
+   aria snapshot shows password values.
 5. **Proposed follow-up issues** (not filed by this PR):
    - `feat(box): browser.* tool RPCs on playwright-core` (#93's scope,
      narrowed by this doc);

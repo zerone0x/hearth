@@ -8,6 +8,8 @@
  * refs the tools hand to the model.
  */
 
+import type { BrowserFieldKind } from "@hearth/protocol";
+
 /** What the pre-dispatch checks found about a target (decision 0032). */
 export interface TargetState {
   /** The ref resolves to an element of the latest snapshot. */
@@ -20,14 +22,28 @@ export interface TargetState {
   readonly covered: boolean;
 }
 
+/** A field as `browser.field` and `browser.fill` see it (decision 0039). */
+export interface FieldInfo {
+  /** The ref resolves to an element. */
+  readonly found: boolean;
+  readonly field: BrowserFieldKind;
+  /**
+   * `scheme://host[:port]` of the frame that owns the element, from the URL the
+   * browser committed for that frame (not from page script); null when the
+   * frame is not on an http(s) URL (about:blank, srcdoc, data:).
+   */
+  readonly origin: string | null;
+}
+
 /**
  * A failure of a driver call, mapped to an outcome by the tools.
  * `unavailable`: the browser went away during the call (Chromium killed or
- * restarted); the box's fault, and the next call reconnects.
+ * restarted); the box's fault, and the next call reconnects. `mask`: a filled
+ * element cannot be found for its screenshot mask, so no screenshot is taken.
  */
 export class DriverError extends Error {
   constructor(
-    readonly kind: "timeout" | "navigation" | "failed" | "unavailable",
+    readonly kind: "timeout" | "navigation" | "failed" | "unavailable" | "mask",
     message: string,
   ) {
     super(message);
@@ -64,9 +80,19 @@ export interface DriverTab {
   ): Promise<void>;
   /** Replaces the value of the field with `text`. */
   fill(ref: string, text: string, timeoutMs: number): Promise<void>;
+  /** The field's kind and its owner frame's origin. */
+  field(ref: string, timeoutMs: number): Promise<FieldInfo>;
+  /**
+   * Marks the element as holding a filled secret: every later screenshot of
+   * the tab masks it, and refuses (`DriverError` `mask`) while the element is
+   * gone from a document that is still loaded. The mark ends when the frame
+   * that owns the element navigates or goes away.
+   */
+  mark(ref: string, timeoutMs: number): Promise<void>;
   select(ref: string, values: readonly string[], timeoutMs: number): Promise<void>;
   press(ref: string | undefined, key: string, timeoutMs: number): Promise<void>;
   textVisible(text: string): Promise<boolean>;
+  /** Masks every marked element; throws `DriverError` `mask` when one cannot be found. */
   screenshot(options: {
     readonly ref?: string;
     readonly fullPage: boolean;
