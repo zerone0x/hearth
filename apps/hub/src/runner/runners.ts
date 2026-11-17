@@ -53,14 +53,21 @@ import {
 } from "./runner";
 import type { RunnerBox, SecretUseContext } from "./tools";
 
-/** The runner's config (hub config; see docs/runner.md). */
-export interface RunnerConfig {
+/**
+ * The model the runners talk to: from the environment (`HEARTH_MODEL*`) or
+ * from the Settings page (decision 0038). `setModel` swaps it at runtime.
+ */
+export interface ModelChoice {
   /** pi provider id, e.g. `anthropic`. */
   readonly provider: string;
   /** pi model id, e.g. `claude-sonnet-5-5`. */
   readonly model: string;
-  /** SecretStore reference of the provider key, e.g. `env:ANTHROPIC_API_KEY`. */
+  /** SecretStore reference of the provider key, e.g. `env:ANTHROPIC_API_KEY` or `vault:model-key`. */
   readonly apiKeyRef?: SecretRef;
+}
+
+/** The runner's config (hub config; see docs/runner.md). */
+export interface RunnerConfig extends ModelChoice {
   readonly denyList?: readonly DenyRule[];
   /** Allowlisted pinned extensions (#56). Empty by default. */
   readonly extensionAllowlist?: readonly ExtensionPin[];
@@ -89,7 +96,13 @@ export interface SessionRunnersOptions {
     operations(boxId: string, callId: string, trace?: RpcTrace): BoxToolOperations;
   };
   readonly secrets: SecretStore;
-  readonly config: RunnerConfig;
+  /**
+   * Without `provider` and `model` no model is set yet: a message fails with
+   * `runner.no-model` until the Settings page sets one (`setModel`).
+   */
+  readonly config: Omit<RunnerConfig, keyof ModelChoice> & Partial<ModelChoice>;
+  /** Waited for before a runner is made: the model settings load (decision 0038). */
+  readonly modelReady?: Promise<unknown>;
   /** Tests pass a runtime with pi-ai's faux provider; otherwise one is created. */
   readonly modelRuntime?: ModelRuntime;
   /** Extensions bundled with the hub; only allowlisted ones load. */
@@ -134,20 +147,37 @@ function failure(code: string, message: string, owner: "user" | "hub" = "user"):
   });
 }
 
+interface RunnerEntry {
+  readonly pending: Promise<SessionRunner>;
+  /** The `setModel` generation it was made under. */
+  readonly generation: number;
+  /** Set once `pending` resolves. */
+  runner?: SessionRunner;
+}
+
 export class SessionRunners {
   readonly #o: SessionRunnersOptions;
   readonly #scope: WorkspaceScope = { workspaceId: DEFAULT_WORKSPACE_ID };
-  readonly #runners = new Map<SessionId, Promise<SessionRunner>>();
+  readonly #runners = new Map<SessionId, RunnerEntry>();
   readonly #context = new Map<SessionId, readonly ContextFile[]>();
   readonly #contextFresh = new Set<SessionId>();
   readonly #denyList: readonly CompiledDenyRule[];
   readonly #extensions: readonly PinnedExtension[];
   #runtime: Promise<ModelRuntime> | undefined;
+  /** pi's model catalog, without a key: checks a model choice before it is saved. */
+  #catalog: Promise<ModelRuntime> | undefined;
+  #model: ModelChoice | undefined;
+  /** Bumped by `setModel`: an idle runner made under an older one is rebuilt on its next use. */
+  #generation = 0;
   /** SecretStore values the runners use (the model key): redacted from stored and logged text. */
   readonly #secretValues = new Set<string>();
 
   constructor(options: SessionRunnersOptions) {
     this.#o = options;
+    const { provider, model, apiKeyRef } = options.config;
+    if (provider !== undefined && model !== undefined) {
+      this.#model = { provider, model, ...(apiKeyRef === undefined ? {} : { apiKeyRef }) };
+    }
     this.#denyList = compileDenyList(options.config.denyList ?? []);
     const selection = selectExtensions(
       options.availableExtensions ?? [],
@@ -180,6 +210,32 @@ export class SessionRunners {
     (this.#o.log ?? console.error)(this.redact(line));
   }
 
+  /** The model new turns use, if one is set. */
+  get model(): ModelChoice | undefined {
+    return this.#model;
+  }
+
+  /**
+   * Switch the model (the Settings page, decision 0038). The next runtime
+   * resolves the new key; an idle runner is rebuilt from the event log on its
+   * next message, while a running turn keeps the model and key it started with.
+   * The old key stays in the redaction set.
+   */
+  setModel(choice: ModelChoice | undefined): void {
+    this.#model = choice;
+    this.#runtime = undefined;
+    this.#generation++;
+  }
+
+  /** Whether pi knows `provider`/`model` (built-in models and `HEARTH_MODELS_FILE`). */
+  async knowsModel(provider: string, model: string): Promise<boolean> {
+    this.#catalog ??= this.#newRuntime();
+    this.#catalog.catch(() => {
+      this.#catalog = undefined;
+    });
+    return (await this.#catalog).getModel(provider, model) !== undefined;
+  }
+
   /** Names of the extensions that load besides Hearth's own. */
   get loadedExtensions(): string[] {
     return this.#extensions.map((e) => e.name);
@@ -205,7 +261,7 @@ export class SessionRunners {
 
   async view(principal: Principal, sessionId: SessionId): Promise<RunnerView> {
     await this.#authorize(principal, "session.read", sessionId);
-    const pending = this.#runners.get(sessionId);
+    const pending = this.#runners.get(sessionId)?.pending;
     const log = await this.#readLog(sessionId);
     if (pending === undefined) {
       return { status: "none", failure: null, codemode: log.codemode };
@@ -243,7 +299,7 @@ export class SessionRunners {
   /** Interrupt the running turn. Resolves `false` when nothing was running. */
   async interrupt(principal: Principal, sessionId: SessionId): Promise<boolean> {
     await this.#authorize(principal, "session.interrupt", sessionId);
-    const pending = this.#runners.get(sessionId);
+    const pending = this.#runners.get(sessionId)?.pending;
     if (pending === undefined) return false;
     return (await pending).interrupt();
   }
@@ -261,18 +317,36 @@ export class SessionRunners {
 
   /** The session's runner, created or rebuilt from the event log on first use. */
   runner(sessionId: SessionId): Promise<SessionRunner> {
-    let pending = this.#runners.get(sessionId);
-    if (pending === undefined) {
-      pending = this.#create(sessionId);
-      this.#runners.set(sessionId, pending);
-      pending.catch(() => this.#runners.delete(sessionId));
+    const entry = this.#runners.get(sessionId);
+    if (entry !== undefined) {
+      // Same model, still being made, or busy with a turn: keep it. An idle
+      // runner made under an older model is rebuilt with the new one.
+      const stale = entry.generation !== this.#generation;
+      if (!stale || entry.runner?.status !== "idle") return entry.pending;
     }
+    const generation = this.#generation;
+    const old = entry?.runner;
+    const pending = (async () => {
+      // Idle means its last turn and that turn's event writes are done (runner.ts).
+      old?.dispose();
+      return this.#create(sessionId);
+    })();
+    const next: RunnerEntry = { pending, generation };
+    this.#runners.set(sessionId, next);
+    pending.then(
+      (runner) => {
+        next.runner = runner;
+      },
+      () => {
+        if (this.#runners.get(sessionId) === next) this.#runners.delete(sessionId);
+      },
+    );
     return pending;
   }
 
   /** Drop every runner (hub stop). */
   async close(): Promise<void> {
-    const all = [...this.#runners.values()];
+    const all = [...this.#runners.values()].map((e) => e.pending);
     this.#runners.clear();
     for (const pending of all) {
       const runner = await pending.catch(() => undefined);
@@ -283,12 +357,17 @@ export class SessionRunners {
   async #create(sessionId: SessionId): Promise<SessionRunner> {
     const log = await this.#readLog(sessionId);
     if (log.context !== undefined) this.#context.set(sessionId, log.context);
-    const runtime = await this.#modelRuntime();
-    const model = runtime.getModel(this.#o.config.provider, this.#o.config.model);
+    await this.#o.modelReady?.catch(() => undefined);
+    const choice = this.#model;
+    if (choice === undefined) {
+      throw failure("runner.no-model", "no model is set: choose one on the Settings page");
+    }
+    const runtime = await this.#modelRuntime(choice);
+    const model = runtime.getModel(choice.provider, choice.model);
     if (model === undefined) {
       throw failure(
         "runner.unknown-model",
-        `model ${this.#o.config.provider}/${this.#o.config.model} is not known to pi`,
+        `model ${choice.provider}/${choice.model} is not known to pi`,
       );
     }
     return SessionRunner.create({
@@ -314,28 +393,35 @@ export class SessionRunners {
     });
   }
 
-  #modelRuntime(): Promise<ModelRuntime> {
-    this.#runtime ??= (async () => {
-      const runtime =
-        this.#o.modelRuntime ??
-        (await ModelRuntime.create({
-          // An empty file of the hub's own: no `~/.pi/agent/auth.json`.
-          authPath: join(mkdtempSync(join(tmpdir(), "hearth-auth-")), "auth.json"),
-          modelsPath: this.#o.config.modelsFile ?? null,
-          refreshOnCreate: false,
-        }));
-      if (this.#o.config.apiKeyRef !== undefined) {
-        const key = (await this.#o.secrets.resolve(this.#o.config.apiKeyRef)).reveal();
+  async #newRuntime(): Promise<ModelRuntime> {
+    return (
+      this.#o.modelRuntime ??
+      (await ModelRuntime.create({
+        // An empty file of the hub's own: no `~/.pi/agent/auth.json`.
+        authPath: join(mkdtempSync(join(tmpdir(), "hearth-auth-")), "auth.json"),
+        modelsPath: this.#o.config.modelsFile ?? null,
+        refreshOnCreate: false,
+      }))
+    );
+  }
+
+  #modelRuntime(choice: ModelChoice): Promise<ModelRuntime> {
+    if (this.#runtime !== undefined) return this.#runtime;
+    const pending = (async () => {
+      const runtime = await this.#newRuntime();
+      if (choice.apiKeyRef !== undefined) {
+        const key = (await this.#o.secrets.resolve(choice.apiKeyRef)).reveal();
         this.#secretValues.add(key);
         registerSecret(key);
-        await runtime.setRuntimeApiKey(this.#o.config.provider, key);
+        await runtime.setRuntimeApiKey(choice.provider, key);
       }
       return runtime;
     })();
-    this.#runtime.catch(() => {
-      this.#runtime = undefined;
+    this.#runtime = pending;
+    pending.catch(() => {
+      if (this.#runtime === pending) this.#runtime = undefined;
     });
-    return this.#runtime;
+    return pending;
   }
 
   #box(sessionId: SessionId): RunnerBox {

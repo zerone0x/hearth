@@ -271,6 +271,7 @@ interface Harness {
 interface HarnessExtra {
   availableExtensions: PinnedExtension[];
   authorizer: Authorizer;
+  secrets: SecretStore;
   vault: SessionRunnersOptions["vault"];
 }
 
@@ -307,7 +308,7 @@ async function harness(
       blobs,
       sessions,
       tools: rpc,
-      secrets: noSecrets,
+      secrets: more.secrets ?? extra.secrets ?? noSecrets,
       config: {
         provider: "faux",
         model: faux.getModel().id,
@@ -526,6 +527,143 @@ describe("restart", () => {
     expect(seen).toEqual(["system", "user", "assistant", "toolResult", "assistant", "user"]);
     // The header is written once, not again on rebuild.
     expect(h.events.of("se_a", "runner.header")).toHaveLength(1);
+  });
+});
+
+describe("model switch (decision 0038)", () => {
+  function recordingSecrets(resolved: string[]): SecretStore {
+    return {
+      ...noSecrets,
+      resolve: async (ref) => {
+        resolved.push(ref);
+        return new SecretValue(`faux-key-for-${ref}`);
+      },
+    };
+  }
+
+  test("an idle runner is rebuilt with the new key and keeps its history", async () => {
+    const resolved: string[] = [];
+    const h = await harness({}, { secrets: recordingSecrets(resolved) });
+    const first = await turn(h, "se_a", "remember 7", [fauxAssistantMessage("noted")]);
+    expect(resolved).toEqual(["env:FAUX_KEY"]);
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id, apiKeyRef: "vault:next" });
+    expect(h.runners.model?.apiKeyRef).toBe("vault:next");
+    let seen: string[] = [];
+    const second = await turn(h, "se_a", "what was it?", [
+      (context) => {
+        seen = context.messages.map((m) => m.role);
+        return fauxAssistantMessage("7");
+      },
+    ]);
+    expect(second).not.toBe(first);
+    expect(resolved).toEqual(["env:FAUX_KEY", "vault:next"]);
+    expect(seen).toEqual(["system", "user", "assistant", "user"]);
+    // Without a new choice the runner is reused, and the key is not resolved again.
+    expect(await h.runners.runner("se_a")).toBe(second);
+    expect(resolved).toHaveLength(2);
+  });
+
+  test("a running turn keeps its runner; the switch applies once it is idle", async () => {
+    const resolved: string[] = [];
+    const h = await harness({}, { secrets: recordingSecrets(resolved) });
+    const gate = Promise.withResolvers<void>();
+    h.faux.setResponses([
+      async () => {
+        await gate.promise;
+        return fauxAssistantMessage("slow");
+      },
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_b", "go");
+    const running = await h.runners.runner("se_b");
+    expect(running.status).toBe("running");
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id, apiKeyRef: "vault:next" });
+    expect(await h.runners.runner("se_b")).toBe(running);
+    gate.resolve();
+    await running.settled();
+    const rebuilt = await h.runners.runner("se_b");
+    expect(rebuilt).not.toBe(running);
+    expect(resolved).toEqual(["env:FAUX_KEY", "vault:next"]);
+  });
+
+  test("without a model a message fails with runner.no-model until one is set", async () => {
+    const h = await harness();
+    const runners = new SessionRunners({
+      authorizer: allowAll,
+      events: h.events,
+      blobs: h.blobs,
+      sessions: h.sessions,
+      tools: h.rpc,
+      secrets: noSecrets,
+      config: {},
+      modelRuntime: h.runtime,
+      boxCwd: h.root,
+      log: () => {},
+    });
+    closers.push(() => runners.close());
+    expect(runners.model).toBeUndefined();
+    const error = await runners.send(LOCAL_PRINCIPAL, "se_a", "hi").catch((e: unknown) => e);
+    expect((error as HearthError).code).toBe("runner.no-model");
+    expect(await runners.knowsModel("faux", h.faux.getModel().id)).toBe(true);
+    expect(await runners.knowsModel("faux", "no-such-model")).toBe(false);
+    runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    h.faux.setResponses([fauxAssistantMessage("hello")]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "hi");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    expect(runner.status).toBe("idle");
+  });
+
+  function unset(h: Awaited<ReturnType<typeof harness>>, modelReady?: Promise<unknown>) {
+    const runners = new SessionRunners({
+      authorizer: allowAll,
+      events: h.events,
+      blobs: h.blobs,
+      sessions: h.sessions,
+      tools: h.rpc,
+      secrets: noSecrets,
+      config: {},
+      ...(modelReady === undefined ? {} : { modelReady }),
+      modelRuntime: h.runtime,
+      boxCwd: h.root,
+      log: () => {},
+    });
+    closers.push(() => runners.close());
+    return runners;
+  }
+
+  test("over HTTP a message without a model answers 409 runner.no-model", async () => {
+    const h = await harness();
+    const runners = unset(h);
+    const auth = new AuthService({ store: new SqliteLoginStore(openDatabase(":memory:")) });
+    const app = createApp({ boxes: {} as BoxConnections, auth });
+    mountRunnerRoutes(app, runners);
+    const res = await app.request("http://localhost/v1/sessions/se_a/messages", {
+      method: "POST",
+      headers: {
+        cookie: `${SESSION_COOKIE}=${auth.issueSession(LOCAL_PRINCIPAL).token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("runner.no-model");
+  });
+
+  test("a message sent before the saved settings load waits for them and uses their model", async () => {
+    const h = await harness();
+    const ready = Promise.withResolvers<void>();
+    const runners = unset(h, ready.promise);
+    h.faux.setResponses([fauxAssistantMessage("hello")]);
+    const sent = runners.send(LOCAL_PRINCIPAL, "se_a", "hi");
+    // Long enough for a runner made without waiting to have failed already.
+    await Bun.sleep(30);
+    runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    ready.resolve();
+    await sent;
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    expect(runner.status).toBe("idle");
+    expect(h.events.types("se_a")).toContain("runner.turn.end");
   });
 });
 

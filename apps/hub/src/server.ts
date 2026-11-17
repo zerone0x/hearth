@@ -43,6 +43,7 @@ import { mountTrajectoryRoutes, Trajectories } from "./obs/routes";
 import { HUB_VERSION } from "./obs/version";
 import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
+import { ModelSettings, mountSettingsRoutes } from "./settings";
 import {
   openDatabase,
   SqliteAuditSink,
@@ -51,6 +52,7 @@ import {
   SqliteEventStore,
   SqliteLoginStore,
   SqliteSessionStore,
+  SqliteSettingStore,
   SqliteVaultStore,
 } from "./store";
 import { HubVault, mountVaultRoutes } from "./vault";
@@ -281,8 +283,9 @@ export function startHub(options: HubOptions) {
   const sessionStore = new SqliteSessionStore(db);
   // The vault (decision 0031): opened in the background; a `vault:` resolve
   // waits for it. A missing or wrong key disables it and nothing else.
+  const vaultStore = new SqliteVaultStore(db);
   const vault = new HubVault({
-    store: new SqliteVaultStore(db),
+    store: vaultStore,
     authorizer,
     audit,
     keySecrets: options.vault?.keySecrets ?? createDefaultSecretStore(),
@@ -290,6 +293,8 @@ export function startHub(options: HubOptions) {
     ...(options.vault?.nextKeyRef === undefined ? {} : { nextKeyRef: options.vault.nextKeyRef }),
     // Its state goes to the hub's log; a hub without one (tests) stays quiet.
     log: options.log ?? (() => {}),
+    // A rotated or deleted model key is resolved again for the next turn (0038).
+    onValueChange: (name) => modelSettings.keyChanged(name),
   });
   const vaultReady = vault.open();
   /** The hub's SecretStore: `env:`, `file:` and `vault:` (E7). */
@@ -560,6 +565,8 @@ export function startHub(options: HubOptions) {
           boxes,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
+  // The model settings load after the vault opens; a first message waits for them.
+  const modelReady = Promise.withResolvers<void>();
   const runners =
     options.runner === undefined
       ? undefined
@@ -576,12 +583,46 @@ export function startHub(options: HubOptions) {
           },
           tools: toolRpc as ToolRpcClient,
           desktopLocks,
+          modelReady: modelReady.promise,
           // browser_fill resolves logins through the vault (decision 0039).
           vault,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
   mountVaultRoutes(app, vault);
+  // Model settings (decision 0038): `HEARTH_MODEL*` wins while set; else the
+  // Settings page's choice, applied to the runners at start and on each save.
+  const envModel = options.runner?.config;
+  const modelSettings = new ModelSettings({
+    settings: new SqliteSettingStore(db),
+    vaultStore,
+    vault,
+    authorizer,
+    audit,
+    ...(envModel?.provider === undefined || envModel.model === undefined
+      ? {}
+      : {
+          env: {
+            provider: envModel.provider,
+            model: envModel.model,
+            ...(envModel.apiKeyRef === undefined ? {} : { apiKeyRef: envModel.apiKeyRef }),
+          },
+        }),
+    // The first-start import reads the env's key through the env:/file: store.
+    importSecrets: options.vault?.keySecrets ?? createDefaultSecretStore(),
+    ...(runners === undefined
+      ? {}
+      : {
+          apply: (choice) => runners.setModel(choice),
+          knowsModel: (provider, model) => runners.knowsModel(provider, model),
+        }),
+    log: options.log ?? (() => {}),
+  });
+  const settingsReady = vaultReady
+    .then(() => modelSettings.start())
+    .catch((error: unknown) => options.log?.(`settings: could not load: ${String(error)}`))
+    .finally(() => modelReady.resolve());
+  mountSettingsRoutes(app, modelSettings);
   mountDesktopLockRoutes(app, desktopLocks);
   // The desktop stream (decision 0016): behind the login guard, owner only.
   desktop = new DesktopBridge({
@@ -615,6 +656,9 @@ export function startHub(options: HubOptions) {
     /** The vault (decision 0031) and its first open. */
     vault,
     vaultReady,
+    /** The model settings (decision 0038), loaded (and imported) once the vault opened. */
+    modelSettings,
+    settingsReady,
     /** The hub's SecretStore: `env:`, `file:` and `vault:`. */
     secrets,
     /** The session manager: sessions, lazy box start, hibernate, supervision (decision 0013). */

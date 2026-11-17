@@ -61,7 +61,7 @@ jobs:
           shell="$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell | head -1)"
           test -x "$shell"
           HEARTH_CHROMIUM="$shell" timeout 300 bun test apps/box-agent/src/browser/playwright.test.ts apps/hub/src/runner/browser-tools.chromium.test.ts
-      - name: Web e2e (setup, login, session, tool card, desktop, reload, asleep, mobile)
+      - name: Web e2e (setup, login, settings, session, tool card, desktop, reload, asleep, mobile)
         env:
           HEARTH_E2E_SCREENSHOTS: ${{ runner.temp }}/web-e2e
         run: timeout 300 bun run e2e:web

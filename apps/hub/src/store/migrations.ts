@@ -285,6 +285,23 @@ export const MIGRATIONS: readonly Migration[] = [
       BEGIN SELECT RAISE(ABORT, 'session_blob is immutable'); END;
     `,
   },
+  {
+    // Hub settings the owner changes in the UI (decision 0038), one JSON value
+    // per key and workspace. `model` holds `{provider, model, keyRef}`; the key
+    // itself is a `vault:` reference, never a value. Every write is audited
+    // (`settings.model.update`, `settings.model.import`) before it happens.
+    version: 8,
+    name: "hub settings",
+    sql: `
+      CREATE TABLE setting (
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, key)
+      ) STRICT;
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

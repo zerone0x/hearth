@@ -95,6 +95,25 @@ describe("migrate", () => {
     db.close();
   });
 
+  test("a database before the settings upgrades to them, empty (decision 0038)", () => {
+    const path = join(dir, "pre-settings.db");
+    const at = MIGRATIONS.findIndex((m) => m.name === "hub settings");
+    expect(at).toBeGreaterThan(5);
+    const old = openDatabase(path, { migrate: false });
+    migrate(old, MIGRATIONS.slice(0, at));
+    old.close();
+    const db = openDatabase(path, { migrate: false });
+    expect(migrate(db)[0]).toBe(at + 1);
+    expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM setting").get()?.n).toBe(0);
+    // A value must be JSON; one row per workspace and key.
+    expect(() =>
+      db.run("INSERT INTO setting VALUES ('ws_default', 'model', 'not json', 0)"),
+    ).toThrow();
+    db.run(`INSERT INTO setting VALUES ('ws_default', 'model', '{}', 0)`);
+    expect(() => db.run(`INSERT INTO setting VALUES ('ws_default', 'model', '{}', 1)`)).toThrow();
+    db.close();
+  });
+
   test("applies only the missing migrations", () => {
     const db = openDatabase(":memory:", { migrate: false });
     const first = [{ version: 1, name: "one", sql: "CREATE TABLE one (workspace_id TEXT)" }];

@@ -110,6 +110,13 @@ unset HEARTH_MODEL_KEY
 
 A model without a key (a local endpoint) still needs the file; leave it empty.
 
+On the first start with a vault (next step), the hub copies this key into the
+vault as `model-key-<provider>` and saves the model as the Settings page's
+choice (decision 0038). `HEARTH_MODEL` in `.env` still wins while it is set;
+to manage the model and its key on the Settings page instead, empty the
+`HEARTH_MODEL_PROVIDER` and `HEARTH_MODEL` lines and restart the hub. Keep the
+`secrets/model_key` file until a release drops it from `compose.yaml`.
+
 ### Create the vault key
 
 The vault (decision 0031) encrypts the secrets you add in Settings with a key

@@ -1,6 +1,7 @@
 /**
  * The web UI's e2e (#46) against a real hub (harness.ts) in Chromium:
- * first-run setup → sign out → sign in → create a session → send a message →
+ * first-run setup → sign out → sign in → Settings: add a model key, save the
+ * model with it, rotate the key, delete another secret → create a session → send a message →
  * see the tool card → open the desktop → take it over, type, release → reload, and the session continues
  * (the chat is rebuilt from the event log and a second turn runs) → the box
  * goes away and the desktop says it is asleep → wake. Along the way: the
@@ -118,6 +119,66 @@ try {
   if (loaded(SESSION_CHUNK) || loaded(NOVNC_CHUNK)) {
     throw new Error(`the session list loaded a lazy chunk: ${scripts.join(", ")}`);
   }
+
+  step("settings: add a model key, save the model with it, rotate it, delete a secret");
+  // Each dialog and select opens here, so a scroll lock's injected <style> (CSP) fails the run.
+  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByRole("heading", { name: "Secrets" }).waitFor();
+  const addSecret = async (name: string, kind: string, value: string) => {
+    await page.getByRole("button", { name: "Add secret" }).click();
+    const form = page.getByRole("form", { name: "Add secret" });
+    await form.getByLabel("Kind").selectOption({ label: kind });
+    await form.getByLabel("Name").fill(name);
+    await form.getByLabel("Value").fill(value);
+    await form.getByRole("button", { name: "Add" }).click();
+    await form.getByRole("status").filter({ hasText: "Saved. Fingerprint" }).waitFor();
+    await page.keyboard.press("Escape");
+    await form.waitFor({ state: "detached" });
+    await page.getByTestId("secret-row").filter({ hasText: name }).waitFor();
+  };
+  await addSecret("e2e-model-key", "Model key", "sk-e2e-model-key-1");
+  await addSecret("e2e-token", "Token", "e2e-token-value-1");
+  const model = page.getByRole("form", { name: "Model" });
+  await model.getByLabel("Provider").fill("faux");
+  await model.getByLabel("Model").fill(e2e.faux.getModel().id);
+  await model.getByLabel("Key").click();
+  await model.getByLabel("Key").selectOption("vault:e2e-model-key");
+  await model.getByRole("button", { name: "Save" }).click();
+  await model
+    .getByRole("status")
+    .filter({ hasText: `Saved. New turns use faux/${e2e.faux.getModel().id}.` })
+    .waitFor();
+  await page
+    .getByTestId("secret-row")
+    .filter({ hasText: "e2e-model-key" })
+    .getByRole("button", { name: "Rotate" })
+    .click();
+  const rotate = page.getByRole("form", { name: "Rotate secret" });
+  await rotate.getByLabel("Value").fill("sk-e2e-model-key-2");
+  await rotate.getByRole("button", { name: "Rotate" }).click();
+  await rotate.getByRole("status").filter({ hasText: "Rotated to version 2" }).waitFor();
+  await page.keyboard.press("Escape");
+  await rotate.waitFor({ state: "detached" });
+  await page
+    .getByTestId("secret-row")
+    .filter({ hasText: "e2e-token" })
+    .getByRole("button", { name: "Delete" })
+    .click();
+  const confirm = page.getByRole("alertdialog");
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await page
+    .getByTestId("secret-row")
+    .filter({ hasText: "e2e-token" })
+    .waitFor({ state: "detached" });
+  await shot(page, "1b-settings");
+  for (const value of ["sk-e2e-model-key-1", "sk-e2e-model-key-2", "e2e-token-value-1"]) {
+    if ((await page.content()).includes(value)) throw new Error("a secret value is in the page");
+  }
+  if (cspViolations.length > 0) {
+    throw new Error(`CSP violations on Settings: ${cspViolations.join("; ")}`);
+  }
+  await page.goto(base);
+  await page.getByRole("button", { name: "New session" }).waitFor();
 
   step("create a session");
   await page.getByLabel("New session title").fill("Say hello");
