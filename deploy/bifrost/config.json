@@ -1,0 +1,31 @@
+{
+  "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
+  "client": {
+    "enable_logging": true,
+    "disable_content_logging": true,
+    "enforce_auth_on_inference": true,
+    "allow_direct_keys": false
+  },
+  "governance": {
+    "auth_config": {
+      "admin_username": "hearth",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD",
+      "is_enabled": true
+    }
+  },
+  "framework": {
+    "pricing": {
+      "mcp_library_sync_interval": 0
+    }
+  },
+  "config_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": { "path": "/app/data/config.db" }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": { "path": "/app/data/logs.db" }
+  }
+}

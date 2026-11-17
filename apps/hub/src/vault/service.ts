@@ -99,6 +99,11 @@ export interface SecretView {
   readonly createdAt: EpochMs;
   readonly updatedAt: EpochMs;
   readonly lastUsedAt: EpochMs | null;
+  /**
+   * The hub generated and manages this entry (`systemEntries`): the API
+   * refuses to rotate or delete it, and the Settings page shows no buttons.
+   */
+  readonly system: boolean;
 }
 
 /** One use, from the audit table. */
@@ -151,6 +156,16 @@ function originOf(raw: string): string | undefined {
   return url.protocol === "https:" || url.protocol === "http:" ? url.origin : undefined;
 }
 
+/** The `use` of a stored policy, or undefined (not a token, or a policy that does not parse). */
+function policyUse(policyJson: string): unknown {
+  try {
+    const policy: unknown = JSON.parse(policyJson);
+    return isRecord(policy) ? policy["use"] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** True for a token entry whose policy opts in to box commands (`use: box-env`). */
 function boxEnvAllowed(kind: VaultKind, policyJson: string): boolean {
   if (kind !== "token") return false;
@@ -179,6 +194,15 @@ export interface HubVaultOptions {
    * settings rebuild the runtime when it is the model's key (decision 0038).
    */
   readonly onValueChange?: (name: string) => void;
+  /** Called after an entry was added: the Bifrost service pushes a new model key (decision 0046). */
+  readonly onEntryAdded?: (name: string) => void;
+  /**
+   * Entries the hub generates and manages itself (Bifrost's admin password
+   * and encryption key, decision 0046). Only the hub (`SYSTEM_PRINCIPAL`)
+   * creates them; nobody rotates, re-uses or deletes them through the API,
+   * since a changed encryption key leaves Bifrost's store unreadable.
+   */
+  readonly systemEntries?: readonly string[];
   readonly now?: () => EpochMs;
   /** Adds a value to the sink-side redaction set. Default `registerSecret` (decision 0021). */
   readonly register?: (value: string) => void;
@@ -222,6 +246,14 @@ function invalid(message: string): HearthError {
   return fail("request.invalid", message);
 }
 
+/** A hub-managed entry (`systemEntries`) the API was asked to change. */
+function systemManaged(name: string, what: string): HearthError {
+  return fail(
+    "secret.system-managed",
+    `${name} is managed by the hub for the Bifrost gateway and cannot be ${what} (decision 0046; docs/install.md, "Bifrost's store")`,
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -246,7 +278,7 @@ function bindingOf(row: EntryBinding): EntryBinding {
   };
 }
 
-function viewOf(row: VaultEntryRecord): SecretView {
+function viewOf(row: VaultEntryRecord, system: boolean): SecretView {
   return {
     id: row.id,
     name: row.name,
@@ -259,6 +291,7 @@ function viewOf(row: VaultEntryRecord): SecretView {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     lastUsedAt: row.lastUsedAt,
+    system,
   };
 }
 
@@ -328,7 +361,7 @@ export class HubVault implements VaultReader {
 
   async list(principal: Principal): Promise<SecretView[]> {
     await this.#authorize(principal, "secret.list", "secret");
-    return this.#o.store.list(this.#workspaceId).map(viewOf);
+    return this.#o.store.list(this.#workspaceId).map((row) => viewOf(row, this.#managed(row)));
   }
 
   async create(
@@ -346,6 +379,9 @@ export class HubVault implements VaultReader {
     const name = input["name"];
     if (typeof name !== "string" || !VAULT_NAME.test(name)) {
       throw invalid("name must match [a-z0-9][a-z0-9._-]{0,63}");
+    }
+    if (this.#isSystem(name) && principal.id !== SYSTEM_PRINCIPAL.id) {
+      throw systemManaged(name, "added by hand");
     }
     const kind = input["kind"];
     if (typeof kind !== "string" || !(VAULT_KINDS as readonly string[]).includes(kind)) {
@@ -395,6 +431,7 @@ export class HubVault implements VaultReader {
       );
       this.#registerFields(fields);
       this.#log(`vault: secret ${name} added (${kind}, ${fingerprint})`);
+      this.#o.onEntryAdded?.(name);
       return { id: binding.id, fingerprint, version: 1 };
     });
   }
@@ -413,6 +450,7 @@ export class HubVault implements VaultReader {
     return this.#serial(async () => {
       const state = await this.#enabled();
       const row = this.#row(id);
+      if (this.#managed(row)) throw systemManaged(row.name, "rotated or given another use");
       const fields = checkEntryFields(row.kind, input["fields"]);
       // A token's `use` (decision 0041) may change with its value, as the owner
       // types it again; the new policy is bound into the new ciphertext's AAD.
@@ -462,6 +500,7 @@ export class HubVault implements VaultReader {
     await this.#authorize(principal, "secret.delete", "secret", id);
     await this.#serial(async () => {
       const row = this.#row(id);
+      if (this.#managed(row)) throw systemManaged(row.name, "deleted");
       await withAudit(
         this.#o.audit,
         this.#record(principal, "secret.delete", id, {
@@ -857,6 +896,24 @@ export class HubVault implements VaultReader {
       throw fail("vault.disabled", `the vault is disabled (${reason})`);
     }
     return state;
+  }
+
+  #isSystem(name: string): boolean {
+    return this.#o.systemEntries?.includes(name) ?? false;
+  }
+
+  /**
+   * A system entry as the hub made it: a global token with `use: hub`. An
+   * entry under a system name that is not (made by hand before the name was
+   * reserved) is the owner's to delete, so the hub can make its own.
+   */
+  #managed(row: VaultEntryRecord): boolean {
+    return (
+      this.#isSystem(row.name) &&
+      row.kind === "token" &&
+      row.scopeSessionId === null &&
+      policyUse(row.policyJson) === "hub"
+    );
   }
 
   #row(id: string): VaultEntryRecord {

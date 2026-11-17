@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { createDefaultSecretStore, type SecretStore } from "@hearth/core";
+import { bifrostConfigFromEnv, markerAllowList } from "./bifrost";
 import { DockerBoxProvider, dockerBoxConfigFromEnv } from "./box/docker";
-import { boxEgressFromEnv } from "./box/egress";
+import { boxEgressFromEnv, DEFAULT_BOX_EGRESS_MARKER } from "./box/egress";
 import { hubLines } from "./obs/hub-log";
 import { registerKnownSecrets } from "./obs/redaction";
 import { observabilityFromEnv } from "./obs/setup";
@@ -148,6 +149,15 @@ export function vaultConfigFromEnv(env: Readonly<Record<string, string | undefin
   };
 }
 
+/** The allow list in the box firewall's marker, or none when there is no marker (decision 0023). */
+export function egressAllowFromMarker(path: string): string[] {
+  try {
+    return markerAllowList(readFileSync(path, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
 if (import.meta.main) {
   // Process entry point. Only listening config, the box provider's host
   // settings and the data directory are read here; secrets never come from env
@@ -161,6 +171,9 @@ if (import.meta.main) {
   mkdirSync(dataDir, { recursive: true });
   const runnerConfig = runnerConfigFromEnv(process.env);
   const webRoot = webRootFromEnv(process.env);
+  // The Bifrost gateway (decision 0046); its allow-list check reads the firewall marker (0023).
+  const bifrost = bifrostConfigFromEnv(process.env);
+  const marker = process.env["HEARTH_BOX_EGRESS_MARKER"] || DEFAULT_BOX_EGRESS_MARKER;
   // JSON logs and optional OTLP export (decision 0021, obs/setup.ts).
   const obs = observabilityFromEnv(process.env);
   const log = obs.logger.child({}, "hub");
@@ -182,6 +195,9 @@ if (import.meta.main) {
     ...(publicOrigin === undefined ? {} : { publicOrigin }),
     ...(provider === undefined ? {} : { provider }),
     boxEgress,
+    ...(bifrost === undefined
+      ? {}
+      : { bifrost: { ...bifrost, egressAllow: () => egressAllowFromMarker(marker) } }),
     dbPath: join(dataDir, "hearth.db"),
     ...(webRoot === undefined ? {} : { webRoot }),
     ...(process.env["HEARTH_BOX_IMAGE"] ? { boxImage: process.env["HEARTH_BOX_IMAGE"] } : {}),

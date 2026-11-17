@@ -70,6 +70,19 @@ describe("hub log lines: level, component and ids", () => {
     expect(lineLevel("box bx_1: ignored unexpected hello frame")).toBe("warn");
     expect(lineLevel("box listener on http://172.18.0.1:8788")).toBe("info");
     expect(lineLevel("first run: set the owner password with setup token hst_abc123")).toBe("info");
+    // Bifrost (decision 0046).
+    expect(lineLevel("bifrost: ok")).toBe("info");
+    expect(lineLevel("bifrost: unreachable (HTTP 503)")).toBe("warn");
+    expect(lineLevel("bifrost: vault-disabled (the secrets live in the vault)")).toBe("warn");
+    expect(lineLevel("bifrost: unauthorized (the admin password was refused)")).toBe("error");
+    expect(lineLevel("bifrost: box-reachable (the allow list covers it)")).toBe("error");
+    expect(
+      lineLevel(
+        "bifrost: secrets-unusable (vault:bifrost-encryption-key is not a global token with use hub)",
+      ),
+    ).toBe("error");
+    expect(lineLevel("bifrost: could not push the provider keys: HTTP 500")).toBe("error");
+    expect(lineFields("bifrost: ok")).toEqual({ component: "bifrost" });
   });
 
   test("component and ids come from the line", () => {

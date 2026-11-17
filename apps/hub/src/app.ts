@@ -3,6 +3,7 @@ import { formatVersion, PROTOCOL_VERSION } from "@hearth/protocol";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
+import type { BifrostState, BifrostStatus } from "./bifrost";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
 import { HUB_VERSION } from "./obs/version";
@@ -37,6 +38,11 @@ export interface AppOptions {
    * hub; `startHub` sets it whenever a box provider is configured.
    */
   readonly boxEgress?: BoxEgressCheck;
+  /**
+   * The Bifrost gateway's state (decision 0046). When set, `/healthz` reports
+   * it as `bifrost`; set whenever Bifrost is configured.
+   */
+  readonly bifrost?: () => BifrostStatus;
   /**
    * Directory of the built web UI (`apps/web/dist`, decision 0017). When set,
    * `GET`/`HEAD` outside `/v1/` are served from it without a login; the
@@ -95,6 +101,12 @@ function statusFor(error: HearthError): 400 | 403 | 409 | 500 | 502 | 504 {
  * Builds the hub's HTTP app. Kept free of listening and process concerns so
  * tests can drive it with `app.request()`.
  */
+/** `/healthz`'s Bifrost fields: the summary and the state behind it. */
+function bifrostHealth(state: BifrostState): { bifrost: string; bifrostState: BifrostState } {
+  const bifrost = state === "ok" || state === "starting" ? state : "unavailable";
+  return { bifrost, bifrostState: state };
+}
+
 export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   const app = new Hono<HubEnv>();
   const publicOrigin = options.publicOrigin;
@@ -167,6 +179,7 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   // input and returns no workspace data (docs/DECISIONS.md, 0001).
   // `boxEgress` is the hub's own state, not workspace data.
   const boxEgress = options.boxEgress;
+  const bifrost = options.bifrost;
   app.get("/healthz", (c) =>
     c.json(
       {
@@ -175,6 +188,9 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
         // The build, as stamped on trajectories (decision 0021).
         version: HUB_VERSION,
         ...(boxEgress === undefined ? {} : { boxEgress: boxEgress().state }),
+        // `ok`, `starting` or `unavailable`, and why (decision 0046). Model
+        // traffic does not need Bifrost yet, so the hub is healthy either way.
+        ...(bifrost === undefined ? {} : bifrostHealth(bifrost().state)),
       },
       200,
     ),

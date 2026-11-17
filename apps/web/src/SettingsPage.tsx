@@ -363,8 +363,14 @@ function SecretsCard({ secrets, vaultOn }: { secrets: Secret[] | undefined; vaul
                     {s.lastUsedAt === null ? "never" : new Date(s.lastUsedAt).toLocaleString()}
                   </TableCell>
                   <TableCell className="text-right whitespace-nowrap">
-                    <RotateSecretDialog secret={s} disabled={!vaultOn} />
-                    <DeleteSecretDialog secret={s} />
+                    {s.system ? (
+                      <span className="text-xs text-muted-foreground">{SYSTEM_SECRET_NOTE}</span>
+                    ) : (
+                      <>
+                        <RotateSecretDialog secret={s} disabled={!vaultOn} />
+                        <DeleteSecretDialog secret={s} />
+                      </>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -375,6 +381,12 @@ function SecretsCard({ secrets, vaultOn }: { secrets: Secret[] | undefined; vaul
     </Card>
   );
 }
+
+/**
+ * In place of Rotate and Delete on an entry the hub manages (Bifrost's admin
+ * password and encryption key, decision 0046): the hub refuses both.
+ */
+export const SYSTEM_SECRET_NOTE = "Managed by the hub";
 
 /** The warning a token usable by box commands carries, in the table and on the switch. */
 export const BOX_ENV_WARNING = "visible to commands in the box";

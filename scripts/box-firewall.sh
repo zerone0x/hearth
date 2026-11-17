@@ -22,6 +22,7 @@
 # Usage (as root, once per boot after Docker started; idempotent):
 #   scripts/box-firewall.sh apply    install or refresh the rules
 #   scripts/box-firewall.sh remove   take them out again
+#   scripts/box-firewall.sh check    validate the settings only; change nothing
 # Settings:
 #   HEARTH_BOX_PORT            the hub's box listener port (default 8788)
 #   HEARTH_BOX_EGRESS_ALLOW    comma-separated IPv4 addresses or CIDRs to let
@@ -29,6 +30,11 @@
 #                              ("192.168.1.1/32"), on one line. A /0, an
 #                              octet with a leading zero and a newline are
 #                              refused.
+#   HEARTH_BIFROST_ADDR        the model gateway's IPv4 address on its compose
+#                              network (decision 0046). It must lie in a range
+#                              these rules reject, and no allow entry may
+#                              cover it, so no box reaches Bifrost's admin or
+#                              inference API. Empty: no gateway to check.
 #   HEARTH_BOX_EGRESS_MARKER   the marker path (default
 #                              /run/hearth/box-egress.applied); the hub reads
 #                              the same variable
@@ -39,6 +45,7 @@ set -euo pipefail
 
 port="${HEARTH_BOX_PORT:-8788}"
 allow="${HEARTH_BOX_EGRESS_ALLOW:-}"
+bifrost="${HEARTH_BIFROST_ADDR:-}"
 marker="${HEARTH_BOX_EGRESS_MARKER:-/run/hearth/box-egress.applied}"
 iface="hbx+"
 in_chain="HEARTH-BOX-IN"
@@ -120,6 +127,23 @@ if [ -n "$allow" ]; then
     [ -n "$entry" ] || continue
     cidr="$(check_cidr "$entry")" || exit 2
     allowed+=("$cidr")
+  done
+fi
+
+# Bifrost (decision 0046): a rejected private address that no allow entry covers.
+if [ -n "$bifrost" ]; then
+  ip_to_int "$bifrost" >/dev/null ||
+    fail "HEARTH_BIFROST_ADDR: '$bifrost' is not an IPv4 address (dotted-quad decimal, no leading zeros)"
+  covered=""
+  for cidr in "${blocked[@]}"; do
+    if in_cidr "$bifrost" "$cidr"; then covered=1; fi
+  done
+  [ -n "$covered" ] ||
+    fail "HEARTH_BIFROST_ADDR: $bifrost is not in a private range these rules reject; boxes could reach Bifrost"
+  for cidr in "${allowed[@]}"; do
+    if in_cidr "$bifrost" "$cidr"; then
+      fail "HEARTH_BOX_EGRESS_ALLOW: '$cidr' covers Bifrost's address $bifrost; boxes must never reach the model gateway"
+    fi
   done
 fi
 
@@ -299,8 +323,9 @@ remove() {
 case "${1:-}" in
   apply) apply ;;
   remove) remove ;;
+  check) echo "box firewall settings are valid" ;;
   *)
-    echo "usage: $0 apply|remove" >&2
+    echo "usage: $0 apply|remove|check" >&2
     exit 2
     ;;
 esac

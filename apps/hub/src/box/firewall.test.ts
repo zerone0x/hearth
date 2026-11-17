@@ -137,6 +137,33 @@ describe.skipIf(!available)("box-firewall.sh in a network namespace", () => {
     expect(errors).toContain("no leading zeros");
   });
 
+  test("an allow list that covers Bifrost's address is refused before any rule or the marker changes (0046)", () => {
+    const r = inNetns(
+      `
+      bash "$fw" apply >/dev/null 2>&1 || exit 10
+      save >"$M/before"
+      for entry in 172.29.249.2 172.29.249.0/29 172.16.0.0/12; do
+        HEARTH_BOX_EGRESS_ALLOW="$entry" bash "$fw" apply 2>>"$M/errors"
+        code=$?
+        save >"$M/after"
+        same=same; cmp -s "$M/before" "$M/after" || same=changed
+        marker=kept; [ -e "$HEARTH_BOX_EGRESS_MARKER" ] || marker=gone
+        echo "$entry $code $same $marker"
+      done
+    `,
+      { HEARTH_BIFROST_ADDR: "172.29.249.2" },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim().split("\n")).toEqual([
+      "172.29.249.2 2 same kept",
+      "172.29.249.0/29 2 same kept",
+      "172.16.0.0/12 2 same kept",
+    ]);
+    expect(read("errors")).toContain("covers Bifrost's address 172.29.249.2");
+    // The applied rules reject Bifrost's address from a box.
+    expect(read("before")).toContain("-A HEARTH-BOX-FWD -d 172.16.0.0/12 -p tcp -j REJECT");
+  });
+
   test("a newline in the allow list is refused, not a silent end of the list", () => {
     const r = inNetns(
       `

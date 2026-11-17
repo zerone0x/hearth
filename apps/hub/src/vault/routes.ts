@@ -28,6 +28,7 @@ function statusOf(code: string): 400 | 403 | 404 | 409 | 500 | 503 {
       return 404;
     case "secret.name-taken":
     case "secret.conflict":
+    case "secret.system-managed":
     case "vault.disabled":
       return 409;
     case "audit.write-failed":
