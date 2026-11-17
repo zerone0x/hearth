@@ -27,6 +27,13 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Check
         run: bun run check
+      # Decision 0046: the hub's Bifrost service against the real Bifrost
+      # v2.5.1 binary (downloaded by pinned checksum, never committed),
+      # started by deploy/bifrost/start.sh with deploy/bifrost/config.json.
+      - name: Bifrost service against the Bifrost binary
+        run: |
+          bin="$(timeout 300 scripts/fetch-bifrost.sh "$RUNNER_TEMP/bifrost")"
+          HEARTH_BIFROST_TESTS=1 HEARTH_BIFROST_BIN="$bin" timeout 300 bun test apps/hub/src/bifrost/
       # docs/demo.md (#36): the hub-box echo without Docker. The output is
       # captured first and grepped after, so a demo that hangs, fails or
       # prints neither line fails the step.
@@ -261,7 +268,8 @@ jobs:
         run: |
           docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/hub.Dockerfile
           docker run --rm -i hadolint/hadolint:v2.15.1 < deploy/firewall.Dockerfile
-          shellcheck scripts/doc-block.sh scripts/run-doc-block.sh deploy/firewall-entrypoint.sh
+          shellcheck scripts/doc-block.sh scripts/run-doc-block.sh deploy/firewall-entrypoint.sh \
+            deploy/bifrost/start.sh scripts/fetch-bifrost.sh
       - name: Start the faux model server (127.0.0.1:18080)
         run: |
           nohup bun deploy/e2e/faux-model.ts 18080 > "$RUNNER_TEMP/faux-model.log" 2>&1 &
@@ -316,6 +324,48 @@ jobs:
           sudo iptables -S HEARTH-BOX-FWD
           cat /run/hearth/box-egress.applied
           curl -fsS http://127.0.0.1:8787/healthz
+      - name: "install.md: Bifrost is up with the vault's secrets (decision 0046)"
+        working-directory: deploy
+        run: |
+          "$RUN_BLOCK" "$DOC" install:bifrost
+          curl -fsS http://127.0.0.1:8787/healthz | jq -e '.bifrost == "ok"'
+          docker compose logs bifrost | grep -F "secrets received from the hub"
+          docker compose logs hub | grep -F "vault: secret bifrost-admin-password added"
+          docker compose logs hub | grep -F "vault: secret bifrost-encryption-key added"
+      - name: Bifrost is on its own network, unpublished, with a store only it mounts
+        working-directory: deploy
+        run: |
+          id="$(docker compose ps -q bifrost)"
+          docker inspect "$id" --format '{{json .NetworkSettings.Ports}}'
+          # No host port published.
+          test -z "$(docker port "$id")"
+          # Its address is the one the hub and the firewall were given.
+          test "$(docker inspect "$id" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')" = 172.29.249.2
+          # The pinned digest.
+          docker inspect "$id" --format '{{.Config.Image}}' | grep -F '@sha256:5ec9873acaf1687556b6e4dd854b92b539d9debf87a5a683b66338648b84d3c8'
+          # Only Bifrost mounts its data volume; the handoff volume is tmpfs.
+          users="$(docker ps -aq --no-trunc --filter volume=hearth_bifrost-data)"
+          test "$users" = "$id"
+          docker volume inspect hearth_bifrost-handoff --format '{{json .Options}}' | grep -F '"type":"tmpfs"'
+          # The host (the hub's network) reaches it; its admin API needs the password.
+          curl -fsS http://172.29.249.2:8080/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://172.29.249.2:8080/api/providers)" = 401
+      # A box-like network (an hbx bridge, as DockerBoxProvider names them)
+      # under the box firewall: Bifrost's address is refused. The same probe
+      # from the host's network (the hub's) gets an answer, so the refusal is
+      # not Bifrost being down.
+      - name: A box cannot reach Bifrost (decisions 0012, 0023, 0046)
+        run: |
+          docker network create -o com.docker.network.bridge.name=hbx0000000bf156 hearth-e2e-bifrost-probe
+          # The box image has python3, not curl.
+          probe=(python3 -c "import urllib.request; urllib.request.urlopen('http://172.29.249.2:8080/health', timeout=5)")
+          if docker run --rm --network hearth-e2e-bifrost-probe --entrypoint "${probe[0]}" hearth-box:local "${probe[@]:1}"; then
+            echo "a box network reached Bifrost" >&2
+            docker network rm hearth-e2e-bifrost-probe
+            exit 1
+          fi
+          docker network rm hearth-e2e-bifrost-probe
+          docker run --rm --network host --entrypoint "${probe[0]}" hearth-box:local "${probe[@]:1}"
       - name: The hub reports the build install.md stamped (not 0.0.0)
         working-directory: deploy
         run: |
@@ -354,6 +404,9 @@ jobs:
           test "$(stat -c %a secrets/vault_key)" = 600
           timeout 60 bash -c 'until docker compose logs --since 10m hub | grep -q "vault: enabled"; do sleep 1; done'
           if docker compose logs hub | grep "key-mismatch"; then echo "vault key mismatch after upgrade" >&2; exit 1; fi
+      - name: After the upgrade Bifrost still accepts the vault's password
+        working-directory: deploy
+        run: timeout 300 "$RUN_BLOCK" "$DOC" install:bifrost
       - name: After the upgrade the session continues
         run: timeout 300 bun deploy/e2e/prototype.ts upgrade
       - name: "install.md: uninstall"
@@ -375,6 +428,7 @@ jobs:
           left="$(docker volume ls -q --filter label=dev.hearth.managed=true)"
           test -z "$left"
           if docker volume inspect hearth_hearth-data >/dev/null 2>&1; then echo "volume hearth_hearth-data left" >&2; exit 1; fi
+          if docker volume inspect hearth_bifrost-data >/dev/null 2>&1; then echo "volume hearth_bifrost-data left" >&2; exit 1; fi
           if docker image inspect hearth-hub:local >/dev/null 2>&1; then echo "image hearth-hub:local left" >&2; exit 1; fi
           test ! -e secrets/vault_key
       - name: Logs

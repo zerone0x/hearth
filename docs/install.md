@@ -1,7 +1,8 @@
 # Install Hearth with Docker Compose
 
 This installs the M1 prototype (PRD §11.1) on one Docker host: the hub with
-its web UI, the box image, and the box egress firewall. The layout and its
+its web UI, the box image, the box egress firewall, and the Bifrost model
+gateway (PRD §6.4, decision 0046). The layout and its
 trade-offs are in decision 0020 (`docs/DECISIONS.md`).
 
 CI runs this page verbatim: every block tagged `install:<step>` is run, in
@@ -47,6 +48,17 @@ Read this before you install.
   `scripts/box-firewall.sh` (decision 0012), which keep boxes off the host,
   your LAN and cloud metadata. It writes `/run/hearth/box-egress.applied`; the
   hub starts no box without it.
+- **Bifrost, the model gateway, runs next to the hub** (`maximhq/bifrost`
+  v2.5.1, pinned by digest; decision 0046). It is on its own bridge network,
+  `hearth-bifrost`, at `172.29.249.2` (`HEARTH_BIFROST_ADDR` and
+  `HEARTH_BIFROST_SUBNET` in `.env` change it if that range is taken), with no
+  port published. The hub reaches it from the host's network; boxes cannot:
+  the firewall rejects private ranges, and it refuses an allow list that
+  covers Bifrost's address. Its admin password and the key that encrypts the
+  provider keys in its store are vault entries the hub generates; they reach
+  Bifrost through a memory-only volume, never a file beside its store. Model
+  calls do not go through Bifrost yet (#157).
+- **Bifrost needs outbound HTTPS** (see [Bifrost's egress](#bifrosts-egress)).
 
 ## First run
 
@@ -154,6 +166,24 @@ mv secrets/vault_key.next secrets/vault_key
 docker compose up -d --force-recreate --wait hub
 ```
 
+### Bifrost's egress
+
+Bifrost connects out to:
+
+- the model providers whose keys you add (for example `api.anthropic.com`,
+  `api.openai.com`), once model calls go through it (#157);
+- `getbifrost.ai`, for its model price list (`/datasheet`) and model
+  parameters, at its first start and every 24 hours after. **On its first
+  start Bifrost v2.5.1 exits if the price list cannot be downloaded** and it
+  has none stored yet; compose restarts it until it can. On a host without
+  this access, set `framework.pricing.pricing_url` and `model_parameters_url`
+  in `deploy/bifrost/config.json` to a mirror you host.
+
+Its MCP catalog sync is off (`mcp_library_sync_interval: 0`). The binary also
+names other `getbifrost.ai` addresses and news feeds; which of them it fetches
+in this configuration is not verified. Bifrost's egress is not filtered by the
+box firewall, which applies to boxes only.
+
 ### Start
 
 ```sh install:up
@@ -161,10 +191,12 @@ docker compose up -d --build --wait hub
 ```
 
 The first build takes several minutes (the box image has Chromium and a
-desktop). Compose builds the three images, runs `box-firewall` (it prints
-`box-firewall: iptables backend ...` and the rules it applied), and starts the
-hub once the firewall is in place. `--wait` returns when the hub's health
-check passes.
+desktop). Compose builds the three images, pulls Bifrost's, runs
+`box-firewall` (it prints `box-firewall: iptables backend ...` and the rules it
+applied), starts Bifrost (it waits for its secrets) and starts the hub once the
+firewall is in place. The hub creates Bifrost's two vault entries on its first
+start (`vault: secret bifrost-admin-password added`) and hands them over.
+`--wait` returns when the health checks of the hub and Bifrost pass.
 
 ### Set the owner password
 
@@ -186,7 +218,21 @@ example `https://hearth.example.com` (decision 0010), then run
 
 ### Check it
 
-`curl -s http://127.0.0.1:8787/healthz` answers `"boxEgress":"filtered"`.
+`curl -s http://127.0.0.1:8787/healthz` answers `"boxEgress":"filtered"` and
+`"bifrost":"ok"`: the hub reached Bifrost and its admin password was accepted.
+Another value names what is wrong (`unreachable`, `unauthorized`,
+`vault-disabled`, `box-reachable`), and the hub's log has a `bifrost:` line
+with the reason:
+
+```sh install:bifrost
+timeout 180 sh -c 'until curl -fsS http://127.0.0.1:8787/healthz | grep -qF "\"bifrost\":\"ok\""; do sleep 2; done'
+docker compose logs hub | grep -F 'bifrost: ok'
+```
+
+Provider keys you add on the Settings page are pushed to Bifrost from the
+vault (`bifrost: provider keys pushed from the vault`); keep adding them there,
+never in Bifrost's own UI: a key Bifrost has that the vault does not is
+removed at the next push.
 Create a session in the UI and send a message: the first tool call starts the
 session's box, so the first answer takes longer.
 

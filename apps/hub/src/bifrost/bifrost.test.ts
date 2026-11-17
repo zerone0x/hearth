@@ -243,7 +243,7 @@ describe("Bifrost service", () => {
     await until(() => fake.providers.get("openai")?.length === 0);
   });
 
-  test("a model key whose provider Bifrost does not have is not pushed; a login is never pushed", async () => {
+  test("a model key whose provider Bifrost does not have is not pushed; a login or token never is", async () => {
     const { hub, fake, logs } = start();
     await hub.bifrostReady;
     await hub.vault.create(LOCAL_PRINCIPAL, {
@@ -256,7 +256,17 @@ describe("Bifrost service", () => {
       name: "site",
       kind: "login",
       policy: { origins: ["https://example.com"] },
-      fields: { username: "u", password: "p-not-pushed" },
+      fields: {
+        username: "bifrost-test-login-user-8c2e",
+        password: "bifrost-test-p-not-pushed-41d7",
+      },
+    });
+    // A token that names a provider is still not a model key.
+    await hub.vault.create(LOCAL_PRINCIPAL, {
+      name: "token-named-openai",
+      kind: "token",
+      meta: { provider: "openai" },
+      fields: { value: "bifrost-test-token-not-pushed-6b1f" },
     });
     await hub.bifrost?.syncKeys();
     expect([...fake.providers.keys()]).toEqual([]);
@@ -274,8 +284,8 @@ describe("Bifrost service", () => {
     expect(fake.providers.size).toBe(0);
     fake.setHealthy(true);
     await hub.bifrost?.check();
+    // The change to ok pushes the keys; no explicit sync.
     expect(hub.bifrost?.status.state).toBe("ok");
-    await hub.bifrost?.syncKeys();
     expect(fake.providers.get("openai")?.map((k) => k.value)).toEqual([OPENAI_KEY]);
   });
 

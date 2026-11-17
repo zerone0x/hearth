@@ -29,6 +29,7 @@ const COMPONENTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/^desktop\b|\bvnc\b/i, "desktop"],
   [/^session /, "session"],
   [/^vault: /, "vault"],
+  [/^bifrost: /, "bifrost"],
   [/^(WARNING: )?box\b|running boxes|listen again for box/, "box"],
 ];
 
@@ -39,6 +40,10 @@ export function lineLevel(line: string): LogLevel {
   if (/^vault: (disabled|running on|key rotated|the next key|the key file)/.test(line)) {
     return "warn";
   }
+  // Bifrost (decision 0046): reachable from boxes or refusing the vault's password is an
+  // error; down or waiting for the vault is a warning.
+  if (/^bifrost: (box-reachable|unauthorized)\b/.test(line)) return "error";
+  if (/^bifrost: (unreachable|vault-disabled|vault:)/.test(line)) return "warn";
   if (ERROR_WORDS.test(line)) return "error";
   if (WARN_WORDS.test(line)) return "warn";
   return "info";
