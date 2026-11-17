@@ -64,13 +64,29 @@ describe("migrate", () => {
     db.close();
   });
 
+  test("a database before the blob store upgrades to it, with no blobs (decision 0037)", () => {
+    const path = join(dir, "pre-blob.db");
+    const at = MIGRATIONS.findIndex((m) => m.name === "content-addressed blobs and their sessions");
+    expect(at).toBeGreaterThan(4);
+    const old = openDatabase(path, { migrate: false });
+    migrate(old, MIGRATIONS.slice(0, at));
+    old.close();
+    const db = openDatabase(path, { migrate: false });
+    expect(migrate(db)[0]).toBe(at + 1);
+    const count = (table: string) =>
+      db.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n;
+    expect(count("blob")).toBe(0);
+    expect(count("session_blob")).toBe(0);
+    db.close();
+  });
+
   test("a database at the login (5) upgrades to the vault (6) with no key row and no secrets", () => {
     const path = join(dir, "hub5.db");
     const old = openDatabase(path, { migrate: false });
     migrate(old, MIGRATIONS.slice(0, 5));
     old.close();
     const db = openDatabase(path, { migrate: false });
-    expect(migrate(db)).toEqual([6]);
+    expect(migrate(db, MIGRATIONS.slice(0, 6))).toEqual([6]);
     expect(MIGRATIONS[5]?.name).toBe("vault: wrapped data key and encrypted secrets");
     const count = (table: string) =>
       db.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n;

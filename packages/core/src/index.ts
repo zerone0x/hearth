@@ -22,6 +22,7 @@
 
 export * from "./audit";
 export * from "./authorize";
+export * from "./blobs";
 export * from "./box";
 export * from "./channel";
 export * from "./events";

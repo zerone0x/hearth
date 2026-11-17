@@ -13,8 +13,17 @@
  * never created or rotated here. If it does not open, the dump is refused
  * (exit 1): its values could not be redacted. `--unredacted-ok` dumps anyway,
  * with only the model key and the credential shapes redacted.
+ *
+ *   bun apps/hub/src/trajectory-cli.ts [--db PATH] --export-blobs DIR <session-id>
+ *
+ * also writes every blob of the session (screenshots, decision 0037) to DIR as
+ * `<sha256>.<ext>`, the names the trajectory's `image_blobs` references give.
+ * Blobs are bytes, not text: they are not redacted (screenshots are masked at
+ * capture, #118). They are written after the dump, so a refused dump writes
+ * none.
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import {
@@ -23,11 +32,18 @@ import {
   DEFAULT_WORKSPACE_ID,
   type SecretStore,
 } from "@hearth/core";
+import { blobFileName } from "./obs/blobs";
 import { redactHub, registerKnownSecrets } from "./obs/redaction";
 import { readAllEvents } from "./obs/routes";
 import { buildTrajectory, toJsonl } from "./obs/trajectory";
 import { HUB_VERSION } from "./obs/version";
-import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "./store";
+import {
+  openDatabase,
+  SqliteAuditSink,
+  SqliteBlobStore,
+  SqliteEventStore,
+  SqliteVaultStore,
+} from "./store";
 import { HubVault } from "./vault";
 
 export interface DumpOptions {
@@ -107,6 +123,35 @@ export async function dumpTrajectory(
   }
 }
 
+/**
+ * Write every blob of the session to `dir` (created 0700 if missing) as
+ * `<sha256>.<ext>`; returns the paths written. The names come from the
+ * store's validated hashes, never from event text.
+ */
+export async function exportBlobs(
+  dbPath: string,
+  sessionId: string,
+  dir: string,
+): Promise<string[]> {
+  const db = openDatabase(dbPath);
+  try {
+    const store = new SqliteBlobStore(db);
+    const scope = { workspaceId: DEFAULT_WORKSPACE_ID };
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const written: string[] = [];
+    for (const ref of await store.list(scope, sessionId)) {
+      const blob = await store.get(scope, sessionId, ref.sha256);
+      if (blob === undefined) continue;
+      const path = join(dir, blobFileName(blob.ref));
+      writeFileSync(path, blob.bytes, { mode: 0o600 });
+      written.push(path);
+    }
+    return written;
+  } finally {
+    db.close();
+  }
+}
+
 if (import.meta.main) {
   const args = process.argv.slice(2);
   let db = join(process.env["HEARTH_DATA_DIR"] || "data", "hearth.db");
@@ -115,12 +160,18 @@ if (import.meta.main) {
     db = args[at + 1] ?? db;
     args.splice(at, 2);
   }
+  let blobDir: string | undefined;
+  const blobsAt = args.indexOf("--export-blobs");
+  if (blobsAt >= 0) {
+    blobDir = args[blobsAt + 1];
+    args.splice(blobsAt, 2);
+  }
   const unredacted = args.indexOf("--unredacted-ok");
   if (unredacted >= 0) args.splice(unredacted, 1);
   const sessionId = args[0];
-  if (sessionId === undefined || args.length !== 1) {
+  if (sessionId === undefined || args.length !== 1 || (blobsAt >= 0 && !blobDir)) {
     console.error(
-      "usage: bun apps/hub/src/trajectory-cli.ts [--db PATH] [--unredacted-ok] <session-id>",
+      "usage: bun apps/hub/src/trajectory-cli.ts [--db PATH] [--unredacted-ok] [--export-blobs DIR] <session-id>",
     );
     process.exit(2);
   }
@@ -136,6 +187,11 @@ if (import.meta.main) {
         unredactedOk: unredacted >= 0,
       }),
     );
+    // After the dump, so a vault that does not open refuses the blobs too.
+    if (blobDir !== undefined) {
+      const written = await exportBlobs(db, sessionId, blobDir);
+      console.error(`wrote ${written.length} blob(s) to ${blobDir}`);
+    }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);

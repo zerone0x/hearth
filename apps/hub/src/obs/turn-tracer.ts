@@ -11,6 +11,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { BlobRef } from "@hearth/core";
 import type { Span } from "@opentelemetry/api";
 import {
   ATTR_ERROR_TYPE,
@@ -32,6 +33,7 @@ import {
   GEN_AI_OPERATION_NAME_VALUE_INVOKE_AGENT,
 } from "@opentelemetry/semantic-conventions/incubating";
 import type { RpcOutcome, RpcTrace } from "../box/tool-rpc";
+import { imageRefs } from "./blobs";
 import { type CappedText, capJson, capText, type Redact } from "./cap";
 import { spanIds, type Telemetry } from "./telemetry";
 
@@ -242,22 +244,32 @@ function round(ms: number): number {
   return Math.round(ms * 1000) / 1000;
 }
 
-function textOf(result: unknown): { text: string; images: number } {
+function textOf(result: unknown): { text: string; images: number; blobs: BlobRef[] } {
   const content = (result as { content?: unknown } | null)?.content;
-  if (!Array.isArray(content)) return { text: typeof result === "string" ? result : "", images: 0 };
+  if (!Array.isArray(content)) {
+    return { text: typeof result === "string" ? result : "", images: 0, blobs: [] };
+  }
   let text = "";
   let images = 0;
   for (const part of content as Array<{ type?: string; text?: unknown }>) {
     if (part.type === "text" && typeof part.text === "string") text += part.text;
     else if (part.type === "image") images++;
   }
-  return { text, images };
+  return { text, images, blobs: imageRefs(content) };
 }
 
-/** The size-capped tool result: redacted head, byte count and sha256 of the full text. */
+/**
+ * The size-capped tool result: redacted head, byte count and sha256 of the
+ * full text; with images, their count and `image_blobs`, a reference (sha256,
+ * size, sniffed mime) per image, never its bytes (decision 0037).
+ */
 export function capResult(result: unknown, redact?: Redact): Record<string, unknown> {
-  const { text, images } = textOf(result);
-  return { ...capText(text, redact), ...(images > 0 ? { images } : {}) };
+  const { text, images, blobs } = textOf(result);
+  return {
+    ...capText(text, redact),
+    ...(images > 0 ? { images } : {}),
+    ...(blobs.length > 0 ? { image_blobs: blobs } : {}),
+  };
 }
 
 /**

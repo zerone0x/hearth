@@ -5,6 +5,7 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,8 @@ import { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type AppendResult,
   type Authorizer,
+  type BlobRef,
+  DEFAULT_WORKSPACE_ID,
   type EventPage,
   type EventStore,
   HearthError,
@@ -31,15 +34,17 @@ import {
   type StoredEvent,
 } from "@hearth/core";
 import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
-import { FakeDriver } from "../../../box-agent/src/browser/fake";
+import { FakeDriver, fakeJpeg } from "../../../box-agent/src/browser/fake";
 import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import { createApp } from "../app";
 import { AuthService, SESSION_COOKIE } from "../auth";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
+import { missingImageText } from "../obs/blobs";
+import { buildTrajectory, toJsonl } from "../obs/trajectory";
 import type { BoxLease, SessionView } from "../session/manager";
-import { openDatabase, SqliteLoginStore } from "../store";
+import { openDatabase, SqliteBlobStore, SqliteLoginStore } from "../store";
 import { BROWSER_TOOLS, NO_BROWSER_IN_BOX } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import {
@@ -249,6 +254,8 @@ interface Harness {
   runtime: ModelRuntime;
   runners: SessionRunners;
   rpc: ToolRpcClient;
+  /** Image results by hash (decision 0037), in an in-memory database. */
+  blobs: SqliteBlobStore;
   make(overrides?: Partial<RunnerConfig>, extra?: Partial<HarnessExtra>): SessionRunners;
 }
 
@@ -268,6 +275,9 @@ async function harness(
   closers.push(() => rpc.close());
   const sessions = new FakeSessions();
   const events = new MemoryEvents();
+  const blobDb = openDatabase(":memory:");
+  closers.push(() => blobDb.close());
+  const blobs = new SqliteBlobStore(blobDb);
   const faux = fauxProvider({ provider: "faux" });
   const authDir = workspace();
   const runtime = await ModelRuntime.create({
@@ -280,6 +290,7 @@ async function harness(
     const runners = new SessionRunners({
       authorizer: more.authorizer ?? extra.authorizer ?? allowAll,
       events,
+      blobs,
       sessions,
       tools: rpc,
       secrets: noSecrets,
@@ -299,7 +310,7 @@ async function harness(
     return runners;
   };
   const runners = make();
-  return { root, boxes, sessions, events, faux, runtime, runners, rpc, make };
+  return { root, boxes, sessions, events, faux, runtime, runners, rpc, blobs, make };
 }
 
 type Msg = { role: string; toolCallId?: string; isError?: boolean; content?: unknown };
@@ -1509,6 +1520,159 @@ describe("browser tools (decision 0032)", () => {
     expect(nav?.isError).toBe(true);
     expect(nav?.content?.map((p) => p.text ?? "").join("")).toContain(NO_BROWSER_IN_BOX);
     expect(h.sessions.inFlight).toBe(0);
+  });
+});
+
+describe("images by reference (decision 0037)", () => {
+  type Part = { type: string; text?: string; data?: string; mimeType?: string; blob?: BlobRef };
+
+  /** Every image part anywhere in `value`, with the key path that holds it. */
+  function imageParts(value: unknown, path = "$", out: Array<[string, Part]> = []) {
+    if (Array.isArray(value)) {
+      for (const [i, v] of value.entries()) imageParts(v, `${path}[${i}]`, out);
+    } else if (value !== null && typeof value === "object") {
+      if ((value as Part).type === "image") out.push([path, value as Part]);
+      for (const [k, v] of Object.entries(value)) imageParts(v, `${path}.${k}`, out);
+    }
+    return out;
+  }
+
+  const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const blobRows = (h: Harness) => h.blobs.list({ workspaceId: DEFAULT_WORKSPACE_ID }, "se_a");
+
+  async function screenshotTurn(h: Harness, ids: string[]) {
+    let seen: Part[] = [];
+    const steps: FauxResponseStep[] = ids.map((id) => call("browser_screenshot", {}, id));
+    steps.push((context) => {
+      // What the model got back: the image itself, with its bytes.
+      seen = context.messages
+        .filter((m) => m.role === "toolResult")
+        .flatMap((m) => m.content as Part[])
+        .filter((p) => p.type === "image");
+      return fauxAssistantMessage("done");
+    });
+    const runner = await turn(h, "se_a", "take a screenshot", steps);
+    return { runner, seen };
+  }
+
+  test("the model gets the image; the events keep only its reference, and the bytes are stored once", async () => {
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    const shot = fakeJpeg(5000, 1280, 800);
+    driver.first.screenshotBytes = () => 5000;
+    const h = await harness({}, {}, driver);
+    const { runner, seen } = await screenshotTurn(h, ["c_shot1", "c_shot2"]);
+    expect(runner.status).toBe("idle");
+    const base64 = shot.toString("base64");
+    expect(seen.map((p) => p.data)).toEqual([base64, base64]);
+    expect(seen.map((p) => p.mimeType)).toEqual(["image/jpeg", "image/jpeg"]);
+
+    const ref: BlobRef = { sha256: sha(shot), size: shot.byteLength, mime: "image/jpeg" };
+    const all = h.events.all.get("se_a") ?? [];
+    const stored = JSON.stringify(all);
+    expect(stored).not.toContain(base64.slice(0, 64));
+    const parts = imageParts(all);
+    // tool_execution_end, the tool result message's start and end, its session entry: per call.
+    expect(parts.length).toBeGreaterThanOrEqual(8);
+    for (const [path, part] of parts) {
+      expect({ path, part }).toEqual({
+        path,
+        part: { type: "image", mimeType: "image/jpeg", blob: ref },
+      });
+    }
+    for (const type of ["pi.tool_execution_end", "runner.entry"]) {
+      expect({ type, n: imageParts(h.events.of("se_a", type)).length }).toEqual({ type, n: 2 });
+    }
+    // Two identical screenshots: one blob.
+    expect(await blobRows(h)).toEqual([ref]);
+    const got = await h.blobs.get({ workspaceId: DEFAULT_WORKSPACE_ID }, "se_a", ref.sha256);
+    expect(Buffer.from(got?.bytes ?? []).equals(shot)).toBe(true);
+
+    // The trajectory step and record reference the image, by hash, size and type.
+    const steps = h.events
+      .of("se_a", "runner.step")
+      .map((e) => e.payload as { name?: string; result?: Record<string, unknown> })
+      .filter((s) => s.name === "browser_screenshot");
+    expect(steps.map((s) => s.result?.["image_blobs"])).toEqual([[ref], [ref]]);
+    expect(steps.map((s) => s.result?.["images"])).toEqual([1, 1]);
+    const records = buildTrajectory(all, {
+      sessionId: "se_a",
+      versions: { pi: "test", hub: "test" },
+    });
+    const jsonl = toJsonl(records);
+    expect(jsonl).not.toContain(base64.slice(0, 64));
+    const toolRecords = records.filter(
+      (r) => r["kind"] === "tool_call" && r["name"] === "browser_screenshot",
+    );
+    expect(toolRecords.map((r) => (r["result"] as Record<string, unknown>)["image_blobs"])).toEqual(
+      [[ref], [ref]],
+    );
+  });
+
+  test("each blob is stored before the first event that names it", async () => {
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    // A different JPEG per call: actions so far (the screenshot is logged first).
+    driver.first.screenshotBytes = () => 3000 + driver.first.actions.length;
+    const h = await harness({}, {}, driver);
+    const put = h.blobs.put.bind(h.blobs);
+    const putAt = new Map<string, number>();
+    h.blobs.put = async (scope, sessionId, bytes) => {
+      const ref = await put(scope, sessionId, bytes);
+      if (!putAt.has(ref.sha256)) putAt.set(ref.sha256, h.events.all.get(sessionId)?.length ?? 0);
+      return ref;
+    };
+    await screenshotTurn(h, ["c_a", "c_b"]);
+    expect(putAt.size).toBe(2);
+    const all = h.events.all.get("se_a") ?? [];
+    for (const [sha256, eventsBefore] of putAt) {
+      const first = all.findIndex((e) => JSON.stringify(e.payload).includes(sha256));
+      expect({ sha256, first: first >= eventsBefore }).toEqual({ sha256, first: true });
+    }
+  });
+
+  test("a blob that cannot be stored fails the runner, and the event naming it is not written", async () => {
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    const h = await harness({}, {}, driver);
+    h.blobs.put = async () => {
+      throw new Error("disk full writing a blob");
+    };
+    const { runner } = await screenshotTurn(h, ["c_shot"]);
+    expect(runner.status).toBe("failed");
+    expect(runner.failure).toContain("disk full writing a blob");
+    expect(imageParts(h.events.all.get("se_a") ?? [])).toEqual([]);
+    expect(h.events.types("se_a")).toContain("runner.failed");
+  });
+
+  test("a rebuilt runner gives the model the image back from the store", async () => {
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    const h = await harness({}, {}, driver);
+    const { runner: first } = await screenshotTurn(h, ["c_shot"]);
+    const before = JSON.stringify(first.messages);
+    expect(before).toContain(fakeJpeg(1000, 1280, 800).toString("base64"));
+    await h.runners.close();
+    const again = h.make();
+    const rebuilt = await again.runner("se_a");
+    expect(JSON.stringify(rebuilt.messages)).toBe(before);
+  });
+
+  test("an image missing from the store comes back as a text part saying so, never an empty image", async () => {
+    const driver = new FakeDriver();
+    driver.first.navigate("http://127.0.0.1:8000/", "Page");
+    const h = await harness({}, {}, driver);
+    await screenshotTurn(h, ["c_shot"]);
+    const [ref] = await blobRows(h);
+    await h.runners.close();
+    h.blobs.get = async () => undefined;
+    const rebuilt = await h.make().runner("se_a");
+    const result = (rebuilt.messages as Array<{ role: string; content: Part[] }>).find(
+      (m) => m.role === "toolResult",
+    );
+    expect(result?.content.map((p) => p.type)).toEqual(["text", "text"]);
+    expect(result?.content[1]?.text).toBe(missingImageText(ref as BlobRef));
+    expect(imageParts(rebuilt.messages)).toEqual([]);
   });
 });
 

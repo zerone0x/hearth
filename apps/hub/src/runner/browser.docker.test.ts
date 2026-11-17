@@ -94,6 +94,8 @@ interface Part {
   text?: string;
   data?: string;
   mimeType?: string;
+  /** An image's reference in a recorded event (decision 0037). */
+  blob?: { sha256: string; size: number; mime: string };
 }
 
 function toolCall(name: string, args: ToolArgs, id: string): AssistantMessage {
@@ -260,15 +262,21 @@ describe.skipIf(!enabled)("browser tools in a Docker box (M2, #116)", () => {
     expect(text("c_click")).toContain("Saved: alice/blue");
     // The server inside the box received the values: checked without the model's word.
     expect(text("c_log")).toContain("GET /submit?name=alice&color=blue");
-    // The screenshot reached the model as an image part, not as text.
+    // The screenshot reached the model as an image part, not as text. The event
+    // keeps its reference, and the bytes are served by hash (decision 0037).
     const shot = ends.find((e) => e.toolCallId === "c_shot")?.result.content ?? [];
     const picture = shot.find((p) => p.type === "image");
     expect(picture?.mimeType).toBe("image/jpeg");
-    expect(
-      Buffer.from(picture?.data ?? "", "base64")
-        .subarray(0, 2)
-        .toString("hex"),
-    ).toBe("ffd8");
+    expect(picture?.data).toBeUndefined();
+    expect(picture?.blob?.mime).toBe("image/jpeg");
+    const blob = await fetch(new URL(`/v1/sessions/${id}/blobs/${picture?.blob?.sha256}`, h.url), {
+      headers: { cookie },
+    });
+    expect(blob.status).toBe(200);
+    expect(blob.headers.get("x-content-type-options")).toBe("nosniff");
+    const bytes = Buffer.from(await blob.arrayBuffer());
+    expect(bytes.subarray(0, 2).toString("hex")).toBe("ffd8");
+    expect(bytes.byteLength).toBe(picture?.blob?.size ?? -1);
     // The trajectory's step of the screenshot counts its image (decision 0021).
     const steps = events
       .filter((e) => e.type === "runner.step")
