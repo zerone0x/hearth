@@ -597,6 +597,59 @@ describe("model switch (decision 0038)", () => {
     await runner.settled();
     expect(runner.status).toBe("idle");
   });
+
+  function unset(h: Awaited<ReturnType<typeof harness>>, modelReady?: Promise<unknown>) {
+    const runners = new SessionRunners({
+      authorizer: allowAll,
+      events: h.events,
+      blobs: h.blobs,
+      sessions: h.sessions,
+      tools: h.rpc,
+      secrets: noSecrets,
+      config: {},
+      ...(modelReady === undefined ? {} : { modelReady }),
+      modelRuntime: h.runtime,
+      boxCwd: h.root,
+      log: () => {},
+    });
+    closers.push(() => runners.close());
+    return runners;
+  }
+
+  test("over HTTP a message without a model answers 409 runner.no-model", async () => {
+    const h = await harness();
+    const runners = unset(h);
+    const auth = new AuthService({ store: new SqliteLoginStore(openDatabase(":memory:")) });
+    const app = createApp({ boxes: {} as BoxConnections, auth });
+    mountRunnerRoutes(app, runners);
+    const res = await app.request("http://localhost/v1/sessions/se_a/messages", {
+      method: "POST",
+      headers: {
+        cookie: `${SESSION_COOKIE}=${auth.issueSession(LOCAL_PRINCIPAL).token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("runner.no-model");
+  });
+
+  test("a message sent before the saved settings load waits for them and uses their model", async () => {
+    const h = await harness();
+    const ready = Promise.withResolvers<void>();
+    const runners = unset(h, ready.promise);
+    h.faux.setResponses([fauxAssistantMessage("hello")]);
+    const sent = runners.send(LOCAL_PRINCIPAL, "se_a", "hi");
+    // Long enough for a runner made without waiting to have failed already.
+    await Bun.sleep(30);
+    runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    ready.resolve();
+    await sent;
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    expect(runner.status).toBe("idle");
+    expect(h.events.types("se_a")).toContain("runner.turn.end");
+  });
 });
 
 describe("box crash", () => {
