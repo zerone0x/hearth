@@ -51,7 +51,7 @@ import {
   scrubHubTempPaths,
 } from "./policy";
 import { mountRunnerRoutes } from "./routes";
-import { REDACTED, RESTART_OUTCOME_UNKNOWN } from "./runner";
+import { REDACTED, RESTART_OUTCOME_UNKNOWN, redactSecrets } from "./runner";
 import { type RunnerConfig, SessionRunners, type SessionRunnersOptions } from "./runners";
 
 const dirs: string[] = [];
@@ -1408,5 +1408,12 @@ describe("browser tools (decision 0032)", () => {
     expect(nav?.isError).toBe(true);
     expect(nav?.content?.map((p) => p.text ?? "").join("")).toContain(NO_BROWSER_IN_BOX);
     expect(h.sessions.inFlight).toBe(0);
+  });
+});
+
+describe("redactSecrets (vault rework)", () => {
+  test("a value that overlaps its own next occurrence is redacted as one span", () => {
+    expect(redactSecrets("x ababab y", ["abab"])).toBe(`x ${REDACTED} y`);
+    expect(redactSecrets("pw=aaaa", ["aaa"])).toBe(`pw=${REDACTED}`);
   });
 });
