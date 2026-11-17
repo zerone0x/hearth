@@ -39,6 +39,51 @@ export interface DesktopLock {
   readonly expiresAt: number | null;
 }
 
+/** The vault's state (decision 0031): never a key, only its check prefix or the reason it is off. */
+export type VaultStatus =
+  | { readonly state: "starting" }
+  | { readonly state: "enabled"; readonly kekCheck: string; readonly key: "current" | "next" }
+  | { readonly state: "disabled"; readonly reason: string; readonly message: string };
+
+export type SecretKind = "model-key" | "login" | "token";
+
+/** One vault entry as the hub lists it: metadata and a keyed fingerprint, never a value. */
+export interface Secret {
+  readonly id: string;
+  readonly name: string;
+  readonly kind: SecretKind;
+  readonly scope: { readonly sessionId: string } | null;
+  readonly policy: {
+    readonly origins?: string[];
+    readonly use?: string;
+    readonly hosts?: string[];
+  };
+  readonly meta: { readonly label?: string; readonly provider?: string };
+  readonly fingerprint: string;
+  readonly version: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly lastUsedAt: number | null;
+}
+
+/** A new entry. `fields` is write-only: the hub answers with a fingerprint. */
+export interface NewSecret {
+  readonly name: string;
+  readonly kind: SecretKind;
+  readonly policy?: { readonly origins: string[] };
+  readonly fields: Readonly<Record<string, string>>;
+}
+
+/** The model settings (decision 0038). `source: "env"` means deploy/.env wins and they are read-only. */
+export interface ModelSettings {
+  readonly source: "env" | "settings" | "none";
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly keyRef: string | null;
+  readonly keyFingerprint: string | null;
+  readonly updatedAt: number | null;
+}
+
 export interface AuthStatus {
   readonly setupRequired: boolean;
   readonly authenticated: boolean;
@@ -66,7 +111,7 @@ type Fetch = (input: string, init: RequestInit) => Promise<Response>;
 
 /** Calls the hub. Bodies are always JSON; a POST without one sends `{}`. */
 export async function call<T>(
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
   fetcher: Fetch = (input, init) => fetch(input, init),
@@ -75,7 +120,7 @@ export async function call<T>(
     method,
     headers: JSON_HEADERS,
     credentials: "same-origin",
-    ...(method === "POST" ? { body: JSON.stringify(body ?? {}) } : {}),
+    ...(method === "POST" || method === "PUT" ? { body: JSON.stringify(body ?? {}) } : {}),
   });
   if (res.status === 204) return undefined as T;
   let data: unknown;
@@ -126,6 +171,18 @@ export const api = {
     ).lock,
   events: (sessionId: string, after: number, limit = 500) =>
     call<EventPage>("GET", `/v1/sessions/${id(sessionId)}/events?after=${after}&limit=${limit}`),
+  vaultStatus: () => call<VaultStatus>("GET", "/v1/vault/status"),
+  secrets: async () => (await call<{ secrets: Secret[] }>("GET", "/v1/secrets")).secrets,
+  addSecret: (secret: NewSecret) =>
+    call<{ id: string; fingerprint: string; version: number }>("POST", "/v1/secrets", secret),
+  rotateSecret: (secretId: string, fields: Readonly<Record<string, string>>) =>
+    call<{ fingerprint: string; version: number }>("PUT", `/v1/secrets/${id(secretId)}/value`, {
+      fields,
+    }),
+  deleteSecret: (secretId: string) => call<unknown>("DELETE", `/v1/secrets/${id(secretId)}`),
+  modelSettings: () => call<ModelSettings>("GET", "/v1/settings/model"),
+  saveModelSettings: (choice: { provider: string; model: string; keyRef: string | null }) =>
+    call<ModelSettings>("PUT", "/v1/settings/model", choice),
 };
 
 /** The desktop WebSocket of a session (decision 0016), on the page's own origin. */

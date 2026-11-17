@@ -25,6 +25,7 @@ function statusFor(code: string): 400 | 403 | 404 | 409 | 500 {
     case "runner.busy":
     case "runner.failed":
     case "runner.configured":
+    case "runner.no-model":
       return 409;
     case "request.invalid":
     case "runner.unknown-model":

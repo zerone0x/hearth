@@ -156,6 +156,11 @@ export interface HubVaultOptions {
   /** `HEARTH_VAULT_KEY_NEXT_REF`: the key to rotate to. A missing file means no rotation. */
   readonly nextKeyRef?: SecretRef;
   readonly log?: (line: string) => void;
+  /**
+   * Called after an entry's value was rotated or the entry deleted: the model
+   * settings rebuild the runtime when it is the model's key (decision 0038).
+   */
+  readonly onValueChange?: (name: string) => void;
   readonly now?: () => EpochMs;
   /** Adds a value to the sink-side redaction set. Default `registerSecret` (decision 0021). */
   readonly register?: (value: string) => void;
@@ -371,6 +376,7 @@ export class HubVault implements VaultReader {
           }),
       );
       this.#registerFields(fields);
+      this.#log(`vault: secret ${name} added (${kind}, ${fingerprint})`);
       return { id: binding.id, fingerprint, version: 1 };
     });
   }
@@ -416,6 +422,10 @@ export class HubVault implements VaultReader {
         },
       );
       this.#registerFields(fields);
+      this.#log(
+        `vault: secret ${row.name} rotated to version ${binding.version} (${row.fingerprint} -> ${fingerprint})`,
+      );
+      this.#o.onValueChange?.(row.name);
       return { fingerprint, version: binding.version };
     });
   }
@@ -434,6 +444,8 @@ export class HubVault implements VaultReader {
         }),
         () => this.#o.store.remove(this.#workspaceId, id),
       );
+      this.#log(`vault: secret ${row.name} deleted (${row.kind}, ${row.fingerprint})`);
+      this.#o.onValueChange?.(row.name);
     });
   }
 

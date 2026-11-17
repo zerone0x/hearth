@@ -24,6 +24,8 @@ import { keys, useAuth, useSessions } from "./queries";
  * session list load without it (#84).
  */
 const SessionPage = lazy(() => import("./SessionPage"));
+/** Settings (decision 0038): its own chunk too, loaded only when opened. */
+const SettingsPage = lazy(() => import("./SettingsPage"));
 
 /** The route is in the hash (`#/s/<id>`), so the hub serves one HTML file. */
 function useRoute(): string {
@@ -56,10 +58,26 @@ export function App() {
     );
   }
   const signOut = (
-    <Button variant="link" onClick={() => logout.mutate()}>
-      Sign out
-    </Button>
+    <nav className="flex items-center">
+      <Button variant="link" asChild>
+        <a href="#/settings">Settings</a>
+      </Button>
+      <Button variant="link" onClick={() => logout.mutate()}>
+        Sign out
+      </Button>
+    </nav>
   );
+  if (route === "/settings") {
+    return (
+      <Shell action={signOut}>
+        <ErrorBoundary fallback={<SessionPageFailed page="settings" />}>
+          <Suspense fallback="Loading…">
+            <SettingsPage />
+          </Suspense>
+        </ErrorBoundary>
+      </Shell>
+    );
+  }
   const match = /^\/s\/([^/]+)$/.exec(route);
   if (match?.[1] !== undefined) {
     // A chunk that fails to load (a hub upgrade replaced the hashed files while
@@ -68,7 +86,7 @@ export function App() {
       <ErrorBoundary
         fallback={
           <Shell action={signOut}>
-            <SessionPageFailed />
+            <SessionPageFailed page="session" />
           </Shell>
         }
       >
@@ -89,10 +107,10 @@ export function App() {
  * React.lazy keeps a failed import, so only a page reload fetches the chunk again
  * (and the new index.html, after a hub upgrade).
  */
-function SessionPageFailed() {
+function SessionPageFailed({ page }: { page: "session" | "settings" }) {
   return (
     <Alert variant="destructive">
-      <AlertTitle>The session page did not load.</AlertTitle>
+      <AlertTitle>The {page} page did not load.</AlertTitle>
       <AlertDescription>
         <p>The hub may have been upgraded since this tab opened.</p>
         <div className="flex gap-2">

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type FauxProviderHandle, fauxProvider } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { BoxId, BoxInfo, BoxSpec, SecretStore } from "@hearth/core";
+import { type BoxId, type BoxInfo, type BoxSpec, createDefaultSecretStore } from "@hearth/core";
 import { type BoxNetworkProvider, type Hub, startHub } from "../../hub/src/server";
 
 const BOX_AGENT = join(import.meta.dir, "../../box-agent/src/main.ts");
@@ -261,11 +261,8 @@ export function startFakeVnc(): { port: number; stop(): void; input: FakeVncInpu
   return { port: server.port, stop: () => server.stop(true), input };
 }
 
-const noSecrets: SecretStore = {
-  resolve: async () => {
-    throw new Error("the e2e hub resolves no secrets");
-  },
-} as unknown as SecretStore;
+/** The vault's key (decision 0031): the Settings page adds, rotates and deletes real entries. */
+const VAULT_KEY = Buffer.alloc(32, 0x5e).toString("base64");
 
 export interface E2eHub {
   readonly hub: Hub;
@@ -301,9 +298,13 @@ export async function startE2eHub(webRoot: string): Promise<E2eHub> {
     webRoot,
     provider: boxes,
     boxEgress: () => ({ state: "unrestricted", detail: "e2e: local processes" }),
+    vault: {
+      keyRef: "env:HEARTH_E2E_VAULT_KEY",
+      keySecrets: createDefaultSecretStore({ env: { HEARTH_E2E_VAULT_KEY: VAULT_KEY } }),
+    },
+    // No HEARTH_MODEL: the run picks the model, and its vault key, on the Settings page.
     runner: {
-      config: { provider: "faux", model: faux.getModel().id },
-      secrets: noSecrets,
+      config: {},
       modelRuntime,
       boxCwd: workspace,
     },
