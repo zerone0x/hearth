@@ -384,6 +384,7 @@ describe("per-session virtual keys", () => {
     await expect(hub.runners?.send(LOCAL_PRINCIPAL, s.id, "hi")).rejects.toMatchObject({
       code: "runner.gateway-unavailable",
     });
+    expect(fake.completions).toEqual([]);
   });
 
   test("a provider Bifrost does not serve stays direct: no key is made", async () => {

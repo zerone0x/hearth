@@ -16,7 +16,7 @@ export const MAX_MESSAGE_CHARS = 256 * 1024;
 const DEFAULT_PAGE = 200;
 const MAX_PAGE = 1000;
 
-function statusFor(code: string): 400 | 403 | 404 | 409 | 500 {
+function statusFor(code: string): 400 | 403 | 404 | 409 | 500 | 503 {
   switch (code) {
     case "authz.denied":
       return 403;
@@ -30,6 +30,9 @@ function statusFor(code: string): 400 | 403 | 404 | 409 | 500 {
     case "request.invalid":
     case "runner.unknown-model":
       return 400;
+    // Bifrost is configured but not up (decision 0047): try again later.
+    case "runner.gateway-unavailable":
+      return 503;
     default:
       return 500;
   }
