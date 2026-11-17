@@ -265,11 +265,8 @@ function AccessModeForm({ settings }: { settings: AccessModeSettings }) {
   const [mode, setMode] = useState<AccessMode>(settings.mode);
   const save = useMutation({
     mutationFn: () => api.saveAccessMode(mode),
-    onSuccess: (saved) => {
-      client.setQueryData(keys.accessMode, saved);
-      // Sessions that follow the default show the new one.
-      void client.invalidateQueries({ queryKey: keys.sessionAccessModes });
-    },
+    // A session page reads its mode again when it opens (it is never fresh).
+    onSuccess: (saved) => client.setQueryData(keys.accessMode, saved),
   });
 
   function onSubmit(event: FormEvent) {

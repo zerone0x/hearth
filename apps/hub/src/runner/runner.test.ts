@@ -791,6 +791,24 @@ describe("access mode (decision 0045)", () => {
     expect(records.map((r) => r["access_mode"])).toEqual(["ask", "yolo", "yolo"]);
   });
 
+  test("a tool call recorded before the setting projects with access_mode null", () => {
+    const records = buildTrajectory(
+      [
+        {
+          workspaceId: "ws_local",
+          sessionId: "se_old",
+          seq: 1,
+          ts: 1,
+          type: "runner.step",
+          payload: { kind: "tool_call", tool_call_id: "c_old", name: "bash", outcome: "ok" },
+        },
+      ],
+      { sessionId: "se_old", versions: { pi: "test", hub: "test" } },
+    ).filter((r) => r["kind"] === "tool_call");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toHaveProperty("access_mode", null);
+  });
+
   test("a resolver that throws blocks the call (fail-closed) and the box never sees it", async () => {
     const h = await harness(
       {},

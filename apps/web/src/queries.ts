@@ -21,8 +21,6 @@ export const keys = {
   secrets: ["secrets"] as const,
   modelSettings: ["model-settings"] as const,
   accessMode: ["access-mode"] as const,
-  /** Every session's access mode; a change of the global default refetches them all. */
-  sessionAccessModes: ["session-access-mode"] as const,
   sessionAccessMode: (id: string) => ["session-access-mode", id] as const,
 };
 
