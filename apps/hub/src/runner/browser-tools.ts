@@ -403,6 +403,8 @@ export function registerBrowserTools(
         const lease = await box.ensureBox(id);
         try {
           await box.prepare?.(lease);
+          // Again: a cold wake takes seconds, and the owner may have taken over meanwhile.
+          assertDesktopFree(box, name, id, onRefused);
           const ops = box.operations(lease.boxId, id);
           let result: ToolResults[typeof spec.method];
           try {
