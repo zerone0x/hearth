@@ -42,11 +42,11 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
   const error = send.error ?? interrupt.error ?? chat.error ?? session.error;
   return (
     <div className="flex h-dvh flex-col">
-      <header className="flex items-center gap-3 border-b bg-card px-4 py-2">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b bg-card px-4 py-2">
         <Button variant="link" size="sm" className="px-0" asChild>
           <a href="#/">Sessions</a>
         </Button>
-        <h1 className="min-w-0 flex-1 truncate font-semibold">
+        <h1 className="min-w-32 flex-1 truncate font-semibold">
           {session.data?.title || sessionId}
         </h1>
         <AccessModeSelect sessionId={sessionId} />
@@ -109,8 +109,15 @@ export function AccessModeSelect({ sessionId }: { sessionId: string }) {
   const data = current.data;
   const failed = save.error ?? current.error;
   return (
-    <div className="flex items-center gap-1.5" data-testid="access-mode" data-mode={data?.mode}>
-      <label htmlFor="session-access-mode" className="text-muted-foreground text-xs">
+    <div
+      className="flex shrink-0 items-center gap-1.5"
+      data-testid="access-mode"
+      data-mode={data?.mode}
+    >
+      <label
+        htmlFor="session-access-mode"
+        className="sr-only text-muted-foreground text-xs sm:not-sr-only"
+      >
         Access
       </label>
       <NativeSelect

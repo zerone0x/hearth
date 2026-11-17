@@ -2,7 +2,8 @@
  * The web UI's e2e (#46) against a real hub (harness.ts) in Chromium:
  * first-run setup → sign out → sign in → Settings: add a model key, save the
  * model with it, rotate the key, add a token usable by box commands and rotate
- * it back off, delete another secret → create a session → send a message →
+ * it back off, delete another secret, set the access mode default → create a
+ * session → set its access mode override in the header → send a message →
  * see the tool card → open the desktop → take it over, type, release → reload, and the session continues
  * (the chat is rebuilt from the event log and a second turn runs) → the box
  * goes away and the desktop says it is asleep → wake. Along the way: the
@@ -21,6 +22,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { DEFAULT_WORKSPACE_ID } from "@hearth/core";
 import { type Browser, type BrowserContext, chromium, type Page } from "playwright";
 import { startE2eHub } from "./harness";
 
@@ -204,6 +206,19 @@ try {
     .getByTestId("secret-row")
     .filter({ hasText: "e2e-token" })
     .waitFor({ state: "detached" });
+  // The access mode default (decision 0045): `ask` until saved, then `yolo` for this run.
+  const access = page.getByRole("form", { name: "Access mode" });
+  const accessSelect = access.getByLabel("Default for sessions");
+  if ((await accessSelect.inputValue()) !== "ask") {
+    throw new Error("a new install does not default to the ask access mode");
+  }
+  await accessSelect.click();
+  await accessSelect.selectOption("yolo");
+  await access.getByRole("button", { name: "Save" }).click();
+  await access
+    .getByRole("status")
+    .filter({ hasText: "Sessions that follow the default use yolo" })
+    .waitFor();
   await shot(page, "1b-settings");
   for (const value of [
     "sk-e2e-model-key-1",
@@ -225,6 +240,21 @@ try {
   await page.getByRole("button", { name: "New session" }).click();
   await page.waitForURL(/#\/s\//);
   const sessionUrl = page.url();
+  const sessionId = decodeURIComponent(sessionUrl.split("#/s/")[1] ?? "");
+
+  step("the session header shows the access mode; the override applies to the next tool call");
+  const accessMode = page.getByTestId("access-mode");
+  const sessionAccess = page.getByLabel("Access", { exact: true });
+  await accessMode.and(page.locator('[data-mode="yolo"]')).waitFor();
+  if ((await sessionAccess.locator("option:checked").textContent()) !== "Default (yolo)") {
+    throw new Error("the session header does not show that it follows the yolo default");
+  }
+  await sessionAccess.click();
+  await sessionAccess.selectOption("ask");
+  await accessMode.and(page.locator('[data-mode="ask"]')).waitFor();
+  if (e2e.hub.accessModes.resolve(sessionId) !== "ask") {
+    throw new Error("the session's override did not reach the hub's resolver");
+  }
 
   step("send a message; the tool call shows as a card");
   e2e.faux.setResponses([
@@ -252,6 +282,27 @@ try {
   if (readFileSync(join(e2e.workspace, "hello.txt"), "utf8") !== "hello from the box\n") {
     throw new Error("the tool call did not run in the box's workspace");
   }
+  // The call ran under the session's override, and its record says so (decision 0045).
+  const steps = await e2e.hub.events.read(
+    { workspaceId: DEFAULT_WORKSPACE_ID },
+    sessionId,
+    0,
+    1000,
+  );
+  const recorded = steps.events
+    .filter((e) => e.type === "runner.step")
+    .map((e) => e.payload as { kind?: string; access_mode?: unknown })
+    .filter((p) => p.kind === "tool_call")
+    .map((p) => p.access_mode);
+  if (JSON.stringify(recorded) !== '["ask"]') {
+    throw new Error(`the tool call's access_mode is ${JSON.stringify(recorded)}, not ["ask"]`);
+  }
+  if (!steps.events.some((e) => e.type === "session.access_mode")) {
+    throw new Error("the override wrote no session.access_mode event");
+  }
+  // Back to following the default.
+  await sessionAccess.selectOption("default");
+  await accessMode.and(page.locator('[data-mode="yolo"]')).waitFor();
 
   if (!loaded(SESSION_CHUNK)) throw new Error("the session page chunk never loaded");
   if (loaded(NOVNC_CHUNK)) throw new Error("noVNC loaded before the desktop was opened");
