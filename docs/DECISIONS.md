@@ -3148,3 +3148,93 @@ The trajectory (0021) recorded only `images: 1`.
   (`deploy/e2e/prototype.ts` step 5f: a real screenshot reaches the faux
   model, the trajectory and event log name it and hold no base64, the blob
   API serves its bytes, and again after the upgrade).
+
+## 0038: Model settings on the Settings page: a `vault:` key, env wins, switched per turn
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #115 (design: research #108, `docs/research/vault.md`; vault core 0031)
+
+### Context
+
+The model, its provider and the key reference are `HEARTH_MODEL*` lines in
+`deploy/.env` and a key file (0020). PRD §6.10 (P0, M2) moves them to the web
+UI, with the key in the vault (0031); the research settled the API, the
+precedence and the first-start import. This entry records what M2 implements
+and where it deviates.
+
+### Decision
+
+- **Storage.** Migration 8 adds `setting(workspace_id, key, value_json,
+  updated_at)`; `model` holds `{provider, model, keyRef}`. Migration 8 follows
+  the blob store's 7 (0037).
+- **API.** `GET /v1/settings/model` answers `{source, provider, model, keyRef,
+  keyFingerprint, updatedAt}`; `PUT /v1/settings/model {provider, model,
+  keyRef}`. Both authorize first (`settings.read`, `settings.model.update`) and
+  the PUT reads its body after. No route returns a value.
+- **Env wins.** While `HEARTH_MODEL` is set, `source` is `env`, the page is
+  read-only and a PUT answers 409 `settings.env-locked`. Existing installs and
+  tests run as before; the owner unlocks the page by emptying the lines.
+- **A saved key is `vault:<name>` of a global `model-key` entry, or none**
+  (a local endpoint). `env:` and `file:` references are refused on the PUT
+  (deviation: the research let the page take any reference). A browser
+  session that could save `file:/any/path` as the model key would send that
+  file to the provider's endpoint; `env:` / `file:` keep working through
+  `HEARTH_MODEL_KEY_REF` for headless installs. A model pi does not know
+  (built-in or `HEARTH_MODELS_FILE`) is `settings.unknown-model` (400).
+- **Audited, logged, applied.** A save writes `settings.model.update` (new
+  provider, model, key reference and fingerprint; the previous choice) before
+  it is stored, logs `settings: model set to …` with the fingerprint, and calls
+  `SessionRunners.setModel`. If the audit write fails nothing is stored or
+  applied. Adding, rotating and deleting a secret now also log one line
+  (`vault: secret <name> added|rotated|deleted`, with fingerprints) next to the
+  `secret.*` audit rows 0031 already writes.
+- **Runtime switch.** `setModel` drops the cached `ModelRuntime`; the next
+  runtime resolves the new key (one audited `secret.use`). A session's runner
+  made under an older choice is rebuilt from the event log on its next message
+  if it is idle; a running turn keeps the model and key it started with. Old
+  keys stay in the redaction set. Rotating or deleting the `vault:` entry the
+  model uses does the same (`HubVault` `onValueChange`), so 0031's "takes
+  effect when the model runtime restarts" now means the next turn, not a hub
+  restart.
+- **Always a runner.** The hub now builds its runners without `HEARTH_MODEL`;
+  until a model is saved, a message fails with `runner.no-model` (409) instead
+  of the message routes being absent. A message sent while the settings load
+  at start waits for them.
+- **First-start import.** Once the vault is enabled, with no saved `model`
+  setting and an env choice whose key is an `env:` or `file:` reference, the
+  hub copies the key into the vault as `model-key-<provider>` (meta label
+  `imported from <ref>`), saves `{provider, model, keyRef:
+  "vault:model-key-<provider>"}` (`settings.model.import`, system principal,
+  with the fingerprint) and logs one line. Env still wins until it is emptied.
+  A taken name, a disabled vault or an unresolvable key skips the import with a
+  log line; it is retried at the next start.
+- **UI.** `#/settings` (its own lazy chunk), linked from the header: a vault
+  Alert when it is off, the model card (provider and model inputs, key Select
+  of global model keys with their fingerprints) and the secrets table (name,
+  origins, kind, scope, fingerprint and version, last use; Rotate in a Dialog,
+  Delete behind an AlertDialog; Add in a Dialog). Value fields are
+  `type="password"` with `autoComplete="off"`; they are cleared after a save
+  and dropped when the dialog closes. shadcn `table`, `select` and
+  `alert-dialog` were added with the shadcn CLI (0019).
+
+### Not in this change (follow-ups)
+
+- A model Select fed by pi's catalog and a "Test connection" button
+  (`POST /v1/settings/model/test`).
+- The uses Sheet (`GET /v1/secrets/:id/uses` exists), editing name, scope or
+  origins (`PATCH /v1/secrets/:id`), session-scoped entries and token hosts in
+  the add dialog, and `POST /v1/vault/rotate-key`.
+- Dropping the `model_key` compose secret and `HEARTH_MODEL_KEY_REF` from
+  `compose.yaml` (research "Migration", step 4), so a fresh install needs no
+  key file at all.
+
+### Consequences
+
+- An upgrade needs no manual step: the key is imported and the page shows the
+  env's choice read-only until the owner empties the `.env` lines.
+- The settings live in the database: a database restore restores them, and a
+  lost vault key leaves a saved `vault:` key unresolvable (`vault.disabled`)
+  until the key file is restored.
+- A rebuilt runner reads its session's event log again; that happens once per
+  session after each model change, not per turn.

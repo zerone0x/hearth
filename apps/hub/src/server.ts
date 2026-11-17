@@ -293,6 +293,8 @@ export function startHub(options: HubOptions) {
     ...(options.vault?.nextKeyRef === undefined ? {} : { nextKeyRef: options.vault.nextKeyRef }),
     // Its state goes to the hub's log; a hub without one (tests) stays quiet.
     log: options.log ?? (() => {}),
+    // A rotated or deleted model key is resolved again for the next turn (0038).
+    onValueChange: (name) => modelSettings.keyChanged(name),
   });
   const vaultReady = vault.open();
   /** The hub's SecretStore: `env:`, `file:` and `vault:` (E7). */

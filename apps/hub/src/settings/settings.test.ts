@@ -5,7 +5,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -177,6 +177,40 @@ describe("saving the model", () => {
       key_ref: "vault:anthropic-key",
     });
     expect(h.applied.at(-1)).toEqual({ provider: "local", model: "llama" });
+  });
+
+  test("secret changes are logged with fingerprints, never values", async () => {
+    const h = await start();
+    const { id, fingerprint } = await addModelKey(h);
+    const rotated = await h.vault.rotate(LOCAL_PRINCIPAL, id, {
+      fields: { value: "sk-settings-test-rotated-4" },
+    });
+    await h.vault.remove(LOCAL_PRINCIPAL, id);
+    const logs = h.logs.join("\n");
+    expect(logs).toContain(`vault: secret anthropic-key added (model-key, ${fingerprint})`);
+    expect(logs).toContain(
+      `vault: secret anthropic-key rotated to version 2 (${fingerprint} -> ${rotated.fingerprint})`,
+    );
+    expect(logs).toContain(
+      `vault: secret anthropic-key deleted (model-key, ${rotated.fingerprint})`,
+    );
+    expect(logs).not.toContain(MODEL_KEY);
+    expect(logs).not.toContain("sk-settings-test-rotated-4");
+  });
+
+  test("keyChanged re-applies only the key in force", async () => {
+    const h = await start();
+    await addModelKey(h);
+    await h.settings.put(LOCAL_PRINCIPAL, {
+      provider: "anthropic",
+      model: "claude-x",
+      keyRef: "vault:anthropic-key",
+    });
+    h.settings.keyChanged("other");
+    expect(h.applied).toHaveLength(1);
+    h.settings.keyChanged("anthropic-key");
+    expect(h.applied).toHaveLength(2);
+    expect(h.applied[1]).toEqual(h.applied[0]);
   });
 
   test("the saved choice is applied at the next start", async () => {
@@ -452,6 +486,30 @@ describe("the hub", () => {
         keyFingerprint: fingerprint,
       });
       expect(hub.runners?.model).toEqual({ provider: "faux", model, apiKeyRef: "vault:faux-key" });
+      // Rotating the key in force makes the runners resolve it again; another entry does not.
+      const runners = hub.runners as NonNullable<typeof hub.runners>;
+      const setModel = spyOn(runners, "setModel");
+      const other = await hub.vault.create(LOCAL_PRINCIPAL, {
+        name: "other",
+        kind: "model-key",
+        fields: { value: "settings-test-other-9" },
+      });
+      await hub.vault.rotate(LOCAL_PRINCIPAL, other.id, {
+        fields: { value: "settings-test-o-10" },
+      });
+      expect(setModel).not.toHaveBeenCalled();
+      const keyId = (await hub.vault.list(LOCAL_PRINCIPAL)).find((e) => e.name === "faux-key")?.id;
+      await hub.vault.rotate(LOCAL_PRINCIPAL, keyId ?? "", {
+        fields: { value: "settings-test-rotated-11" },
+      });
+      expect(setModel).toHaveBeenCalledTimes(1);
+      expect(setModel.mock.calls[0]?.[0]).toEqual({
+        provider: "faux",
+        model,
+        apiKeyRef: "vault:faux-key",
+      });
+      await hub.vault.remove(LOCAL_PRINCIPAL, keyId ?? "");
+      expect(setModel).toHaveBeenCalledTimes(2);
     } finally {
       await hub.stop();
     }

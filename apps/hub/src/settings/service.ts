@@ -156,6 +156,17 @@ export class ModelSettings {
     };
   }
 
+  /**
+   * The vault entry `name` was rotated or deleted: when it is the key in
+   * force, the runners resolve it again for the next turn.
+   */
+  keyChanged(name: string): void {
+    const choice = this.effective;
+    if (choice?.apiKeyRef !== `vault:${name}`) return;
+    this.#o.apply?.(choice);
+    this.#log(`settings: the model key vault:${name} changed; new turns resolve it again`);
+  }
+
   /** Save `{provider, model, keyRef}` and switch the runners to it for the next turn. */
   async put(
     principal: Principal,

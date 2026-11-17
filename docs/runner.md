@@ -9,7 +9,10 @@ provider and need no model key.
 The key never goes to pi through the environment: the hub resolves
 `HEARTH_MODEL_KEY_REF` through its `SecretStore` (`env:NAME` reads `NAME`) and
 hands the value to pi in memory (`ModelRuntime.setRuntimeApiKey`). Without
-`HEARTH_MODEL` the runner is off and the message routes are not served. A
+`HEARTH_MODEL` the model and its `vault:` key come from the Settings page
+(decision 0038); until one is saved a message fails with `runner.no-model`
+(409). Saving switches the model for the next turn: an idle runner is rebuilt
+from the event log, a running turn keeps the model it started with. A
 provider error that echoes the key is stored and logged with the key replaced
 by `[redacted]`.
 
