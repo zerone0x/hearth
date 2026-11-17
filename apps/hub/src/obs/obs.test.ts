@@ -664,6 +664,17 @@ describe("bash calls record the command rules' verdict (#69)", () => {
     });
     expect(byId("c_read")).not.toHaveProperty("bash_policy");
   });
+
+  test("a verdict for a call the tracer does not know is dropped, not thrown", () => {
+    const t = new TurnTracer({
+      sessionId: "se_v",
+      telemetry: new Telemetry(),
+      versions: { pi: "p", hub: "h" },
+    });
+    expect(() =>
+      t.onBashVerdict("c_unknown", { action: "deny", rule: "x", reason: "y" }),
+    ).not.toThrow();
+  });
 });
 
 describe("model calls carry their request and output (schema /2)", () => {
