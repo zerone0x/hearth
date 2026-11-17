@@ -73,7 +73,8 @@ DECISIONS entry of the issue that builds it.
 1. **Access mode: write Hearth's own small `tool_call` gate. Adopt none of the
    five packages, and vendor none of their rule engines.** None can be driven
    from the hub without faking pi's TUI dialog API. Each reads its config from
-   `~/.pi` on the host. Two make calls off the hub: one spawns a `pi`
+   pi's agent directory (`~/.pi/agent` or `getAgentDir()`) or the project
+   on the host, not from Hearth's settings. Two make calls off the hub: one spawns a `pi`
    subprocess as an LLM "approver", the other has an optional hosted judge.
    One targets the frozen `@mariozechner` package name. And their command
    matchers are either a scanner or `shell-quote`, which missed 10 of the 36
@@ -84,8 +85,8 @@ DECISIONS entry of the issue that builds it.
 2. **Bash parsing (#69): `unbash` 6.0.4** (ISC, pure TypeScript, no deps,
    sync, 0.08 ms for a typical command). Hearth puts a small policy layer on
    top: unwrap `sudo`/`env`/`timeout`, re-parse `bash -c` and `eval`, and ask
-   for any non-literal command name, alias, parse error or nesting deeper than
-   3. `unbash`, `tree-sitter-bash` and `sh-syntax` all scored 36 out of 36 on
+   for any non-literal command name, alias, or parse error, and for
+   `-c`/`eval` nesting deeper than 3. `unbash`, `tree-sitter-bash` and `sh-syntax` all scored 36 out of 36 on
    the hostile set. `unbash` wins on size and supply chain. Its one trap: nested
    scripts are lazy fields, so a plain object walk misses `$(...)` (7 misses
    in the first run). Only its `forEachChild` visitor sees them.
@@ -105,7 +106,8 @@ DECISIONS entry of the issue that builds it.
    once); deactivate; and delete. Spend came from `/api/logs/stats?virtual_key_ids=`,
    and $1.59 equals the sum of the rows. Over budget is HTTP 402
    `budget_exceeded`. Usage survived a Bifrost restart. Two caveats: the call
-   that crosses the budget is allowed (it overshoots by one call), and usage
+   that crosses the budget is allowed (an overshoot of one call per request
+  in flight), and usage
    and logs reach the database in batches (about 5-10 s).
 5. **Fits the existing decisions without a PRD change, so no decision entry.**
    The gate is a Hearth built-in on the `tool_call` hook that already exists
@@ -161,7 +163,7 @@ string, not structured data for a card.
 | `@pi-kit/permissions` | deny > ask > allow globs over tools, bash and paths, plus an `outsideCwd` dimension (`src/decide.ts`); clean and small | a scanner: "not a parser … `$(...)`, backticks, braces and heredocs are not tracked" (`src/match/command.ts:3-11`) | no: `ctx.ui.select`; headless means `headlessAsk: "deny"` (`extensions/index.ts:132-137`, `src/config/defaults.ts`) | reads `~/.pi/agent` and project config | the best of the five; credit the ordering idea |
 | `@skibum1869/pi-permission-gate` | a fixed severity inventory (high/medium) in code | `shell-quote` tokens split on `&&`, `\|\|`, `;` (`src/analyze.ts:1-13`) | no: `ctx.ui.select`, `ctx.ui.theme` | reads `PI_CODING_AGENT_DIR` or `~/.pi/agent` (`src/index.ts:196`); its source repo is gone (404) | credit the inventory as a seed list only |
 | `pi-permission-suite` | wildcard rules plus an "auto approver" | tree-sitter-bash, but "falls back to simple string splitting when tree-sitter is unavailable" (`bash-parser.ts:10`) | no: `ctx.ui.select` | **spawns `pi` as a subprocess LLM approver** (`subprocess-runner.ts:66`, `approver.ts`); writes config into `~/.pi/agent/extensions` (`config-loader.ts:39,68,81`) | no |
-| `@rhedbull/pi-permissions` | modes and globs in one file | regex | no: `ctx.ui.select` | imports `@mariozechner/pi-coding-agent` (`extensions/index.ts:29`), the frozen name PRD §8.4 forbids | no |
+| `@rhedbull/pi-permissions` | modes and pattern lists in one file | substrings of the raw command (`findMatch`, `extensions/index.ts:207,270`) | no: `ctx.ui.select` | imports `@mariozechner/pi-coding-agent` (`extensions/index.ts:29`), the frozen name PRD §8.4 forbids | no |
 | `pi-ask-permission` | rich, but TUI-centred (`ctx.ui.custom`, `onTerminalInput`) | `shell-quote` plus a 689-line read-only-command list | partly: a "no UI" mode allows or blocks (`src/pi/events.ts:117-120`) | an optional LLM judge, off by default, whose default provider posts tool calls to `https://api.typesafe.ai/v1` (`src/core/judge/backends/jev.ts:14`, `judge/config.ts:35`); writes an "always yes" file | no |
 
 **Supply chain.** The runner is in the hub, and the hub holds the vault key and
@@ -173,9 +175,12 @@ are most of the work.
 
 **Recommendation: a small Hearth gate, built in (not a package).** It is
 registered by the runner next to `hearth-tools`, under a reserved name, so
-#56's allowlist does not apply. It is loaded only when the mode in force is
-`ask`. For `yolo`, Hearth's existing `tool_call` handler still records the mode
-(question 3). About 200 lines plus the parser:
+#56's allowlist does not apply. It runs in both modes: `deny` rules block in
+both, as the config deny-list does today, and `ask` rules only ask in `ask`
+mode. In `yolo` they pass, but the mode is still recorded (question 3). PRD
+§6.5 says `yolo` "simply does not load" the extension; skipping its `ask` rules
+does the same for the owner and keeps one place that records the mode. About
+200 lines plus the parser:
 
 1. Classify the call: `bash` through the parser (question 2); path tools
    through the existing normalized-path rules (0015); `browser_*` by tool name
@@ -222,10 +227,10 @@ Results (Bun 1.4.4, one core):
 
 | Parser | As expected | Typical command | 3,000-deep `$(` | Notes |
 |---|---|---|---|---|
-| `tree-sitter-bash` (web-tree-sitter) | **36/36** | 0.10-0.16 ms | ask (error nodes), 33-55 ms | async `Parser.init()` once, then sync. A parse error shows as `ERROR`/`MISSING` nodes, so the check is `rootNode.hasError`. |
+| `tree-sitter-bash` (web-tree-sitter) | **36/36** | 0.10-0.16 ms | parsed without error; ask, because each level's command name is a substitution; 33-55 ms | async `Parser.init()` once, then sync. A parse error shows as `ERROR`/`MISSING` nodes, so the check is `rootNode.hasError`. |
 | `unbash` | **36/36** | 0.08-0.17 ms | ask ("maximum command substitution nesting depth exceeded"), 1-226 ms | Sync, typed AST. Tolerant: returns a partial tree plus `errors`, and **a nested script has its own `errors`**. The first run, which walked object fields, scored 29/36: every `$(...)`, backtick, process substitution and heredoc command was missed, because a substitution's `script` is a lazy prototype getter. Only `forEachChild` resolves it (README "Visit"). |
-| `sh-syntax` (mvdan/sh) | **36/36** | 0.6 ms | ask, 56-65 ms | async API (a sync entry exists), 4.1 MB Go wasm. The most mature grammar of the three. |
-| `bash-parser` | 35/36 | 0.8-1.2 ms | ask | Runs a quoted heredoc's body as a command (a false "ask"). Unmaintained since 2017, 12 old deps. |
+| `sh-syntax` (mvdan/sh) | **36/36** | 0.6 ms | ask, but only because the wasm threw `RangeError: Maximum call stack size exceeded`; 56-65 ms | async API (a sync entry exists), 4.1 MB Go wasm. The most mature grammar of the three. |
+| `bash-parser` | 35/36 | 0.8-1.2 ms | ask (`Unclosed $(`, a wrong error) | Runs a quoted heredoc's body as a command (a false "ask"). Unmaintained since 2017, 12 old deps. |
 | `shell-quote` | 26/36 | 0.02 ms | **allow** | Flat tokens. Misses backticks, `${:-$(...)}`, brace groups, `if`/`for`/functions, and `$X` as a name, and accepts unterminated quotes. Not a parser. |
 
 **Recommendation: `unbash` behind a Hearth interface**
@@ -233,7 +238,8 @@ Results (Bun 1.4.4, one core):
 - `forEachChild` as the only traversal, and an error check on every node that
   has `errors`;
 - a cap on input length (for example 64 KiB, above which it asks) next to the
-  parser's own depth cap;
+  parser's own depth cap, and a caught exception from the parser counts as a
+  parse error (`sh-syntax` overflowed its stack on the deep sample);
 - the hostile set above as the #69 test table, with an `unbash` test that
   fails if a nested `$(...)` is not seen, guarding against the lazy-field trap
   after an upgrade.
@@ -320,9 +326,9 @@ so (#71).
 **Trajectory.** Every `tool_call` record gains `access_mode: "yolo" | "ask"`
 (the mode in force when the call was preflighted) and, when gated,
 `approval: {id, rule, decision, decided_by, waited_ms}`. These are added
-fields, so the schema stays `hearth.trajectory/2`, the precedent of 0037. In
-`yolo`, the existing `tool_call` handler records the mode, so both modes leave
-the field (S3 checks it). A mode change, global or per session, writes an
+fields, so the schema stays `hearth.trajectory/2`, the precedent of 0037. The
+gate runs in both modes (question 1), so both leave the field, which S3
+checks. A mode change, global or per session, writes an
 audit row and a `session.access_mode` event. The mode is read once per tool
 call, so a change mid-turn applies to the next call.
 
@@ -388,12 +394,14 @@ instead.
   `/api/logs` for rows) through the hub, cached and refreshed after each turn.
   Writes arrive in batches, about 5 s for logs and about 10 s for budgets, so
   the S3 check waits for the batch before it compares.
-- **Over budget.** A 402 `budget_exceeded` (or a rate-limit refusal, not probed here) is
-  classified `gateway`, not retried and not given a fallback model (§8.1, principle 2).
-  The turn ends with a visible message naming the budget and the spend, which
-  is the exit criterion. The call that crosses the budget is allowed, so the UI
-  says "budget reached" once spend is at or over the budget, and the doc says
-  the overshoot is at most one call.
+- **Over budget.** A 402 `budget_exceeded` (or a rate-limit refusal, not
+  probed here) is classified `gateway`, not retried and not given a fallback
+  model (§8.1, principle 2). The turn ends with a visible message naming the
+  budget and the spend, which is the exit criterion. The check runs before a
+  call on the usage so far, so the call that crosses the budget is allowed.
+  The overshoot is one call for each request in flight (sequential calls in
+  the probe). The UI says "budget reached" once spend is at or over the
+  budget, and `install.md` names the overshoot.
 
 ### 5. Fit with existing decisions
 
