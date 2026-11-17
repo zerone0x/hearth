@@ -1748,6 +1748,8 @@ describe("browser_fill (decision 0039)", () => {
     const result = resultsOf(runner).get("c_fill");
     expect(result?.isError).toBe(true);
     expect(result?.text).toContain("vault.kind-mismatch");
+    // The vault refused it (the runner asks for logins only), not the tool after a hand-out.
+    expect(result?.text).toContain("a token entry cannot be used here");
     expect(tab.actions.some((a) => a.startsWith("fill"))).toBe(false);
   });
 });
