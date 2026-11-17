@@ -52,9 +52,11 @@ import {
   type ModelSettings,
   type Secret,
   type SecretKind,
+  type SessionBudget,
 } from "./api";
 import { ErrorAlert } from "./ErrorAlert";
 import { keys } from "./queries";
+import { formatUsd } from "./spend";
 
 /** The encrypted fields of each kind, as the hub's vault takes them (decision 0031). */
 export const KIND_FIELDS: Record<SecretKind, readonly string[]> = {
@@ -88,6 +90,7 @@ export default function SettingsPage() {
       )}
       <ModelCard secrets={secrets.data ?? []} />
       <AccessModeCard />
+      <BudgetCard />
       <SecretsCard secrets={secrets.data} vaultOn={vault.data?.state === "enabled"} />
     </>
   );
@@ -296,6 +299,95 @@ function AccessModeForm({ settings }: { settings: AccessModeSettings }) {
       {save.isSuccess ? (
         <p className="text-sm text-muted-foreground" role="status">
           {`Saved. Sessions that follow the default use ${save.data.mode} from their next tool call.`}
+        </p>
+      ) : null}
+      <Button type="submit" className="self-start" disabled={save.isPending}>
+        Save
+      </Button>
+    </form>
+  );
+}
+
+/** Bifrost's state as the Settings page says it. */
+function gatewayText(state: string | null): string {
+  if (state === null)
+    return "Bifrost is not configured: model calls go straight to the provider, without a budget.";
+  if (state === "ok") return "Model calls go through Bifrost, with a virtual key per session.";
+  return `Bifrost is not available (${state}): model calls wait for it.`;
+}
+
+function BudgetCard() {
+  const budget = useQuery({ queryKey: keys.sessionBudget, queryFn: api.sessionBudget });
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>
+          <h2>Session budget</h2>
+        </CardTitle>
+        <CardDescription>
+          Each session gets this budget on its own virtual key. A session that reaches it stops with
+          a message; raise it here to continue. One call in flight can go past it.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ErrorAlert error={budget.error} />
+        {budget.data === undefined ? (
+          budget.isError ? null : (
+            <p className="text-muted-foreground">Loading…</p>
+          )
+        ) : (
+          <BudgetForm budget={budget.data} />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function BudgetForm({ budget }: { budget: SessionBudget }) {
+  const client = useQueryClient();
+  const [value, setValue] = useState(String(budget.budgetUsd));
+  const save = useMutation({
+    mutationFn: () => api.saveSessionBudget(Number(value)),
+    onSuccess: (saved) => client.setQueryData(keys.sessionBudget, saved),
+  });
+
+  function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    save.mutate();
+  }
+
+  const total = budget.total;
+  return (
+    <form className="flex flex-col gap-3" onSubmit={onSubmit} aria-label="Session budget">
+      <p className="text-sm text-muted-foreground" data-testid="gateway-state">
+        {gatewayText(budget.bifrostState)}
+      </p>
+      {total === null ? null : (
+        <p className="text-sm" data-testid="total-spend">
+          {`All sessions: ${formatUsd(total.costUsd)}, ${total.totalTokens.toLocaleString("en-US")} tokens in ${total.requests} calls (Bifrost logs a call within about ${budget.flushSeconds} s).`}
+        </p>
+      )}
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor="session-budget">Budget per session (US dollars)</Label>
+        <Input
+          id="session-budget"
+          type="number"
+          inputMode="decimal"
+          min="0.01"
+          step="any"
+          required
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          className="max-w-40"
+        />
+        {budget.source === "default" ? (
+          <p className="text-xs text-muted-foreground">Not saved yet: the default applies.</p>
+        ) : null}
+      </div>
+      <ErrorAlert error={save.error} />
+      {save.isSuccess ? (
+        <p className="text-sm text-muted-foreground" role="status">
+          {`Saved. Every session's budget is ${formatUsd(save.data.budgetUsd)}.`}
         </p>
       ) : null}
       <Button type="submit" className="self-start" disabled={save.isPending}>

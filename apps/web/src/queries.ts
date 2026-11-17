@@ -22,7 +22,12 @@ export const keys = {
   modelSettings: ["model-settings"] as const,
   accessMode: ["access-mode"] as const,
   sessionAccessMode: (id: string) => ["session-access-mode", id] as const,
+  sessionSpend: (id: string) => ["session-spend", id] as const,
+  sessionBudget: ["session-budget"] as const,
 };
+
+/** How often an open session re-reads its spend: Bifrost logs a call within about 10 s. */
+export const POLL_SPEND_MS = 10_000;
 
 /** How often an open desktop re-reads its lock: a lease can lapse or be taken meanwhile. */
 export const POLL_DESKTOP_LOCK_MS = 3000;
