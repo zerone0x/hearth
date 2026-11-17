@@ -314,6 +314,29 @@ export const MIGRATIONS: readonly Migration[] = [
         CHECK (access_mode IS NULL OR access_mode IN ('yolo', 'ask'));
     `,
   },
+  {
+    // A session's Bifrost virtual key (decision 0047, PRD §6.4): only its id,
+    // never the value, which is rotated on every runner build and kept in the
+    // runner's memory. `provider`/`model` are the allowlist last sent;
+    // `budget_usd` the budget last sent. `active` is 0 once the session is
+    // archived (the key is deactivated in Bifrost).
+    version: 10,
+    name: "session virtual keys",
+    sql: `
+      CREATE TABLE session_virtual_key (
+        workspace_id TEXT NOT NULL REFERENCES workspace (id),
+        session_id TEXT NOT NULL REFERENCES session (id),
+        vk_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        budget_usd REAL NOT NULL CHECK (budget_usd > 0),
+        active INTEGER NOT NULL CHECK (active IN (0, 1)),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, session_id)
+      ) STRICT;
+    `,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

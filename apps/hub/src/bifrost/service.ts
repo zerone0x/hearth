@@ -19,14 +19,14 @@
  *   that is not a global `use: hub` token is never handed over.
  * - **Health.** `GET /health` and an authorized admin call every
  *   `checkEveryMs`; each change of state is one log line, and `/healthz`
- *   reports it (`unavailable` and the state). The hub never depends on
- *   Bifrost being up: no model call uses it yet.
+ *   reports it (`unavailable` and the state). The hub starts without
+ *   Bifrost; a model call waits for it (decision 0047).
  * - **Never reachable from a box.** At start the hub checks that the box
  *   egress allow list (decisions 0012, 0023) does not cover Bifrost's
  *   address; `scripts/box-firewall.sh` refuses such a list as well.
  *
- * Model traffic does not go through Bifrost yet: #157 adds per-session
- * virtual keys and switches the runner (decision 0046).
+ * Model traffic goes through Bifrost with a virtual key per session
+ * (`virtual-keys.ts`, decision 0047).
  */
 
 import { randomBytes } from "node:crypto";
@@ -165,6 +165,8 @@ export class BifrostService {
   #timer: ReturnType<typeof setInterval> | undefined;
   #syncing: Promise<void> = Promise.resolve();
   #stopped = false;
+  /** The entries the hub is generating now: their `onEntryAdded` is not a change. */
+  readonly #generating = new Set<string>();
 
   constructor(options: BifrostServiceOptions) {
     this.#o = options;
@@ -172,6 +174,16 @@ export class BifrostService {
 
   get status(): BifrostStatus {
     return this.#status;
+  }
+
+  /** Bifrost's base URL (`HEARTH_BIFROST_URL`). */
+  get url(): string {
+    return this.#o.url;
+  }
+
+  /** The admin client while Bifrost is `ok`; undefined otherwise. */
+  get client(): BifrostClient | undefined {
+    return this.#status.state === "ok" ? this.#client : undefined;
   }
 
   /**
@@ -247,6 +259,8 @@ export class BifrostService {
   /** A vault entry was added, rotated or deleted: push the model keys again. */
   entryChanged(name: string): void {
     if (name === BIFROST_ADMIN_ENTRY || name === BIFROST_ENCRYPTION_ENTRY) {
+      // The hub's own first creation of the entry is not a change (#157).
+      if (this.#generating.has(name)) return;
       this.#o.log(
         `bifrost: vault:${name} changed; Bifrost keeps the old value until it is set up again (decision 0046)`,
       );
@@ -345,13 +359,18 @@ export class BifrostService {
         );
       }
     } else {
-      await this.#o.vault.create(SYSTEM_PRINCIPAL, {
-        name,
-        kind: "token",
-        policy: { use: "hub" },
-        meta: { label: "generated for the Bifrost gateway (decision 0046)" },
-        fields: { value: randomBytes(32).toString("base64url") },
-      });
+      this.#generating.add(name);
+      try {
+        await this.#o.vault.create(SYSTEM_PRINCIPAL, {
+          name,
+          kind: "token",
+          policy: { use: "hub" },
+          meta: { label: "generated for the Bifrost gateway (decision 0046)" },
+          fields: { value: randomBytes(32).toString("base64url") },
+        });
+      } finally {
+        this.#generating.delete(name);
+      }
     }
     return this.#o.vault.readForHub(name, undefined, `vault:${name}`);
   }

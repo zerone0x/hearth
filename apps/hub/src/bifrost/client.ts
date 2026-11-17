@@ -2,8 +2,8 @@
  * A small typed client for the parts of Bifrost's admin API the hub uses
  * (decision 0046): its health and the provider keys pushed from the vault.
  * Bifrost v2.5.1 (`maximhq/bifrost`, Apache-2.0); shapes as verified against
- * the binary (docs/research/m3-models-access.md, question 4). Per-session
- * virtual keys are #157 and not here.
+ * the binary (docs/research/m3-models-access.md, question 4), and the
+ * per-session virtual keys and their spend (#157, decision 0047).
  *
  * The admin password is sent as HTTP Basic auth on every `/api` call; it is
  * never logged and never part of an error message.
@@ -41,6 +41,106 @@ export interface BifrostClientOptions {
   readonly fetch?: typeof fetch;
   /** Per request. Default 10 s. */
   readonly timeoutMs?: number;
+}
+
+/**
+ * A per-session virtual key as the hub asks for it (decision 0047). The model
+ * allowlist is explicit and never empty: Bifrost reads an empty list
+ * differently from PRD §6.4 ("empty means none"), so the client refuses one
+ * before anything is sent. No key ever sets `allow_all_providers`.
+ */
+export interface VirtualKeyInput {
+  readonly name: string;
+  /** The Bifrost provider, e.g. `openai`. */
+  readonly provider: string;
+  /** Model ids as Bifrost names them for that provider, e.g. `gpt-4o-mini`. */
+  readonly models: readonly string[];
+  /** The budget in US dollars, over `BUDGET_RESET` (a lifetime for a session). */
+  readonly budgetUsd: number;
+}
+
+/** A virtual key Bifrost made or rotated: the value lives only in the caller's memory. */
+export interface IssuedVirtualKey {
+  readonly id: string;
+  readonly value: string;
+}
+
+/** Bifrost's request-log totals for one virtual key (`GET /api/logs/stats`). */
+export interface VirtualKeyStats {
+  readonly requests: number;
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  readonly costUsd: number;
+}
+
+/** The budget window of a session's key: long enough to be the session's lifetime. */
+export const BUDGET_RESET = "1Y";
+/** Requests per minute a session's key allows (Bifrost answers 429 above it). */
+export const SESSION_RATE_LIMIT = { requests: 120, reset: "1m" } as const;
+
+/** The checked allowlist: non-empty, model ids only (no `*`), no duplicates. */
+export function checkAllowlist(models: readonly unknown[]): string[] {
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new HearthError("a virtual key needs at least one allowed model (empty means none)", {
+      owner: "hub",
+      disposition: "give-up",
+      code: "bifrost.empty-allowlist",
+    });
+  }
+  for (const m of models) {
+    if (typeof m !== "string" || m.trim() === "" || m.includes("*")) {
+      throw new HearthError(`not a model id for an allowlist: ${JSON.stringify(m)}`, {
+        owner: "hub",
+        disposition: "give-up",
+        code: "bifrost.bad-allowlist",
+      });
+    }
+  }
+  return [...new Set(models as string[])];
+}
+
+function checkBudget(usd: number): number {
+  if (!Number.isFinite(usd) || usd <= 0) {
+    throw new HearthError(`a session budget must be a positive amount, got ${usd}`, {
+      owner: "hub",
+      disposition: "give-up",
+      code: "bifrost.bad-budget",
+    });
+  }
+  return usd;
+}
+
+/** The body Bifrost gets for a key's provider config: always `allow_all_providers: false`. */
+export function virtualKeyBody(
+  input: Pick<VirtualKeyInput, "provider" | "models"> & Partial<VirtualKeyInput>,
+): Record<string, unknown> {
+  return {
+    ...(input.name === undefined ? {} : { name: input.name }),
+    provider_configs: [
+      {
+        provider: checkProvider(input.provider),
+        allowed_models: checkAllowlist(input.models),
+        key_ids: ["*"],
+      },
+    ],
+    allow_all_providers: false,
+    ...(input.budgetUsd === undefined
+      ? {}
+      : { budgets: [{ max_limit: checkBudget(input.budgetUsd), reset_duration: BUDGET_RESET }] }),
+  };
+}
+
+function numberOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function issuedOf(body: unknown): IssuedVirtualKey | undefined {
+  const vk = isRecord(body) ? body["virtual_key"] : undefined;
+  if (!isRecord(vk) || typeof vk["id"] !== "string" || typeof vk["value"] !== "string") {
+    return undefined;
+  }
+  return { id: vk["id"], value: vk["value"] };
 }
 
 /** A provider name as Bifrost takes it in a path. */
@@ -144,6 +244,64 @@ export class BifrostClient {
     );
   }
 
+  /** `POST /api/governance/virtual-keys`: allowlist, budget and rate limit; never all providers. */
+  async createVirtualKey(input: VirtualKeyInput): Promise<IssuedVirtualKey> {
+    const body = {
+      ...virtualKeyBody(input),
+      rate_limit: {
+        request_max_limit: SESSION_RATE_LIMIT.requests,
+        request_reset_duration: SESSION_RATE_LIMIT.reset,
+      },
+      is_active: true,
+    };
+    const issued = issuedOf((await this.#call("POST", "/api/governance/virtual-keys", body)).body);
+    if (issued === undefined) throw fail("bifrost.bad-answer", "Bifrost answered no virtual key");
+    return issued;
+  }
+
+  /** `PUT /api/governance/virtual-keys/{id}`: a model switch (allowlist) and the budget. */
+  async updateVirtualKey(
+    id: string,
+    input: Pick<VirtualKeyInput, "provider" | "models"> & { budgetUsd?: number },
+  ): Promise<void> {
+    await this.#call("PUT", vkPath(id), virtualKeyBody(input));
+  }
+
+  /** `PUT …/{id} {is_active}`: an inactive key is refused (403) on every model call. */
+  async setVirtualKeyActive(id: string, active: boolean): Promise<void> {
+    await this.#call("PUT", vkPath(id), { is_active: active });
+  }
+
+  /** `POST …/{id}/rotate`: a new value; the old one is refused at once. */
+  async rotateVirtualKey(id: string): Promise<IssuedVirtualKey> {
+    const issued = issuedOf((await this.#call("POST", `${vkPath(id)}/rotate`)).body);
+    if (issued === undefined) throw fail("bifrost.bad-answer", "Bifrost answered no virtual key");
+    return issued;
+  }
+
+  /** `DELETE …/{id}`; a key already gone is not an error. Its log rows stay. */
+  async deleteVirtualKey(id: string): Promise<void> {
+    await this.#call("DELETE", vkPath(id), undefined, [200, 404]);
+  }
+
+  /**
+   * Request-log totals for `id`, or for every key when `id` is undefined.
+   * Bifrost writes log rows in batches (about 5 s), so a call that just ended
+   * may not be counted yet.
+   */
+  async stats(id?: string): Promise<VirtualKeyStats> {
+    const query = id === undefined ? "" : `?virtual_key_ids=${encodeURIComponent(id)}`;
+    const body = (await this.#call("GET", `/api/logs/stats${query}`)).body;
+    const b = isRecord(body) ? body : {};
+    return {
+      requests: numberOf(b["total_requests"]),
+      promptTokens: numberOf(b["prompt_tokens"]),
+      completionTokens: numberOf(b["completion_tokens"]),
+      totalTokens: numberOf(b["total_tokens"]),
+      costUsd: numberOf(b["total_cost"]),
+    };
+  }
+
   async #call(
     method: string,
     path: string,
@@ -186,6 +344,10 @@ export class BifrostClient {
 function checkProvider(provider: string): string {
   if (!PROVIDER.test(provider)) throw new Error(`not a Bifrost provider name: ${provider}`);
   return provider;
+}
+
+function vkPath(id: string): string {
+  return `/api/governance/virtual-keys/${encodeURIComponent(id)}`;
 }
 
 function keyBody(key: BifrostKeyInput): Record<string, unknown> {

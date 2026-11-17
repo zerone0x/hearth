@@ -28,6 +28,7 @@ export {
   SqliteSessionStore,
 } from "./sessions";
 export { type SettingRow, SqliteSettingStore } from "./setting-store";
+export { SqliteVirtualKeyStore, type VirtualKeyRow } from "./virtual-key-store";
 export {
   type SecretUseRow,
   SqliteVaultStore,
