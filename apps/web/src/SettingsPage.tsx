@@ -11,6 +11,10 @@
  * A token can be made usable by box commands (decision 0041): a `bash` call
  * may then pass it to one command as an environment variable. The switch and
  * the table badge both say it is then visible to commands in the box.
+ *
+ * The access mode card (decision 0045) sets the default every session follows
+ * unless it has its own choice (the session header). A native select, like the
+ * model key's, so no Radix scroll lock touches the CSP.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -41,7 +45,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { api, type ModelSettings, type Secret, type SecretKind } from "./api";
+import {
+  type AccessMode,
+  type AccessModeSettings,
+  api,
+  type ModelSettings,
+  type Secret,
+  type SecretKind,
+} from "./api";
 import { ErrorAlert } from "./ErrorAlert";
 import { keys } from "./queries";
 
@@ -76,6 +87,7 @@ export default function SettingsPage() {
         </Alert>
       )}
       <ModelCard secrets={secrets.data ?? []} />
+      <AccessModeCard />
       <SecretsCard secrets={secrets.data} vaultOn={vault.data?.state === "enabled"} />
     </>
   );
@@ -211,6 +223,87 @@ function ModelForm({ settings, keys: modelKeys }: { settings: ModelSettings; key
           Save
         </Button>
       )}
+    </form>
+  );
+}
+
+/** What each access mode does. */
+const ACCESS_MODE_LABEL: Record<AccessMode, string> = {
+  ask: "Ask: risky actions wait for your approval",
+  yolo: "Yolo: run every tool without asking",
+};
+
+function AccessModeCard() {
+  const settings = useQuery({ queryKey: keys.accessMode, queryFn: api.accessMode });
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>
+          <h2>Access mode</h2>
+        </CardTitle>
+        <CardDescription>
+          The default for every session without its own choice (set on the session). A change
+          applies from each session's next tool call; every tool call records the mode it ran under.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ErrorAlert error={settings.error} />
+        {settings.data === undefined ? (
+          settings.isError ? null : (
+            <p className="text-muted-foreground">Loading…</p>
+          )
+        ) : (
+          <AccessModeForm settings={settings.data} />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function AccessModeForm({ settings }: { settings: AccessModeSettings }) {
+  const client = useQueryClient();
+  const [mode, setMode] = useState<AccessMode>(settings.mode);
+  const save = useMutation({
+    mutationFn: () => api.saveAccessMode(mode),
+    onSuccess: (saved) => {
+      client.setQueryData(keys.accessMode, saved);
+      // Sessions that follow the default show the new one.
+      void client.invalidateQueries({ queryKey: keys.sessionAccessModes });
+    },
+  });
+
+  function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    save.mutate();
+  }
+
+  return (
+    <form className="flex flex-col gap-3" onSubmit={onSubmit} aria-label="Access mode">
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor="access-mode">Default for sessions</Label>
+        <NativeSelect
+          id="access-mode"
+          value={mode}
+          onChange={(e) => setMode(e.target.value === "yolo" ? "yolo" : "ask")}
+        >
+          <NativeSelectOption value="ask">{ACCESS_MODE_LABEL.ask}</NativeSelectOption>
+          <NativeSelectOption value="yolo">{ACCESS_MODE_LABEL.yolo}</NativeSelectOption>
+        </NativeSelect>
+        <p className="text-xs text-muted-foreground">
+          {settings.source === "default" ? "Not saved yet, so sessions use ask. " : ""}
+          Approval prompts for ask are not in this version yet: until they are, both modes run tools
+          as before, and the deny-list blocks in both.
+        </p>
+      </div>
+      <ErrorAlert error={save.error} />
+      {save.isSuccess ? (
+        <p className="text-sm text-muted-foreground" role="status">
+          {`Saved. Sessions that follow the default use ${save.data.mode} from their next tool call.`}
+        </p>
+      ) : null}
+      <Button type="submit" className="self-start" disabled={save.isPending}>
+        Save
+      </Button>
     </form>
   );
 }

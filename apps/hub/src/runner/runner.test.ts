@@ -292,6 +292,10 @@ interface HarnessExtra {
   accessMode: SessionRunnersOptions["accessMode"];
 }
 
+function accessModeOption(accessMode: SessionRunnersOptions["accessMode"]) {
+  return accessMode === undefined ? {} : { accessMode };
+}
+
 function vaultOption(vault: SessionRunnersOptions["vault"]) {
   return vault === undefined ? {} : { vault };
 }
@@ -338,9 +342,7 @@ async function harness(
       boxCwd: root,
       log: () => {},
       ...vaultOption(more.vault ?? extra.vault),
-      ...((more.accessMode ?? extra.accessMode) === undefined
-        ? {}
-        : { accessMode: more.accessMode ?? extra.accessMode }),
+      ...accessModeOption(more.accessMode ?? extra.accessMode),
     });
     closers.push(() => runners.close());
     return runners;

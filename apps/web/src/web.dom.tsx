@@ -46,6 +46,10 @@ function hub(extra: Route) {
     if (path === "/v1/auth/status") return ok({ setupRequired: false, authenticated: true });
     if (path === "/v1/sessions") return ok({ sessions: [SESSION] });
     if (path === "/v1/sessions/se_1") return ok({ session: SESSION });
+    if (path === "/v1/settings/access-mode")
+      return ok({ mode: "ask", source: "default", updatedAt: null });
+    if (path === "/v1/sessions/se_1/access-mode")
+      return ok({ sessionId: "se_1", override: null, global: "ask", mode: "ask" });
     if (path.startsWith("/v1/sessions/se_1/events"))
       return ok({ events: [], cursor: 0, hasMore: false });
     return fail(404, `no route ${method} ${path}`);
@@ -418,6 +422,109 @@ describe("settings page in a DOM", () => {
     for (const button of screen.getAllByRole("button", { name: "Rotate" })) {
       expect((button as HTMLButtonElement).disabled).toBe(true);
     }
+  });
+});
+
+describe("access mode in a DOM (decision 0045)", () => {
+  /** A hub whose global default and session override change as the UI saves them. */
+  function accessHub(initial: { global: "yolo" | "ask"; override: "yolo" | "ask" | null }) {
+    const state = { ...initial };
+    const sent: Array<{ method: string; path: string; body: unknown }> = [];
+    const sessionView = () => ({
+      sessionId: "se_1",
+      override: state.override,
+      global: state.global,
+      mode: state.override ?? state.global,
+    });
+    hub((method, path, body) => {
+      if (path === "/v1/vault/status")
+        return ok({ state: "enabled", kekCheck: "a", key: "current" });
+      if (path === "/v1/secrets") return ok({ secrets: [] });
+      if (path === "/v1/settings/model")
+        return ok({ source: "none", provider: null, model: null, keyRef: null });
+      if (path === "/v1/settings/access-mode") {
+        if (method === "PUT") {
+          sent.push({ method, path, body });
+          state.global = (body as { mode: "yolo" | "ask" }).mode;
+        }
+        return ok({ mode: state.global, source: "settings", updatedAt: 5 });
+      }
+      if (path === "/v1/sessions/se_1/access-mode") {
+        if (method === "PUT") {
+          sent.push({ method, path, body });
+          state.override = (body as { mode: "yolo" | "ask" | null }).mode;
+        }
+        return ok(sessionView());
+      }
+      return undefined;
+    });
+    return { sent };
+  }
+
+  test("the Settings card saves the global default", async () => {
+    const { sent } = accessHub({ global: "ask", override: null });
+    renderApp("#/settings");
+    const form = await screen.findByRole("form", { name: "Access mode" });
+    const select = within(form).getByLabelText("Default for sessions") as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("ask"));
+    expect([...select.options].map((o) => o.value)).toEqual(["ask", "yolo"]);
+    fireEvent.change(select, { target: { value: "yolo" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    });
+    expect(
+      await within(form).findByText(
+        "Saved. Sessions that follow the default use yolo from their next tool call.",
+      ),
+    ).toBeTruthy();
+    expect(sent).toEqual([
+      { method: "PUT", path: "/v1/settings/access-mode", body: { mode: "yolo" } },
+    ]);
+  });
+
+  test("the session header shows the mode and sets or clears the override", async () => {
+    const { sent } = accessHub({ global: "yolo", override: null });
+    renderApp("#/s/se_1");
+    const select = (await screen.findByLabelText("Access")) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("default"));
+    expect(select.selectedOptions[0]?.textContent).toBe("Default (yolo)");
+    expect(screen.getByTestId("access-mode").dataset["mode"]).toBe("yolo");
+
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "ask" } });
+    });
+    await waitFor(() => expect(screen.getByTestId("access-mode").dataset["mode"]).toBe("ask"));
+    expect(select.value).toBe("ask");
+
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "default" } });
+    });
+    await waitFor(() => expect(screen.getByTestId("access-mode").dataset["mode"]).toBe("yolo"));
+    expect(select.value).toBe("default");
+    expect(sent).toEqual([
+      { method: "PUT", path: "/v1/sessions/se_1/access-mode", body: { mode: "ask" } },
+      { method: "PUT", path: "/v1/sessions/se_1/access-mode", body: { mode: null } },
+    ]);
+  });
+
+  test("a refused change says why and keeps the mode the hub has", async () => {
+    hub((method, path) => {
+      if (path === "/v1/sessions/se_1/access-mode") {
+        return method === "PUT"
+          ? fail(403, "session.access_mode.update denied")
+          : ok({ sessionId: "se_1", override: "ask", global: "yolo", mode: "ask" });
+      }
+      return undefined;
+    });
+    renderApp("#/s/se_1");
+    const select = (await screen.findByLabelText("Access")) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe("ask"));
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "yolo" } });
+    });
+    expect(await screen.findByText("session.access_mode.update denied")).toBeTruthy();
+    expect(select.value).toBe("ask");
+    expect(screen.getByTestId("access-mode").dataset["mode"]).toBe("ask");
   });
 });
 

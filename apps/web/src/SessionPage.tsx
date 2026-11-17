@@ -2,12 +2,17 @@
  * One session: the chat and the desktop panel. App.tsx loads this module
  * lazily, so the chat (assistant-ui, markdown) stays out of the first load;
  * the desktop panel loads noVNC only when it connects (#84).
+ *
+ * The header shows the session's access mode (decision 0045) as a native
+ * select (CSP: no Radix scroll lock): follow the global default, or `ask` /
+ * `yolo` for this session only. A change applies from the next tool call.
  */
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { api } from "./api";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { type AccessMode, api } from "./api";
 import { DesktopPanel } from "./Desktop";
 import { ErrorAlert } from "./ErrorAlert";
 import { emptyChat, isRunning, projectChat } from "./hearthPi";
@@ -44,6 +49,7 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
         <h1 className="min-w-0 flex-1 truncate font-semibold">
           {session.data?.title || sessionId}
         </h1>
+        <AccessModeSelect sessionId={sessionId} />
         <span className="text-muted-foreground text-xs" data-testid="session-state">
           {running ? "working" : (session.data?.state ?? "")}
         </span>
@@ -82,6 +88,55 @@ export default function SessionPage({ sessionId }: { sessionId: string }) {
           <DesktopPanel sessionId={sessionId} />
         </aside>
       </div>
+    </div>
+  );
+}
+
+/** The select's value for "follow the global default". */
+const FOLLOW = "default";
+
+/** The session's access mode: its own, or the global default's (decision 0045). */
+export function AccessModeSelect({ sessionId }: { sessionId: string }) {
+  const client = useQueryClient();
+  const current = useQuery({
+    queryKey: keys.sessionAccessMode(sessionId),
+    queryFn: () => api.sessionAccessMode(sessionId),
+  });
+  const save = useMutation({
+    mutationFn: (mode: AccessMode | null) => api.saveSessionAccessMode(sessionId, mode),
+    onSuccess: (saved) => client.setQueryData(keys.sessionAccessMode(sessionId), saved),
+  });
+  const data = current.data;
+  const failed = save.error ?? current.error;
+  return (
+    <div className="flex items-center gap-1.5" data-testid="access-mode" data-mode={data?.mode}>
+      <label htmlFor="session-access-mode" className="text-muted-foreground text-xs">
+        Access
+      </label>
+      <NativeSelect
+        id="session-access-mode"
+        size="sm"
+        value={data === undefined ? FOLLOW : (data.override ?? FOLLOW)}
+        disabled={data === undefined || save.isPending}
+        aria-describedby={failed === null ? undefined : "session-access-mode-error"}
+        aria-invalid={failed === null ? undefined : true}
+        title={data === undefined ? undefined : `Tool calls run in ${data.mode}`}
+        onChange={(e) => {
+          const value = e.target.value;
+          save.mutate(value === "ask" || value === "yolo" ? value : null);
+        }}
+      >
+        <NativeSelectOption value={FOLLOW}>
+          {data === undefined ? "Default" : `Default (${data.global})`}
+        </NativeSelectOption>
+        <NativeSelectOption value="ask">Ask</NativeSelectOption>
+        <NativeSelectOption value="yolo">Yolo</NativeSelectOption>
+      </NativeSelect>
+      {failed === null ? null : (
+        <span id="session-access-mode-error" role="alert" className="text-destructive text-xs">
+          {failed.message}
+        </span>
+      )}
     </div>
   );
 }
