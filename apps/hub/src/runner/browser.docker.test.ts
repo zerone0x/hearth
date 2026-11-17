@@ -159,6 +159,8 @@ describe.skipIf(!enabled)("browser tools in a Docker box (M2, #116)", () => {
         modelRuntime,
       },
     });
+    // These runs test tools, not the gate: `ask` would hold a risky call (decision 0048).
+    await hub.accessModes.putGlobal(LOCAL_PRINCIPAL, { mode: "yolo" });
     const h = hub;
     const cookie = `${SESSION_COOKIE}=${h.auth.issueSession(LOCAL_PRINCIPAL).token}`;
     const api = async (path: string, body?: unknown) => {
