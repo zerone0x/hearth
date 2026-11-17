@@ -14,8 +14,8 @@ import {
   AllowAllAuthorizer,
   type AuditSink,
   type Authorizer,
-  type EventStore,
   DEFAULT_WORKSPACE_ID,
+  type EventStore,
   type HearthError,
   LOCAL_PRINCIPAL,
   type Principal,
@@ -418,7 +418,7 @@ describe("gaps from the #158 verification", () => {
     const h = start({
       authorizer: () => ({
         authorize: async (_principal, action, resource) => {
-          seen.push({ action, type: resource.type, id: resource.id });
+          seen.push({ action, type: resource.type, id: resource.id ?? "" });
           return { allowed: true, policy: "test" };
         },
       }),

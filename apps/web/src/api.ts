@@ -105,6 +105,16 @@ export interface SessionAccessMode {
   readonly mode: AccessMode;
 }
 
+/** A pending approval as `GET /v1/approvals` lists it (decision 0048). */
+export interface PendingApproval {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly toolCallId: string;
+  readonly tool: string;
+  readonly summary: string;
+  readonly expiresAt: number;
+}
+
 export interface AuthStatus {
   readonly setupRequired: boolean;
   readonly authenticated: boolean;
@@ -218,6 +228,14 @@ export const api = {
   /** `null` follows the global default again. */
   saveSessionAccessMode: (sessionId: string, mode: AccessMode | null) =>
     call<SessionAccessMode>("PUT", `/v1/sessions/${id(sessionId)}/access-mode`, { mode }),
+  /** The owner's decision on a held tool call (decision 0048). */
+  decideApproval: (sessionId: string, approvalId: string, decision: "approve" | "deny") =>
+    call<unknown>("POST", `/v1/sessions/${id(sessionId)}/approvals/${id(approvalId)}`, {
+      decision,
+    }),
+  /** Every approval waiting for the owner, for the session list. */
+  approvals: async () =>
+    (await call<{ approvals: PendingApproval[] }>("GET", "/v1/approvals")).approvals,
 };
 
 /** The desktop WebSocket of a session (decision 0016), on the page's own origin. */

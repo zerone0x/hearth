@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, Fragment, lazy, Suspense, useEffect, useState } from "react";
 import { ErrorBoundary } from "react-error-boundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -17,7 +18,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { api } from "./api";
 import { ErrorAlert } from "./ErrorAlert";
-import { keys, useAuth, useSessions } from "./queries";
+import { keys, useApprovals, useAuth, useSessions } from "./queries";
 
 /**
  * The session page (chat, markdown, desktop) is its own chunk: sign-in and the
@@ -208,6 +209,9 @@ function AuthForm({ mode }: { mode: "setup" | "login" }) {
 function SessionList() {
   const client = useQueryClient();
   const sessions = useSessions();
+  // Sessions with a tool call waiting for the owner (decision 0048).
+  const approvals = useApprovals();
+  const waiting = new Set((approvals.data ?? []).map((a) => a.sessionId));
   const [title, setTitle] = useState("");
   const create = useMutation({
     mutationFn: () => api.create(title.trim()),
@@ -255,6 +259,11 @@ function SessionList() {
                     <a className="truncate" href={`#/s/${encodeURIComponent(s.id)}`}>
                       {s.title || s.id}
                     </a>
+                    {waiting.has(s.id) ? (
+                      <Badge variant="destructive" data-testid="approval-pending">
+                        Approval needed
+                      </Badge>
+                    ) : null}
                   </ItemTitle>
                   <ItemDescription className="text-xs">
                     {s.state} · {new Date(s.lastActivityAt).toLocaleString()}

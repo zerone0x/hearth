@@ -4,6 +4,12 @@
  * `useExternalStoreRuntime`. Hearth plugs its own pieces in through the
  * registry component's slots: tool cards (`ToolFallback`), its notices
  * (`AssistantMessage`, for system messages) and the empty state (`Welcome`).
+ *
+ * A tool call the access gate holds for the owner (decision 0048) is a branch
+ * of the same card: what it does, the rule, the time left, and Approve/Deny
+ * as plain buttons in the card (no dialog or portal, so the CSP stays as
+ * decision 0038 left it). After it ends the card says who decided and when,
+ * or that it expired.
  */
 
 import {
@@ -16,7 +22,7 @@ import {
   useAuiState,
   useExternalStoreRuntime,
 } from "@assistant-ui/react";
-import type { ReactNode } from "react";
+import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
 import {
   AssistantMessage as RegistryAssistantMessage,
   Thread as RegistryThread,
@@ -25,8 +31,10 @@ import {
 import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
+  type ApprovalCard,
   type HearthToolStatus,
   hearthToolStatus,
   liveOutputOf,
@@ -46,8 +54,112 @@ const STATUS_VARIANT: Record<
   interrupted: "secondary",
 };
 
+/** What the cards need to show and decide approvals: from the session page. */
+export interface ApprovalActions {
+  /** The approval of each held tool call, by tool call id. */
+  readonly approvals: Readonly<Record<string, ApprovalCard>>;
+  readonly decide: (approvalId: string, decision: "approve" | "deny") => Promise<unknown>;
+}
+
+const NO_APPROVALS: ApprovalActions = { approvals: {}, decide: async () => undefined };
+
+export const ApprovalContext = createContext<ApprovalActions>(NO_APPROVALS);
+
+/** The current time, ticking every second while `active`. */
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  return now;
+}
+
+/** `m:ss` of a duration in ms, never negative. */
+export function countdown(ms: number): string {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+/** How an ended approval reads on its card. */
+export function approvalEnding(card: ApprovalCard): string {
+  const when = card.at === null ? "" : ` at ${new Date(card.at).toLocaleTimeString()}`;
+  switch (card.status) {
+    case "approved":
+      return `Approved by ${card.by ?? "the owner"}${when}.`;
+    case "denied":
+      return `Denied by ${card.by ?? "the owner"}${when}. Not run.`;
+    case "expired":
+      return `Expired${when}: no decision in time. Not run.`;
+    case "cancelled":
+      return `Cancelled${when}${card.why === null ? "" : ` (${card.why})`}. Not run.`;
+    case "interrupted":
+      return "The hub restarted before a decision. Not run.";
+    default:
+      return "";
+  }
+}
+
+/** The approval branch of a tool card: pending (buttons, countdown) or how it ended. */
+function ApprovalPanel({ card }: { card: ApprovalCard }) {
+  const { decide } = useContext(ApprovalContext);
+  const pending = card.status === "pending";
+  const now = useNow(pending);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const act = async (decision: "approve" | "deny") => {
+    setBusy(true);
+    setError(null);
+    try {
+      await decide(card.id, decision);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!pending) {
+    return (
+      <p className="mb-2 text-muted-foreground text-xs" data-testid="approval-ended">
+        {approvalEnding(card)}
+      </p>
+    );
+  }
+  return (
+    <section
+      aria-label="Approval needed"
+      data-testid="approval"
+      className="mb-2 flex flex-col gap-2 rounded-md border border-amber-500/50 bg-amber-500/5 p-2"
+    >
+      <p className="font-medium">
+        Approve this {card.rule === "marked-secret" ? "use" : "command"}?
+      </p>
+      <code className="break-all font-mono text-xs">{card.summary}</code>
+      <p className="text-muted-foreground text-xs">
+        {card.reason || card.rule} · Denied automatically in{" "}
+        <span data-testid="approval-countdown">{countdown(card.expiresAt - now)}</span>
+      </p>
+      <div className="flex gap-2">
+        <Button size="sm" disabled={busy} onClick={() => void act("approve")}>
+          Approve
+        </Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void act("deny")}>
+          Deny
+        </Button>
+      </div>
+      {error === null ? null : (
+        <p role="alert" className="text-destructive text-xs">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 /** A tool call: assistant-ui's collapsible tool UI with Hearth's status and target. */
 export const ToolCard: ToolCallMessagePartComponent = (part) => {
+  const approval = useContext(ApprovalContext).approvals[part.toolCallId];
   const interrupted = useAuiState((s) =>
     wasInterrupted(s.message.metadata.custom, part.toolCallId),
   );
@@ -59,13 +171,14 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
   const liveCapped = useAuiState(
     (s) => liveOutputOf(s.message.metadata.custom, part.toolCallId)?.truncated === true,
   );
-  const label = TOOL_STATUS_LABEL[status];
+  const waiting = approval?.status === "pending" && status === "running";
+  const label = waiting ? "needs approval" : TOOL_STATUS_LABEL[status];
   const target = toolTarget(part.toolName, part.args);
   return (
     <ToolFallback.Root
       className="my-2 rounded-md border bg-card px-3 text-sm"
       data-testid="tool-card"
-      data-status={status}
+      data-status={waiting ? "approval" : status}
     >
       <div className="flex min-w-0 items-center gap-2">
         <ToolFallback.Trigger
@@ -86,6 +199,9 @@ export const ToolCard: ToolCallMessagePartComponent = (part) => {
           {label}
         </Badge>
       </div>
+      {approval === undefined || (approval.status === "pending" && !waiting) ? null : (
+        <ApprovalPanel card={approval} />
+      )}
       {status === "running" && liveText !== undefined ? (
         // Live output (decision 0036): outside the collapsed details, so it shows
         // while the call runs. The result replaces it when the call ends.

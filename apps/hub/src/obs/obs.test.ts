@@ -670,6 +670,29 @@ describe("bash calls record the command rules' verdict (#69)", () => {
     expect(byId("c_read")).not.toHaveProperty("bash_policy");
   });
 
+  test("0043: an exception in the access gate blocks the call in both modes", async () => {
+    for (const mode of ["yolo", "ask"] as const) {
+      // A deny rule whose match throws: the gate's verdict cannot be reached.
+      const pattern = /never/;
+      Object.defineProperty(pattern, "test", {
+        value: () => {
+          throw new Error("gate broke");
+        },
+      });
+      const s = await setup({
+        denyList: [{ tool: "bash", pattern, reason: "x" }],
+        accessMode: mode,
+      });
+      await turn(s, "go", [
+        call("bash", { command: "echo hi" }, "c_x"),
+        fauxAssistantMessage("ok"),
+      ]);
+      const step = trajectory(s).find((r) => r.kind === "tool_call");
+      expect(step).toMatchObject({ is_error: true, access_mode: mode, rpcs: [] });
+      expect(JSON.stringify(step?.["result"])).toContain("gate broke");
+    }
+  });
+
   test("a verdict for a call the tracer does not know is dropped, not thrown", () => {
     const t = new TurnTracer({
       sessionId: "se_v",

@@ -22,6 +22,7 @@ export const keys = {
   modelSettings: ["model-settings"] as const,
   accessMode: ["access-mode"] as const,
   sessionAccessMode: (id: string) => ["session-access-mode", id] as const,
+  approvals: ["approvals"] as const,
 };
 
 /** How often an open desktop re-reads its lock: a lease can lapse or be taken meanwhile. */
@@ -60,6 +61,15 @@ export function useAuth() {
 
 export function useSessions() {
   return useQuery({ queryKey: keys.sessions, queryFn: api.sessions });
+}
+
+/** Approvals waiting for the owner (decision 0048), polled for the session list's marker. */
+export function useApprovals() {
+  return useQuery({
+    queryKey: keys.approvals,
+    queryFn: api.approvals,
+    refetchInterval: POLL_IDLE_MS,
+  });
 }
 
 export function useSession(sessionId: string) {

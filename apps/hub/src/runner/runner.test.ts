@@ -22,6 +22,7 @@ import { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   AllowAllAuthorizer,
   type AppendResult,
+  type AuditSink,
   type Authorizer,
   type BlobRef,
   createDefaultSecretStore,
@@ -45,6 +46,7 @@ import { FakeDriver, fakeJpeg } from "../../../box-agent/src/browser/fake";
 import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import { createApp } from "../app";
+import { APPROVAL_INTERRUPTED, Approvals } from "../approvals";
 import { AuthService, SESSION_COOKIE } from "../auth";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
 import { NO_SECRET_ENV_IN_BOX, ToolRpcClient } from "../box/tool-rpc";
@@ -53,12 +55,14 @@ import { buildTrajectory, toJsonl } from "../obs/trajectory";
 import type { BoxLease, SessionView } from "../session/manager";
 import {
   openDatabase,
+  SqliteApprovalStore,
   SqliteAuditSink,
   SqliteBlobStore,
   SqliteLoginStore,
   SqliteVaultStore,
 } from "../store";
 import { HubVault } from "../vault";
+import type { CommandRule } from "./bash-policy";
 import { BROWSER_TOOLS, NO_BROWSER_IN_BOX, NO_VAULT_FOR_FILL } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import {
@@ -290,6 +294,7 @@ interface HarnessExtra {
   secrets: SecretStore;
   vault: SessionRunnersOptions["vault"];
   accessMode: SessionRunnersOptions["accessMode"];
+  approvals: SessionRunnersOptions["approvals"];
 }
 
 /**
@@ -299,6 +304,10 @@ interface HarnessExtra {
  */
 function accessModeOption(accessMode: SessionRunnersOptions["accessMode"]) {
   return { accessMode: accessMode ?? (() => "yolo" as const) };
+}
+
+function approvalsOption(approvals: SessionRunnersOptions["approvals"]) {
+  return approvals === undefined ? {} : { approvals };
 }
 
 function vaultOption(vault: SessionRunnersOptions["vault"]) {
@@ -348,6 +357,7 @@ async function harness(
       log: () => {},
       ...vaultOption(more.vault ?? extra.vault),
       ...accessModeOption(more.accessMode ?? extra.accessMode),
+      ...approvalsOption(more.approvals ?? extra.approvals),
     });
     closers.push(() => runners.close());
     return runners;
@@ -773,28 +783,6 @@ describe("approvals", () => {
     expect(JSON.stringify(execs)).not.toContain("--force");
   });
 
-  test("an `ask` verdict runs as before: there is no approval gate yet (#69)", async () => {
-    // The seed rules are all `ask`; none blocks.
-    const h = await harness();
-    const runner = await turn(h, "se_a", "clean", [
-      call("bash", { command: "mkdir -p b && rm -rf b && echo gone" }, "c_rm"),
-      call("bash", { command: "X=echo; $X unclear" }, "c_x"),
-      fauxAssistantMessage("fine"),
-    ]);
-    const results = toolResults(runner.messages);
-    expect(results.map((r) => [r.isError, r.text.trim()])).toEqual([
-      [false, "gone"],
-      [false, "unclear"],
-    ]);
-    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(2);
-    // The seed rules are on by default, and each verdict is on the call's step.
-    const policies = (h.events.all.get("se_a") ?? [])
-      .map((e) => (e.payload as { bash_policy?: { action: string; rule: string } }).bash_policy)
-      .filter((p) => p !== undefined)
-      .map((p) => `${p.action} ${p.rule}`);
-    expect(policies).toEqual(["ask rm-recursive-force", "ask unclear:name"]);
-  });
-
   test("a bad command rule fails at startup", async () => {
     await expect(
       harness({ commandRules: [{ name: "x", command: ["git"], action: "block" as "deny" }] }),
@@ -805,6 +793,329 @@ describe("approvals", () => {
     await expect(harness({ denyList: [{ tool: "bash", pattern: "(" }] })).rejects.toThrow(
       "bad pattern",
     );
+  });
+});
+
+describe("the access gate (decisions 0043, 0048)", () => {
+  const PUSH_RULE: CommandRule = {
+    name: "git-push",
+    command: ["git"],
+    subcommand: "push",
+    action: "ask",
+    reason: "git push needs the owner",
+  };
+
+  /** Real approval records on an in-memory database, over the harness's event log. */
+  function approvalsFor(
+    events: MemoryEvents,
+    options: { timeoutMs?: number; audit?: AuditSink } = {},
+  ) {
+    const db = openDatabase(":memory:");
+    closers.push(() => db.close());
+    const audit = options.audit ?? new SqliteAuditSink(db);
+    const approvals = new Approvals({
+      store: new SqliteApprovalStore(db),
+      events,
+      audit,
+      authorizer: new AllowAllAuthorizer({ audit }),
+      timeoutMs: options.timeoutMs ?? 60_000,
+      log: () => {},
+    });
+    closers.push(() => approvals.close());
+    return { approvals, db };
+  }
+
+  async function pendingId(h: Harness, sessionId = "se_a"): Promise<string> {
+    for (let i = 0; i < 1000; i++) {
+      const requested = h.events.of(sessionId, "approval.requested");
+      const ended = new Set(
+        (h.events.all.get(sessionId) ?? [])
+          .filter((e) => e.type.startsWith("approval.") && e.type !== "approval.requested")
+          .map((e) => (e.payload as { approvalId: string }).approvalId),
+      );
+      const open = requested
+        .map((e) => (e.payload as { approvalId: string }).approvalId)
+        .find((id) => !ended.has(id));
+      if (open !== undefined) return open;
+      await Bun.sleep(5);
+    }
+    throw new Error("no approval was requested");
+  }
+
+  function toolSteps(h: Harness, sessionId = "se_a") {
+    return h.events
+      .of(sessionId, "runner.step")
+      .map((e) => e.payload as Record<string, unknown>)
+      .filter((p) => p["kind"] === "tool_call");
+  }
+
+  test("ask: git push waits; approving runs it, recorded with who decided", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] }, { accessMode: () => "ask" });
+    const { approvals } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    h.faux.setResponses([
+      call("bash", { command: "git push origin main || echo pushed" }, "c_push"),
+      fauxAssistantMessage("pushed"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push it");
+    const id = await pendingId(h);
+    // Held: nothing reached the box, and no lease was taken while it waits.
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+    expect(h.sessions.leases).toBe(0);
+    const requested = h.events.of("se_a", "approval.requested")[0];
+    expect(requested?.payload).toMatchObject({
+      toolCallId: "c_push",
+      tool: "bash",
+      summary: "git push origin main",
+      rule: "git-push",
+      mode: "ask",
+    });
+    expect(requested?.turnId).toBeDefined();
+    await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "approve" });
+    const runner = await h.runners.runner("se_a");
+    await runner.settled();
+    expect(toolResults(runner.messages)[0]?.isError).toBe(false);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(1);
+    const [step] = toolSteps(h);
+    expect(step).toMatchObject({
+      access_mode: "ask",
+      outcome: "ok",
+      approval: { id, rule: "git-push", decision: "approved", decided_by: "user:pr_local" },
+    });
+    expect(h.events.of("se_a", "runner.turn.end")[0]?.payload).toHaveProperty("approval_wait_ms");
+    const records = buildTrajectory(h.events.all.get("se_a") ?? [], {
+      sessionId: "se_a",
+      versions: { pi: "test", hub: "test" },
+    });
+    expect(records.filter((r) => r["kind"] === "approval").map((r) => r["event"])).toEqual([
+      "requested",
+      "approved",
+    ]);
+  });
+
+  test("ask: a call left alone expires, is never run, and the turn says so", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 50 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    let seen = "";
+    const runner = await turn(h, "se_a", "push it", [
+      call("bash", { command: "git push" }, "c_push"),
+      (context) => {
+        const last = context.messages.at(-1) as { content?: Array<{ text?: string }> };
+        seen = (last.content ?? []).map((c) => c.text ?? "").join("");
+        return fauxAssistantMessage("The push was not approved in time.");
+      },
+    ]);
+    const [result] = toolResults(runner.messages);
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("no decision within");
+    expect(seen).toContain("no decision within");
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+    expect(h.events.types("se_a")).toContain("approval.expired");
+    expect(toolSteps(h)[0]).toMatchObject({
+      outcome: "denied",
+      approval: { decision: "expired", decided_by: null },
+    });
+  });
+
+  test("yolo: the same call runs at once, with no approval, and the mode is recorded", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "yolo", approvals });
+    const runner = await turn(h, "se_a", "push it", [
+      call("bash", { command: "git push origin main || echo pushed" }, "c_push"),
+      fauxAssistantMessage("pushed"),
+    ]);
+    expect(toolResults(runner.messages)[0]?.isError).toBe(false);
+    expect(h.events.types("se_a").filter((t) => t.startsWith("approval."))).toEqual([]);
+    expect(toolSteps(h)[0]).toMatchObject({ access_mode: "yolo", outcome: "ok" });
+    expect(toolSteps(h)[0]).not.toHaveProperty("approval");
+  });
+
+  test("ask without an approval channel blocks the call (fail-closed)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] }, { accessMode: () => "ask" });
+    const runner = await turn(h, "se_a", "push", [
+      call("bash", { command: "git push" }, "c_push"),
+      fauxAssistantMessage("ok"),
+    ]);
+    expect(toolResults(runner.messages)[0]).toMatchObject({ isError: true });
+    expect(toolResults(runner.messages)[0]?.text).toContain("no way to ask");
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("0043: a deny rule blocks in yolo and in ask, with no card", async () => {
+    for (const mode of ["yolo", "ask"] as const) {
+      const h = await harness({ commandRules: [{ ...PUSH_RULE, action: "deny" }] });
+      const { approvals } = approvalsFor(h.events);
+      h.runners = h.make({}, { accessMode: () => mode, approvals });
+      const runner = await turn(h, "se_a", "push", [
+        call("bash", { command: "git push" }, "c_push"),
+        fauxAssistantMessage("ok"),
+      ]);
+      expect(toolResults(runner.messages)[0]).toMatchObject({
+        isError: true,
+        text: "git push needs the owner",
+      });
+      expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+      expect(h.events.types("se_a").filter((t) => t.startsWith("approval."))).toEqual([]);
+    }
+  });
+
+  test("0043: in yolo an unparseable command the raw deny-list matches is blocked; another runs", async () => {
+    const h = await harness({
+      denyList: [{ tool: "bash", pattern: "rm\\s+-rf", reason: "raw: no rm -rf" }],
+    });
+    const { approvals } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "yolo", approvals });
+    const runner = await turn(h, "se_a", "go", [
+      // A parse error (an unclosed quote): the parser cannot read either.
+      call("bash", { command: 'rm -rf /workspace "oops' }, "c_bad"),
+      call("bash", { command: 'echo fine; echo "oops' }, "c_other"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results[0]).toMatchObject({ isError: true, text: "raw: no rm -rf" });
+    // Unreadable but not raw-denied: `ask`, which yolo skips. It reaches the box.
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(1);
+    expect(JSON.stringify(h.boxes.sent)).not.toContain("rm -rf");
+    const policies = toolSteps(h).map((p) => (p["bash_policy"] as { rule: string }).rule);
+    expect(policies[0]).toBe("raw:0");
+    expect(policies[1]).toStartWith("unclear:");
+  });
+
+  test("an allowlisted extension cannot take the gate's name: the gate still holds the call", async () => {
+    let loaded = 0;
+    const impostor: ExtensionFactory = (pi) => {
+      loaded++;
+      pi.on("tool_call", () => undefined);
+    };
+    const h = await harness(
+      { commandRules: [PUSH_RULE], extensionAllowlist: [{ name: "hearth-access", version: "1" }] },
+      {
+        accessMode: () => "ask",
+        availableExtensions: [{ name: "hearth-access", version: "1", factory: impostor }],
+      },
+    );
+    expect(h.runners.loadedExtensions).toEqual([]);
+    const runner = await turn(h, "se_a", "push", [
+      call("bash", { command: "git push" }, "c_push"),
+      fauxAssistantMessage("ok"),
+    ]);
+    expect(loaded).toBe(0);
+    expect(toolResults(runner.messages)[0]?.text).toContain("no way to ask");
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("a request that cannot be recorded blocks the call (fail-closed)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, {
+      audit: {
+        write: async () => {
+          throw new Error("disk full");
+        },
+      },
+    });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const runner = await turn(h, "se_a", "push", [
+      call("bash", { command: "git push" }, "c_push"),
+      fauxAssistantMessage("ok"),
+    ]);
+    expect(toolResults(runner.messages)[0]?.isError).toBe(true);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("a new owner message cancels the pending approval and is read in the same turn", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    let seen: string[] = [];
+    h.faux.setResponses([
+      call("bash", { command: "git push" }, "c_push"),
+      (context) => {
+        seen = context.messages.map((m) => m.role);
+        return fauxAssistantMessage("OK, not pushing.");
+      },
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push it");
+    await pendingId(h);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "actually, don't push");
+    const runner = await h.runners.runner("se_a");
+    await runner.settled();
+    expect(h.events.of("se_a", "approval.cancelled")[0]?.payload).toMatchObject({
+      why: "new message",
+    });
+    expect(toolResults(runner.messages)[0]?.text).toContain("new message");
+    expect(seen).toEqual(["system", "user", "assistant", "toolResult", "user"]);
+    expect(h.events.of("se_a", "message.user").map((e) => e.payload)).toMatchObject([
+      { text: "push it" },
+      { text: "actually, don't push", steered: true },
+    ]);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("interrupt cancels the pending approval", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    h.faux.setResponses([
+      call("bash", { command: "git push" }, "c_push"),
+      fauxAssistantMessage("never"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push it");
+    await pendingId(h);
+    expect(await h.runners.interrupt(LOCAL_PRINCIPAL, "se_a")).toBe(true);
+    const runner = await h.runners.runner("se_a");
+    await runner.settled();
+    expect(approvals.hasPending("se_a")).toBe(false);
+    expect(h.events.of("se_a", "approval.cancelled")[0]?.payload).toMatchObject({
+      why: "stopped",
+    });
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("a hub restart while a call waits: interrupted, and the rebuilt call reads denied, not run", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals, db } = approvalsFor(h.events);
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    h.faux.setResponses([call("bash", { command: "git push" }, "c_push")]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push it");
+    await pendingId(h);
+    // The hub dies here: a new hub over the same database and event log.
+    const audit = new SqliteAuditSink(db);
+    const restarted = new Approvals({
+      store: new SqliteApprovalStore(db),
+      events: h.events,
+      audit,
+      authorizer: new AllowAllAuthorizer({ audit }),
+      log: () => {},
+    });
+    expect(await restarted.recover()).toBe(1);
+    const again = h.make({}, { accessMode: () => "ask", approvals: restarted });
+    const rebuilt = await again.runner("se_a");
+    const result = toolResults(rebuilt.messages).find((r) => r.id === "c_push");
+    expect(result).toMatchObject({ isError: true, text: APPROVAL_INTERRUPTED });
+    expect(h.events.types("se_a")).toContain("approval.interrupted");
+    // Not "outcome unknown": nothing reached the box.
+    expect(h.events.types("se_a")).not.toContain("runner.outcome-unknown");
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+  });
+
+  test("#158 gap: two sessions of one SessionRunners record and enforce their own mode", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const modes: Record<string, "ask" | "yolo"> = { se_a: "ask", se_b: "yolo" };
+    h.runners = h.make({}, { accessMode: (sessionId) => modes[sessionId] ?? "ask" });
+    h.faux.setResponses([
+      call("bash", { command: "git push origin main || echo pushed" }, "c_a"),
+      fauxAssistantMessage("a"),
+      call("bash", { command: "git push origin main || echo pushed" }, "c_b"),
+      fauxAssistantMessage("b"),
+    ]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "push");
+    await (await h.runners.runner("se_a")).settled();
+    await h.runners.send(LOCAL_PRINCIPAL, "se_b", "push");
+    await (await h.runners.runner("se_b")).settled();
+    expect(toolSteps(h, "se_a")[0]).toMatchObject({ access_mode: "ask", outcome: "denied" });
+    expect(toolSteps(h, "se_b")[0]).toMatchObject({ access_mode: "yolo", outcome: "ok" });
   });
 });
 
@@ -891,6 +1202,13 @@ describe("access mode (decision 0045)", () => {
     const results = toolResults(runner.messages);
     expect(results[0]?.isError).toBe(true);
     expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
+    // #158 gap: the call was never preflighted, so its record has no mode.
+    const steps = h.events
+      .of("se_a", "runner.step")
+      .map((e) => e.payload as { kind: string; access_mode: unknown })
+      .filter((p) => p.kind === "tool_call");
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toHaveProperty("access_mode", null);
   });
 });
 
