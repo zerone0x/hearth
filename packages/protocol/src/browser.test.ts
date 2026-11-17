@@ -52,7 +52,7 @@ describe("browser methods (protocol 1.3)", () => {
       expect(TOOL_METHODS).toContain(method);
     }
     expect(isBrowserMethod("tool.exec")).toBe(false);
-    expect(isBrowserMethod("browser.fill")).toBe(false);
+    expect(isBrowserMethod("browser.evaluate")).toBe(false);
   });
 
   test("acting methods are mutating, observing ones are not", () => {
@@ -80,7 +80,7 @@ describe("browser methods (protocol 1.3)", () => {
   });
 
   test("a 1.2 peer is still compatible; the box answers what it does not know as unknown-method", () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 5 });
     expect(isCompatible({ major: 1, minor: 2 })).toBe(true);
     expect(isCompatible({ major: 2, minor: 0 })).toBe(false);
     expect(checkHelloVersion({ version: { major: 1, minor: 2 } })).toBeNull();

@@ -16,6 +16,13 @@
  * These are tool methods like `tool.*` (decision 0011): same frames, same
  * idempotent-per-boot calls, same error classification. A 1.2 box answers
  * them `unknown-method`. Pure types and guards, no I/O.
+ *
+ * Protocol 1.5 (decision 0039) adds `browser.field` and `browser.fill`: the
+ * hub reads a field's kind and owner-frame origin, resolves a vault login
+ * bound to that origin, and sends the value only in `browser.fill`, which the
+ * box checks again on the owner frame just before it fills. The box masks
+ * every filled element in later screenshots. A 1.4 box answers them
+ * `unknown-method`.
  */
 
 import { FieldError, Fields, isObj } from "./fields";
@@ -62,6 +69,11 @@ export const BROWSER_NAVIGATION_TIMEOUT_MS = 30_000;
 export const DEFAULT_EXPECT_TIMEOUT_MS = 3_000;
 /** Longest `expectTimeoutMs`, and longest `browser.wait`. */
 export const MAX_EXPECT_TIMEOUT_MS = 30_000;
+
+/** Longest secret value `browser.fill` carries, in characters (the vault's field cap). */
+export const MAX_FILL_VALUE_LENGTH = 16_384;
+/** Most origins `browser.fill` names. */
+export const MAX_FILL_ORIGINS = 64;
 
 // ---------------------------------------------------------------------------
 // Refs
@@ -113,6 +125,23 @@ interface Acting {
   /** How long `expect` is checked; `DEFAULT_EXPECT_TIMEOUT_MS` when absent. */
   readonly expectTimeoutMs?: number;
 }
+
+/**
+ * What kind of field an element is, as `browser.field` and `browser.fill`
+ * judge it (decision 0039): `password` (an `input type=password`),
+ * `username` (`autocomplete=username` or `email`, or `input type=email`),
+ * `one-time-code` (`autocomplete=one-time-code`), `other` (any other field
+ * that takes text) and `none` (not a text field at all).
+ */
+export type BrowserFieldKind = "password" | "username" | "one-time-code" | "other" | "none";
+
+export const BROWSER_FIELD_KINDS: readonly BrowserFieldKind[] = [
+  "password",
+  "username",
+  "one-time-code",
+  "other",
+  "none",
+];
 
 export type BrowserTabAction = "list" | "new" | "select" | "close";
 export type BrowserButton = "left" | "right" | "middle";
@@ -181,7 +210,32 @@ export interface BrowserParams {
       readonly tab?: number;
       readonly timeoutMs: number;
     };
-  /** A JPEG of the tab's viewport, the whole page, or the element `ref`. */
+  /**
+   * A field's kind and the origin of the frame that owns it (1.5). Read-only:
+   * the hub uses it to pick the secret before `browser.fill`.
+   */
+  "browser.field": Base & { readonly ref: string };
+  /**
+   * Fills a field with a secret value (1.5). The box refuses with
+   * `browser.origin-mismatch` unless the owner frame's origin is one of
+   * `origins`, and with `browser.field-mismatch` unless the field's kind is one
+   * of `fields` (an empty list: any field that takes text). The value is never
+   * echoed: results and later snapshots have it replaced, and the element is
+   * masked in every later screenshot.
+   */
+  "browser.fill": Base &
+    Acting & {
+      readonly ref: string;
+      readonly value: string;
+      readonly origins: readonly string[];
+      readonly fields: readonly BrowserFieldKind[];
+      readonly submit?: boolean;
+    };
+  /**
+   * A JPEG of the tab's viewport, the whole page, or the element `ref`. Every
+   * element `browser.fill` filled is masked; a filled element that cannot be
+   * found refuses the screenshot (`browser.mask-missing`).
+   */
   "browser.screenshot": Base & {
     readonly tab?: number;
     readonly ref?: string;
@@ -279,6 +333,12 @@ export interface BrowserResults {
   "browser.select": BrowserActionResult;
   "browser.press": BrowserActionResult;
   "browser.wait": BrowserActionResult;
+  "browser.field": BrowserPageInfo & {
+    readonly field: BrowserFieldKind;
+    /** `scheme://host[:port]` of the frame that owns the element; null when it has none (about:blank, data:). */
+    readonly origin: string | null;
+  };
+  "browser.fill": BrowserActionResult;
   /** `data` is the JPEG in base64. */
   "browser.screenshot": BrowserPageInfo & {
     readonly data: string;
@@ -306,6 +366,8 @@ export const BROWSER_METHODS: readonly BrowserMethod[] = [
   "browser.wait",
   "browser.screenshot",
   "browser.tabs",
+  "browser.field",
+  "browser.fill",
 ];
 
 /** Methods that change the page or the tabs; never re-sent to a new boot. */
@@ -318,6 +380,7 @@ export const MUTATING_BROWSER_METHODS: readonly BrowserMethod[] = [
   "browser.select",
   "browser.press",
   "browser.tabs",
+  "browser.fill",
 ];
 
 export function isBrowserMethod(method: string): method is BrowserMethod {
@@ -339,6 +402,7 @@ export function browserBudgetMs<M extends BrowserMethod>(
     case "browser.snapshot":
     case "browser.find":
     case "browser.screenshot":
+    case "browser.field":
       return observe + BROWSER_OBSERVE_TIMEOUT_MS;
     case "browser.wait":
       return observe + (p.timeoutMs ?? 0);
@@ -516,6 +580,38 @@ export const BROWSER_PARAMS: {
     if (out.ref !== undefined && out.fullPage === true) f.fail("fullPage", "not with a ref");
     return out;
   },
+  "browser.field": (f) => ({ ...base(f), ref: ref(f, "ref") }),
+  "browser.fill": (f) => {
+    const origins = array(f, "origins", MAX_FILL_ORIGINS, true);
+    const fields = array(f, "fields", BROWSER_FIELD_KINDS.length);
+    return {
+      ...base(f),
+      ref: ref(f, "ref"),
+      element: element(f),
+      // Never echoed in an error: a FieldError names the key, not the value.
+      value: f.string("value", MAX_FILL_VALUE_LENGTH, false),
+      origins: origins.map((item, index) => {
+        if (typeof item !== "string" || item.length > MAX_URL_LENGTH) {
+          throw new FieldError(`${f.path("origins")}[${index}]`, "expected an origin");
+        }
+        return item;
+      }),
+      fields: fields.map((item, index) => {
+        if (
+          typeof item !== "string" ||
+          !(BROWSER_FIELD_KINDS as readonly string[]).includes(item)
+        ) {
+          throw new FieldError(
+            `${f.path("fields")}[${index}]`,
+            `expected one of ${BROWSER_FIELD_KINDS.join(", ")}`,
+          );
+        }
+        return item as BrowserFieldKind;
+      }),
+      ...optional(f, "submit", (k) => f.bool(k)),
+      ...expectation(f),
+    };
+  },
   "browser.tabs": (f) => {
     const action = f.oneOf("action", ["list", "new", "select", "close"] as const);
     const out = {
@@ -608,6 +704,12 @@ export const BROWSER_RESULTS: {
   "browser.select": action,
   "browser.press": action,
   "browser.wait": action,
+  "browser.field": (f) => ({
+    ...pageInfo(f),
+    field: f.oneOf("field", BROWSER_FIELD_KINDS),
+    origin: f.raw("origin") === null ? null : f.string("origin", MAX_URL_LENGTH, false),
+  }),
+  "browser.fill": action,
   "browser.screenshot": (f) => {
     const mimeType = f.oneOf("mimeType", ["image/jpeg"] as const);
     return {

@@ -262,7 +262,10 @@ export type ToolErrorCode =
   | "browser.no-tab"
   | "browser.stale-ref"
   | "browser.bad-url"
-  | "browser.failed";
+  | "browser.failed"
+  | "browser.origin-mismatch"
+  | "browser.field-mismatch"
+  | "browser.mask-missing";
 
 /**
  * Owner and retry disposition of each error code (PRD §8.1, principle 2).
@@ -295,6 +298,12 @@ export const TOOL_ERRORS: Readonly<
   "browser.stale-ref": { owner: "user", disposition: "give-up" },
   // Playwright refused the call for a reason that is no outcome (a bad key name, say).
   "browser.failed": { owner: "user", disposition: "give-up" },
+  // browser.fill (1.5): the field's frame is not on an origin the secret allows,
+  // or the field is not of a kind the secret may go into. Nothing was filled.
+  "browser.origin-mismatch": { owner: "user", disposition: "give-up" },
+  "browser.field-mismatch": { owner: "user", disposition: "give-up" },
+  // A filled element is gone from its page, so its mask cannot be placed: no screenshot.
+  "browser.mask-missing": { owner: "user", disposition: "give-up" },
 };
 
 export function isToolErrorCode(code: string): code is ToolErrorCode {

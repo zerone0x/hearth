@@ -18,12 +18,19 @@
  *   is false when it does not hold.
  * - **Snapshot last.** Acting calls return the tab's fresh snapshot, capped at
  *   `MAX_SNAPSHOT_TEXT_BYTES`; the whole one is spilled to a box file.
+ * - **Filled secrets** (protocol 1.5, decision 0039). `browser.fill` checks
+ *   the field's owner-frame origin and kind just before it fills, marks the
+ *   element for the screenshot mask, and remembers the value for the life of
+ *   the process: every later result, error and spilled snapshot has it
+ *   replaced by `[redacted]`. A screenshot with a filled element missing is
+ *   refused (`browser.mask-missing`).
  */
 
 import { createHash } from "node:crypto";
 import { closeSync, writeSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { posix } from "node:path";
+import { LOG_REDACTED, redactValues } from "@hearth/core";
 import {
   BROWSER_ACTION_TIMEOUT_MS,
   BROWSER_NAVIGATION_TIMEOUT_MS,
@@ -84,6 +91,8 @@ export class BrowserTools {
   #generation = 0;
   #active: DriverTab | undefined;
   #queue: Promise<unknown> = Promise.resolve();
+  /** Every value `browser.fill` was given: never echoed in a result, an error or a spill. */
+  readonly #secrets = new Set<string>();
 
   constructor(options: BrowserToolsOptions) {
     this.#driver = options.driver;
@@ -115,7 +124,39 @@ export class BrowserTools {
       return this.#dispatch(method, params);
     });
     this.#queue = result.catch(() => {});
-    return result;
+    return result.then(
+      (value) => this.#scrubResult(value),
+      (error: unknown) => {
+        throw this.#scrubError(error);
+      },
+    );
+  }
+
+  /** `text` with every filled value replaced. */
+  #scrub(text: string): string {
+    return this.#secrets.size === 0 ? text : redactValues(text, this.#secrets, LOG_REDACTED);
+  }
+
+  /** Every string of a result scrubbed, but a screenshot's base64 `data`. */
+  #scrubResult<T>(value: T): T {
+    if (this.#secrets.size === 0) return value;
+    const walk = (node: unknown, key: string | undefined): unknown => {
+      if (typeof node === "string") return key === "data" ? node : this.#scrub(node);
+      if (Array.isArray(node)) return node.map((item) => walk(item, undefined));
+      if (node !== null && typeof node === "object") {
+        return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, walk(v, k)]));
+      }
+      return node;
+    };
+    return walk(value, undefined) as T;
+  }
+
+  #scrubError(error: unknown): unknown {
+    if (this.#secrets.size === 0) return error;
+    if (error instanceof ToolCallError)
+      return new ToolCallError(error.code, this.#scrub(error.message));
+    if (error instanceof Error) return new Error(this.#scrub(error.message));
+    return new Error(this.#scrub(String(error)));
   }
 
   async close(): Promise<void> {
@@ -149,6 +190,10 @@ export class BrowserTools {
         return (await this.screenshot(p)) as BrowserResults[M];
       case "browser.tabs":
         return (await this.tabs(p)) as BrowserResults[M];
+      case "browser.field":
+        return (await this.field(p)) as BrowserResults[M];
+      case "browser.fill":
+        return (await this.fill(p)) as BrowserResults[M];
     }
     throw new ToolCallError("tool.bad-params", `no method ${method}`);
   }
@@ -215,7 +260,10 @@ export class BrowserTools {
     options: { readonly ref?: string; readonly depth?: number } = {},
   ): Promise<BrowserSnapshot> {
     const navigations = tab.navigations;
-    const raw = await tab.snapshot({ ...options, timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS });
+    // Scrubbed before it is cut or spilled: the spill file is readable in the box.
+    const raw = this.#scrub(
+      await tab.snapshot({ ...options, timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS }),
+    );
     const generation = this.#nextGeneration(tab, navigations);
     const snapshotId = `s${generation}`;
     const text = tagRefs(raw, generation);
@@ -318,7 +366,9 @@ export class BrowserTools {
   async find(params: BrowserParams["browser.find"]): Promise<BrowserResults["browser.find"]> {
     const tab = await this.#tab(params.tab);
     const navigations = tab.navigations;
-    const raw = await this.#observe(() => tab.snapshot({ timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS }));
+    const raw = this.#scrub(
+      await this.#observe(() => tab.snapshot({ timeoutMs: BROWSER_OBSERVE_TIMEOUT_MS })),
+    );
     const generation = this.#nextGeneration(tab, navigations);
     const text = tagRefs(raw, generation);
     let match: (line: string) => boolean;
@@ -420,6 +470,67 @@ export class BrowserTools {
     tab.takeDialogs();
     try {
       await this.#dispatchAction(method, params, tab, local);
+    } catch (error) {
+      return await this.#failed(tab, error);
+    }
+    return await this.#finish(tab, params.expect, params.expectTimeoutMs);
+  }
+
+  /** `browser.field`: the kind and owner-frame origin of the field `ref`. */
+  async field(params: BrowserParams["browser.field"]): Promise<BrowserResults["browser.field"]> {
+    const resolved = await this.#resolve(params.ref);
+    if (resolved.kind === "stale") throw new ToolCallError("browser.stale-ref", resolved.message);
+    const info = await this.#observe(() =>
+      resolved.tab.field(resolved.local, BROWSER_OBSERVE_TIMEOUT_MS),
+    );
+    if (!info.found) {
+      throw new ToolCallError("browser.stale-ref", "the element is no longer on the page");
+    }
+    return { ...(await this.#page(resolved.tab)), field: info.field, origin: info.origin };
+  }
+
+  /**
+   * `browser.fill`: the same pre-dispatch checks as `browser.type`, then the
+   * owner frame's origin and the field's kind, read again right before the
+   * fill (the hub read them one call earlier, and the page may have moved).
+   * A refusal throws and fills nothing. The value joins the scrub set before
+   * anything that could echo it runs.
+   */
+  async fill(params: BrowserParams["browser.fill"]): Promise<BrowserActionResult> {
+    const resolved = await this.#resolve(params.ref);
+    if (resolved.kind === "stale") {
+      return await this.#refused(await this.#tab(), "stale_ref", resolved.message);
+    }
+    const { tab, local } = resolved;
+    const refusal = await this.#check("browser.type", tab, local);
+    if (refusal !== undefined) return await this.#refused(tab, refusal.outcome, refusal.message);
+    const info = await this.#observe(() => tab.field(local, BROWSER_OBSERVE_TIMEOUT_MS));
+    if (!info.found)
+      return await this.#refused(tab, "stale_ref", "the element is no longer on the page");
+    const allowed = params.origins.map((origin) => origin.toLowerCase());
+    if (info.origin === null || !allowed.includes(info.origin)) {
+      throw new ToolCallError(
+        "browser.origin-mismatch",
+        `the field is in a frame on ${info.origin ?? "no web origin"}, which this secret is not bound to; nothing was filled`,
+      );
+    }
+    if (
+      info.field === "none" ||
+      (params.fields.length > 0 && !params.fields.includes(info.field))
+    ) {
+      throw new ToolCallError(
+        "browser.field-mismatch",
+        `the field is a ${info.field} field; this secret may go only into ${params.fields.length === 0 ? "a text" : params.fields.join(" or ")} field. Nothing was filled`,
+      );
+    }
+    this.#secrets.add(params.value);
+    tab.takeDialogs();
+    const timeout = BROWSER_ACTION_TIMEOUT_MS;
+    try {
+      // Marked first, so no screenshot can see the value unmasked.
+      await tab.mark(local, timeout);
+      await tab.fill(local, params.value, timeout);
+      if (params.submit === true) await tab.press(local, "Enter", timeout);
     } catch (error) {
       return await this.#failed(tab, error);
     }
@@ -589,7 +700,7 @@ export class BrowserTools {
     extra: { status?: number | null } = {},
   ): Promise<BrowserActionResult> {
     if (!(error instanceof DriverError)) throw error;
-    if (error.kind === "failed" || error.kind === "unavailable") throw toolError(error);
+    if (error.kind !== "timeout" && error.kind !== "navigation") throw toolError(error);
     const outcome: BrowserOutcome = error.kind === "timeout" ? "timeout" : "navigation_failed";
     return await this.#result(tab, {
       ok: false,
@@ -746,10 +857,13 @@ export class BrowserTools {
  * `browser.failed`.
  */
 function toolError(error: DriverError): ToolCallError {
-  return new ToolCallError(
-    error.kind === "unavailable" ? "browser.unavailable" : "browser.failed",
-    error.message,
-  );
+  const code =
+    error.kind === "unavailable"
+      ? "browser.unavailable"
+      : error.kind === "mask"
+        ? "browser.mask-missing"
+        : "browser.failed";
+  return new ToolCallError(code, error.message);
 }
 
 function firstLine(error: unknown): string {

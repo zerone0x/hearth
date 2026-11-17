@@ -21,7 +21,7 @@ import {
 
 describe("tool RPC", () => {
   test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2; browser methods 1.3; live exec output 1.4)", () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 5 });
   });
 
   test("exec params never carry an environment", () => {
