@@ -144,6 +144,8 @@ export interface PendingApproval {
   readonly tool: string;
   readonly summary: string;
   readonly hidden_chars: boolean;
+  readonly steps: readonly string[];
+  readonly non_ascii: boolean;
   readonly expiresAt: number;
 }
 

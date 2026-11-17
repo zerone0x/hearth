@@ -82,6 +82,10 @@ export interface ApprovalRequest {
   readonly mode: "yolo" | "ask";
   /** The shown text held hidden characters, escaped by the gate as `⟨U+XXXX⟩` (#165). */
   readonly hiddenChars?: boolean;
+  /** Each simple command the parser found, escaped (#169). */
+  readonly steps?: readonly string[];
+  /** The command holds a non-ASCII character (#169). */
+  readonly nonAscii?: boolean;
   readonly turnId?: string;
 }
 
@@ -109,6 +113,10 @@ export interface ApprovalView {
   readonly mode: "yolo" | "ask";
   /** The card text holds escaped hidden characters (`⟨U+XXXX⟩`; #165), read from the stored text. */
   readonly hidden_chars: boolean;
+  /** Each simple command the parser found in the command (#169). */
+  readonly steps: readonly string[];
+  /** The stored command holds a non-ASCII character (#169). */
+  readonly non_ascii: boolean;
   readonly status: ApprovalStatus;
   readonly requestedAt: EpochMs;
   readonly expiresAt: EpochMs;
@@ -156,6 +164,8 @@ function viewOf(row: ApprovalRow): ApprovalView {
     rule: row.rule,
     mode: row.mode,
     hidden_chars: hasHiddenEscape(row.summary) || hasHiddenEscape(row.command),
+    steps: row.steps,
+    non_ascii: /\P{ASCII}/u.test(row.command),
     status: row.status,
     requestedAt: row.requestedAt,
     expiresAt: row.expiresAt,
@@ -215,6 +225,7 @@ export class Approvals {
       tool: req.tool,
       summary: req.summary,
       command: req.command,
+      steps: req.steps ?? [],
       rule: req.rule,
       mode: req.mode,
       status: "pending",
@@ -244,6 +255,8 @@ export class Approvals {
         reason: req.reason,
         mode: row.mode,
         hidden_chars: req.hiddenChars === true,
+        steps: row.steps,
+        non_ascii: req.nonAscii === true,
         requestedAt: row.requestedAt,
         expiresAt: row.expiresAt,
       });

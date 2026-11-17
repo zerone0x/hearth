@@ -91,6 +91,10 @@ export interface ApprovalCard {
   readonly reason: string;
   /** The shown text holds hidden characters the hub wrote out as `⟨U+XXXX⟩` (#165). */
   readonly hiddenChars: boolean;
+  /** Each simple command the hub's parser found, escaped; listed under the full command (#169). */
+  readonly steps: readonly string[];
+  /** The command holds a non-ASCII character (#169). */
+  readonly nonAscii: boolean;
   readonly expiresAt: number;
   readonly status: ApprovalStatus;
   /** Who decided (`user:<id>`), for approved and denied. */
@@ -204,6 +208,10 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
           rule: text("rule"),
           reason: text("reason"),
           hiddenChars: p["hidden_chars"] === true,
+          steps: Array.isArray(p["steps"])
+            ? p["steps"].filter((s): s is string => typeof s === "string")
+            : [],
+          nonAscii: p["non_ascii"] === true,
           expiresAt: typeof p["expiresAt"] === "number" ? p["expiresAt"] : event.ts,
           status: "pending",
           by: null,

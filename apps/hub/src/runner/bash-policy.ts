@@ -849,6 +849,8 @@ interface Context {
   readonly raw: readonly CompiledDenyRule[];
   readonly depth: number;
   readonly budget: Budget;
+  /** Collects every simple command read, as written (`commandSteps`). */
+  readonly steps?: string[];
 }
 
 function unclear(why: string, reason: string, command?: string): BashVerdict {
@@ -919,6 +921,7 @@ function gitInlineAlias(args: readonly BashWord[]): boolean {
 
 function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashVerdict {
   ctx.budget.steps -= command.words.length + ctx.rules.length;
+  ctx.steps?.push(display(command.words));
   // The command as written, before unwrapping, also meets the raw patterns.
   let verdict = rawDeny(command.words, ctx) ?? ALLOW;
   const inner = unwrap(command.words);
@@ -1045,4 +1048,21 @@ export function classifyBash(
     return { action: "deny", rule: `raw:${raw.indexOf(whole)}`, reason: whole.reason };
   }
   return judgeScript(command, ctx);
+}
+
+/**
+ * Every simple command the parser reads in `command`, in order, as written:
+ * the commands of the script, of `bash -c`/`eval`-style nested scripts and of
+ * substitutions. The approval card lists them (#169), so a command hidden
+ * behind look-alike glyphs still shows as its own step. Prefix assignments
+ * are not part of a step (the parser drops them).
+ */
+export function commandSteps(
+  command: string,
+  rules: readonly CommandRule[],
+  raw: readonly CompiledDenyRule[] = [],
+): string[] {
+  const steps: string[] = [];
+  judgeScript(command, { rules, raw, depth: 0, budget: { steps: MAX_POLICY_STEPS }, steps });
+  return steps;
 }

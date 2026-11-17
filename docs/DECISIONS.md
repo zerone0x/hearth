@@ -4135,7 +4135,17 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   text. Chosen by Unicode property, not a list (#167): non-ASCII
   `White_Space`, `Default_Ignorable_Code_Point`, `Cf`, `Zl`/`Zp` and `Cc`
   (bash splits only at ASCII space, tab, newline); the tool-card header
-  escapes the same way (`packages/core/src/hidden-chars.ts`). Residual: a secret split by quoting shows its pieces in `command`,
+  escapes the same way (`packages/core/src/hidden-chars.ts`). Escaping alone cannot close look-alikes of
+  shell syntax (U+FF03, curly quotes, U+2800: visible, not whitespace), so
+  the card also lists, under the full command, every simple command the
+  parser found in the redacted command (`commandSteps`: nested `bash -c` and
+  substitutions included, each escaped, at most 50) as "Runs: 1. ... 2. ...",
+  so a hidden `touch EX` is its own step (#169). The steps travel as `steps`
+  on `approval.requested` and `GET /v1/approvals` (migration 12, column
+  `steps`). The warning "contains non-ASCII characters" is the simple form:
+  any non-ASCII character anywhere in the command (`non_ascii`; the list API
+  derives it from the stored command). Per-step verdicts are not shown.
+  Residual: a secret split by quoting shows its pieces in `command`,
   as in main's tool-call records.
 - **Timeout** `HEARTH_APPROVAL_TIMEOUT_MINUTES`, default 10.
 - **Cancel.** A stop cancels with `why: "stopped"`, through the held call's

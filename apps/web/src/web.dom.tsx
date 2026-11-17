@@ -572,6 +572,8 @@ describe("approval cards in a DOM (decision 0048)", () => {
     command = "git push origin main",
     summary = command,
     hiddenChars = false,
+    steps: string[] = [],
+    nonAscii = false,
   ) {
     let seq = 0;
     const ev = (type: string, payload: unknown) => ({ seq: ++seq, ts: 0, type, payload });
@@ -594,6 +596,8 @@ describe("approval cards in a DOM (decision 0048)", () => {
         reason: "git push needs the owner",
         mode: "ask",
         hidden_chars: hiddenChars,
+        steps,
+        non_ascii: nonAscii,
         expiresAt: Date.now() + 90_000,
       }),
     ];
@@ -670,6 +674,28 @@ describe("approval cards in a DOM (decision 0048)", () => {
     );
     expect(within(panel).getByTestId("approval-summary").textContent).toBe(escaped);
     expect(within(panel).getByTestId("approval-command").textContent).toBe(escaped);
+  });
+
+  test("the parser's steps are listed under the command, with the non-ASCII warning (#169)", async () => {
+    const command = "git push; \uFF03 a note;touch EX";
+    approvalHub([], command, "git push", false, ["git push", "\uFF03 a note", "touch EX"], true);
+    renderApp("#/s/se_1");
+    const panel = await screen.findByRole("region", { name: "Approval needed" });
+    const steps = within(panel).getByTestId("approval-steps");
+    expect([...steps.querySelectorAll("li")].map((li) => li.textContent)).toEqual([
+      "git push",
+      "\uFF03 a note",
+      "touch EX",
+    ]);
+    expect(within(panel).getByTestId("approval-non-ascii").textContent).toContain("non-ASCII");
+  });
+
+  test("no steps list and no non-ASCII warning on a plain card", async () => {
+    approvalHub([]);
+    renderApp("#/s/se_1");
+    const panel = await screen.findByRole("region", { name: "Approval needed" });
+    expect(within(panel).queryByTestId("approval-steps")).toBeNull();
+    expect(within(panel).queryByTestId("approval-non-ascii")).toBeNull();
   });
 
   test("no warning when the hub saw no hidden characters", async () => {

