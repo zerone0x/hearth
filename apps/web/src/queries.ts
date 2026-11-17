@@ -17,6 +17,9 @@ export const keys = {
   session: (id: string) => ["session", id] as const,
   events: (id: string) => ["events", id] as const,
   desktopLock: (id: string) => ["desktop-lock", id] as const,
+  vaultStatus: ["vault-status"] as const,
+  secrets: ["secrets"] as const,
+  modelSettings: ["model-settings"] as const,
 };
 
 /** How often an open desktop re-reads its lock: a lease can lapse or be taken meanwhile. */

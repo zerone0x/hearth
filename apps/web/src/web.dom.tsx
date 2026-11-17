@@ -126,6 +126,189 @@ describe("app in a DOM", () => {
   });
 });
 
+describe("settings page in a DOM", () => {
+  const KEY = {
+    id: "sec_1",
+    name: "anthropic-key",
+    kind: "model-key",
+    scope: null,
+    policy: {},
+    meta: {},
+    fingerprint: "hmac:3f9a00112233",
+    version: 1,
+    createdAt: 0,
+    updatedAt: 0,
+    lastUsedAt: null,
+  };
+  const LOGIN = {
+    ...KEY,
+    id: "sec_2",
+    name: "github",
+    kind: "login",
+    policy: { origins: ["https://github.com"], allow_any_field: false },
+    fingerprint: "hmac:91c2aabbccdd",
+  };
+
+  function settingsHub(
+    model: Record<string, unknown>,
+    vault: Record<string, unknown> = { state: "enabled", kekCheck: "abc", key: "current" },
+  ) {
+    const sent: Array<{ method: string; path: string; body: unknown }> = [];
+    hub((method, path, body) => {
+      if (path === "/v1/vault/status") return ok(vault);
+      if (path === "/v1/secrets" && method === "GET") return ok({ secrets: [KEY, LOGIN] });
+      if (path === "/v1/settings/model" && method === "GET") return ok(model);
+      if (method !== "GET") {
+        sent.push({ method, path, body });
+        if (path === "/v1/settings/model") return ok({ ...model, ...(body as object) });
+        if (path === "/v1/secrets") return ok({ id: "sec_3", fingerprint: "hmac:0b7e44556677" });
+        if (path.endsWith("/value")) return ok({ fingerprint: "hmac:ffff00001111", version: 2 });
+        if (method === "DELETE") return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    return sent;
+  }
+
+  const NONE = {
+    source: "none",
+    provider: null,
+    model: null,
+    keyRef: null,
+    keyFingerprint: null,
+    updatedAt: null,
+  };
+
+  test("the secrets table shows fingerprints, scope and origins; the header links to it", async () => {
+    settingsHub(NONE);
+    renderApp("#/");
+    const link = await screen.findByRole("link", { name: "Settings" });
+    expect(link.getAttribute("href")).toBe("#/settings");
+    window.location.hash = "#/settings";
+    await act(async () => {
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    const table = await screen.findByRole("table", { name: "Secrets" });
+    const rows = within(table).getAllByTestId("secret-row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.textContent).toContain("hmac:3f9a00112233");
+    expect(rows[0]?.textContent).toContain("global");
+    expect(rows[0]?.textContent).toContain("never");
+    expect(rows[1]?.textContent).toContain("https://github.com");
+  });
+
+  test("adding a secret posts its value once, shows the fingerprint, and forgets the value", async () => {
+    const sent = settingsHub(NONE);
+    renderApp("#/settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Add secret" }));
+    const form = await screen.findByRole("form", { name: "Add secret" });
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "openai-key" } });
+    const value = within(form).getByLabelText("Value") as HTMLInputElement;
+    expect(value.type).toBe("password");
+    expect(value.autocomplete).toBe("off");
+    fireEvent.change(value, { target: { value: "sk-dom-test-secret" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Add" }));
+    });
+    expect(await within(form).findByText("hmac:0b7e44556677")).toBeTruthy();
+    expect(sent).toEqual([
+      {
+        method: "POST",
+        path: "/v1/secrets",
+        body: { name: "openai-key", kind: "model-key", fields: { value: "sk-dom-test-secret" } },
+      },
+    ]);
+    // Cleared after the save, and nowhere on the page.
+    expect(value.value).toBe("");
+    expect(document.body.innerHTML).not.toContain("sk-dom-test-secret");
+  });
+
+  test("rotate sends the new value to the entry; delete asks first", async () => {
+    const sent = settingsHub(NONE);
+    renderApp("#/settings");
+    const table = await screen.findByRole("table", { name: "Secrets" });
+    const first = within(table).getAllByTestId("secret-row")[0] as HTMLElement;
+    fireEvent.click(within(first).getByRole("button", { name: "Rotate" }));
+    const form = await screen.findByRole("form", { name: "Rotate secret" });
+    fireEvent.change(within(form).getByLabelText("Value"), { target: { value: "sk-dom-new" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Rotate" }));
+    });
+    expect(await within(form).findByText("hmac:ffff00001111")).toBeTruthy();
+    expect(sent.at(-1)).toEqual({
+      method: "PUT",
+      path: "/v1/secrets/sec_1/value",
+      body: { fields: { value: "sk-dom-new" } },
+    });
+    fireEvent.keyDown(form, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Rotate secret" })).toBeNull());
+
+    fireEvent.click(within(first).getByRole("button", { name: "Delete" }));
+    const confirm = await screen.findByRole("alertdialog");
+    expect(confirm.textContent).toContain("vault:anthropic-key will fail");
+    expect(sent.filter((c) => c.method === "DELETE")).toHaveLength(0);
+    await act(async () => {
+      fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
+    });
+    await waitFor(() =>
+      expect(sent.at(-1)).toEqual({ method: "DELETE", path: "/v1/secrets/sec_1", body: undefined }),
+    );
+  });
+
+  test("the model card saves provider, model and the vault key", async () => {
+    const sent = settingsHub({
+      ...NONE,
+      source: "settings",
+      provider: "anthropic",
+      model: "claude-old",
+      keyRef: "vault:anthropic-key",
+      keyFingerprint: KEY.fingerprint,
+    });
+    renderApp("#/settings");
+    const form = await screen.findByRole("form", { name: "Model" });
+    expect(within(form).getByRole("combobox").textContent).toContain("anthropic-key");
+    fireEvent.change(within(form).getByLabelText("Model"), { target: { value: "claude-new" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+    });
+    expect(await screen.findByText("Saved. New turns use anthropic/claude-new.")).toBeTruthy();
+    expect(sent).toEqual([
+      {
+        method: "PUT",
+        path: "/v1/settings/model",
+        body: { provider: "anthropic", model: "claude-new", keyRef: "vault:anthropic-key" },
+      },
+    ]);
+  });
+
+  test("with the model set in deploy/.env the card is read-only", async () => {
+    settingsHub({ ...NONE, source: "env", provider: "anthropic", model: "claude-env" });
+    renderApp("#/settings");
+    const form = await screen.findByRole("form", { name: "Model" });
+    expect(within(form).getByText("Set by deploy/.env")).toBeTruthy();
+    expect((within(form).getByLabelText("Model") as HTMLInputElement).disabled).toBe(true);
+    expect(within(form).queryByRole("button", { name: "Save" })).toBeNull();
+  });
+
+  test("a disabled vault says why and blocks adding and rotating", async () => {
+    settingsHub(NONE, {
+      state: "disabled",
+      reason: "key-missing",
+      message: "add deploy/secrets/vault_key and restart the hub",
+    });
+    renderApp("#/settings");
+    expect(await screen.findByText("The vault is off (key-missing)")).toBeTruthy();
+    expect(screen.getByText("add deploy/secrets/vault_key and restart the hub")).toBeTruthy();
+    await screen.findByRole("table", { name: "Secrets" });
+    expect((screen.getByRole("button", { name: "Add secret" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    for (const button of screen.getAllByRole("button", { name: "Rotate" })) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+  });
+});
+
 describe("tool card in a DOM", () => {
   test("an outcome-unknown call says so when opened", async () => {
     const S = "se_t";
