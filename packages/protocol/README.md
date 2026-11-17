@@ -1,6 +1,6 @@
 # @hearth/protocol
 
-The hub-box wire protocol, version **1.5** (PRD §8.1–8.2). Pure types and
+The hub-box wire protocol, version **1.6** (PRD §8.1–8.2). Pure types and
 encode/decode functions: no sockets, no I/O, and no hub-local paths or addresses.
 
 ```ts
@@ -169,7 +169,7 @@ and limits are in `src/tools.ts`: `decodeToolParams`, `decodeToolResult`,
 | `tool.readdir` | `LsOperations.readdir` | `path` | `entries`, `omitted` |
 | `tool.glob` | `FindOperations.glob` | `pattern`, `cwd`, `ignore`, `limit` | `paths` (relative to `cwd`), `limitReached` |
 | `tool.grep` | the grep tool's `execute()`, run as `rg` in the box | `pattern`, `path`, `glob?`, `ignoreCase`, `literal`, `context`, `limit` | `output`, `matches`, `limitReached`, `truncatedBytes` |
-| `tool.exec` | `BashOperations.exec` | `command`, `cwd`, `timeoutMs`, `outputStream?` (1.4, [live output](#live-exec-output-14)) | `outcome` (`exited`, `timed-out`, `cancelled`), `exitCode`, `output`, `truncatedBytes`, `fullOutputPath` |
+| `tool.exec` | `BashOperations.exec` | `command`, `cwd`, `timeoutMs`, `outputStream?` (1.4, [live output](#live-exec-output-14)), `env?` (1.6, [secret env](#secret-env-16)) | `outcome` (`exited`, `timed-out`, `cancelled`), `exitCode`, `output`, `truncatedBytes`, `fullOutputPath` |
 | `tool.cancel` | pi's abort signal | `target` (the `rpc` id) | `found` |
 
 Rules:
@@ -179,8 +179,9 @@ Rules:
   running id is answered when it ends, of a finished id with the same answer,
   and of an id whose answer was evicted with `tool.result-expired`. The hub
   mints ids as `tool_<uuid>`.
-- **No environment crosses.** `tool.exec` has no `env` field (the decoder drops
-  one). The box runs commands with its own minimal environment.
+- **No environment crosses** but the one-command secret env (1.6, below). The
+  box runs commands with its own minimal environment; the hub's never leaves
+  the hub.
 - **Paths are box paths inside `/workspace`.** Relative ones resolve against
   it. The box refuses absolute paths outside it, any `..` segment, and paths
   that leave it through a symlink (`tool.path-escape`). A glob pattern whose
@@ -314,6 +315,23 @@ Decision 0039. A 1.4 box answers these `unknown-method`.
   snapshot has it replaced by `[redacted]`.
 - The filled element is masked in every later `browser.screenshot`; a filled
   element gone from a loaded page refuses it with `browser.mask-missing`.
+
+### Secret env (1.6)
+
+Decision 0041. `tool.exec`'s `env` maps variable names to vault `box-env`
+token values the hub resolved for this one command.
+
+- At most `MAX_EXEC_ENV_VARS` (8) variables; each name matches
+  `^[A-Z][A-Z0-9_]*$` and passes `execEnvNameProblem` (no shell, linker,
+  interpreter or box names, no `LD_`/`BASH_`/`HEARTH_`/… prefix); each value
+  is 1 to 16,384 characters without NUL. A failed check names the variable,
+  never the value.
+- The box adds them under its own variables, writes no spill file for the
+  call (`fullOutputPath` is `null`), replaces each value with `[redacted]` in
+  the result, and logs no params.
+- A 1.5 box drops the field and would run the command without it, so the hub
+  sends `env` only to a box whose `hello` named 1.6 or later
+  (`supportsExecEnv`), and refuses the call otherwise with nothing sent.
 
 ## Versioning
 

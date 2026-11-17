@@ -119,6 +119,12 @@ export interface VaultUseContext {
   readonly origin?: string;
   /** Kinds this use accepts. */
   readonly kinds: readonly VaultKind[];
+  /**
+   * The variable a `bash` call puts the value in (decision 0041). Set, only a
+   * `token` entry with `use: box-env` is handed out, and anything else is
+   * refused before the entry is decrypted.
+   */
+  readonly env?: string;
 }
 
 /**
@@ -143,6 +149,18 @@ function originOf(raw: string): string | undefined {
   if (!URL.canParse(raw)) return undefined;
   const url = new URL(raw);
   return url.protocol === "https:" || url.protocol === "http:" ? url.origin : undefined;
+}
+
+/** True for a token entry whose policy opts in to box commands (`use: box-env`). */
+function boxEnvAllowed(kind: VaultKind, policyJson: string): boolean {
+  if (kind !== "token") return false;
+  let use: unknown;
+  try {
+    use = (JSON.parse(policyJson) as { use?: unknown }).use;
+  } catch {
+    // A stored policy that does not parse (an edited row) allows nothing.
+  }
+  return use === "box-env";
 }
 
 export interface HubVaultOptions {
@@ -389,14 +407,22 @@ export class HubVault implements VaultReader {
   ): Promise<{ fingerprint: string; version: number }> {
     await this.#authorize(principal, "secret.rotate", "secret", id);
     const input = await bodyOf(body);
-    if (!isRecord(input) || Object.keys(input).some((k) => k !== "fields")) {
-      throw invalid("expected {fields}");
+    if (!isRecord(input) || Object.keys(input).some((k) => k !== "fields" && k !== "use")) {
+      throw invalid("expected {fields, use?}");
     }
     return this.#serial(async () => {
       const state = await this.#enabled();
       const row = this.#row(id);
       const fields = checkEntryFields(row.kind, input["fields"]);
-      const binding = { ...bindingOf(row), version: row.version + 1 };
+      // A token's `use` (decision 0041) may change with its value, as the owner
+      // types it again; the new policy is bound into the new ciphertext's AAD.
+      let policyJson = row.policyJson;
+      if (input["use"] !== undefined) {
+        if (row.kind !== "token") throw invalid("only a token has a use");
+        const current = JSON.parse(row.policyJson) as Record<string, unknown>;
+        policyJson = canonicalPolicy("token", { ...current, use: input["use"] });
+      }
+      const binding = { ...bindingOf(row), version: row.version + 1, policyJson };
       // The old ciphertext must still open: a tampered row is not rotated
       // into a valid one under a policy nobody set.
       await this.#open_(state.dek, row);
@@ -410,11 +436,13 @@ export class HubVault implements VaultReader {
           fingerprint,
           previous_fingerprint: row.fingerprint,
           version: binding.version,
+          ...(policyJson === row.policyJson ? {} : { policy: JSON.parse(policyJson) }),
         }),
         () => {
           const ok = this.#o.store.replaceValue(this.#workspaceId, id, row.version, {
             ...sealed,
             fingerprint,
+            policyJson,
             version: binding.version,
             updatedAt: this.#now(),
           });
@@ -525,6 +553,7 @@ export class HubVault implements VaultReader {
       readonly tool?: string;
       readonly toolCallId?: string;
       readonly origin?: string;
+      readonly env?: string;
     },
   ): Promise<{ value: string; name: string; kind: VaultKind; field: string; policy: VaultPolicy }> {
     await this.open();
@@ -549,6 +578,7 @@ export class HubVault implements VaultReader {
       tool: context.tool ?? null,
       tool_call_id: context.toolCallId ?? null,
       origin: context.origin ?? null,
+      ...(context.env === undefined ? {} : { env: context.env }),
     };
     const refuse = async (code: SecretErrorCode, problem: string): Promise<never> => {
       // Best effort: a refusal hands out nothing, so a failed record does not change it.
@@ -557,6 +587,19 @@ export class HubVault implements VaultReader {
         .catch(() => {});
       throw vaultSecretError(ref, code, problem);
     };
+    // A box-env use (decision 0041) is refused on the stored columns before
+    // the entry is decrypted: only a token opted in to box commands, global or
+    // of this session. The same checks run again below on the authenticated row.
+    if (context.env !== undefined && !boxEnvAllowed(row.kind, row.policyJson)) {
+      return refuse("vault.kind-mismatch", "only a token marked usable by box commands");
+    }
+    if (
+      context.env !== undefined &&
+      row.scopeSessionId !== null &&
+      row.scopeSessionId !== context.sessionId
+    ) {
+      return refuse("vault.scope-mismatch", "the entry is scoped to another session");
+    }
     let fields: Record<string, string>;
     try {
       // Decrypt first: the scope and policy checked below are authentic only
@@ -573,6 +616,12 @@ export class HubVault implements VaultReader {
       const tokenPolicy = JSON.parse(row.policyJson) as { use?: string };
       if (tokenPolicy.use !== "hub") {
         return refuse("vault.kind-mismatch", "this token is for box commands, not the hub");
+      }
+    }
+    if (row.kind === "token" && context.consumer === "tool") {
+      // A tool hands a token only to a box command, and only one opted in.
+      if (context.env === undefined || !boxEnvAllowed(row.kind, row.policyJson)) {
+        return refuse("vault.kind-mismatch", "this token is not usable by box commands");
       }
     }
     if (row.scopeSessionId !== null && row.scopeSessionId !== context.sessionId) {

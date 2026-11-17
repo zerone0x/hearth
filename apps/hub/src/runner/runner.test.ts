@@ -35,14 +35,19 @@ import {
   SecretValue,
   type StoredEvent,
 } from "@hearth/core";
-import type { RpcFrame, RpcResultFrame } from "@hearth/protocol";
+import {
+  PROTOCOL_VERSION,
+  type ProtocolVersion,
+  type RpcFrame,
+  type RpcResultFrame,
+} from "@hearth/protocol";
 import { FakeDriver, fakeJpeg } from "../../../box-agent/src/browser/fake";
 import { BrowserTools } from "../../../box-agent/src/browser/tools";
 import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import { createApp } from "../app";
 import { AuthService, SESSION_COOKIE } from "../auth";
 import type { BoxConnectionListener, BoxConnections } from "../box/connections";
-import { ToolRpcClient } from "../box/tool-rpc";
+import { NO_SECRET_ENV_IN_BOX, ToolRpcClient } from "../box/tool-rpc";
 import { missingImageText } from "../obs/blobs";
 import { buildTrajectory, toJsonl } from "../obs/trajectory";
 import type { BoxLease, SessionView } from "../session/manager";
@@ -67,6 +72,7 @@ import {
 import { mountRunnerRoutes } from "./routes";
 import { REDACTED, RESTART_OUTCOME_UNKNOWN, redactSecrets } from "./runner";
 import { type RunnerConfig, SessionRunners, type SessionRunnersOptions } from "./runners";
+import { NO_VAULT_FOR_ENV } from "./tools";
 
 const dirs: string[] = [];
 const closers: Array<() => unknown> = [];
@@ -140,6 +146,8 @@ class FakeBoxes {
   browser: BrowserTools | undefined;
   /** Stream frames the hub sent the box. */
   readonly streamsClosed: Array<{ streamId: number; reason: string | undefined }> = [];
+  /** The protocol version the box's hello named. */
+  version: ProtocolVersion | undefined = PROTOCOL_VERSION;
 
   constructor(
     readonly root: string,
@@ -148,13 +156,17 @@ class FakeBoxes {
     this.executor = this.#newExecutor();
   }
 
+  /** Rewrites the box's answers on the way to the hub (a buggy or older box). */
+  rewriteAnswer: ((frame: RpcResultFrame) => RpcResultFrame) | undefined;
+
   #newExecutor(): ToolExecutor {
     this.browser =
       this.driver === null ? undefined : new BrowserTools({ driver: this.driver, root: this.root });
     return new ToolExecutor({
       root: this.root,
       ...(this.browser === undefined ? {} : { browser: this.browser }),
-      send: (frame: RpcResultFrame) => {
+      send: (answer: RpcResultFrame) => {
+        const frame = this.rewriteAnswer?.(answer) ?? answer;
         for (const l of this.listeners) if (l.rpcResult?.("box_1", frame)) return;
       },
       // Live output (decision 0036), in the same order as the answers.
@@ -162,6 +174,10 @@ class FakeBoxes {
         for (const l of this.listeners) if (l.stream?.("box_1", frame)) return;
       },
     });
+  }
+
+  versionOf(_boxId: string): ProtocolVersion | undefined {
+    return this.version;
   }
 
   listen(listener: BoxConnectionListener): () => void {
@@ -1996,6 +2012,36 @@ describe("browser_fill (decision 0039)", () => {
     });
   });
 
+  test("a filled value stays scrubbed after the runner is rebuilt (model switch)", async () => {
+    const driver = new FakeDriver();
+    signIn(driver);
+    const { vault } = await vaultWith();
+    const h = await harness({}, { vault }, driver);
+    writeFileSync(join(h.root, "dump.txt"), `field=${PASSWORD}\n`);
+    const first = await turn(h, "se_a", "sign in", [
+      call("browser_snapshot", {}, "c_snap"),
+      fill("s1e3", "vault:site#password"),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(resultsOf(first).get("c_fill")?.isError).toBe(false);
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    let sent = "";
+    const second = await turn(h, "se_a", "look again", [
+      call("browser_snapshot", {}, "c_snap2"),
+      call("bash", { command: "cat dump.txt" }, "c_bash"),
+      (context) => {
+        sent = JSON.stringify(context.messages);
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    expect(second).not.toBe(first);
+    const r = resultsOf(second);
+    expect(r.get("c_snap2")?.text).toContain("[redacted]");
+    expect(r.get("c_bash")?.text).toContain("field=[redacted]");
+    expect(sent).not.toContain(PASSWORD);
+    expect(JSON.stringify(second.messages)).not.toContain(PASSWORD);
+  });
+
   test("a page on another origin: refused before the value is resolved or sent", async () => {
     const driver = new FakeDriver();
     const tab = signIn(driver, "https://evil.example/signin");
@@ -2116,4 +2162,384 @@ describe("browser_fill (decision 0039)", () => {
     expect(result?.text).toContain("a token entry cannot be used here");
     expect(tab.actions.some((a) => a.startsWith("fill"))).toBe(false);
   });
+});
+
+describe("bash env: vault tokens for one command (decision 0041)", () => {
+  /** Distinctive: the redaction registry is process-wide. */
+  const TOKEN = "ghp_envTest5c2e91b7d0aa";
+  const HUB_TOKEN = "hub-only-token-41f7c3";
+  const OTHER = "other-session-token-8be2";
+  /** A value whose JSON and URL forms differ from it. */
+  const SPECIAL = 'sp3c-al/tok en+4&"q\\z';
+  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+  /** A real vault on a temp SQLite file: one opted-in token and the entries bash must not get. */
+  async function envVault() {
+    const dir = workspace();
+    const db = openDatabase(join(dir, "hub.db"));
+    closers.push(() => db.close());
+    db.run(
+      `INSERT INTO session (id, workspace_id, title, state, last_activity_at, created_at)
+       VALUES ('se_b', 'ws_default', 't', 'idle', 0, 0)`,
+    );
+    const audit = new SqliteAuditSink(db);
+    const vault = new HubVault({
+      store: new SqliteVaultStore(db),
+      authorizer: new AllowAllAuthorizer({ audit }),
+      audit,
+      keySecrets: createDefaultSecretStore({
+        env: { VAULT_KEY: Buffer.alloc(32, 0x6d).toString("base64") },
+      }),
+      keyRef: "env:VAULT_KEY",
+      log: () => {},
+    });
+    await vault.open();
+    const create = (input: Record<string, unknown>) => vault.create(LOCAL_PRINCIPAL, input);
+    await create({
+      name: "github",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: TOKEN },
+    });
+    await create({ name: "hub-token", kind: "token", fields: { value: HUB_TOKEN } });
+    await create({
+      name: "site",
+      kind: "login",
+      policy: { origins: ["https://login.example"] },
+      fields: { username: "env-test-user", password: "env-test-pw-3a9d" },
+    });
+    await create({
+      name: "other",
+      kind: "token",
+      scope: { sessionId: "se_b" },
+      policy: { use: "box-env" },
+      fields: { value: OTHER },
+    });
+    const uses = () =>
+      db
+        .query<{ detail_json: string }, []>(
+          "SELECT detail_json FROM audit WHERE action = 'secret.use' ORDER BY id",
+        )
+        .all()
+        .map((r) => JSON.parse(r.detail_json) as Record<string, unknown>);
+    return { vault, uses };
+  }
+
+  const bash = (id: string, command: string, env?: Record<string, unknown>) =>
+    call(
+      "bash",
+      { command, ...(env === undefined ? {} : { env: env as Record<string, string> }) },
+      id,
+    );
+
+  function execFrames(h: Harness) {
+    return h.boxes.sent
+      .filter((f) => f.method === "tool.exec")
+      .map((f) => f.params as { command: string; env?: Record<string, string> });
+  }
+
+  test("the value is in that one command's environment only, audited first, and never shown", async () => {
+    const { vault, uses } = await envVault();
+    const h = await harness({}, { vault });
+    const runner = await turn(h, "se_a", "use the token", [
+      bash(
+        "c_env",
+        'printf %s "$GH_TOKEN" | sha256sum; echo "raw:$GH_TOKEN"; printf %s "$GH_TOKEN" > t.txt',
+        { GH_TOKEN: "vault:github" },
+      ),
+      bash("c_plain", 'echo "second:${GH_TOKEN:-unset}"; cat t.txt'),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const results = new Map(toolResults(runner.messages).map((r) => [r.id, r]));
+    // The command saw the value: its hash is the token's.
+    expect(results.get("c_env")?.text).toContain(sha(TOKEN));
+    expect(results.get("c_env")?.text).toContain(`raw:${REDACTED}`);
+    // The next command did not get the variable; the file it reads is scrubbed.
+    expect(results.get("c_plain")?.text).toContain("second:unset");
+    expect(results.get("c_plain")?.text).toContain(REDACTED);
+    // Sent once, in that one exec; never in a later one.
+    const frames = execFrames(h);
+    expect(frames).toHaveLength(2);
+    expect(frames[0]?.env).toEqual({ GH_TOKEN: TOKEN });
+    expect(frames[1]?.env).toBeUndefined();
+    // Audited once, with its variable and call.
+    expect(uses()).toHaveLength(1);
+    expect(uses()[0]).toMatchObject({
+      name: "github",
+      tool: "bash",
+      tool_call_id: "c_env",
+      env: "GH_TOKEN",
+      session_id: "se_a",
+    });
+    // Nowhere the model, the event log or the trajectory reads.
+    expect(JSON.stringify(runner.messages)).not.toContain(TOKEN);
+    expect(JSON.stringify(h.events.all.get("se_a"))).not.toContain(TOKEN);
+    const trajectory = toJsonl(
+      buildTrajectory(h.events.all.get("se_a") ?? [], {
+        sessionId: "se_a",
+        versions: { pi: "test", hub: "test" },
+      }),
+    );
+    expect(trajectory).not.toContain(TOKEN);
+    // The tool call the model made names the reference only.
+    expect(JSON.stringify(runner.messages)).toContain("vault:github");
+    // No spill file of the call holds it.
+    const spillDir = join(h.root, ".hearth", "exec");
+    if (existsSync(spillDir)) {
+      for (const name of new Bun.Glob("*").scanSync(spillDir)) {
+        expect(readFileSync(join(spillDir, name), "utf8")).not.toContain(TOKEN);
+      }
+    }
+  }, 20_000);
+
+  /** Turn 2 reads what turn 1 wrote; returns its result and the text the model was sent. */
+  async function readBack(h: Harness, runners: SessionRunners, command: string) {
+    let sent = "";
+    h.faux.setResponses([
+      bash("c_read", command),
+      (context) => {
+        sent = JSON.stringify(context.messages);
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    await runners.send(LOCAL_PRINCIPAL, "se_a", "read it back");
+    const runner = await runners.runner("se_a");
+    await runner.settled();
+    return { result: toolResults(runner.messages).find((r) => r.id === "c_read"), sent, runner };
+  }
+
+  const writeToken = (h: Harness) =>
+    turn(h, "se_a", "write the token", [
+      bash("c_write", 'printf "f:%s\\n" "$GH_TOKEN" > t2.txt; cat t2.txt', {
+        GH_TOKEN: "vault:github",
+      }),
+      fauxAssistantMessage("written"),
+    ]);
+
+  test("a file the command wrote stays scrubbed after a model switch rebuilds the runner", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    const first = await writeToken(h);
+    expect(toolResults(first.messages)[0]?.text).toContain(`f:${REDACTED}`);
+    h.runners.setModel({ provider: "faux", model: h.faux.getModel().id });
+    const { result, sent, runner } = await readBack(h, h.runners, "cat t2.txt");
+    expect(runner).not.toBe(first);
+    expect(result?.text).toContain(`f:${REDACTED}`);
+    expect(sent).toContain(`f:${REDACTED}`);
+    expect(sent).not.toContain(TOKEN);
+    expect(JSON.stringify(runner.messages)).not.toContain(TOKEN);
+  }, 20_000);
+
+  test("a file and a background child's environment stay scrubbed after a hub restart", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    const marker = `bg-${crypto.randomUUID()}`;
+    await turn(h, "se_a", "write the token", [
+      bash(
+        "c_write",
+        `printf "f:%s\\n" "$GH_TOKEN" > t2.txt; (exec -a ${marker} sleep 20) >/dev/null 2>&1 & echo started`,
+        { GH_TOKEN: "vault:github" },
+      ),
+      fauxAssistantMessage("written"),
+    ]);
+    await h.runners.close();
+    const again = h.make({}, { vault });
+    try {
+      const { result, sent } = await readBack(
+        h,
+        again,
+        `cat t2.txt; for p in /proc/[0-9]*; do if grep -q ${marker} $p/cmdline 2>/dev/null; then tr "\\0" "\\n" < $p/environ | grep GH_TOKEN; fi; done`,
+      );
+      expect(result?.text).toContain(`f:${REDACTED}`);
+      // The child started by the env call still holds the value; the model sees it masked.
+      expect(result?.text).toContain(`GH_TOKEN=${REDACTED}`);
+      expect(sent).not.toContain(TOKEN);
+    } finally {
+      Bun.spawnSync(["pkill", "-f", marker]);
+    }
+  }, 20_000);
+
+  test("encoded and split forms: JSON-escaped and URL-encoded output, and live output chunks", async () => {
+    const { vault } = await envVault();
+    await vault.create(LOCAL_PRINCIPAL, {
+      name: "special",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: SPECIAL },
+    });
+    const h = await harness({}, { vault });
+    const encode = [
+      "python3 -c 'import os, json, urllib.parse as u",
+      't = os.environ["SP"]',
+      "print(json.dumps(t))",
+      'print(u.quote(t, safe=""))',
+      "print(u.quote_plus(t))'",
+    ].join("\n");
+    const runner = await turn(h, "se_a", "go", [
+      bash(
+        "c_split",
+        // A first line, then half the token, a pause long enough for a live
+        // output event, then the rest.
+        `echo before; sleep 0.6; printf %s "\${GH_TOKEN:0:9}"; sleep 0.6; printf "%s\\n" "\${GH_TOKEN:9}"; ${encode}`,
+        { GH_TOKEN: "vault:github", SP: "vault:special" },
+      ),
+      fauxAssistantMessage("done"),
+    ]);
+    expect(runner.status).toBe("idle");
+    const text = toolResults(runner.messages).find((r) => r.id === "c_split")?.text ?? "";
+    expect(text).toContain("before");
+    expect(text).not.toContain(TOKEN);
+    for (const form of [
+      JSON.stringify(SPECIAL).slice(1, -1),
+      encodeURIComponent(SPECIAL),
+      encodeURIComponent(SPECIAL).replaceAll("%20", "+"),
+    ]) {
+      expect(text).not.toContain(form);
+    }
+    // Four redactions: the token, then the special one JSON-escaped and URL-encoded twice.
+    expect(text.split(REDACTED).length - 1).toBe(4);
+    const live = h.events
+      .of("se_a", "tool.output")
+      .map((e) => (e.payload as { text: string }).text)
+      .join("");
+    expect(live).toContain("before");
+    // Neither the token nor its first half reached a live output event.
+    expect(live).not.toContain(TOKEN);
+    expect(live).not.toContain(TOKEN.slice(0, 9));
+    expect(JSON.stringify(h.events.all.get("se_a"))).not.toContain(TOKEN);
+  }, 20_000);
+
+  test("a box that answers with the raw value: the hub scrubs it before pi sees the output", async () => {
+    const { vault } = await envVault();
+    const h = await harness({}, { vault });
+    // As a box without its own scrub would answer; long, so pi keeps it in a hub temp file.
+    const marker = `raw-answer-${crypto.randomUUID()}`;
+    const output = `${marker}:${TOKEN}\n${"x\n".repeat(3000)}end:${TOKEN}\n`;
+    h.boxes.rewriteAnswer = (frame) =>
+      frame.ok && typeof (frame.result as { output?: unknown }).output === "string"
+        ? { ...frame, result: { ...(frame.result as object), output } }
+        : frame;
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_raw", "true", { GH_TOKEN: "vault:github" }),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_raw");
+    expect(result?.text).toContain(`end:${REDACTED}`);
+    expect(JSON.stringify(runner.messages)).not.toContain(TOKEN);
+    const files = [...new Bun.Glob("pi-bash*").scanSync({ cwd: tmpdir(), absolute: true })]
+      .map((path) => readFileSync(path, "utf8"))
+      .filter((text) => text.includes(marker));
+    expect(files).toHaveLength(1);
+    expect(files[0]).not.toContain(TOKEN);
+  }, 20_000);
+
+  test("refused before decrypt and before the box: hub tokens, logins, another session's token, a missing entry", async () => {
+    const { vault, uses } = await envVault();
+    const h = await harness({}, { vault });
+    const refs: Array<[string, string]> = [
+      ["vault:hub-token", "vault.kind-mismatch"],
+      ["vault:site", "vault.kind-mismatch"],
+      ["vault:site#password", "vault.kind-mismatch"],
+      ["vault:other", "vault.scope-mismatch"],
+      ["vault:missing", "secret.not-found"],
+    ];
+    const runner = await turn(h, "se_a", "try", [
+      ...refs.map(([ref], i) => bash(`c_${i}`, "env", { GH_TOKEN: ref })),
+      fauxAssistantMessage("done"),
+    ]);
+    const results = new Map(toolResults(runner.messages).map((r) => [r.id, r]));
+    refs.forEach(([ref, code], i) => {
+      const result = results.get(`c_${i}`);
+      expect(`${ref}: ${result?.isError}`).toBe(`${ref}: true`);
+      expect(`${ref}: ${result?.text}`).toContain(code);
+      expect(result?.text).toContain("Nothing was run");
+    });
+    expect(execFrames(h)).toHaveLength(0);
+    expect(uses()).toHaveLength(0);
+    for (const value of [HUB_TOKEN, OTHER, "env-test-pw-3a9d"]) {
+      expect(JSON.stringify(runner.messages)).not.toContain(value);
+    }
+  }, 20_000);
+
+  test("a value, a bad or reserved name, or too many variables are refused before a lease, unechoed", async () => {
+    const { vault, uses } = await envVault();
+    const h = await harness({}, { vault });
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ GH_TOKEN: "ghp_literalGuess77" }, "secret.malformed-ref"],
+      [{ GH_TOKEN: "vault:" }, "secret.malformed-ref"],
+      [{ PATH: "vault:github" }, "bash.env-name"],
+      [{ LD_PRELOAD: "vault:github" }, "bash.env-name"],
+      [{ BASH_ENV: "vault:github" }, "bash.env-name"],
+      [{ gh_token: "vault:github" }, "bash.env-name"],
+      [
+        Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`T_${i}`, "vault:github"])),
+        "bash.env-invalid",
+      ],
+    ];
+    const runner = await turn(h, "se_a", "try", [
+      ...cases.map(([env], i) => bash(`c_${i}`, "env", env)),
+      fauxAssistantMessage("done"),
+    ]);
+    const results = new Map(toolResults(runner.messages).map((r) => [r.id, r]));
+    cases.forEach(([, code], i) => {
+      expect(results.get(`c_${i}`)?.isError).toBe(true);
+      expect(results.get(`c_${i}`)?.text).toContain(code);
+    });
+    expect(results.get("c_0")?.text).not.toContain("ghp_literalGuess77");
+    expect(h.sessions.leases).toBe(0);
+    expect(execFrames(h)).toHaveLength(0);
+    expect(uses()).toHaveLength(0);
+  }, 20_000);
+
+  test("a box older than 1.6 would drop the variables: refused before the vault is asked", async () => {
+    const { vault, uses } = await envVault();
+    const h = await harness({}, { vault });
+    h.boxes.version = { major: 1, minor: 5 };
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_old", "env", { GH_TOKEN: "vault:github" }),
+      bash("c_plain", "echo old-box-ok"),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_old");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain(NO_SECRET_ENV_IN_BOX);
+    expect(uses()).toHaveLength(0);
+    // A command without env still runs on the old box.
+    expect(toolResults(runner.messages).find((r) => r.id === "c_plain")?.text).toContain(
+      "old-box-ok",
+    );
+    expect(execFrames(h).map((f) => f.command)).toEqual(["echo old-box-ok"]);
+  }, 20_000);
+
+  test("a vault failure that is not a refusal is passed on as it is; nothing runs", async () => {
+    const vault = {
+      use: async () => {
+        throw new Error("disk I/O error in the vault");
+      },
+    } as unknown as SessionRunnersOptions["vault"];
+    const h = await harness({}, { vault });
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_env", "env", { GH_TOKEN: "vault:github" }),
+      fauxAssistantMessage("done"),
+    ]);
+    const result = toolResults(runner.messages).find((r) => r.id === "c_env");
+    expect(result?.isError).toBe(true);
+    expect(result?.text).toContain("disk I/O error in the vault");
+    expect(result?.text).not.toContain("Nothing was run");
+    expect(execFrames(h)).toHaveLength(0);
+  }, 20_000);
+
+  test("without a vault a call with env refuses; a call without env runs as before", async () => {
+    const h = await harness();
+    const runner = await turn(h, "se_a", "go", [
+      bash("c_env", "env", { GH_TOKEN: "vault:github" }),
+      bash("c_plain", "echo plain-ok"),
+      fauxAssistantMessage("done"),
+    ]);
+    const results = new Map(toolResults(runner.messages).map((r) => [r.id, r]));
+    expect(results.get("c_env")?.text).toContain(NO_VAULT_FOR_ENV);
+    expect(results.get("c_plain")?.text).toContain("plain-ok");
+    expect(execFrames(h)).toHaveLength(1);
+  }, 20_000);
 });

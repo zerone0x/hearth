@@ -3403,6 +3403,94 @@ how the eval runs in CI without a model key.
   broke the line), so the fixture script avoids such text. The fix of the
   redaction is #144.
 
+## 0041: `bash` env with `box-env` vault tokens: one command, refused before decrypt, scrubbed (protocol 1.6)
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #130
+
+### Context
+
+CLI tools in the box (`gh`, `npm`, `aws`) read a token from the environment.
+The vault (0031) already has the policy field for it, `use: hub | box-env`,
+and the research (`docs/research/vault.md`, "API tokens for tools") says a
+`box-env` token may enter the box only inside the one exec RPC that uses it,
+with its output redacted. Until now `tool.exec` had no `env` at all (PRD
+§8.2.1: the hub's environment never reaches the box), and only the hub's own
+SecretStore read tokens, refusing `box-env` ones.
+
+### Decision
+
+- **Opt-in per entry, by the owner.** A `token` entry is usable by box
+  commands only with `use: box-env`, set when it is added
+  (`POST /v1/secrets`) or rotated (`PUT /v1/secrets/:id/value {fields,
+  use?}`, token only; the new policy is bound into the new ciphertext's AAD
+  and named in the `secret.rotate` audit row). Default stays `hub`. The
+  Settings page has a "Usable by box commands" switch on both forms, shown
+  only for a token, with the badge "visible to commands in the box" (also in
+  the table). shadcn's Switch on `radix-ui`; no portal, no scroll lock, so CSP
+  stays as 0038 left it.
+- **Tool.** `bash` takes an optional `env: { NAME: "vault:<name>" }` (at most 8).
+  Each name must match `^[A-Z][A-Z0-9_]*$` and not be a name the shell, the
+  linker, an interpreter or the box uses (`PATH`, `HOME`, `IFS`, `ENV`,
+  `NODE_OPTIONS`, …) or start with `LD_`, `DYLD_`, `BASH_`, `LC_`, `GIT_`,
+  `XDG_`, `HEARTH_` (`execEnvNameProblem`, shared by hub and box). A value
+  must be a `vault:` reference; anything else is refused without being echoed.
+  These checks run before a box lease.
+- **Order in the hub.** Lease, then the box's protocol version (a 1.5 box
+  drops unknown fields, so it would run the command without the variable:
+  refused, nothing asked of the vault), then `HubVault.use` per variable with
+  the variable name. The vault refuses anything but a `box-env` token that is
+  global or scoped to this session, first on the stored columns, before it
+  decrypts (`secret.use-refused`, no `secret.use`), then again on the
+  authenticated row after the AAD verified. A token through a tool without a
+  variable is refused as well, and a `box-env` token is still never the hub's.
+  The use is audited (`secret.use` with `env`, `tool: bash`, the call id)
+  before the value is returned and registered for sink redaction (0021).
+- **Value path.** The value is registered for redaction before it is sent,
+  then travels in that one `tool.exec` only (`env`, protocol 1.6). The hub
+  checks the version again with no await before the send, so an older box
+  never receives it. Box-agent adds the variables under its own (box
+  variables win), writes no spill file for that call, and replaces each value
+  in the result. It never logs params. The variables live in the child's
+  environment only; the next command does not have them.
+- **Scrubbing.** Before pi sees the output (so its result, its update events
+  and its hub temp file), the hub replaces each value in the raw, JSON-escaped
+  and URL-encoded forms (`redactValues`, 0039; the URL forms include Python's
+  `urllib.parse.quote` and `quote_plus`). Every later tool result of the
+  session is scrubbed too, whatever the tool: the runner's `tool_result` hook
+  replaces every secret the hub has registered (`knownSecrets`, 0021; the
+  vault registers each stored value when it opens, and each value it adds,
+  rotates or hands out), not a per-runner set. So the scrub holds after the
+  runner is rebuilt (a model switch, 0038, or a hub restart), for
+  `browser_fill` values (0039) too. Live output goes through the runner's
+  redactor, which holds back a tail that could start a secret, so a value
+  split across chunks is never half shown (0036). Events, trajectory and
+  logs redact it through the sink registry.
+
+### Consequences
+
+- The command, and anything it starts, sees the value and can write it to a
+  file, send it out (egress is open, 0023) or transform it beyond what the
+  redactor knows (base64, hex, a split or reversed string, any other
+  encoding). The model can then read the transformed form. This is the
+  residual the research names for `box-env`; the badge says so, and every use
+  is audited.
+- A file the command wrote with the raw value is scrubbed when a later tool
+  result shows it, in this runner or a rebuilt one, but stays in the box. A
+  child the command started in the background (`cmd &`, `setsid`) keeps the
+  value in its environment for as long as it runs; reading it
+  (`/proc/<pid>/environ`) is scrubbed the same way.
+- A value is scrubbed only while the hub knows it: a deleted token, or the
+  old value of a rotated one, leaves the registry at the next hub start, so a
+  file written with it earlier is shown raw after that restart.
+- A call with secrets has no `fullOutputPath`: the model sees only the
+  output tail (256 KiB).
+- A token's `hosts` is not enforced for `box-env` uses; the box's egress is
+  not per command.
+- The box-agent's own check that a box variable cannot be overridden is
+  defense in depth: the decoder already refuses those names.
+
 ## 0042: M3 without phone channels; access mode `yolo` or `ask`
 
 - Date: 2026-11-17

@@ -5,13 +5,18 @@ import {
   decodeToolParams,
   decodeToolResult,
   encodeFrame,
+  execEnvNameProblem,
   FS_DEADLINE_MS,
   isLiveOutputStreamId,
   LIVE_OUTPUT_STREAM_BASE,
+  MAX_EXEC_ENV_NAME_LENGTH,
+  MAX_EXEC_ENV_VALUE_LENGTH,
+  MAX_EXEC_ENV_VARS,
   MAX_EXEC_TIMEOUT_MS,
   MUTATING_TOOL_METHODS,
   PROTOCOL_VERSION,
   SEARCH_TIMEOUT_MS,
+  supportsExecEnv,
   TOOL_DEADLINE_GRACE_MS,
   TOOL_ERRORS,
   TOOL_METHODS,
@@ -20,22 +25,93 @@ import {
 } from "./index";
 
 describe("tool RPC", () => {
-  test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2; browser methods 1.3; live exec output 1.4)", () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 5 });
+  test("is a minor bump of protocol 1 (1.1; traceparent made it 1.2; browser methods 1.3; live exec output 1.4; secret fill 1.5; exec env 1.6)", () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 6 });
   });
 
-  test("exec params never carry an environment", () => {
-    const decoded = decodeToolParams("tool.exec", {
-      callId: "call_1",
-      command: "env",
-      cwd: "/workspace",
-      timeoutMs: 1000,
-      env: { SECRET: "hub" },
-    });
-    expect(decoded).toEqual({
+  test("exec env (1.6): checked names and non-empty values; a failure never quotes a value", () => {
+    const params = { callId: "call_1", command: "env", cwd: "/workspace", timeoutMs: 1000 };
+    expect(decodeToolParams("tool.exec", { ...params, env: { GH_TOKEN: "tok-1" } })).toEqual({
       ok: true,
-      value: { callId: "call_1", command: "env", cwd: "/workspace", timeoutMs: 1000 },
+      value: { ...params, env: { GH_TOKEN: "tok-1" } },
     });
+    expect(decodeToolParams("tool.exec", params)).toEqual({ ok: true, value: params });
+    const eight = Object.fromEntries(
+      Array.from({ length: MAX_EXEC_ENV_VARS }, (_, i) => [`TOKEN_${i}`, "v"]),
+    );
+    expect(decodeToolParams("tool.exec", { ...params, env: eight })).toEqual({
+      ok: true,
+      value: { ...params, env: eight },
+    });
+    const longest = { GH_TOKEN: "v".repeat(MAX_EXEC_ENV_VALUE_LENGTH) };
+    expect(decodeToolParams("tool.exec", { ...params, env: longest }).ok).toBe(true);
+    const value = "do-not-echo-this-value";
+    const bad: unknown[] = [
+      null,
+      { GH_TOKEN: "fine", PATH: value },
+      {},
+      [],
+      "GH_TOKEN=x",
+      { gh_token: value },
+      { "GH-TOKEN": value },
+      { "1TOKEN": value },
+      { PATH: value },
+      { LD_PRELOAD: value },
+      { BASH_ENV: value },
+      { BASH_FUNC_x: value },
+      { HEARTH_EXEC: value },
+      { GIT_SSH_COMMAND: value },
+      { GH_TOKEN: "" },
+      { GH_TOKEN: 7 },
+      { GH_TOKEN: `${value}\u0000` },
+      { GH_TOKEN: "x".repeat(MAX_EXEC_ENV_VALUE_LENGTH + 1) },
+      { [`A${"B".repeat(MAX_EXEC_ENV_NAME_LENGTH)}`]: value },
+      Object.fromEntries(
+        Array.from({ length: MAX_EXEC_ENV_VARS + 1 }, (_, i) => [`TOKEN_${i}`, value]),
+      ),
+    ];
+    for (const env of bad) {
+      const decoded = decodeToolParams("tool.exec", { ...params, env } as never);
+      expect(decoded.ok).toBe(false);
+      if (!decoded.ok) expect(decoded.message).not.toContain(value);
+    }
+  });
+
+  test("execEnvNameProblem: the pattern minus the reserved names and prefixes", () => {
+    expect(execEnvNameProblem(`A${"B".repeat(MAX_EXEC_ENV_NAME_LENGTH - 1)}`)).toBeUndefined();
+    expect(execEnvNameProblem(`A${"B".repeat(MAX_EXEC_ENV_NAME_LENGTH)}`)).toBeDefined();
+    for (const ok of ["GH_TOKEN", "NPM_TOKEN", "AWS_SECRET_ACCESS_KEY", "A", "X1"]) {
+      expect(execEnvNameProblem(ok)).toBeUndefined();
+    }
+    for (const no of [
+      "",
+      "gh_token",
+      "_X",
+      "9X",
+      "A-B",
+      "A B",
+      "PATH",
+      "HOME",
+      "IFS",
+      "LD_X",
+      "LC_ALL",
+      "DYLD_X",
+      "XDG_X",
+      "NODE_OPTIONS",
+      "PWD",
+      "PS4",
+      "PROMPT_COMMAND",
+    ]) {
+      expect(execEnvNameProblem(no)).toBeDefined();
+    }
+  });
+
+  test("supportsExecEnv: only a 1.6+ box of major 1", () => {
+    expect(supportsExecEnv(undefined)).toBe(false);
+    expect(supportsExecEnv({ major: 1, minor: 5 })).toBe(false);
+    expect(supportsExecEnv({ major: 1, minor: 6 })).toBe(true);
+    expect(supportsExecEnv({ major: 1, minor: 9 })).toBe(true);
+    expect(supportsExecEnv({ major: 2, minor: 6 })).toBe(false);
   });
 
   test("exec may name a live output stream (1.4); only an even id in the live range", () => {

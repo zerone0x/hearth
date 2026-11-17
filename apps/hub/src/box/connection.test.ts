@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOCAL_PRINCIPAL } from "@hearth/core";
+import { PROTOCOL_VERSION } from "@hearth/protocol";
 import { BoxAgent } from "../../../box-agent/src/connection";
 import { SESSION_COOKIE } from "../auth";
 import { startHub } from "../server";
@@ -159,6 +160,9 @@ describe("join and echo", () => {
       ok: true,
       result: { message: "hello box", n: [1, 2, 3] },
     });
+    // The hub knows what the box speaks (decision 0041: env goes only to 1.6+).
+    expect(h.boxes.versionOf("box_echo")).toEqual(PROTOCOL_VERSION);
+    expect(h.boxes.versionOf("box_other")).toBeUndefined();
 
     // authorize ran (and was audited) for the connect and for the echo.
     expect(auditActions(dbPath)).toEqual(["box.connect", "box.echo"]);
@@ -289,11 +293,11 @@ describe("protocol version", () => {
     expect(reject).toMatchObject({
       type: "reject",
       reason: "version-mismatch",
-      hubVersion: { major: 1, minor: 5 },
+      hubVersion: { major: 1, minor: 6 },
       boxVersion: { major: 2, minor: 3 },
     });
     expect(reject.message).toContain("2.3");
-    expect(reject.message).toContain("1.5");
+    expect(reject.message).toContain("1.6");
   });
 
   test("a box-agent speaking another major stops with the hub's message", async () => {

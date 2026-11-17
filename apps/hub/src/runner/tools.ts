@@ -8,8 +8,12 @@
  *   whatever the outcome.
  * - The operations are built per call, so every box call carries pi's tool
  *   call id.
- * - `bash` drops pi's `env` (the hub's environment); the tool RPC has no field
- *   for it either.
+ * - `bash` drops pi's `env` (the hub's environment). Its own optional `env`
+ *   (decision 0041) maps variable names to `vault:` references of tokens
+ *   opted in to box commands; the hub resolves them through the vault
+ *   (audited first, registered for redaction) and sends the values in that
+ *   one `tool.exec` only. The command's output is scrubbed of them before pi
+ *   sees it.
  * - `grep` replaces `execute()` as a whole: pi's own grep always runs the
  *   hub's `rg`.
  * - `tool_call` rewrites `~` to the box workspace and applies the deny-list;
@@ -17,9 +21,12 @@
  * - The `browser_*` tools (browser-tools.ts, decision 0032) go to the box the
  *   same way, as `browser.*` methods of the tool RPC, and refuse while the
  *   owner holds the desktop lock (decision 0035).
- * - Every value `browser_fill` filled (decision 0039) is replaced in the text
- *   of every later tool result of the session, whatever the tool, before the
- *   model reads it.
+ * - Every value `browser_fill` filled (decision 0039) or `bash` passed in its
+ *   env (decision 0041) is replaced in the text of every later tool result of
+ *   the session, whatever the tool, before the model reads it. The scrub uses
+ *   every secret the hub knows (`knownSecrets`: the vault registers each stored
+ *   value when it opens and each value it hands out), so it holds after the
+ *   runner is rebuilt (a model switch, decision 0038, or a restart).
  */
 
 import {
@@ -34,14 +41,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   type BoxId,
+  HearthError,
   LOG_REDACTED,
   redactValues,
   type SecretValue,
   type VaultKind,
   type VaultPolicy,
 } from "@hearth/core";
-import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
+import { Type } from "typebox";
+import { type BoxToolOperations, NO_SECRET_ENV_IN_BOX, type RpcTrace } from "../box/tool-rpc";
+import { knownSecrets } from "../obs/redaction";
 import type { BoxLease } from "../session/manager";
+import { BASH_ENV_HINT, BASH_ENV_PARAMETER, envRefusal, parseEnvRefs } from "./bash-env";
 import { registerBrowserTools } from "./browser-tools";
 import {
   type CompiledDenyRule,
@@ -73,6 +84,13 @@ export interface RunnerBox {
    */
   useSecret?(ref: string, context: SecretUseContext): Promise<FillSecret>;
   /**
+   * Resolves a `vault:` token for `bash`'s `env` (decision 0041): the
+   * session's `HubVault.use` for a `box-env` token, refused before decrypt
+   * for anything else, audited before it returns. Unset (no vault), a call
+   * with `env` refuses.
+   */
+  useEnvSecret?(ref: string, context: EnvSecretContext): Promise<{ readonly value: SecretValue }>;
+  /**
    * Throws `desktop.locked` while a person holds this session's desktop lock
    * (`DesktopLocks.assertUnlocked`, decision 0033). The browser tools call it
    * before anything else; unset, nothing is locked.
@@ -86,6 +104,17 @@ export interface SecretUseContext {
   /** The owner frame's origin, as the box reported it. */
   readonly origin: string;
 }
+
+/** What `bash` tells the vault about a use of a token in its env. */
+export interface EnvSecretContext {
+  readonly toolCallId: string;
+  /** The variable the value goes into. */
+  readonly env: string;
+}
+
+/** What the model reads when a call has `env` and the hub has no vault. */
+export const NO_VAULT_FOR_ENV =
+  "bash env is not available: the hub has no vault. Ask the owner to set one up. Nothing was run.";
 
 /** A login value for `browser_fill`, with the policy read from the authenticated row. */
 export interface FillSecret {
@@ -147,8 +176,6 @@ function absolute(path: string | undefined, boxCwd: string): string {
 export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFactory {
   const { box, boxCwd } = options;
   return (pi) => {
-    // The values browser_fill filled in this session: never shown to the model.
-    const filled = new Set<string>();
     pi.registerTool({
       ...createReadToolDefinition(boxCwd),
       execute: (id, params, signal, onUpdate, ctx) =>
@@ -191,30 +218,76 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         ),
     });
 
+    const bash = createBashToolDefinition(boxCwd);
     pi.registerTool({
-      ...createBashToolDefinition(boxCwd),
-      execute: (id, params, signal, onUpdate, ctx) =>
-        withOps(box, id, (ops) =>
-          createBashToolDefinition(boxCwd, {
-            operations: {
-              // pi passes the hub's environment as `env`; it never leaves the hub.
-              exec: async (command, cwd, { onData, signal: execSignal, timeout }) => {
-                const live = options.liveOutput?.(id);
-                try {
-                  return await ops.bash.exec(command, cwd, {
-                    onData,
-                    ...(execSignal === undefined ? {} : { signal: execSignal }),
-                    ...(timeout === undefined ? {} : { timeout }),
-                    ...(live === undefined ? {} : { onOutput: (chunk) => live.write(chunk) }),
-                  });
-                } finally {
-                  // The result (through onData) is the answer from here on.
-                  live?.close();
-                }
+      ...bash,
+      description: `${bash.description} ${BASH_ENV_HINT}`,
+      parameters: Type.Object({ ...bash.parameters.properties, env: BASH_ENV_PARAMETER }),
+      execute: async (id, raw, signal, onUpdate, ctx) => {
+        const { env, ...params } = raw as { command: string; timeout?: number; env?: unknown };
+        // Checked before a lease: a refused call neither starts nor wakes the box.
+        const refs = parseEnvRefs(env);
+        const useEnvSecret = box.useEnvSecret;
+        if (refs.length > 0 && useEnvSecret === undefined) throw new Error(NO_VAULT_FOR_ENV);
+        const values: string[] = [];
+        const scrub = (text: string) =>
+          values.length === 0 ? text : redactValues(text, values, LOG_REDACTED);
+        try {
+          return await withOps(box, id, async (ops) => {
+            let secretEnv: Record<string, string> | undefined;
+            if (refs.length > 0 && useEnvSecret !== undefined) {
+              // Before the vault is asked: an old box would drop the variables.
+              if (!ops.bash.acceptsSecretEnv()) throw new Error(NO_SECRET_ENV_IN_BOX);
+              secretEnv = {};
+              for (const { name, ref } of refs) {
+                // Refused before decrypt, audited before it returns; a SecretError names the ref only.
+                const secret = await useEnvSecret(ref, { toolCallId: id, env: name }).catch(
+                  (error: unknown) => {
+                    if (error instanceof HearthError && error.code !== undefined) {
+                      throw envRefusal(error.code, error.message);
+                    }
+                    throw error;
+                  },
+                );
+                const value = secret.value.reveal();
+                // Before the value leaves the hub: this result is scrubbed of it. The vault
+                // registered it (knownSecrets), so every later result is too.
+                values.push(value);
+                secretEnv[name] = value;
+              }
+            }
+            return await createBashToolDefinition(boxCwd, {
+              operations: {
+                // pi passes the hub's environment as `env`; it never leaves the hub.
+                exec: async (command, cwd, { onData, signal: execSignal, timeout }) => {
+                  const live = options.liveOutput?.(id);
+                  try {
+                    return await ops.bash.exec(command, cwd, {
+                      // Scrubbed before pi sees it: its result, updates and temp file.
+                      onData: (data) => {
+                        onData(
+                          values.length === 0 ? data : Buffer.from(scrub(data.toString("utf8"))),
+                        );
+                      },
+                      ...(execSignal === undefined ? {} : { signal: execSignal }),
+                      ...(timeout === undefined ? {} : { timeout }),
+                      ...(live === undefined ? {} : { onOutput: (chunk) => live.write(chunk) }),
+                      ...(secretEnv === undefined ? {} : { secretEnv }),
+                    });
+                  } finally {
+                    // The result (through onData) is the answer from here on.
+                    live?.close();
+                  }
+                },
               },
-            },
-          }).execute(id, params, signal, onUpdate, ctx),
-        ),
+            }).execute(id, params, signal, onUpdate, ctx);
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const clean = scrub(message);
+          throw clean === message ? error : new Error(clean);
+        }
+      },
     });
 
     pi.registerTool({
@@ -264,7 +337,7 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         }),
     });
 
-    registerBrowserTools(pi, box, options.onRefused, filled);
+    registerBrowserTools(pi, box, options.onRefused);
 
     pi.on("tool_call", (event) => {
       if (PATH_TOOLS.has(event.toolName)) {
@@ -282,7 +355,9 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
       const content = event.content.map((part) => {
         if (part.type !== "text") return part;
         let text = scrubHubTempPaths(part.text, options.hubTempDir);
-        if (filled.size > 0) text = redactValues(text, filled, LOG_REDACTED);
+        // Every secret the hub knows, not a per-runner set: a rebuilt runner (a model
+        // switch, decision 0038, or a restart) still scrubs what an earlier one handed out.
+        text = redactValues(text, knownSecrets(), LOG_REDACTED);
         if (text === part.text) return part;
         changed = true;
         return { ...part, text };

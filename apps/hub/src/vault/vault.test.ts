@@ -584,6 +584,7 @@ describe("writes", () => {
       fingerprint: "hmac:000000000000",
       version: 2,
       updatedAt: 5,
+      policyJson: "{}",
     };
     for (const stale of [0, 2, 7]) {
       expect(store.replaceValue("ws_default", id, stale, next)).toBe(false);
@@ -604,16 +605,32 @@ describe("scope and kind", () => {
       name: "scoped",
       kind: "token",
       scope: { sessionId: "ses_1" },
+      policy: { use: "box-env" },
       fields: { value: TOKEN },
     });
-    const ctx = (sessionId: string) => ({ sessionId, tool: "bash", kinds: ["token"] as const });
+    const ctx = (sessionId: string) => ({
+      sessionId,
+      tool: "bash",
+      env: "API_TOKEN",
+      kinds: ["token"] as const,
+    });
     expect(
       (await h.vault.use("vault:scoped", { ...ctx("ses_1"), kinds: ["token"] })).value.reveal(),
     ).toBe(TOKEN);
     expect(
       (await errorOf(h.vault.use("vault:scoped", { ...ctx("ses_2"), kinds: ["token"] }))).code,
     ).toBe("vault.scope-mismatch");
-    expect((await errorOf(h.secrets.resolve("vault:scoped"))).code).toBe("vault.scope-mismatch");
+    // A box-env token is never the hub's; a scoped hub token is not either.
+    expect((await errorOf(h.secrets.resolve("vault:scoped"))).code).toBe("vault.kind-mismatch");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "scoped-hub",
+      kind: "token",
+      scope: { sessionId: "ses_1" },
+      fields: { value: TOKEN },
+    });
+    expect((await errorOf(h.secrets.resolve("vault:scoped-hub"))).code).toBe(
+      "vault.scope-mismatch",
+    );
   });
 
   test("a scope naming no session is refused; a taken name is refused by the store too", async () => {
@@ -757,6 +774,7 @@ describe("tool uses: origin, policy and fields", () => {
     const token = await h.vault.use("vault:deploy", {
       sessionId: "ses_1",
       tool: "bash",
+      env: "DEPLOY_TOKEN",
       kinds: ["token"],
     });
     expect(token.value.reveal()).toBe(TOKEN);
@@ -791,6 +809,177 @@ describe("tool uses: origin, policy and fields", () => {
       expect(`${field}: ${error.code}`).toBe(`${field}: vault.field-unknown`);
     }
     expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+  });
+});
+
+describe("box-env uses (decision 0041)", () => {
+  const BOX_TOKEN = "ghp_boxEnvToken7d21aa";
+  const bash = (sessionId: string, env = "GH_TOKEN") => ({
+    sessionId,
+    tool: "bash",
+    toolCallId: "call_env",
+    env,
+    kinds: ["token"] as const,
+  });
+
+  test("an opted-in token is audited with its variable before it is handed out and registered", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    const { id } = await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "github",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: BOX_TOKEN },
+    });
+    h.registered.length = 0;
+    const used = await h.vault.use("vault:github", bash("ses_1"));
+    expect(used.value.reveal()).toBe(BOX_TOKEN);
+    expect(h.registered).toEqual([BOX_TOKEN]);
+    const rows = auditRows(h.db, "secret.use");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.resource_id).toBe(id);
+    expect(JSON.parse(rows[0]?.detail_json ?? "{}")).toMatchObject({
+      name: "github",
+      kind: "token",
+      consumer: "tool",
+      session_id: "ses_1",
+      tool: "bash",
+      tool_call_id: "call_env",
+      env: "GH_TOKEN",
+    });
+    expect(rows[0]?.detail_json).not.toContain(BOX_TOKEN);
+  });
+
+  test("anything but an opted-in token in scope is refused before decrypt: no secret.use, nothing registered", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    addSession(h.db, "ses_2");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "hub-token",
+      kind: "token",
+      fields: { value: TOKEN },
+    });
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "site",
+      kind: "login",
+      policy: { origins: ["https://github.com"] },
+      fields: LOGIN,
+    });
+    await addModelKey(h);
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "other-session",
+      kind: "token",
+      scope: { sessionId: "ses_2" },
+      policy: { use: "box-env" },
+      fields: { value: BOX_TOKEN },
+    });
+    // Ciphertexts that no longer open: a refusal that decrypted first would
+    // say vault.entry-corrupt instead.
+    h.db.run("UPDATE secret SET ciphertext = randomblob(length(ciphertext))");
+    h.registered.length = 0;
+    const cases: Array<[string, string]> = [
+      ["vault:hub-token", "vault.kind-mismatch"],
+      ["vault:site", "vault.kind-mismatch"],
+      ["vault:site#password", "vault.kind-mismatch"],
+      ["vault:model", "vault.kind-mismatch"],
+      ["vault:other-session", "vault.scope-mismatch"],
+      ["vault:missing", "secret.not-found"],
+    ];
+    for (const [ref, code] of cases) {
+      const error = await errorOf(h.vault.use(ref, bash("ses_1")));
+      expect(`${ref}: ${error.code}`).toBe(`${ref}: ${code}`);
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+    expect(auditRows(h.db, "secret.use-refused")).toHaveLength(5);
+    expect(h.registered).toEqual([]);
+  });
+
+  test("the opt-in is authenticated: a hub token edited to box-env in SQL does not open", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await h.vault.create(LOCAL_PRINCIPAL, { name: "t", kind: "token", fields: { value: TOKEN } });
+    h.db.run(`UPDATE secret SET policy_json = '{"hosts":[],"use":"box-env"}'`);
+    expect((await errorOf(h.vault.use("vault:t", bash("ses_1")))).code).toBe("vault.entry-corrupt");
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+  });
+
+  test("stored columns edited in SQL: a login claiming box-env or a null policy is refused before decrypt", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "site",
+      kind: "login",
+      policy: { origins: ["https://github.com"] },
+      fields: LOGIN,
+    });
+    await h.vault.create(LOCAL_PRINCIPAL, { name: "t", kind: "token", fields: { value: TOKEN } });
+    h.db.run(`UPDATE secret SET policy_json = '{"use":"box-env"}' WHERE name = 'site'`);
+    h.db.run(`UPDATE secret SET policy_json = 'null' WHERE name = 't'`);
+    for (const ref of ["vault:site", "vault:t"]) {
+      expect(`${ref}: ${(await errorOf(h.vault.use(ref, bash("ses_1")))).code}`).toBe(
+        `${ref}: vault.kind-mismatch`,
+      );
+    }
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+  });
+
+  test("a tool gets a token only for a box command: without a variable even an opted-in one is refused", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "github",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: BOX_TOKEN },
+    });
+    const error = await errorOf(
+      h.vault.use("vault:github", { sessionId: "ses_1", tool: "other", kinds: ["token"] }),
+    );
+    expect(error.code).toBe("vault.kind-mismatch");
+    expect(auditRows(h.db, "secret.use")).toHaveLength(0);
+  });
+
+  test("rotate can switch a token's use; the new policy is bound and audited; other kinds have no use", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    addSession(h.db, "ses_1");
+    const { id } = await h.vault.create(LOCAL_PRINCIPAL, {
+      name: "github",
+      kind: "token",
+      policy: { hosts: ["api.github.com"] },
+      fields: { value: TOKEN },
+    });
+    expect((await errorOf(h.vault.use("vault:github", bash("ses_1")))).code).toBe(
+      "vault.kind-mismatch",
+    );
+    await h.vault.rotate(LOCAL_PRINCIPAL, id, { fields: { value: BOX_TOKEN }, use: "box-env" });
+    expect((await h.vault.use("vault:github", bash("ses_1"))).value.reveal()).toBe(BOX_TOKEN);
+    const listed = (await h.vault.list(LOCAL_PRINCIPAL)).find((s) => s.id === id);
+    expect(listed?.policy).toEqual({ hosts: ["api.github.com"], use: "box-env" });
+    // The authorizer's row and the rotation's own, which names the new policy.
+    const rotated = auditRows(h.db, "secret.rotate").map((r) => JSON.parse(r.detail_json ?? "{}"));
+    expect(rotated.find((d) => d.version === 2)?.policy).toEqual({
+      hosts: ["api.github.com"],
+      use: "box-env",
+    });
+    // Without `use` the policy stays; back to hub, the box gets it no more.
+    await h.vault.rotate(LOCAL_PRINCIPAL, id, { fields: { value: BOX_TOKEN } });
+    expect((await h.vault.use("vault:github", bash("ses_1"))).value.reveal()).toBe(BOX_TOKEN);
+    await h.vault.rotate(LOCAL_PRINCIPAL, id, { fields: { value: TOKEN }, use: "hub" });
+    expect((await errorOf(h.vault.use("vault:github", bash("ses_1")))).code).toBe(
+      "vault.kind-mismatch",
+    );
+    expect(await h.secrets.resolve("vault:github").then((v) => v.reveal())).toBe(TOKEN);
+    const model = await addModelKey(h);
+    const bad = await h.vault
+      .rotate(LOCAL_PRINCIPAL, model.id, { fields: { value: MODEL_KEY }, use: "box-env" })
+      .then(() => ({ code: "accepted" }))
+      .catch((e: unknown) => e as { code: string });
+    expect(bad.code).toBe("request.invalid");
+    const badUse = await h.vault
+      .rotate(LOCAL_PRINCIPAL, id, { fields: { value: TOKEN }, use: "everywhere" })
+      .then(() => ({ code: "accepted" }))
+      .catch((e: unknown) => e as { code: string });
+    expect(badUse.code).toBe("request.invalid");
   });
 });
 

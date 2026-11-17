@@ -148,15 +148,24 @@ describe("settings page in a DOM", () => {
     policy: { origins: ["https://github.com"], allow_any_field: false },
     fingerprint: "hmac:91c2aabbccdd",
   };
+  const TOKEN = {
+    ...KEY,
+    id: "sec_4",
+    name: "gh-cli",
+    kind: "token",
+    policy: { use: "hub", hosts: [] },
+    fingerprint: "hmac:77aa11bb22cc",
+  };
 
   function settingsHub(
     model: Record<string, unknown>,
     vault: Record<string, unknown> = { state: "enabled", kekCheck: "abc", key: "current" },
+    secrets: readonly unknown[] = [KEY, LOGIN],
   ) {
     const sent: Array<{ method: string; path: string; body: unknown }> = [];
     hub((method, path, body) => {
       if (path === "/v1/vault/status") return ok(vault);
-      if (path === "/v1/secrets" && method === "GET") return ok({ secrets: [KEY, LOGIN] });
+      if (path === "/v1/secrets" && method === "GET") return ok({ secrets });
       if (path === "/v1/settings/model" && method === "GET") return ok(model);
       if (method !== "GET") {
         sent.push({ method, path, body });
@@ -228,6 +237,67 @@ describe("settings page in a DOM", () => {
     // Cleared after the save, and nowhere on the page.
     expect(value.value).toBe("");
     expect(document.body.innerHTML).not.toContain("sk-dom-test-secret");
+  });
+
+  test("a token can be made usable by box commands, with the warning, on add and on rotate (decision 0041)", async () => {
+    const sent = settingsHub(NONE, undefined, [
+      TOKEN,
+      { ...TOKEN, id: "sec_5", name: "npm", policy: { use: "box-env", hosts: [] } },
+    ]);
+    renderApp("#/settings");
+    const table = await screen.findByRole("table", { name: "Secrets" });
+    const rows = within(table).getAllByTestId("secret-row");
+    expect(rows[0]?.textContent).not.toContain("visible to commands in the box");
+    expect(rows[1]?.textContent).toContain("visible to commands in the box");
+
+    fireEvent.click(screen.getByRole("button", { name: "Add secret" }));
+    const form = await screen.findByRole("form", { name: "Add secret" });
+    // Only a token has the switch.
+    expect(within(form).queryByRole("switch")).toBeNull();
+    fireEvent.change(within(form).getByLabelText("Kind"), { target: { value: "token" } });
+    const toggle = within(form).getByRole("switch", { name: "Usable by box commands" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(form.textContent).not.toContain("visible to commands in the box");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(form.textContent).toContain("visible to commands in the box");
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "github" } });
+    fireEvent.change(within(form).getByLabelText("Value"), { target: { value: "ghp_dom" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Add" }));
+    });
+    await waitFor(() =>
+      expect(sent.at(-1)).toEqual({
+        method: "POST",
+        path: "/v1/secrets",
+        body: {
+          name: "github",
+          kind: "token",
+          policy: { use: "box-env" },
+          fields: { value: "ghp_dom" },
+        },
+      }),
+    );
+    fireEvent.keyDown(form, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Add secret" })).toBeNull());
+
+    // Rotate starts from the entry's use and sends the one chosen.
+    fireEvent.click(within(rows[1] as HTMLElement).getByRole("button", { name: "Rotate" }));
+    const rotate = await screen.findByRole("form", { name: "Rotate secret" });
+    const again = within(rotate).getByRole("switch", { name: "Usable by box commands" });
+    expect(again.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(again);
+    fireEvent.change(within(rotate).getByLabelText("Value"), { target: { value: "npm_new" } });
+    await act(async () => {
+      fireEvent.click(within(rotate).getByRole("button", { name: "Rotate" }));
+    });
+    await waitFor(() =>
+      expect(sent.at(-1)).toEqual({
+        method: "PUT",
+        path: "/v1/secrets/sec_5/value",
+        body: { fields: { value: "npm_new" }, use: "hub" },
+      }),
+    );
   });
 
   test("rotate sends the new value to the entry; delete asks first", async () => {

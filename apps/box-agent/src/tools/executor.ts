@@ -11,7 +11,7 @@
 
 import { access, constants, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { posix } from "node:path";
-import type { Logger } from "@hearth/core";
+import { LOG_REDACTED, type Logger, redactValues } from "@hearth/core";
 import {
   type BrowserMethod,
   type BrowserParams,
@@ -680,24 +680,33 @@ export class ToolExecutor {
     signal: AbortSignal,
     live: LiveOutputSender | undefined,
   ): Promise<ToolResults["tool.exec"]> {
+    // Vault tokens for this one command (decision 0041): in the child's
+    // environment only, under the box's own variables, never in a spill file,
+    // and replaced in the result. The hub scrubs the live output.
+    const secrets = p.env === undefined ? [] : Object.values(p.env);
     const run = await runProcess({
       argv: [this.#options.shell ?? "/bin/bash", "-c", p.command],
       cwd: real,
-      env: { ...this.#env, PWD: lexical },
+      env: { ...p.env, ...this.#env, PWD: lexical },
       timeoutMs: p.timeoutMs,
       signal,
       outputCap: MAX_TOOL_OUTPUT_BYTES,
-      spill: {
-        path: posix.join(realRoot, spillRelative),
-        cap: MAX_EXEC_SPILL_BYTES,
-        // Never through a symlinked `.hearth` or `exec`: no spill rather than a write outside.
-        open: () => openPlainFile(realRoot, EXEC_SPILL_DIR.split("/"), name),
-      },
+      ...(secrets.length > 0
+        ? {}
+        : {
+            spill: {
+              path: posix.join(realRoot, spillRelative),
+              cap: MAX_EXEC_SPILL_BYTES,
+              // Never through a symlinked `.hearth` or `exec`: no spill rather than a write outside.
+              open: () => openPlainFile(realRoot, EXEC_SPILL_DIR.split("/"), name),
+            },
+          }),
       ...(live === undefined ? {} : { onOutput: (chunk: Buffer) => live.write(chunk) }),
     });
     const fullOutputPath =
       run.spillPath === null ? null : posix.join(this.workspace.root, spillRelative);
-    const text = run.output.toString("utf8");
+    const raw = run.output.toString("utf8");
+    const text = secrets.length === 0 ? raw : redactValues(raw, secrets, LOG_REDACTED);
     return {
       outcome: run.outcome,
       exitCode: run.exitCode,

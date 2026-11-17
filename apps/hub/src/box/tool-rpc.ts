@@ -34,6 +34,7 @@ import {
   type RpcResultFrame,
   type StreamCloseFrame,
   type StreamDataFrame,
+  supportsExecEnv,
   type ToolMethod,
   type ToolParams,
   type ToolResults,
@@ -41,12 +42,17 @@ import {
 } from "@hearth/protocol";
 import type { BoxConnections } from "./connections";
 
+/** What the model reads when a command needs a vault token and the box is older than 1.6. */
+export const NO_SECRET_ENV_IN_BOX =
+  "This box cannot pass vault tokens to a command: its box-agent is older than protocol 1.6. " +
+  "Ask the owner to update the box image; nothing was run.";
+
 /** Params without `callId`, which the client fills in. */
 export type CallParams<M extends ToolMethod> = Omit<ToolParams[M], "callId">;
 
 export interface ToolRpcClientOptions {
   readonly boxes: Pick<BoxConnections, "listen" | "sendRpc"> &
-    Partial<Pick<BoxConnections, "sendStream">>;
+    Partial<Pick<BoxConnections, "sendStream" | "versionOf">>;
   /** Overrides `toolDeadlineMs`; tests shorten it. */
   readonly deadlineMs?: <M extends ToolMethod>(method: M, params: ToolParams[M]) => number;
   readonly log?: (line: string) => void;
@@ -127,8 +133,16 @@ export interface BoxToolOperations {
          * sending it.
          */
         onOutput?: (chunk: Uint8Array) => boolean | undefined;
+        /**
+         * Not in pi's `BashOperations`: resolved `box-env` tokens for this
+         * one command (protocol 1.6, decision 0041). Sent only to a box that
+         * applies them; to an older box the call fails and nothing is sent.
+         */
+        secretEnv?: Readonly<Record<string, string>>;
       },
     ): Promise<{ exitCode: number | null }>;
+    /** True when the connected box applies `secretEnv` (protocol 1.6). */
+    acceptsSecretEnv(): boolean;
   };
   readonly ls: {
     exists(absolutePath: string): Promise<boolean>;
@@ -330,6 +344,7 @@ export class ToolRpcClient {
       await call("tool.writeFile", { path, content });
     };
     const exists = async (path: string) => (await call("tool.exists", { path })).exists;
+    const acceptsSecretEnv = () => supportsExecEnv(this.#boxes.versionOf?.(boxId));
     return {
       read: {
         readFile,
@@ -353,7 +368,16 @@ export class ToolRpcClient {
       },
       bash: {
         // `env` is pi's (the hub's) environment and is dropped here on purpose.
-        exec: async (command, cwd, { onData, signal, timeout, onOutput }) => {
+        exec: async (command, cwd, { onData, signal, timeout, onOutput, secretEnv }) => {
+          const hasEnv = secretEnv !== undefined && Object.keys(secretEnv).length > 0;
+          // Checked with no await before the send: the box it is sent to is this one.
+          if (hasEnv && !acceptsSecretEnv()) {
+            throw new HearthError(NO_SECRET_ENV_IN_BOX, {
+              owner: "user",
+              disposition: "give-up",
+              code: "tool.box-too-old",
+            });
+          }
           const timeoutMs =
             timeout !== undefined && timeout > 0
               ? Math.min(Math.ceil(timeout * 1000), MAX_EXEC_TIMEOUT_MS)
@@ -368,6 +392,7 @@ export class ToolRpcClient {
                 cwd,
                 timeoutMs,
                 ...(stream === undefined ? {} : { outputStream: stream.id }),
+                ...(hasEnv ? { env: secretEnv } : {}),
               },
               signal,
             );
@@ -379,6 +404,7 @@ export class ToolRpcClient {
           if (result.output.length > 0) onData(Buffer.from(result.output, "utf8"));
           return { exitCode: result.exitCode };
         },
+        acceptsSecretEnv,
       },
       ls: {
         exists,

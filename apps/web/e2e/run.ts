@@ -1,7 +1,8 @@
 /**
  * The web UI's e2e (#46) against a real hub (harness.ts) in Chromium:
  * first-run setup → sign out → sign in → Settings: add a model key, save the
- * model with it, rotate the key, delete another secret → create a session → send a message →
+ * model with it, rotate the key, add a token usable by box commands and rotate
+ * it back off, delete another secret → create a session → send a message →
  * see the tool card → open the desktop → take it over, type, release → reload, and the session continues
  * (the chat is rebuilt from the event log and a second turn runs) → the box
  * goes away and the desktop says it is asleep → wake. Along the way: the
@@ -24,6 +25,8 @@ import { type Browser, type BrowserContext, chromium, type Page } from "playwrig
 import { startE2eHub } from "./harness";
 
 const WEB_ROOT = join(import.meta.dir, "../dist");
+/** The badge a token usable by box commands carries (SettingsPage.tsx `BOX_ENV_WARNING`). */
+const BOX_ENV_WARNING = "visible to commands in the box";
 const PASSWORD = "correct horse battery staple";
 const STEP_MS = 15_000;
 
@@ -120,16 +123,26 @@ try {
     throw new Error(`the session list loaded a lazy chunk: ${scripts.join(", ")}`);
   }
 
-  step("settings: add a model key, save the model with it, rotate it, delete a secret");
+  step(
+    "settings: add a model key, save the model with it, rotate it, box-env token, delete a secret",
+  );
   // Each dialog and select opens here, so a scroll lock's injected <style> (CSP) fails the run.
   await page.getByRole("link", { name: "Settings" }).click();
   await page.getByRole("heading", { name: "Secrets" }).waitFor();
-  const addSecret = async (name: string, kind: string, value: string) => {
+  const addSecret = async (name: string, kind: string, value: string, boxEnv = false) => {
     await page.getByRole("button", { name: "Add secret" }).click();
     const form = page.getByRole("form", { name: "Add secret" });
     await form.getByLabel("Kind").selectOption({ label: kind });
     await form.getByLabel("Name").fill(name);
     await form.getByLabel("Value").fill(value);
+    if (boxEnv) {
+      const toggle = form.getByRole("switch", { name: "Usable by box commands" });
+      await toggle.click();
+      if ((await toggle.getAttribute("aria-checked")) !== "true") {
+        throw new Error("the box-command switch did not turn on");
+      }
+      await form.getByText(BOX_ENV_WARNING).waitFor();
+    }
     await form.getByRole("button", { name: "Add" }).click();
     await form.getByRole("status").filter({ hasText: "Saved. Fingerprint" }).waitFor();
     await page.keyboard.press("Escape");
@@ -138,6 +151,27 @@ try {
   };
   await addSecret("e2e-model-key", "Model key", "sk-e2e-model-key-1");
   await addSecret("e2e-token", "Token", "e2e-token-value-1");
+  // A token usable by box commands (decision 0041): its row carries the warning badge
+  // until a rotate turns the switch off.
+  await addSecret("e2e-gh", "Token", "e2e-gh-value-1", true);
+  const ghRow = page.getByTestId("secret-row").filter({ hasText: "e2e-gh" });
+  await ghRow.getByText(BOX_ENV_WARNING).waitFor();
+  if ((await page.getByTestId("secret-row").getByText(BOX_ENV_WARNING).count()) !== 1) {
+    throw new Error("the box-command badge is on a row it does not belong to");
+  }
+  await ghRow.getByRole("button", { name: "Rotate" }).click();
+  const rotateGh = page.getByRole("form", { name: "Rotate secret" });
+  const ghToggle = rotateGh.getByRole("switch", { name: "Usable by box commands" });
+  if ((await ghToggle.getAttribute("aria-checked")) !== "true") {
+    throw new Error("the rotate dialog does not show the token as usable by box commands");
+  }
+  await ghToggle.click();
+  await rotateGh.getByLabel("Value").fill("e2e-gh-value-2");
+  await rotateGh.getByRole("button", { name: "Rotate" }).click();
+  await rotateGh.getByRole("status").filter({ hasText: "Rotated to version 2" }).waitFor();
+  await page.keyboard.press("Escape");
+  await rotateGh.waitFor({ state: "detached" });
+  await ghRow.getByText(BOX_ENV_WARNING).waitFor({ state: "detached" });
   const model = page.getByRole("form", { name: "Model" });
   await model.getByLabel("Provider").fill("faux");
   await model.getByLabel("Model").fill(e2e.faux.getModel().id);
@@ -171,7 +205,13 @@ try {
     .filter({ hasText: "e2e-token" })
     .waitFor({ state: "detached" });
   await shot(page, "1b-settings");
-  for (const value of ["sk-e2e-model-key-1", "sk-e2e-model-key-2", "e2e-token-value-1"]) {
+  for (const value of [
+    "sk-e2e-model-key-1",
+    "sk-e2e-model-key-2",
+    "e2e-token-value-1",
+    "e2e-gh-value-1",
+    "e2e-gh-value-2",
+  ]) {
     if ((await page.content()).includes(value)) throw new Error("a secret value is in the page");
   }
   if (cspViolations.length > 0) {

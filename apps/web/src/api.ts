@@ -70,7 +70,7 @@ export interface Secret {
 export interface NewSecret {
   readonly name: string;
   readonly kind: SecretKind;
-  readonly policy?: { readonly origins: string[] };
+  readonly policy?: { readonly origins: string[] } | { readonly use: "hub" | "box-env" };
   readonly fields: Readonly<Record<string, string>>;
 }
 
@@ -175,9 +175,15 @@ export const api = {
   secrets: async () => (await call<{ secrets: Secret[] }>("GET", "/v1/secrets")).secrets,
   addSecret: (secret: NewSecret) =>
     call<{ id: string; fingerprint: string; version: number }>("POST", "/v1/secrets", secret),
-  rotateSecret: (secretId: string, fields: Readonly<Record<string, string>>) =>
+  /** `use` only for a token: whether box commands may get it (decision 0041). */
+  rotateSecret: (
+    secretId: string,
+    fields: Readonly<Record<string, string>>,
+    use?: "hub" | "box-env",
+  ) =>
     call<{ fingerprint: string; version: number }>("PUT", `/v1/secrets/${id(secretId)}/value`, {
       fields,
+      ...(use === undefined ? {} : { use }),
     }),
   deleteSecret: (secretId: string) => call<unknown>("DELETE", `/v1/secrets/${id(secretId)}`),
   modelSettings: () => call<ModelSettings>("GET", "/v1/settings/model"),
