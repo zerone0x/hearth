@@ -28,6 +28,7 @@ import { observabilityFromEnv } from "../obs/setup";
 import { Telemetry } from "../obs/telemetry";
 import { RequestBody } from "../request-body";
 import { redactSecrets, SessionRunners } from "../runner";
+import { LiveToolOutput } from "../runner/live-output";
 import { startHub } from "../server";
 import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
 import { dumpTrajectory, UnredactedDumpError } from "../trajectory-cli";
@@ -1462,6 +1463,33 @@ describe("redaction", () => {
       config: { provider: "faux", model: "m" },
     } as unknown as ConstructorParameters<typeof SessionRunners>[0]);
     expect(runners.redact(`{"text":"${value}"}`)).not.toContain(value);
+  });
+
+  test("live bash output never stores a multi-line vault value, even split at its line breaks", async () => {
+    const value = "-----BEGIN KEY-----\nMIIEpAIBAAKCAQEAvaultsecretline2\n-----END KEY-----";
+    registerSecret(value);
+    const runners = new SessionRunners({
+      config: { provider: "faux", model: "m" },
+    } as unknown as ConstructorParameters<typeof SessionRunners>[0]);
+    // The hold point is the start of the vault value, not only of a model key.
+    expect(runners.secretStart(`out\n${value.slice(0, 30)}`)).toBe(4);
+    const stored: string[] = [];
+    const live = new LiveToolOutput({
+      toolCallId: "c",
+      intervalMs: 5,
+      redact: (t) => runners.redact(t),
+      secretStart: (t) => runners.secretStart(t),
+      append: async (p) => {
+        stored.push(p.text);
+      },
+    });
+    const enc = new TextEncoder();
+    live.write(enc.encode("-----BEGIN KEY-----\nMIIEpAIBAAKCAQEAvaultsecretline2\n"));
+    await Bun.sleep(40);
+    live.write(enc.encode("-----END KEY-----\ndone\n"));
+    await Bun.sleep(40);
+    expect(stored.join("")).not.toContain("vaultsecretline2");
+    expect(stored.join("")).not.toContain("BEGIN KEY");
   });
 
   test("overlapping values leave no tail on any sink, in either order of registration", async () => {

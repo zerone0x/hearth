@@ -163,7 +163,8 @@ export class SessionRunners {
 
   /** Where a tail of `text` that could start one of those secrets begins (decision 0036). */
   secretStart(text: string): number {
-    return secretStart(text, this.#secretValues);
+    // The same set `redact` uses: a vault value must never span a live-output cut.
+    return secretStart(text, [...this.#secretValues, ...knownSecrets()]);
   }
 
   #log(line: string): void {
