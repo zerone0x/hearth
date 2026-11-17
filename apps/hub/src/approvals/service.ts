@@ -84,6 +84,8 @@ export interface ApprovalRequest {
   readonly hiddenChars?: boolean;
   /** Each simple command the parser found, escaped (#169). */
   readonly steps?: readonly string[];
+  /** How many steps the cap left out of `steps` (#171). */
+  readonly stepsOmitted?: number;
   /** The command holds a non-ASCII character (#169). */
   readonly nonAscii?: boolean;
   readonly turnId?: string;
@@ -115,6 +117,8 @@ export interface ApprovalView {
   readonly hidden_chars: boolean;
   /** Each simple command the parser found in the command (#169). */
   readonly steps: readonly string[];
+  /** How many steps the card's cap left out (#171). */
+  readonly steps_omitted: number;
   /** The stored command holds a non-ASCII character (#169). */
   readonly non_ascii: boolean;
   readonly status: ApprovalStatus;
@@ -165,6 +169,7 @@ function viewOf(row: ApprovalRow): ApprovalView {
     mode: row.mode,
     hidden_chars: hasHiddenEscape(row.summary) || hasHiddenEscape(row.command),
     steps: row.steps,
+    steps_omitted: row.stepsOmitted,
     non_ascii: /\P{ASCII}/u.test(row.command),
     status: row.status,
     requestedAt: row.requestedAt,
@@ -226,6 +231,7 @@ export class Approvals {
       summary: req.summary,
       command: req.command,
       steps: req.steps ?? [],
+      stepsOmitted: req.stepsOmitted ?? 0,
       rule: req.rule,
       mode: req.mode,
       status: "pending",
@@ -256,6 +262,7 @@ export class Approvals {
         mode: row.mode,
         hidden_chars: req.hiddenChars === true,
         steps: row.steps,
+        steps_omitted: row.stepsOmitted,
         non_ascii: req.nonAscii === true,
         requestedAt: row.requestedAt,
         expiresAt: row.expiresAt,

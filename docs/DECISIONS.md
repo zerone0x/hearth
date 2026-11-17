@@ -4144,7 +4144,14 @@ example extensions are the pattern for a blocking `tool_call` with a timeout.
   on `approval.requested` and `GET /v1/approvals` (migration 12, column
   `steps`). The warning "contains non-ASCII characters" is the simple form:
   any non-ASCII character anywhere in the command (`non_ascii`; the list API
-  derives it from the stored command). Per-step verdicts are not shown.
+  derives it from the stored command). Past the cap (#171) the list keeps every step that
+  matched a rule or is opaque, then the last step, then the rest in order,
+  and says "and N more steps not listed" (`steps_omitted`, migration 13). A
+  step whose script the parser cannot read (`unclear:*`: a heredoc or stdin
+  into a shell, `eval` of a non-literal, `source`, a parse-error or
+  over-budget tail) is marked "runs a script the parser cannot see". The
+  reason line adds "Also matched: ..." for every other rule a step matched.
+  Per-step verdicts are not shown otherwise.
   Residual: a secret split by quoting shows its pieces in `command`,
   as in main's tool-call records.
 - **Timeout** `HEARTH_APPROVAL_TIMEOUT_MINUTES`, default 10.

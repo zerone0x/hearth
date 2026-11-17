@@ -50,6 +50,7 @@ describe("the card's text", () => {
       reason: verdict.reason,
       hiddenChars: false,
       steps: ["git push origin main"],
+      stepsOmitted: 0,
       nonAscii: false,
     });
   });
@@ -95,7 +96,7 @@ describe("the card's text", () => {
     expect(verdict.rule).toBe("git-push");
     expect(gateVerdict("bash", { command: card.command }, RULES, []).rule).toBe("curl-ask");
     expect(card.summary).toBe("git XXXX origin main; curl https://x.example");
-    expect(card.reason).toBe("git XXXX needs the owner");
+    expect(card.reason).toBe("git XXXX needs the owner Also matched: curl-ask.");
   });
 
   test("a marked secret: browser_fill has no command; its summary is redacted", () => {
@@ -111,6 +112,7 @@ describe("the card's text", () => {
       reason: "uses a marked secret: vault:[redacted]",
       hiddenChars: false,
       steps: [],
+      stepsOmitted: 0,
       nonAscii: false,
     });
   });
@@ -209,8 +211,55 @@ describe("the steps and the non-ASCII warning (#169)", () => {
     expect(shown("git push; touch \u200BEX").shown.steps).toContain("touch ⟨U+200B⟩EX");
   });
 
-  test("a non-bash tool has no steps; the list is capped", () => {
-    const many = Array.from({ length: 80 }, (_, i) => `echo ${i}`).join("; ");
-    expect(shown(`git push; ${many}`).shown.steps).toHaveLength(50);
+  test("past the cap every ruled and opaque step stays, the rest fill in order, and the count says how many are left out", () => {
+    const echoes = Array.from({ length: 60 }, (_, i) => `echo ${i}`).join("; ");
+    const { shown: card } = shown(`git push; ${echoes}; curl https://x.example; touch CAPMARK`);
+    expect(card.steps).toHaveLength(50);
+    expect(card.steps[0]).toBe("git push");
+    // The last step is listed too: padding must not hide what comes after it.
+    expect(card.steps.at(-1)).toBe("touch CAPMARK");
+    expect(card.steps).toContain("curl https://x.example");
+    // Not ruled: dropped from the end of the fill, so the last echoes go first.
+    expect(card.steps).toContain("echo 0");
+    expect(card.steps).not.toContain("echo 59");
+    // 63 steps in all, 50 listed.
+    expect(card.stepsOmitted).toBe(13);
+    expect(shown("git push; echo ok").shown.stepsOmitted).toBe(0);
+  });
+
+  test("a step that is a rule match is listed even when it comes last", () => {
+    const echoes = Array.from({ length: 60 }, (_, i) => `echo ${i}`).join("; ");
+    const { shown: card } = shown(`${echoes}; git push origin main`);
+    expect(card.steps).toContain("git push origin main");
+    expect(card.steps.at(-1)).toBe("git push origin main");
+  });
+
+  test("a script the parser cannot see is marked on its step", () => {
+    const note = " [runs a script the parser cannot see]";
+    const heredoc = shown("git push; sh <<'EOF'\ntouch HD\nEOF").shown.steps;
+    expect(heredoc).toContain(`sh${note}`);
+    const evalVar = shown('git push; eval "$C"').shown.steps;
+    expect(evalVar.some((s) => s.startsWith("eval") && s.endsWith(note))).toBe(true);
+    const src = shown("git push; source <(echo x)").shown.steps;
+    expect(src.some((s) => s.startsWith("source") && s.endsWith(note))).toBe(true);
+    // A literal script is read, so its steps are listed and not opaque.
+    expect(shown("git push; sh -c 'touch A'").shown.steps).toEqual([
+      "git push",
+      "sh -c touch A",
+      "touch A",
+    ]);
+  });
+
+  test("a parse error or a deep tail is flagged as unreadable", () => {
+    const note = " [runs a script the parser cannot see]";
+    const broken = shown("git push; echo 'unterminated").shown.steps;
+    expect(broken.at(-1)).toBe(`(the rest of the script could not be read)${note}`);
+  });
+
+  test("the reason names every rule that matched, not only the first", () => {
+    const { shown: card } = shown("git push; curl https://x.example; sh <<'EOF'\nx\nEOF");
+    expect(card.reason).toContain("git push needs the owner");
+    expect(card.reason).toContain("Also matched: curl-ask, unclear:script.");
+    expect(shown("git push origin main").shown.reason).not.toContain("Also matched");
   });
 });

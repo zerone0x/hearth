@@ -374,6 +374,12 @@ export const MIGRATIONS: readonly Migration[] = [
     name: "approval-steps",
     sql: `ALTER TABLE approval ADD COLUMN steps TEXT NOT NULL DEFAULT '[]';`,
   },
+  {
+    // How many steps the card's cap left out (#171).
+    version: 13,
+    name: "approval-steps-omitted",
+    sql: `ALTER TABLE approval ADD COLUMN steps_omitted INTEGER NOT NULL DEFAULT 0;`,
+  },
 ];
 
 /** The schema version this code expects: the highest migration it knows. */

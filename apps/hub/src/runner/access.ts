@@ -25,7 +25,13 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { escapeHidden, hasHidden } from "@hearth/core";
 import type { ApprovalOutcome } from "../approvals/service";
 import type { AccessMode } from "../settings/access-mode";
-import { type BashVerdict, type CommandRule, classifyBash, commandSteps } from "./bash-policy";
+import {
+  type BashVerdict,
+  type CommandRule,
+  classifyBash,
+  commandSteps,
+  type StepEntry,
+} from "./bash-policy";
 import type { CompiledDenyRule } from "./policy";
 
 /** The reserved extension name (`RESERVED_EXTENSION_NAMES`). */
@@ -49,6 +55,8 @@ export interface GateRequest {
   readonly hiddenChars?: boolean;
   /** Each simple command the parser found in the command, escaped (#169). */
   readonly steps?: readonly string[];
+  /** How many steps the cap left out of `steps` (#171). */
+  readonly stepsOmitted?: number;
   /** The command holds a non-ASCII character (#169). */
   readonly nonAscii?: boolean;
 }
@@ -165,6 +173,40 @@ export function gateVerdict(
 /** The most steps a card lists; a command with more is cut there (the full command is always shown). */
 export const MAX_CARD_STEPS = 50;
 const NON_ASCII = /\P{ASCII}/u;
+/** Added to a step the parser cannot read the script of (#171). */
+export const OPAQUE_NOTE = " [runs a script the parser cannot see]";
+
+/**
+ * The steps the card lists, cut to `MAX_CARD_STEPS` (#171): every step that
+ * matched a rule or is opaque first, then the last step (padding hides what
+ * comes after it), the rest in order up to the cap, all in the order they
+ * were read. `omitted` counts the steps left out.
+ */
+export function cardSteps(entries: readonly StepEntry[]): { steps: string[]; omitted: number } {
+  const important = (e: StepEntry) => e.action !== "allow";
+  let room = MAX_CARD_STEPS;
+  const keep = new Set<number>();
+  entries.forEach((e, i) => {
+    if (important(e) && room > 0) {
+      keep.add(i);
+      room--;
+    }
+  });
+  if (entries.length > 0 && !keep.has(entries.length - 1) && room > 0) {
+    keep.add(entries.length - 1);
+    room--;
+  }
+  entries.forEach((e, i) => {
+    if (!important(e) && room > 0) {
+      keep.add(i);
+      room--;
+    }
+  });
+  const steps = entries
+    .filter((_, i) => keep.has(i))
+    .map((e) => escapeHidden(e.text) + (e.rule.startsWith("unclear:") ? OPAQUE_NOTE : ""));
+  return { steps, omitted: entries.length - steps.length };
+}
 
 /**
  * What the card shows for `verdict`, redacted. The parser's display of the
@@ -185,16 +227,26 @@ export function shownVerdict(
 ): Pick<GateVerdict, "summary" | "command" | "reason"> & {
   hiddenChars: boolean;
   steps: string[];
+  stepsOmitted: number;
   nonAscii: boolean;
 } {
   const command = redact(verdict.command);
   const again = gateVerdict(toolName, { ...(input as object), command }, commandRules, denyList);
   const same = again.rule === verdict.rule;
+  const entries =
+    toolName === "bash" && command !== "" ? commandSteps(command, commandRules, denyList) : [];
+  // Every rule that matched a step, not only the one that decided (#171).
+  const others = [
+    ...new Set(entries.filter((e) => e.action !== "allow").map((e) => e.rule)),
+  ].filter((rule) => rule !== verdict.rule);
   const shown = {
     summary: redact(same ? again.summary : command),
     command,
-    reason: redact(same ? again.reason : verdict.reason),
+    reason:
+      redact(same ? again.reason : verdict.reason) +
+      (others.length === 0 ? "" : ` Also matched: ${others.join(", ")}.`),
   };
+  const listed = cardSteps(entries);
   // After redaction and the re-parse, never before: a secret holding a hidden
   // character is redacted whole, and the parser reads the real characters (#165).
   return {
@@ -204,12 +256,8 @@ export function shownVerdict(
     hiddenChars: hasHidden(shown.summary + shown.command + shown.reason),
     // The parser's own reading of the redacted command, one line per simple
     // command, whatever glyphs surround it (#169).
-    steps:
-      toolName === "bash" && command !== ""
-        ? commandSteps(command, commandRules, denyList)
-            .slice(0, MAX_CARD_STEPS)
-            .map((step) => escapeHidden(step))
-        : [],
+    steps: listed.steps,
+    stepsOmitted: listed.omitted,
     // The simple version (#169): any non-ASCII character in the command, in
     // or out of quotes. A look-alike glyph is read by bash as an ordinary one.
     nonAscii: NON_ASCII.test(shown.command),

@@ -93,6 +93,8 @@ export interface ApprovalCard {
   readonly hiddenChars: boolean;
   /** Each simple command the hub's parser found, escaped; listed under the full command (#169). */
   readonly steps: readonly string[];
+  /** How many steps the hub's cap left out of `steps` (#171). */
+  readonly stepsOmitted: number;
   /** The command holds a non-ASCII character (#169). */
   readonly nonAscii: boolean;
   readonly expiresAt: number;
@@ -211,6 +213,7 @@ export function applyHubEvent(chat: HearthChat, event: HubEvent): HearthChat {
           steps: Array.isArray(p["steps"])
             ? p["steps"].filter((s): s is string => typeof s === "string")
             : [],
+          stepsOmitted: typeof p["steps_omitted"] === "number" ? p["steps_omitted"] : 0,
           nonAscii: p["non_ascii"] === true,
           expiresAt: typeof p["expiresAt"] === "number" ? p["expiresAt"] : event.ts,
           status: "pending",
