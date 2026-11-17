@@ -32,8 +32,8 @@ import {
   HearthError,
   type JsonValue,
   type Principal,
-  SYSTEM_PRINCIPAL,
   type SessionId,
+  SYSTEM_PRINCIPAL,
   withAudit,
 } from "@hearth/core";
 import { registerSecret } from "../obs/redaction";

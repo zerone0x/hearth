@@ -38,13 +38,13 @@ import {
   type SessionId,
   type WorkspaceScope,
 } from "@hearth/core";
+import type { GatewayRoute } from "../bifrost/virtual-keys";
 import type { BoxToolOperations, RpcTrace } from "../box/tool-rpc";
 import type { DesktopLockCheck } from "../desktop/lock";
 import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
-import type { GatewayRoute } from "../bifrost/virtual-keys";
 import type { AccessMode } from "../settings/access-mode";
 import type { HubVault } from "../vault/service";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
