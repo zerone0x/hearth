@@ -50,9 +50,9 @@ import {
 import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
-import type { CommandRule } from "./bash-policy";
 import { type AccessMode, DEFAULT_ACCESS_MODE } from "../settings/access-mode";
 import { ACCESS_EXTENSION, accessExtension } from "./access";
+import type { CommandRule } from "./bash-policy";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import { liveToolOutput } from "./live-output";
