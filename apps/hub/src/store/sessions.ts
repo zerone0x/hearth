@@ -19,6 +19,8 @@ export interface SessionRow {
   readonly lastActivityAt: EpochMs;
   readonly createdAt: EpochMs;
   readonly archivedAt: EpochMs | null;
+  /** The session's access mode override (decision 0045); null follows the global default. */
+  readonly accessMode: string | null;
 }
 
 export interface BoxRow {
@@ -51,6 +53,7 @@ interface RawSession {
   last_activity_at: number;
   created_at: number;
   archived_at: number | null;
+  access_mode: string | null;
 }
 
 function toSession(r: RawSession): SessionRow {
@@ -65,11 +68,12 @@ function toSession(r: RawSession): SessionRow {
     lastActivityAt: r.last_activity_at,
     createdAt: r.created_at,
     archivedAt: r.archived_at,
+    accessMode: r.access_mode,
   };
 }
 
 const SESSION_COLUMNS =
-  "id, workspace_id, title, state, model, repo_url, box_id, last_activity_at, created_at, archived_at";
+  "id, workspace_id, title, state, model, repo_url, box_id, last_activity_at, created_at, archived_at, access_mode";
 
 export class SqliteSessionStore {
   readonly #db: Database;
@@ -135,6 +139,15 @@ export class SqliteSessionStore {
        WHERE workspace_id = ? AND id = ?`,
       [state, now, state, now, scope.workspaceId, id],
     );
+  }
+
+  /** Set the session's access mode override; null follows the global default (decision 0045). */
+  setAccessMode(scope: WorkspaceScope, id: SessionId, mode: string | null): void {
+    this.#db.run("UPDATE session SET access_mode = ? WHERE workspace_id = ? AND id = ?", [
+      mode,
+      scope.workspaceId,
+      id,
+    ]);
   }
 
   upsertBox(

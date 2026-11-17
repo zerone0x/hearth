@@ -141,6 +141,8 @@ const ROUTES: [string, string, unknown?][] = [
   ["POST", "/v1/sessions/%/desktop/lock", {}],
   ["POST", "/v1/sessions/%/desktop/lock/release", {}],
   ["GET", `/v1/sessions/%/blobs/${"0".repeat(64)}`],
+  ["GET", "/v1/sessions/%/access-mode"],
+  ["PUT", "/v1/sessions/%/access-mode", { mode: "yolo" }],
 ];
 
 /** Another id of the same shape as `id`, that no session has. */

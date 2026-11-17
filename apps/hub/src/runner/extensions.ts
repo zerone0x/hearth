@@ -30,6 +30,8 @@ export interface ExtensionSelection {
 /** Names reserved for the runner's own extensions; an allowlist cannot shadow them. */
 export const RESERVED_EXTENSION_NAMES: ReadonlySet<string> = new Set([
   "hearth-tools",
+  // The access mode reader and, with #155, the access gate (decisions 0043, 0045).
+  "hearth-access",
   "codemode",
   // The trajectory observer (decision 0021): runs last and must stay passive.
   "hearth-trace",

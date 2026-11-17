@@ -40,6 +40,7 @@ import { knownSecrets, registerSecret } from "../obs/redaction";
 import type { Telemetry } from "../obs/telemetry";
 import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
+import type { AccessMode } from "../settings/access-mode";
 import type { HubVault } from "../vault/service";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
@@ -123,6 +124,11 @@ export interface SessionRunnersOptions {
    * through it, bound to the session and the page origin. Unset, it refuses.
    */
   readonly vault?: Pick<HubVault, "use">;
+  /**
+   * The access mode resolver (`AccessModes.resolve`, decision 0045), read once
+   * per tool call. Unset (tests), every call is recorded as the default `ask`.
+   */
+  readonly accessMode?: (sessionId: SessionId) => AccessMode;
 }
 
 export interface RunnerOptionsInput {
@@ -370,6 +376,7 @@ export class SessionRunners {
         `model ${choice.provider}/${choice.model} is not known to pi`,
       );
     }
+    const resolveMode = this.#o.accessMode;
     return SessionRunner.create({
       sessionId,
       scope: this.#scope,
@@ -379,6 +386,7 @@ export class SessionRunners {
       modelRuntime: runtime,
       model: model as Model<string>,
       denyList: this.#denyList,
+      ...(resolveMode === undefined ? {} : { accessMode: () => resolveMode(sessionId) }),
       extensions: this.#extensions,
       codemode: log.codemode,
       ...(log.header === undefined ? {} : { entries: [log.header, ...log.entries] }),

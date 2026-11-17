@@ -43,7 +43,7 @@ import { mountTrajectoryRoutes, Trajectories } from "./obs/routes";
 import { HUB_VERSION } from "./obs/version";
 import { mountRunnerRoutes, SessionRunners, type SessionRunnersOptions } from "./runner";
 import { mountSessionRoutes, SessionManager, type SessionManagerOptions } from "./session";
-import { ModelSettings, mountSettingsRoutes } from "./settings";
+import { AccessModes, ModelSettings, mountAccessModeRoutes, mountSettingsRoutes } from "./settings";
 import {
   openDatabase,
   SqliteAuditSink,
@@ -565,6 +565,18 @@ export function startHub(options: HubOptions) {
           boxes,
           ...(options.log === undefined ? {} : { log: options.log }),
         });
+  // The access mode (decision 0045): a global default next to the model
+  // settings and a per-session override, resolved once per tool call.
+  const settingStore = new SqliteSettingStore(db);
+  const accessModes = new AccessModes({
+    settings: settingStore,
+    sessions: sessionStore,
+    events,
+    authorizer,
+    audit,
+    log: options.log ?? (() => {}),
+  });
+  mountAccessModeRoutes(app, accessModes);
   // The model settings load after the vault opens; a first message waits for them.
   const modelReady = Promise.withResolvers<void>();
   const runners =
@@ -586,6 +598,7 @@ export function startHub(options: HubOptions) {
           modelReady: modelReady.promise,
           // browser_fill resolves logins through the vault (decision 0039).
           vault,
+          accessMode: (sessionId) => accessModes.resolve(sessionId),
           ...(options.log === undefined ? {} : { log: options.log }),
         });
   if (runners !== undefined) mountRunnerRoutes(app, runners);
@@ -594,7 +607,7 @@ export function startHub(options: HubOptions) {
   // Settings page's choice, applied to the runners at start and on each save.
   const envModel = options.runner?.config;
   const modelSettings = new ModelSettings({
-    settings: new SqliteSettingStore(db),
+    settings: settingStore,
     vaultStore,
     vault,
     authorizer,
@@ -656,6 +669,8 @@ export function startHub(options: HubOptions) {
     /** The vault (decision 0031) and its first open. */
     vault,
     vaultReady,
+    /** The access mode setting and its resolver (decision 0045). */
+    accessModes,
     /** The model settings (decision 0038), loaded (and imported) once the vault opened. */
     modelSettings,
     settingsReady,

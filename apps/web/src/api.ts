@@ -84,6 +84,25 @@ export interface ModelSettings {
   readonly updatedAt: number | null;
 }
 
+/** The access mode (decision 0045): `yolo` runs every tool without asking, `ask` stops risky ones. */
+export type AccessMode = "yolo" | "ask";
+
+/** The global default. `source: "default"` means nothing is saved and it is `ask`. */
+export interface AccessModeSettings {
+  readonly mode: AccessMode;
+  readonly source: "default" | "settings";
+  readonly updatedAt: number | null;
+}
+
+/** A session's mode: its own `override`, or null to follow the global default. */
+export interface SessionAccessMode {
+  readonly sessionId: string;
+  readonly override: AccessMode | null;
+  readonly global: AccessMode;
+  /** The mode in force: `override ?? global`. */
+  readonly mode: AccessMode;
+}
+
 export interface AuthStatus {
   readonly setupRequired: boolean;
   readonly authenticated: boolean;
@@ -189,6 +208,14 @@ export const api = {
   modelSettings: () => call<ModelSettings>("GET", "/v1/settings/model"),
   saveModelSettings: (choice: { provider: string; model: string; keyRef: string | null }) =>
     call<ModelSettings>("PUT", "/v1/settings/model", choice),
+  accessMode: () => call<AccessModeSettings>("GET", "/v1/settings/access-mode"),
+  saveAccessMode: (mode: AccessMode) =>
+    call<AccessModeSettings>("PUT", "/v1/settings/access-mode", { mode }),
+  sessionAccessMode: (sessionId: string) =>
+    call<SessionAccessMode>("GET", `/v1/sessions/${id(sessionId)}/access-mode`),
+  /** `null` follows the global default again. */
+  saveSessionAccessMode: (sessionId: string, mode: AccessMode | null) =>
+    call<SessionAccessMode>("PUT", `/v1/sessions/${id(sessionId)}/access-mode`, { mode }),
 };
 
 /** The desktop WebSocket of a session (decision 0016), on the page's own origin. */
