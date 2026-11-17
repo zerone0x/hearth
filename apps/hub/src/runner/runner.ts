@@ -52,6 +52,7 @@ import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/t
 import { HUB_VERSION } from "../obs/version";
 import { type AccessMode, DEFAULT_ACCESS_MODE } from "../settings/access-mode";
 import { ACCESS_EXTENSION, accessExtension } from "./access";
+import type { CommandRule } from "./bash-policy";
 import { BROWSER_TOOLS } from "./browser-tools";
 import type { PinnedExtension } from "./extensions";
 import { liveToolOutput } from "./live-output";
@@ -79,6 +80,8 @@ export interface SessionRunnerOptions {
   readonly modelRuntime: ModelRuntime;
   readonly model: Model<string>;
   readonly denyList: readonly CompiledDenyRule[];
+  /** Compiled command rules for `bash` (decision 0044). Unset: none. */
+  readonly commandRules?: readonly CommandRule[];
   /**
    * The session's access mode now (decision 0045), read once per tool call and
    * recorded as `access_mode` on its trajectory record. Unset (tests), the
@@ -326,6 +329,9 @@ export class SessionRunner {
             box,
             boxCwd,
             denyList: options.denyList,
+            ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
+            onBashVerdict: (toolCallId, verdict) =>
+              self?.observe(() => self?.tracer.onBashVerdict(toolCallId, verdict)),
             onDenied: (_name, toolCallId, reason) =>
               self?.observe(() => self?.tracer.onDenied(toolCallId, reason)),
             onRefused: (_name, toolCallId, code) =>

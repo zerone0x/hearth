@@ -9,7 +9,9 @@
  *   the full approvals UI is M3). It is best-effort, not a boundary: paths are
  *   normalized before matching (`//`, `..`, relative paths), but a shell
  *   command can always be spelled another way (`rm -fr`, `$X -rf`, base64).
- *   The box is the boundary; real approvals are M3 (decision 0015).
+ *   The box is the boundary; real approvals are M3 (decision 0015). A `bash`
+ *   command is also parsed and matched by command rules first
+ *   (bash-policy.ts, decision 0044); this raw match stays as its fallback.
  * - A result that names a hub temp file (pi's bash truncation hint, codemode's
  *   spilled output or saved image) is rewritten: that file is on the hub, the
  *   model's next `read` would go to the box, and the hub's disk is not the

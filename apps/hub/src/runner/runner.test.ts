@@ -735,6 +735,67 @@ describe("approvals", () => {
     expect(h.sessions.leases).toBe(1);
   });
 
+  test("bash is parsed first: a command rule set to deny blocks every spelling (#69)", async () => {
+    const h = await harness({
+      commandRules: [
+        {
+          name: "no-push",
+          command: ["git"],
+          subcommand: "push",
+          optionsWithValue: ["-C"],
+          action: "deny",
+          reason: "no push",
+        },
+      ],
+    });
+    const runner = await turn(h, "se_a", "push", [
+      call("bash", { command: "sudo timeout 5 git -C . push --force" }, "c_p1"),
+      call("bash", { command: "echo $(git push)" }, "c_p2"),
+      call("bash", { command: "bash -c 'g\"i\"t push'" }, "c_p3"),
+      call("bash", { command: "echo git push" }, "c_ok"),
+      fauxAssistantMessage("fine"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results.map((r) => [r.isError, r.text.trim()])).toEqual([
+      [true, "no push"],
+      [true, "no push"],
+      [true, "no push"],
+      [false, "git push"],
+    ]);
+    const execs = h.boxes.sent.filter((f) => f.method === "tool.exec");
+    expect(execs).toHaveLength(1);
+    expect(JSON.stringify(execs)).toContain("echo git push");
+    expect(JSON.stringify(execs)).not.toContain("--force");
+  });
+
+  test("an `ask` verdict runs as before: there is no approval gate yet (#69)", async () => {
+    // The seed rules are all `ask`; none blocks.
+    const h = await harness();
+    const runner = await turn(h, "se_a", "clean", [
+      call("bash", { command: "mkdir -p b && rm -rf b && echo gone" }, "c_rm"),
+      call("bash", { command: "X=echo; $X unclear" }, "c_x"),
+      fauxAssistantMessage("fine"),
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results.map((r) => [r.isError, r.text.trim()])).toEqual([
+      [false, "gone"],
+      [false, "unclear"],
+    ]);
+    expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(2);
+    // The seed rules are on by default, and each verdict is on the call's step.
+    const policies = (h.events.all.get("se_a") ?? [])
+      .map((e) => (e.payload as { bash_policy?: { action: string; rule: string } }).bash_policy)
+      .filter((p) => p !== undefined)
+      .map((p) => `${p.action} ${p.rule}`);
+    expect(policies).toEqual(["ask rm-recursive-force", "ask unclear:name"]);
+  });
+
+  test("a bad command rule fails at startup", async () => {
+    await expect(
+      harness({ commandRules: [{ name: "x", command: ["git"], action: "block" as "deny" }] }),
+    ).rejects.toThrow('action must be "ask" or "deny"');
+  });
+
   test("a bad deny pattern fails at startup", async () => {
     await expect(harness({ denyList: [{ tool: "bash", pattern: "(" }] })).rejects.toThrow(
       "bad pattern",

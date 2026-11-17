@@ -42,6 +42,7 @@ import { bodyOf, type RequestBody } from "../request-body";
 import type { BoxLease, SessionView } from "../session/manager";
 import type { AccessMode } from "../settings/access-mode";
 import type { HubVault } from "../vault/service";
+import { type CommandRule, compileCommandRules, DEFAULT_COMMAND_RULES } from "./bash-policy";
 import { type ExtensionPin, type PinnedExtension, selectExtensions } from "./extensions";
 import { type CompiledDenyRule, compileDenyList, type DenyRule } from "./policy";
 import {
@@ -70,6 +71,11 @@ export interface ModelChoice {
 /** The runner's config (hub config; see docs/runner.md). */
 export interface RunnerConfig extends ModelChoice {
   readonly denyList?: readonly DenyRule[];
+  /**
+   * Command rules for `bash`, matched after parsing (decision 0044). Unset:
+   * `DEFAULT_COMMAND_RULES`; `[]` turns them off. Only `deny` blocks today.
+   */
+  readonly commandRules?: readonly CommandRule[];
   /** Allowlisted pinned extensions (#56). Empty by default. */
   readonly extensionAllowlist?: readonly ExtensionPin[];
   /**
@@ -168,6 +174,7 @@ export class SessionRunners {
   readonly #context = new Map<SessionId, readonly ContextFile[]>();
   readonly #contextFresh = new Set<SessionId>();
   readonly #denyList: readonly CompiledDenyRule[];
+  readonly #commandRules: readonly CommandRule[];
   readonly #extensions: readonly PinnedExtension[];
   #runtime: Promise<ModelRuntime> | undefined;
   /** pi's model catalog, without a key: checks a model choice before it is saved. */
@@ -185,6 +192,7 @@ export class SessionRunners {
       this.#model = { provider, model, ...(apiKeyRef === undefined ? {} : { apiKeyRef }) };
     }
     this.#denyList = compileDenyList(options.config.denyList ?? []);
+    this.#commandRules = compileCommandRules(options.config.commandRules ?? DEFAULT_COMMAND_RULES);
     const selection = selectExtensions(
       options.availableExtensions ?? [],
       options.config.extensionAllowlist ?? [],
@@ -386,6 +394,7 @@ export class SessionRunners {
       modelRuntime: runtime,
       model: model as Model<string>,
       denyList: this.#denyList,
+      commandRules: this.#commandRules,
       ...(resolveMode === undefined ? {} : { accessMode: () => resolveMode(sessionId) }),
       extensions: this.#extensions,
       codemode: log.codemode,

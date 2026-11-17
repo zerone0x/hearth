@@ -3616,6 +3616,137 @@ behind it would be off on a new install, which must start in `ask`.
   fallback, a gate exception blocks in both modes, and an allowlisted extension
   cannot take the gate's reserved name.
 
+## 0044: Bash commands are parsed before the command rules (`unbash`), and only `deny` is enforced until the approval gate
+
+- Date: 2026-11-17
+- Status: accepted
+- Issue: #69 (research: `docs/research/m3-models-access.md`, question 2, #153)
+
+### Context
+
+The deny-list (0015) is a regular expression over the raw `bash` string, so
+`rm -fr`, `X=rm; $X -rf`, `bash -c "r""m -rf"` and `echo $(git push)` all get
+past a rule. PRD §6.5 makes the risky set in `ask` mode "the deny-list after
+bash parsing". The idea of parsing a command into simple commands before
+matching rules comes from stakpak/agent (#64, `docs/research/stakpak.md` F1);
+no code was copied. Decision 0043 (the access gate, loaded in both modes)
+says that in `yolo` a command the parser cannot read is still checked against
+the raw-pattern deny-list, and that an exception in the gate blocks the call.
+
+### Decision
+
+- **Parser: `unbash` 6.0.4** (ISC, pure TypeScript, no dependencies, no
+  install script), pinned exactly in `apps/hub`. It is behind one adapter,
+  `apps/hub/src/runner/bash-parse.ts` (`parseBash(source)`: simple commands as
+  word lists, `null` for a word that is not a literal, plus every parse error),
+  so `tree-sitter-bash` can replace it and the same tests prove the swap.
+  The tree is walked with `forEachChild` only: a substitution's nested script
+  (`$(...)`, backticks, `<(...)`, `>(...)`) is a lazy field that a walk over
+  the object's own fields misses (a test pins this). Every nested script's
+  own `errors` count. A command records the earlier stages of every pipeline
+  it is in as index ranges into the command list, and the commands that feed
+  its stdin (`< <(curl x)`, `<<< "$(curl x)"`), in one walk: the first cut
+  copied the upstream list per stage, and a 64 KiB `sh|sh|...` took 31.7 s
+  in the hub's synchronous `tool_call` handler (#160 review). Input over
+  64 KiB is not parsed, and one classification has a work budget
+  (`MAX_POLICY_STEPS`, 1,000,000 steps: a character parsed, a nested
+  script's characters parsed again when its lazy field is read, a node
+  walked, a word checked); past it the verdict is at least `ask`
+  (`unclear:budget`): the commands already read are still judged, so a
+  readable `git push` before the overflow keeps its `deny`, and the raw
+  deny-list has already been applied. The worst 64 KiB shapes
+  known take under 0.3 s. An exception
+  from the parser or the walk is a parse error, so the command is one the
+  parser cannot read (0043); any other exception in `classifyBash` reaches
+  pi's `tool_call` handler and blocks the call (fail-closed, 0043).
+- **A small Hearth policy layer** (`bash-policy.ts`, `classifyBash`) strips the
+  wrappers `sudo`, `doas`, `env` (and its `VAR=x`), `timeout`, `nice`,
+  `ionice`, `nohup`, `time`, `stdbuf`, `builtin`, `command`, `exec`, `xargs`,
+  `setsid`, `chroot` (and its root), `flock` (and its lock file), `taskset`
+  (and its mask), `strace`, `unbuffer` and `busybox` (the applet is the next
+  word) with their options. Wrapper options are read the way getopt reads
+  them: short clusters (`env -iS'...'` is `-i` then `-S`), long options with
+  `=value` or the next word, an unambiguous prefix of a long option
+  (`sudo --us root`); a long option the table does not know asks. It
+  re-parses the string of `bash|sh|zsh|dash|ksh -c`, `su -c`, `script -c`,
+  `flock -c`, the words of `eval` and `watch`, and the command of
+  `sudo -s`/`-i` (run by a shell), up to 3 levels; and gives `ask` when it
+  cannot see what runs: a parse error, a command name that is not a literal,
+  `alias`, `git -c alias.*=...`, `source`/`.`, a shell (or `su`, `chroot`,
+  `sudo -s` with no command) reading a script, a pipe, a stdin redirect, a
+  here-doc or here-string, or `xargs`' words; `env -S`/`--split-string`,
+  `sudo -e`, `parallel`, `runuser`, deeper nesting, or the work budget.
+- **`xargs`.** Words from stdin are added to the command, so a rule's
+  `subcommand`, `flags` or `args` test that the written words do not meet is
+  `ask` under `xargs` (`echo push | xargs git`); with `-I`/`--replace` any
+  word can be replaced, so a different subcommand is `ask` too, and a shell
+  `-c` string, a wrapper's script (`su -c`, `flock -c`, `watch`, …) or
+  `eval` under `-I`/`-i`/`--replace` is `unclear:script`: xargs puts its
+  input into that string (`echo 'git push' | xargs -I{} sh -c '{}'`).
+- **Rules key on the command, not the string**: `{ name, command[],
+  subcommand?, optionsWithValue?, flags?, args?, pipedFrom?, action:
+  ask|deny, reason? }`. A one-letter flag matches inside a cluster (`-r` in
+  `-fr`); a long flag matches `--flag=value` and every GNU prefix of it
+  (`rm --rec --for`, `git reset --har`), ambiguous ones too, which errs
+  strict. `pipedFrom` matches an earlier stage of any enclosing pipeline,
+  compound stages included (`(curl x) | sh`), and a command that feeds the
+  shell's stdin (`sh -s < <(curl x)`). A non-literal argument that could decide the match makes the rule
+  `ask`. The most restrictive result over all simple commands wins, deny >
+  ask > allow; that order is credited to `@pi-kit/permissions`.
+- **Seed rules**, `runner.config.commandRules` (unset: the seed; `[]`: none):
+  `rm` with `-r` and `-f`, `git push`, `git reset --hard`, `curl`/`wget` piped
+  into a shell, `dd`, `mkfs*`, `chmod -R 777 /`. All `ask`, so a new install
+  blocks nothing it did not block before; an owner sets `deny` for a hard block.
+- **The raw-pattern deny-list stays.** For `bash` it is tested against the raw
+  command first, as before, which is 0043's fallback when parsing fails, and then
+  against each parsed command (before and after unwrapping) as words joined
+  by one space, so `bash -c "r""m -rf x"` meets `^rm\s+-rf`.
+- **Only `deny` is enforced today.** The verdict (`allow` | `ask` | `deny`,
+  the rule, the reason, the command it saw) goes on the call's trajectory
+  step as `bash_policy`. `ask` runs as before until the approval gate and the
+  access mode exist (follow-up issues of #153); they read the same verdict.
+  That is already 0043's `yolo`: deny rules block, `ask` runs, an unreadable
+  command meets the raw deny-list. Command rules also match the commands a
+  partly parsed tree does show, so a parse error elsewhere does not hide a
+  readable `git push`.
+
+### Alternatives rejected
+
+- **`tree-sitter-bash`.** Equally correct on the hostile set, but wasm plus an
+  npm package with a native install script, and an async init.
+- **`sh-syntax`.** The most mature grammar, but a 4 MB Go-wasm blob in the hub,
+  and it overflowed its stack on the deep sample.
+- **`shell-quote` or a tokenizer.** Missed 10 of the 36 hostile samples.
+- **A third-party permission package.** None can be driven from the hub (#153).
+- **Treat a parse error as `deny`.** There is no approval UI to recover with;
+  a typo in a command would fail a turn. It is `ask`, and the raw deny-list
+  still applies.
+
+### Consequences
+
+- Not a boundary; the box is (0015). Known gaps, each `allow` unless said:
+  interpreters (`python -c`, `node -e`, `perl -e`, `awk 'BEGIN{system(...)}'`);
+  `find -exec`/`-execdir`/`-ok`; `trap '<string>'`; environment variables
+  that run code (`PROMPT_COMMAND`, `BASH_ENV`, `ENV`: prefix assignments are
+  dropped); git aliases set in the box's config, and other git config that
+  runs a command (`-c core.sshCommand=...`, `core.pager`, `include.path`,
+  `GIT_CONFIG_*`); a script written and then run; `exec < file` followed by a
+  shell (only a command's own redirects and its compound's are seen);
+  wrappers not in the table (`nsenter`, `unshare`, `systemd-run`, `firejail`,
+  `ltrace`, `ssh host cmd`, ...); `download-to-shell` sees the name an
+  upstream stage runs after unwrapping, not inside its `-c` string
+  (`bash -c 'curl x' | sh` is `ask` as a shell reading a pipe, not the rule);
+  network calls that do what a rule forbids (`curl` to a forge API). The
+  wrapper table errs strict where the real tool differs: `sudo -s` joins its
+  words without sudo's escaping, `timeout`/`taskset` options after the
+  positional are still read as options, and `ionice -p PID cmd` is read as
+  a command.
+- A rule's `optionsWithValue` must list options that take a value, or their
+  value is read as the subcommand (`git -C dir push`); the seed git rules
+  list git's.
+- `tool_call` trajectory records of `bash` gain `bash_policy`, an added field
+  under schema `/2`.
+
 ## 0045: Access mode setting: a global default, a per-session override, one resolver per tool call
 
 - Date: 2026-11-17
