@@ -277,6 +277,10 @@ describe("shells and eval are parsed again, up to a depth", () => {
     expect(verdict(nest("git push", MAX_SHELL_DEPTH + 1), DENY_ALL)).toBe("ask unclear:depth");
   });
 
+  test("a parse error does not hide a readable command of the partial tree", () => {
+    expect(verdict('git push; echo "oops', DENY_ALL)).toBe("deny git-push");
+  });
+
   test("a parse error inside a -c script asks", () => {
     expect(verdict(`bash -c 'echo "oops'`, DENY_ALL)).toBe("ask unclear:parse-error");
   });
