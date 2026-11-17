@@ -20,7 +20,7 @@ from the REST API (`GET /repos/{owner}/{repo}`), both read on 2026-11-17.
 
 | Package | Version, published | License | Size | Runtime deps | Repo, stars, last push |
 |---|---|---|---|---|---|
-| `@pi-kit/permissions` | 0.4.0, 2026-10-25 | MIT | 58.9 kB, 1,413 lines | `@pi-kit/shared` 0.1.0 (26 lines) | `j7an/pi-kit`, 1, 2026-11-17 |
+| `@pi-kit/permissions` | 0.4.0, 2026-10-25 | MIT | 58.9 kB, 1,413 lines | `@pi-kit/shared` 0.1.0 (MIT, same repo, 26 lines) | `j7an/pi-kit`, 1, 2026-11-17 |
 | `@skibum1869/pi-permission-gate` | 1.0.1, 2026-08-30 | MIT | 35.2 kB, 729 lines | `shell-quote` ^1.10.0 | `skibum1869/pi-extensions`: **404** |
 | `pi-permission-suite` | 0.2.3, 2026-07-11 | MIT | 70.6 kB, 1,734 lines | `tree-sitter-bash` ^0.25.1 (native install script), `web-tree-sitter` ^0.26.9 | `Eddie0521/pi-permission-suite`, 3, 2026-07-11 |
 | `@rhedbull/pi-permissions` | 1.1.0, 2026-02-27 | MIT | 24.4 kB, 449 lines | none; peer `@mariozechner/pi-coding-agent` >=0.51.0 | `rHedBull/pi-permissions`, 6, 2026-03-29 |
@@ -31,8 +31,8 @@ from the REST API (`GET /repos/{owner}/{repo}`), both read on 2026-11-17.
 
 | Package | Version, published | License | Size | What it is | Repo, stars, last push |
 |---|---|---|---|---|---|
-| `web-tree-sitter` + `tree-sitter-bash` | 0.27.2 (2026-11-07) + 0.25.1 (2025-12-02) | MIT | 211 kB + 1.36 MB of wasm (the `tree-sitter-bash` package is 20 MB unpacked, mostly C sources) | tree-sitter runtime and bash grammar, as wasm | `tree-sitter/tree-sitter-bash`, 336, 2026-09-13 |
-| `unbash` | 6.0.4, 2026-11-07 | ISC | 488 kB, no deps | a bash 5.3 parser in TypeScript | `webpro-nl/unbash`, 147, 2026-11-07 |
+| `web-tree-sitter` + `tree-sitter-bash` | 0.27.2 (2026-11-07) + 0.25.1 (2025-12-02) | MIT | 211 kB + 1.36 MB of wasm (the `tree-sitter-bash` package is 20 MB unpacked, mostly C sources) | tree-sitter runtime and bash grammar, as wasm | `tree-sitter/tree-sitter` (`web-tree-sitter`), 27,496, 2026-11-17; `tree-sitter/tree-sitter-bash`, 336, 2026-09-13 |
+| `unbash` | 6.0.4, 2026-11-07 | ISC | 367,564 bytes unpacked (`dist.unpackedSize`), no deps | a bash 5.3 parser in TypeScript | `webpro-nl/unbash`, 147, 2026-11-07 |
 | `sh-syntax` | 0.8.7, 2026-11-15 | MIT (wraps `mvdan/sh`, BSD-3-Clause) | 4.1 MB wasm (Go) | mvdan/sh compiled to wasm | `un-ts/sh-syntax`, 73, 2026-11-15 (`mvdan/sh`: 9,205, 2026-11-17) |
 | `bash-parser` | 0.5.0, **2017-06-22** | MIT | 12 deps (`babylon` 6, ...) | an old POSIX parser | `vorpaljs/bash-parser`, 230, 2024-06-23 |
 | `shell-quote` | 1.12.0, 2026-10-02 | MIT | 26 kB | a tokenizer, not a parser | `ljharb/shell-quote`, 68, 2026-10-02 |
@@ -48,10 +48,14 @@ names v2.5.1 as the latest. The binary run here is
 static, sha256 `2b629808…4c0734`, which matches the `.sha256` file on the same
 host. The Docker image is `maximhq/bifrost:v2.5.1`, digest
 `sha256:5ec9873acaf1687556b6e4dd854b92b539d9debf87a5a683b66338648b84d3c8`
-(Docker Hub API). The npm launcher `@maximhq/bifrost@1.6.3` is 13 kB and has no
-deps. Docs read: `docs/features/governance/virtual-keys.mdx` and
+(Docker Hub API). The npm launcher `@maximhq/bifrost@1.6.3` (Apache-2.0, same repo) is 13 kB
+and has no deps. Docs read: `docs/features/governance/virtual-keys.mdx` and
 `budget-and-limits.mdx`. Code read: `transports/config.schema.json`,
-`transports/bifrost-http/handlers/{governance,logging}.go` (routes only).
+`transports/bifrost-http/handlers/{governance,logging}.go` (routes only), and
+at the tag commit `plugins/governance/{main,store,tracker,utils}.go` for the
+refusals (402 `budget_exceeded` and 429 `policy_rate_limited`,
+`main.go:988-991`), the budget pre-check and the `allow_all_providers`
+widening (`store.go:1549-1550`, `utils.go:331`).
 
 **Not verified:**
 - Bifrost with a streaming response. The probe's fake provider only answers
@@ -109,10 +113,15 @@ DECISIONS entry of the issue that builds it.
    that crosses the budget is allowed (an overshoot of one call per request
   in flight), and usage
    and logs reach the database in batches (about 5-10 s).
-5. **Fits the existing decisions without a PRD change, so no decision entry.**
-   The gate is a Hearth built-in on the `tool_call` hook that already exists
-   (`apps/hub/src/runner/tools.ts:342`). A VK value is never stored: the hub
-   keeps only its id and rotates on every runner build.
+5. **Two departures from decision 0042, recorded as decision 0043 (PRD
+   v0.5.1) in this PR.** The gate is loaded in both modes: `yolo` skips its
+   `ask` rules, but deny rules still block, an unparseable command falls back
+   to the raw deny-list, and the mode is recorded on every call. And the gate
+   is a Hearth built-in under a reserved name, on the `tool_call` hook that
+   already exists (`apps/hub/src/runner/tools.ts:342`), so the third-party
+   extension allowlist (#56) does not apply to it. Everything else fits the
+   existing decisions. A VK value is never stored: the hub keeps only its id
+   and rotates on every runner build.
 
 ---
 
@@ -174,13 +183,20 @@ restart-safe pending state, a mode from Settings, and an audit entry. Those
 are most of the work.
 
 **Recommendation: a small Hearth gate, built in (not a package).** It is
-registered by the runner next to `hearth-tools`, under a reserved name, so
-#56's allowlist does not apply. It runs in both modes: `deny` rules block in
-both, as the config deny-list does today, and `ask` rules only ask in `ask`
-mode. In `yolo` they pass, but the mode is still recorded (question 3). PRD
-§6.5 says `yolo` "simply does not load" the extension; skipping its `ask` rules
-does the same for the owner and keeps one place that records the mode. About
-200 lines plus the parser:
+registered by the runner next to `hearth-tools`, under a reserved name. It
+ships in the repo and is reviewed and tested like the rest of the hub, so
+#56's allowlist, which governs extensions the owner adds, does not apply. It
+runs in both modes: `deny` rules block in both, as the config deny-list does
+today, and `ask` rules only ask in `ask` mode. In `yolo` they pass, but the
+mode is still recorded (question 3). In `yolo`, a `bash` command the parser
+cannot read (which would ask in `ask` mode) is checked against today's
+raw-pattern deny-list (`apps/hub/src/runner/policy.ts`) instead of being
+skipped, so a command spelled to defeat the parser cannot escape a deny rule
+that matches it as text. An exception in the gate blocks the call in both
+modes (pi fails safe, above); that is intended. Both points depart from
+decision 0042 and PRD v0.5 §6.5 ("`yolo` simply does not load it"; "goes
+through the extension allowlist (#56)"), so this PR adds decision 0043 and
+PRD v0.5.1, which supersede them. About 200 lines plus the parser:
 
 1. Classify the call: `bash` through the parser (question 2); path tools
    through the existing normalized-path rules (0015); `browser_*` by tool name
@@ -379,11 +395,16 @@ instead.
   they never enter a box or the compose file. The Bifrost admin password is a
   vault entry made at install, written into Bifrost's config secret. Bifrost
   stores provider keys encrypted with its own `encryption_key`, which is also
-  generated at install.
+  generated at install and kept as a vault entry.
 - **Per session.** On the session's first model call, `POST` a VK with the
-  session's model allowlist (always an explicit list: Bifrost's docs say an
-  empty `key_ids` denies all keys, and the probe did not check an empty
-  `allowed_models`), its budget and its rate limit. The
+  session's model allowlist (always an explicit, non-empty list, and never
+  `allow_all_providers`: Bifrost's docs say an empty `key_ids` denies all
+  keys, but the probe did not check an empty `allowed_models`, and the VK flag
+  `allow_all_providers` widens a key to every configured provider,
+  `plugins/governance/store.go:1549-1550`, `utils.go:331`), its budget and its
+  rate limit. PRD §6.4 says an empty allowlist means none, never all, so the
+  hub refuses to create or `PUT` a VK with an empty model list and issue 5
+  tests that. The
   hub stores **only the VK id**. On every runner build (hub restart or model
   switch) it calls `rotate` and keeps the new value in the runner's memory
   (`setRuntimeApiKey` for a custom OpenAI-compatible provider whose base URL
@@ -394,8 +415,9 @@ instead.
   `/api/logs` for rows) through the hub, cached and refreshed after each turn.
   Writes arrive in batches, about 5 s for logs and about 10 s for budgets, so
   the S3 check waits for the batch before it compares.
-- **Over budget.** A 402 `budget_exceeded` (or a rate-limit refusal, not
-  probed here) is classified `gateway`, not retried and not given a fallback
+- **Over budget.** A 402 `budget_exceeded` (or a 429 `policy_rate_limited`
+  rate-limit refusal, read in source at `plugins/governance/main.go:988`, not
+  probed) is classified `gateway`, not retried and not given a fallback
   model (§8.1, principle 2). The turn ends with a visible message naming the
   budget and the spend, which is the exit criterion. The check runs before a
   call on the usage so far, so the call that crosses the budget is allowed.
@@ -408,13 +430,15 @@ instead.
 | Decision | Fit |
 |---|---|
 | 0011 tool RPC | The gate decides before the RPC, so a denied or expired call never reaches the box. No protocol change. |
-| 0015 runner, deny-list, allowlist | The gate replaces the regex deny-list for `bash` with parsed rules. Path rules stay. It is a built-in under a reserved name (#56). Restart adds `approval.interrupted` next to outcome-unknown. |
+| 0015 runner, deny-list, allowlist | The gate replaces the regex deny-list for `bash` with parsed rules, and keeps the regex as the `yolo` fallback for unparseable commands. Path rules stay. It is a built-in under a reserved name. Restart adds `approval.interrupted` next to outcome-unknown. |
 | 0021 / 0037 trajectories | `access_mode` and `approval` are added fields under `/2`. |
 | 0031 vault | Provider keys and the Bifrost admin password are vault entries. A VK value is not stored at all (rotate per runner build). |
 | 0035 desktop lock | Checked after approval, at execute. A browser call waiting for approval does not hold or queue the lock. |
 | 0038 settings | Global access mode next to the model card. The provider pick becomes "through Bifrost" when Bifrost is configured. The per-turn switch maps to a VK `PUT`. The CSP is unchanged. |
 | 0041 box-env | A `bash` call with `env` vault refs is "uses a marked secret": in `ask` mode it is approved before decrypt, which keeps 0041's "refused before decrypt" order. |
-| #56 allowlist | No third-party permission package is loaded. |
+| 0042 M3 access mode | Kept: `ask` on pi's `tool_call`, `ask` default, web-only cards. Departs on two points: the gate is loaded in `yolo` too (deny rules, mode recorded) and is not behind #56. Recorded as 0043. |
+| 0043 gate built in, both modes | Added by this PR; supersedes those two points of 0042 (PRD v0.5.1 §6.5). |
+| #56 allowlist | No third-party permission package is loaded. The gate is first-party and built in, so #56 does not apply to it (0043); an allowlisted extension cannot take its reserved name. |
 
 ## Threat notes
 
@@ -433,7 +457,13 @@ instead.
   trajectory. Do not add "approve all for this session"; the owner switches
   the session to `yolo` instead.
 - **Bifrost in the trust base.** It holds the provider keys and sees every
-  prompt in transit. Pinned digest, internal network only, content logging
+  prompt in transit. Its SQLite config store is a second at-rest copy of the
+  provider keys, next to the vault (0031), encrypted with Bifrost's
+  `encryption_key`. To keep 0031's "the vault is the source": keys are only
+  pushed from the vault (never typed into Bifrost), the store sits on an
+  internal volume that no box mounts, and the `encryption_key` is a vault
+  entry handed to Bifrost at start, not a value in the compose file beside the
+  store. A copy of the volume alone does not give the keys. Pinned digest, internal network only, content logging
   off, admin auth from the vault. Its admin API must never be reachable from
   a box: issue 4 checks that the box egress allow list (0012, 0023) does not
   cover Bifrost's address.
@@ -459,15 +489,23 @@ duplicated.
    gate, the `approval.*` events, the timeout, cancel on a new message or
    stop, `approval.interrupted` on restart, paused turn clocks, the approve
    route, and the `ToolFallback` branch. Includes the S3 e2e (web only,
-   `git push` approved, a second one expired, `yolo` runs at once).
+   `git push` approved, a second one expired, `yolo` runs at once). Tests
+   for decision 0043: a deny rule blocks in `yolo`, an unparseable command
+   that the raw deny-list matches is blocked in `yolo`, a gate exception
+   blocks in both modes, and an allowlisted extension cannot take the gate's
+   reserved name.
 4. **deploy+hub: Bifrost service.** Compose service pinned by digest on the
    internal network, a generated admin password and `encryption_key` in the
    vault, provider keys pushed from the vault, `install.md` (egress for the
-   pricing sync), and a hub health check. Tests run against the binary with a
+   pricing sync), and a hub health check. A test checks that the box egress
+   allow list (0012, 0023) does not cover Bifrost's address, so no box can
+   reach its admin or inference API. Tests run against the binary with a
    fake provider. The Docker part is gated by `HEARTH_DOCKER_TESTS=1`.
 5. **hub+web: per-session virtual keys and spend.** Create on first model
    call, rotate per runner build, `PUT` on model switch, deactivate on
-   archive, delete on delete. Spend and tokens from `/api/logs/stats`. A 402
+   archive, delete on delete. Spend and tokens from `/api/logs/stats`. An
+   empty model allowlist is refused (PRD §6.4: empty means none), never sent
+   to Bifrost, and no VK sets `allow_all_providers`; a test covers both. A 402
    ends the turn visibly. Exit criteria: UI spend equals the request-log sum
    after the batch flush, and an over-budget session is refused with a
    message.
