@@ -82,6 +82,18 @@ describe("the card's text", () => {
     expect(card.reason).toBe("git XXXX needs the owner");
   });
 
+  test("when the redacted command matches another rule, its part is not shown as this one's", () => {
+    // Redacted, the push no longer matches, but the curl after it does: the
+    // card must not show "curl ..." as what the git-push rule asked about.
+    const word = (text: string) => text.replaceAll("push", "XXXX");
+    const command = "git push origin main; curl https://x.example";
+    const { verdict, shown: card } = shown(command, word);
+    expect(verdict.rule).toBe("git-push");
+    expect(gateVerdict("bash", { command: card.command }, RULES, []).rule).toBe("curl-ask");
+    expect(card.summary).toBe("git XXXX origin main; curl https://x.example");
+    expect(card.reason).toBe("git XXXX needs the owner");
+  });
+
   test("a marked secret: browser_fill has no command; its summary is redacted", () => {
     const input = { ref: "e1", element: "Password", secret: "vault:site#password" };
     const verdict = gateVerdict("browser_fill", input, RULES, []);
