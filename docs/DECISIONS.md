@@ -3447,7 +3447,7 @@ SecretStore read tokens, refusing `box-env` ones.
   variable is refused as well, and a `box-env` token is still never the hub's.
   The use is audited (`secret.use` with `env`, `tool: bash`, the call id)
   before the value is returned and registered for sink redaction (0021).
-- **Value path.** The value joins the session's scrub set before it is sent,
+- **Value path.** The value is registered for redaction before it is sent,
   then travels in that one `tool.exec` only (`env`, protocol 1.6). The hub
   checks the version again with no await before the send, so an older box
   never receives it. Box-agent adds the variables under its own (box
@@ -3456,21 +3456,34 @@ SecretStore read tokens, refusing `box-env` ones.
   environment only; the next command does not have them.
 - **Scrubbing.** Before pi sees the output (so its result, its update events
   and its hub temp file), the hub replaces each value in the raw, JSON-escaped
-  and URL-encoded forms (`redactValues`, 0039). Every later tool result of the
-  session is scrubbed too, whatever the tool. Live output goes through the
-  runner's redactor, which holds back a tail that could start a secret, so a
-  value split across chunks is never half shown (0036). Events, trajectory and
+  and URL-encoded forms (`redactValues`, 0039; the URL forms include Python's
+  `urllib.parse.quote` and `quote_plus`). Every later tool result of the
+  session is scrubbed too, whatever the tool: the runner's `tool_result` hook
+  replaces every secret the hub has registered (`knownSecrets`, 0021; the
+  vault registers each stored value when it opens, and each value it adds,
+  rotates or hands out), not a per-runner set. So the scrub holds after the
+  runner is rebuilt (a model switch, 0038, or a hub restart), for
+  `browser_fill` values (0039) too. Live output goes through the runner's
+  redactor, which holds back a tail that could start a secret, so a value
+  split across chunks is never half shown (0036). Events, trajectory and
   logs redact it through the sink registry.
 
 ### Consequences
 
 - The command, and anything it starts, sees the value and can write it to a
-  file, send it out (egress is open, 0023) or encode it beyond what the
-  redactor knows (base64, hex, Python's `quote` of `!'()*`, `quote_plus` of
-  `~`). The model can then read the encoded form. This is the residual the
-  research names for `box-env`; the badge says so, and every use is audited.
+  file, send it out (egress is open, 0023) or transform it beyond what the
+  redactor knows (base64, hex, a split or reversed string, any other
+  encoding). The model can then read the transformed form. This is the
+  residual the research names for `box-env`; the badge says so, and every use
+  is audited.
 - A file the command wrote with the raw value is scrubbed when a later tool
-  result shows it, but stays in the box.
+  result shows it, in this runner or a rebuilt one, but stays in the box. A
+  child the command started in the background (`cmd &`, `setsid`) keeps the
+  value in its environment for as long as it runs; reading it
+  (`/proc/<pid>/environ`) is scrubbed the same way.
+- A value is scrubbed only while the hub knows it: a deleted token, or the
+  old value of a rotated one, leaves the registry at the next hub start, so a
+  file written with it earlier is shown raw after that restart.
 - A call with secrets has no `fullOutputPath`: the model sees only the
   output tail (256 KiB).
 - A token's `hosts` is not enforced for `box-env` uses; the box's egress is

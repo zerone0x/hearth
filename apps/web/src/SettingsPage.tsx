@@ -308,7 +308,8 @@ function BoxEnvSwitch({
       </div>
       <p className="text-xs text-muted-foreground">
         The agent can pass it to one bash command as an environment variable (env: GH_TOKEN:
-        vault:name). The model never sees it, but that command and anything it runs can.
+        vault:name). That command and anything it runs can read it. The model is shown it masked,
+        unless a command re-encodes it (base64, for example).
       </p>
     </div>
   );

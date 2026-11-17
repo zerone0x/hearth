@@ -11,9 +11,9 @@
  * - `bash` drops pi's `env` (the hub's environment). Its own optional `env`
  *   (decision 0041) maps variable names to `vault:` references of tokens
  *   opted in to box commands; the hub resolves them through the vault
- *   (audited first) and sends the values in that one `tool.exec` only. Each
- *   value joins the session's scrub set before it is sent, and the command's
- *   output is scrubbed before pi sees it.
+ *   (audited first, registered for redaction) and sends the values in that
+ *   one `tool.exec` only. The command's output is scrubbed of them before pi
+ *   sees it.
  * - `grep` replaces `execute()` as a whole: pi's own grep always runs the
  *   hub's `rg`.
  * - `tool_call` rewrites `~` to the box workspace and applies the deny-list;
@@ -25,8 +25,8 @@
  *   env (decision 0041) is replaced in the text of every later tool result of
  *   the session, whatever the tool, before the model reads it. The scrub uses
  *   every secret the hub knows (`knownSecrets`: the vault registers each stored
- *   value when it opens) on top of the values this runner used, so it holds
- *   after the runner is rebuilt (a model switch, decision 0038, or a restart).
+ *   value when it opens and each value it hands out), so it holds after the
+ *   runner is rebuilt (a model switch, decision 0038, or a restart).
  */
 
 import {
@@ -176,9 +176,6 @@ function absolute(path: string | undefined, boxCwd: string): string {
 export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFactory {
   const { box, boxCwd } = options;
   return (pi) => {
-    // The values browser_fill filled or bash passed through this runner: never shown to the
-    // model. The tool_result scrub adds every registered secret, which a rebuilt runner keeps.
-    const filled = new Set<string>();
     pi.registerTool({
       ...createReadToolDefinition(boxCwd),
       execute: (id, params, signal, onUpdate, ctx) =>
@@ -253,8 +250,8 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
                   },
                 );
                 const value = secret.value.reveal();
-                // Before the value leaves the hub: this result and every later one are scrubbed.
-                filled.add(value);
+                // Before the value leaves the hub: this result is scrubbed of it. The vault
+                // registered it (knownSecrets), so every later result is too.
                 values.push(value);
                 secretEnv[name] = value;
               }
@@ -340,7 +337,7 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
         }),
     });
 
-    registerBrowserTools(pi, box, options.onRefused, filled);
+    registerBrowserTools(pi, box, options.onRefused);
 
     pi.on("tool_call", (event) => {
       if (PATH_TOOLS.has(event.toolName)) {
@@ -358,7 +355,9 @@ export function hearthToolsExtension(options: HearthToolsOptions): ExtensionFact
       const content = event.content.map((part) => {
         if (part.type !== "text") return part;
         let text = scrubHubTempPaths(part.text, options.hubTempDir);
-        text = redactValues(text, [...filled, ...knownSecrets()], LOG_REDACTED);
+        // Every secret the hub knows, not a per-runner set: a rebuilt runner (a model
+        // switch, decision 0038, or a restart) still scrubs what an earlier one handed out.
+        text = redactValues(text, knownSecrets(), LOG_REDACTED);
         if (text === part.text) return part;
         changed = true;
         return { ...part, text };
