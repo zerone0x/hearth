@@ -189,6 +189,9 @@ describe("parseBash: errors and bounds", () => {
   test("the step budget stops the walk; nested scripts are charged by their length", () => {
     expect(parseBash("a | b | c", undefined, { steps: 5 })).toMatchObject({ exhausted: true });
     expect(parseBash("a | b | c", undefined, { steps: 1000 }).exhausted).toBeUndefined();
+    // Past the characters, each node walked costs a step.
+    expect(parseBash("a|b|c|d", undefined, { steps: 7 + 3 })).toMatchObject({ exhausted: true });
+    expect(parseBash("a|b|c|d", undefined, { steps: 7 + 100 }).exhausted).toBeUndefined();
     const budget = { steps: 10_000 };
     parseBash("echo $(true)", undefined, budget);
     expect(10_000 - budget.steps).toBeGreaterThan("echo $(true)".length + "$(true)".length);

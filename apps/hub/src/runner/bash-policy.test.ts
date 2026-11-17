@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parseBash } from "./bash-parse";
 import {
   type BashVerdict,
   type CommandRule,
@@ -550,6 +551,16 @@ describe("bounded work: the hub's tool_call handler is synchronous", () => {
     expect(verdict(`echo ${"$(".repeat(21800)}x${")".repeat(21800)}`, DENY_ALL)).toBe(
       "ask unclear:budget",
     );
+  });
+
+  test("judging the commands spends the budget too, not only parsing them", () => {
+    const command = "a; ".repeat(2000);
+    const budget = { steps: 1e9 };
+    expect(parseBash(command, undefined, budget).exhausted).toBeUndefined();
+    const parseCost = 1e9 - budget.steps;
+    expect(verdict(command, DENY_ALL)).toBe("allow none");
+    const v = classifyBash(command, DENY_ALL, [], parseCost + 100);
+    expect(`${v.action} ${v.rule}`).toBe("ask unclear:budget");
   });
 
   test("running out mid-way keeps what was already seen, and the raw deny-list still applies", () => {
