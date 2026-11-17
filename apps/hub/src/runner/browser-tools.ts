@@ -433,8 +433,12 @@ function assertDesktopFree(
 }
 
 /**
- * Registers the browser tools on pi. Every call first checks the desktop
- * lock, then takes a lease and goes to the box.
+ * Registers the browser tools on pi. Every call checks the desktop lock
+ * twice (decision 0035): first before it takes a box lease, so a refused call
+ * neither starts nor wakes the box; then again after `ensureBox` and
+ * `prepare`, just before the RPC, since a cold wake takes seconds and the
+ * owner may have taken over meanwhile (#133). A refusal at the second check
+ * releases the lease and sends nothing to the box.
  */
 export function registerBrowserTools(
   pi: ExtensionAPI,

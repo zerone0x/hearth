@@ -6,10 +6,10 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   AllowAllAuthorizer,
@@ -21,6 +21,9 @@ import {
   type Principal,
 } from "@hearth/core";
 import { Hono } from "hono";
+import { FakeDriver } from "../../../box-agent/src/browser/fake";
+import { BrowserTools } from "../../../box-agent/src/browser/tools";
+import { BoxAgent } from "../../../box-agent/src/connection";
 import { type HubEnv, SESSION_COOKIE } from "../auth";
 import type { ModelChoice } from "../runner";
 import { startHub } from "../server";
@@ -525,6 +528,142 @@ describe("the hub", () => {
       await hub.stop();
     }
   });
+
+  // `startHub` hands the runners its vault (decision 0039); a Settings model
+  // switch must not lose it (#142).
+  test("browser_fill resolves a vault login through the hub's vault, before and after a model switch", async () => {
+    const PASSWORD = "settings-fill-pw-4e0b91";
+    const ORIGIN = "https://login.example";
+    const faux = fauxProvider({ provider: "faux" });
+    const runtime = await ModelRuntime.create({
+      authPath: join(dir, "auth.json"),
+      modelsPath: null,
+      refreshOnCreate: false,
+    });
+    runtime.registerNativeProvider(faux.provider);
+    const hub = startHub({
+      port: 0,
+      boxPort: 0,
+      dbPath: join(dir, "fill.db"),
+      vault: {
+        keyRef: "env:VAULT_KEY",
+        keySecrets: createDefaultSecretStore({ env: { VAULT_KEY } }),
+      },
+      runner: { config: {}, modelRuntime: runtime },
+      log: () => {},
+    });
+    let agent: BoxAgent | undefined;
+    try {
+      await hub.settingsReady;
+      // A box with a fake browser on a sign-in page, joined to the session.
+      const root = join(dir, "workspace");
+      mkdirSync(root);
+      const driver = new FakeDriver();
+      const tab = driver.first;
+      tab.navigate(`${ORIGIN}/signin`, "Sign in");
+      tab.targets.set("e3", { field: "password" });
+      Object.defineProperty(tab, "snapshotText", {
+        get: () => '- generic [ref=e1]:\n  - textbox "Password" [ref=e3]',
+      });
+      const session = await hub.sessions.create(LOCAL_PRINCIPAL, { title: "fill" });
+      const { token } = await hub.issueJoinToken("box_fill", session.id);
+      agent = new BoxAgent({
+        hubUrl: hub.listenForBoxes("127.0.0.1"),
+        boxId: "box_fill",
+        joinToken: token,
+        log: () => {},
+        tools: { root, browser: new BrowserTools({ driver, root }) },
+      });
+      agent.start();
+      await hub.boxes.waitForBox("box_fill", 15_000);
+      hub.sessions.ensureBox = async (sessionId) => ({
+        sessionId,
+        boxId: "box_fill",
+        release: () => {},
+      });
+      const { id } = await hub.vault.create(LOCAL_PRINCIPAL, {
+        name: "site",
+        kind: "login",
+        policy: { origins: [ORIGIN] },
+        fields: { username: "settings-fill-user", password: PASSWORD },
+      });
+      for (const name of ["faux-key", "faux-key-2"]) {
+        await hub.vault.create(LOCAL_PRINCIPAL, {
+          name,
+          kind: "model-key",
+          fields: { value: `settings-fill-model-${name}-77c3` },
+        });
+      }
+      const headers = {
+        cookie: `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}`,
+        "content-type": "application/json",
+      };
+      const model = faux.getModel().id;
+      const choose = async (keyRef: string) => {
+        const res = await fetch(new URL("/v1/settings/model", hub.url), {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({ provider: "faux", model, keyRef }),
+        });
+        expect(res.status).toBe(200);
+        expect(hub.runners?.model).toEqual({ provider: "faux", model, apiKeyRef: keyRef });
+      };
+      // The ref is of that turn's snapshot (`s1e3`; the fill's own result was `s2`, so then `s3e3`).
+      const fill = async (callId: string, ref: string) => {
+        faux.setResponses([
+          fauxAssistantMessage([fauxToolCall("browser_snapshot", {}, { id: `${callId}_snap` })], {
+            stopReason: "toolUse",
+          }),
+          fauxAssistantMessage(
+            [
+              fauxToolCall(
+                "browser_fill",
+                { ref, element: "Password", secret: "vault:site#password" },
+                { id: callId },
+              ),
+            ],
+            { stopReason: "toolUse" },
+          ),
+          fauxAssistantMessage("signed in"),
+        ]);
+        await hub.runners?.send(LOCAL_PRINCIPAL, session.id, "sign in");
+        const runner = await hub.runners?.runner(session.id);
+        await runner?.settled();
+        const result = (
+          (runner?.messages ?? []) as Array<{
+            role: string;
+            toolCallId?: string;
+            isError?: boolean;
+          }>
+        ).find((m) => m.role === "toolResult" && m.toolCallId === callId);
+        return { isError: result?.isError, text: JSON.stringify(result) };
+      };
+
+      await choose("vault:faux-key");
+      const before = await fill("c_fill_1", "s1e3");
+      expect(before).toMatchObject({ isError: false });
+      expect(before.text).toContain('\\"outcome\\":\\"done\\"');
+      expect(tab.actions.filter((a) => a === `fill e3 ${PASSWORD}`)).toHaveLength(1);
+
+      await choose("vault:faux-key-2");
+      const after = await fill("c_fill_2", "s3e3");
+      expect(after).toMatchObject({ isError: false });
+      expect(tab.actions.filter((a) => a === `fill e3 ${PASSWORD}`)).toHaveLength(2);
+      // Each fill was a vault use, bound to the session and the page's origin.
+      const uses = await hub.vault.uses(LOCAL_PRINCIPAL, id);
+      const used = uses.map((u) => {
+        const detail = u.detail as Record<string, unknown>;
+        return [String(detail["tool_call_id"]), detail["origin"]];
+      });
+      expect(used.sort()).toEqual([
+        ["c_fill_1", ORIGIN],
+        ["c_fill_2", ORIGIN],
+      ]);
+    } finally {
+      agent?.stop();
+      await hub.stop();
+    }
+  }, 30_000);
 
   // A raw provider key, and an `env:` name that is really a pasted token.
   test.each([

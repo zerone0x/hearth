@@ -6,7 +6,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,7 +30,13 @@ import { RequestBody } from "../request-body";
 import { redactSecrets, SessionRunners } from "../runner";
 import { LiveToolOutput } from "../runner/live-output";
 import { startHub } from "../server";
-import { openDatabase, SqliteAuditSink, SqliteEventStore, SqliteVaultStore } from "../store";
+import {
+  openDatabase,
+  SqliteAuditSink,
+  SqliteBlobStore,
+  SqliteEventStore,
+  SqliteVaultStore,
+} from "../store";
 import { dumpTrajectory, UnredactedDumpError } from "../trajectory-cli";
 import { HubVault, mountVaultRoutes, type VaultStatus } from ".";
 
@@ -1700,6 +1706,33 @@ describe("redaction", () => {
     expect(forced.exitCode).toBe(0);
     const ok = run(["se_none"], { HEARTH_VAULT_KEY_REF: "env:K", K: KEY_A });
     expect(ok.exitCode).toBe(0);
+  });
+
+  // The blobs are written after the dump: a refused dump writes none (#137).
+  test("the trajectory CLI refuses --export-blobs with the dump: exit 1, no blob directory", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A } });
+    // A screenshot of the session that an export would write.
+    await new SqliteBlobStore(h.db).put(
+      { workspaceId: "ws_default" },
+      "se_shot",
+      new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]),
+    );
+    const cli = join(import.meta.dir, "..", "trajectory-cli.ts");
+    const run = (out: string, key: string) =>
+      Bun.spawnSync([process.execPath, cli, "--db", path, "--export-blobs", out, "se_shot"], {
+        env: { PATH: process.env["PATH"] ?? "", HEARTH_VAULT_KEY_REF: "env:K", K: key },
+      });
+    const refusedDir = join(dir, "refused-blobs");
+    const refused = run(refusedDir, KEY_B);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stdout.toString()).toBe("");
+    expect(refused.stderr.toString()).toBe(`${new UnredactedDumpError("key-mismatch").message}\n`);
+    expect(existsSync(refusedDir)).toBe(false);
+    // The same command with the vault's key writes the blob.
+    const okDir = join(dir, "ok-blobs");
+    const ok = run(okDir, KEY_A);
+    expect(ok.exitCode).toBe(0);
+    expect(readdirSync(okDir)).toHaveLength(1);
   });
 
   test("the trajectory CLI opens a vault mid-rotation through the next key, and never rotates", async () => {

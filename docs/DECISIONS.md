@@ -2928,8 +2928,11 @@ with a short bound.
 - **The trajectory records the refusal.** The tool call's `runner.step` has
   `outcome: "desktop-locked"` (a new value next to 0021's `ok`, `error`,
   `aborted`, `timeout`, `denied`, `outcome-unknown`; added values do not bump
-  the schema), `refused_code: "desktop.locked"`, no box and no RPCs, and the
-  summary counts it under `tool_failures_by_class["desktop-locked"]`.
+  the schema), `refused_code: "desktop.locked"` and no RPCs, and the
+  summary counts it under `tool_failures_by_class["desktop-locked"]`. A
+  refusal at the first check has no box (`box_id: null`); one at the second
+  check (after the wake, see Consequences) records the woken box's `box_id`
+  and `box_wait_ms`.
 - Any other error of the check is not a refusal: it is rethrown as is.
 
 ### Alternatives rejected

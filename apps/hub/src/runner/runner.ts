@@ -40,7 +40,13 @@ import {
   secretForms,
   type WorkspaceScope,
 } from "@hearth/core";
-import { imagesToRefs, type PendingBlob, restoreImages, storeBlobs } from "../obs/blobs";
+import {
+  imagesToRefs,
+  type PendingBlob,
+  redactKeepingHashes,
+  restoreImages,
+  storeBlobs,
+} from "../obs/blobs";
 import { Telemetry } from "../obs/telemetry";
 import { type Clock, SYSTEM_CLOCK, type TracedEvent, TurnTracer } from "../obs/turn-tracer";
 import { HUB_VERSION } from "../obs/version";
@@ -176,7 +182,9 @@ function jsonSafe(
         : imagesToRefs(key, v, pending),
   );
   if (raw === undefined) return null;
-  const text = redact(raw);
+  // The references' hashes are not redacted: a rebuild looks the bytes up by them (#137).
+  const hashes = new Set((pending ?? []).map((blob) => blob.ref.sha256));
+  const text = redactKeepingHashes(raw, redact, hashes);
   if (text.length > MAX_RUNNER_EVENT_BYTES) {
     return { truncated: true, bytes: text.length, head: text.slice(0, 4096) };
   }

@@ -287,6 +287,62 @@ describe("the desktop lock (decision 0035)", () => {
     expect(refused).toEqual([["browser_navigate", "call_1", "desktop.locked"]]);
   });
 
+  // The second check sits after `prepare` (the context refresh that runs on
+  // the woken box): a takeover during it refuses the call too (#131).
+  test("an owner who takes over during a slow prepare is refused: lease released, no box call", async () => {
+    for (const name of BROWSER_TOOLS) {
+      let held = false;
+      let released = 0;
+      const tools = new Map<string, Tool>();
+      const pi = {
+        registerTool: (tool: { name: string; execute: never }) => tools.set(tool.name, tool),
+      } as unknown as ExtensionAPI;
+      const calls: string[] = [];
+      const uses: string[] = [];
+      const refused: Array<[string, string, string]> = [];
+      const box = {
+        assertDesktopUnlocked: () => {
+          if (held) locked();
+        },
+        ensureBox: async () => ({ boxId: "bx_1", release: () => released++ }),
+        prepare: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          held = true; // the owner takes over while the context is read
+        },
+        useSecret: async (ref: string) => {
+          uses.push(ref);
+          return {} as FillSecret;
+        },
+        operations: () => ({
+          browser: {
+            call: async (method: string) => {
+              calls.push(method);
+              return action();
+            },
+          },
+        }),
+      } as unknown as RunnerBox;
+      registerBrowserTools(pi, box, (tool, id, code) => refused.push([tool, id, code]));
+      const params =
+        name === "browser_fill"
+          ? { ref: "e3", element: "Password", secret: "vault:site#password" }
+          : {};
+      const error = await tools
+        .get(name)
+        ?.execute("call_1", params)
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect({ name, error: (error as Error | undefined)?.message }).toEqual({
+        name,
+        error: DESKTOP_LOCKED_MESSAGE,
+      });
+      expect({ name, calls, uses, released }).toEqual({ name, calls: [], uses: [], released: 1 });
+      expect(refused).toEqual([[name, "call_1", "desktop.locked"]]);
+    }
+  });
+
   test("the same tool works again once the lock is released", async () => {
     let held = true;
     const r = rig(() => {
