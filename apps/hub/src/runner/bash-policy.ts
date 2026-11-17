@@ -387,7 +387,6 @@ function judgeScript(source: string, ctx: Context): BashVerdict {
   }
   for (const command of parsed.commands) {
     verdict = stricter(verdict, judgeCommand(command, ctx));
-    if (verdict.action === "deny") break;
   }
   return verdict;
 }

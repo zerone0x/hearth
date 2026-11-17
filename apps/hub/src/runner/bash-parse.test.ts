@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parse } from "unbash";
+import { type ParsedScript, parse } from "unbash";
 import { MAX_COMMAND_BYTES, parseBash } from "./bash-parse";
 
 /** The literal word lists of every simple command, `null` for a non-literal word. */
@@ -128,5 +128,44 @@ describe("parseBash: errors and bounds", () => {
       errors: [`command longer than ${MAX_COMMAND_BYTES} characters`],
     });
     expect(parseBash(`echo ${"a".repeat(MAX_COMMAND_BYTES - 5)}`).errors).toEqual([]);
+  });
+});
+
+describe("parseBash: a parser failure is a parse error, not a throw", () => {
+  const at = { pos: 0, end: 1 };
+  const script = (command: unknown) =>
+    ({
+      type: "Script",
+      ...at,
+      commands: [{ type: "Statement", ...at, command }],
+    }) as unknown as ParsedScript;
+
+  test("the parser throws", () => {
+    const parsed = parseBash("x", () => {
+      throw new RangeError("Maximum call stack size exceeded");
+    });
+    expect(parsed).toEqual({
+      commands: [],
+      errors: ["parser failed: RangeError: Maximum call stack size exceeded"],
+    });
+  });
+
+  test("the walk meets a node it does not know", () => {
+    const parsed = parseBash("x", () => script({ type: "Bogus", ...at }));
+    expect(parsed.errors).toEqual([expect.stringContaining("parser failed: TypeError")]);
+  });
+
+  test("a substitution whose script is missing is reported", () => {
+    const name = {
+      type: "Word",
+      ...at,
+      text: "$(x)",
+      value: "$(x)",
+      parts: [{ type: "CommandExpansion", ...at, text: "$(x)", script: undefined }],
+    };
+    const command = { type: "Command", ...at, name, prefix: [], suffix: [], args: [] };
+    const parsed = parseBash("x", () => script(command));
+    expect(parsed.errors).toEqual(["unparsed substitution: $(x)"]);
+    expect(parsed.commands.map((c) => c.words.map((w) => w.value))).toEqual([[null]]);
   });
 });

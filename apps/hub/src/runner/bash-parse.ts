@@ -12,17 +12,15 @@
  *   is reported.
  * - A word is literal when it has no expansion, glob or brace part: quotes and
  *   escapes are removed (`g"i"t` is `git`), anything else is `null`.
- * - Bounded: the input length is capped (`MAX_COMMAND_BYTES`), the parser caps
- *   nesting itself (3,000 nested `$(` is an error, not a hang), the walk counts
- *   nodes, and an exception from the parser is a parse error.
+ * - Bounded: the input length is capped (`MAX_COMMAND_BYTES`), which bounds
+ *   the tree; the parser caps nesting itself (3,000 nested `$(` is an error,
+ *   not a hang); an exception from the parser or the walk is a parse error.
  */
 
 import { forEachChild, type ParsedScript, parse, type SyntaxNode, type Word } from "unbash";
 
 /** Above this many UTF-16 units the command is not parsed; the policy asks. */
 export const MAX_COMMAND_BYTES = 64 * 1024;
-/** The walk stops after this many syntax nodes and reports an error. */
-export const MAX_SYNTAX_NODES = 200_000;
 
 /** One word of a simple command. */
 export interface BashWord {
@@ -83,29 +81,27 @@ interface Frame {
   readonly upstream: readonly (readonly BashWord[])[];
 }
 
-/** Parses one script; never throws. */
-export function parseBash(source: string): ParsedBash {
+/** Parses one script; never throws. `parser` is for tests. */
+export function parseBash(
+  source: string,
+  parser: (source: string) => ParsedScript = parse,
+): ParsedBash {
   if (source.length > MAX_COMMAND_BYTES) {
     return { commands: [], errors: [`command longer than ${MAX_COMMAND_BYTES} characters`] };
   }
   let root: ParsedScript;
   try {
-    root = parse(source);
+    root = parser(source);
   } catch (error) {
     return { commands: [], errors: [`parser failed: ${String(error)}`] };
   }
   const commands: SimpleCommand[] = [];
   const errors: string[] = [];
   const stack: Frame[] = [{ node: root, upstream: [] }];
-  let visited = 0;
   try {
     while (stack.length > 0) {
       const frame = stack.pop() as Frame;
       const node = frame.node;
-      if (++visited > MAX_SYNTAX_NODES) {
-        errors.push(`more than ${MAX_SYNTAX_NODES} syntax nodes`);
-        break;
-      }
       // A nested script starts a fresh pipeline context.
       const upstream = node.type === "Script" ? [] : frame.upstream;
       if (node.type === "Script") {

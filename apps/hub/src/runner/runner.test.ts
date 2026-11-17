@@ -776,6 +776,12 @@ describe("approvals", () => {
       [false, "unclear"],
     ]);
     expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(2);
+    // The seed rules are on by default, and each verdict is on the call's step.
+    const policies = (h.events.all.get("se_a") ?? [])
+      .map((e) => (e.payload as { bash_policy?: { action: string; rule: string } }).bash_policy)
+      .filter((p) => p !== undefined)
+      .map((p) => `${p.action} ${p.rule}`);
+    expect(policies).toEqual(["ask rm-recursive-force", "ask unclear:name"]);
   });
 
   test("a bad command rule fails at startup", async () => {
