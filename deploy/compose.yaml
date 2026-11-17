@@ -108,6 +108,7 @@ services:
       HEARTH_VAULT_KEY_REF: file:/run/hearth-secrets/vault_key
       HEARTH_VAULT_KEY_NEXT_REF: file:/run/hearth-secrets/vault_key.next
       HEARTH_IDLE_MINUTES: ${HEARTH_IDLE_MINUTES:-}
+      HEARTH_APPROVAL_TIMEOUT_MINUTES: ${HEARTH_APPROVAL_TIMEOUT_MINUTES:-}
       HEARTH_BOX_EGRESS: ${HEARTH_BOX_EGRESS:-}
       HEARTH_BOX_INSTANCE: ${HEARTH_BOX_INSTANCE:-hearth}
       HEARTH_BOX_IMAGE: hearth-box:local

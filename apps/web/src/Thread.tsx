@@ -137,7 +137,7 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
       </p>
       <code className="break-all font-mono text-xs">{card.summary}</code>
       <p className="text-muted-foreground text-xs">
-        {card.reason || card.rule} · Denied automatically in{" "}
+        Rule <code className="font-mono">{card.rule}</code> · Denied automatically in{" "}
         <span data-testid="approval-countdown">{countdown(card.expiresAt - now)}</span>
       </p>
       <div className="flex gap-2">

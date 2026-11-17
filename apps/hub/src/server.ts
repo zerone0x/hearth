@@ -228,7 +228,7 @@ export interface HubOptions extends HubListenOptions {
   readonly desktopLockTtlMs?: number;
   /**
    * How long the owner has to decide on a held tool call before it is denied
-   * (decision 0048; `HEARTH_APPROVAL_TIMEOUT_S`). Defaults to
+   * (decision 0048; `HEARTH_APPROVAL_TIMEOUT_MINUTES`). Defaults to
    * `DEFAULT_APPROVAL_TIMEOUT_MS` (10 minutes).
    */
   readonly approvalTimeoutMs?: number;

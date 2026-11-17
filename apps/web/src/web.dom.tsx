@@ -621,7 +621,7 @@ describe("approval cards in a DOM (decision 0048)", () => {
     expect(screen.getByRole("button", { name: "Tool call bash: needs approval" })).toBeTruthy();
     expect(screen.getByTestId("approval-pending").textContent).toBe("Approval needed");
     expect(within(panel).getByText("git push origin main")).toBeTruthy();
-    expect(within(panel).getByText(/git push needs the owner/)).toBeTruthy();
+    expect(within(panel).getByText("git-push")).toBeTruthy();
     expect(within(panel).getByTestId("approval-countdown").textContent).toMatch(/^1:(2|3)\d$/);
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "Approve" }));

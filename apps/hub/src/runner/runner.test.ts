@@ -943,6 +943,33 @@ describe("the access gate (decisions 0043, 0048)", () => {
     expect(h.boxes.sent.filter((f) => f.method === "tool.exec")).toHaveLength(0);
   });
 
+  test("a marked secret is ask: bash with a vault env and browser_fill wait for the owner", async () => {
+    const h = await harness({ commandRules: [] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 30 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const runner = await turn(h, "se_a", "go", [
+      call("bash", { command: "echo hi", env: { GH_TOKEN: "vault:gh" } }, "c_env"),
+      call(
+        "browser_fill",
+        { ref: "e1", element: "Password", secret: "vault:site#password" },
+        "c_fill",
+      ),
+      call("bash", { command: "echo plain" }, "c_plain"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const requested = h.events.of("se_a", "approval.requested").map((e) => e.payload);
+    expect(requested).toMatchObject([
+      { toolCallId: "c_env", rule: "marked-secret", summary: "echo hi" },
+      {
+        toolCallId: "c_fill",
+        rule: "marked-secret",
+        summary: "browser_fill with vault:site#password",
+      },
+    ]);
+    const results = toolResults(runner.messages);
+    expect(results.map((r) => r.isError)).toEqual([true, true, false]);
+  });
+
   test("0043: a deny rule blocks in yolo and in ask, with no card", async () => {
     for (const mode of ["yolo", "ask"] as const) {
       const h = await harness({ commandRules: [{ ...PUSH_RULE, action: "deny" }] });

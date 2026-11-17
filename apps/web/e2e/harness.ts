@@ -277,6 +277,9 @@ export interface E2eHub {
 }
 
 /** Starts the hub on a free loopback port with the UI from `webRoot`. */
+/** How long the owner has to decide in the e2e (the hub's default is 10 minutes). */
+export const APPROVAL_TIMEOUT_MS = 12_000;
+
 export async function startE2eHub(webRoot: string): Promise<E2eHub> {
   const dir = mkdtempSync(join(tmpdir(), "hearth-web-e2e-"));
   const workspace = join(dir, "workspace");
@@ -308,6 +311,8 @@ export async function startE2eHub(webRoot: string): Promise<E2eHub> {
       modelRuntime,
       boxCwd: workspace,
     },
+    // S3 (decision 0048): short enough that the run sees an approval expire.
+    approvalTimeoutMs: APPROVAL_TIMEOUT_MS,
     log: (line) => logs.push(line),
   });
   const setupToken = hub.auth.setupToken();
