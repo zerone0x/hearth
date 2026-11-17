@@ -37,6 +37,7 @@ import {
   projectPiThreadMessages,
   reducePiThreadState,
 } from "@assistant-ui/react-pi";
+import { escapeHidden } from "@hearth/core";
 import type { HubEvent } from "./api";
 
 /** At most this much of a tool's output is kept per card. */
@@ -450,6 +451,11 @@ export function hearthToolStatus(
 
 /** What a tool call acts on: the shell command, else the path, else the pattern. */
 export function toolTarget(name: string, args: unknown): string {
+  // Hidden characters written out, as on the approval card: the header sits right above it (#167).
+  return escapeHidden(rawToolTarget(name, args));
+}
+
+function rawToolTarget(name: string, args: unknown): string {
   const a = record(args);
   const str = (key: string) => (typeof a[key] === "string" ? (a[key] as string) : undefined);
   if (name === "bash") return str("command") ?? "";

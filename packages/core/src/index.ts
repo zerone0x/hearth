@@ -28,6 +28,7 @@ export * from "./channel";
 export * from "./events";
 export * from "./failure";
 export * from "./gateway";
+export * from "./hidden-chars";
 export * from "./identity";
 export * from "./ids";
 export * from "./log";

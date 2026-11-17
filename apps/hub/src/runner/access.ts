@@ -22,10 +22,10 @@
  */
 
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { escapeHidden, hasHidden } from "@hearth/core";
 import type { ApprovalOutcome } from "../approvals/service";
 import type { AccessMode } from "../settings/access-mode";
 import { type BashVerdict, type CommandRule, classifyBash } from "./bash-policy";
-import { escapeHidden, hasHidden } from "./hidden-chars";
 import type { CompiledDenyRule } from "./policy";
 
 /** The reserved extension name (`RESERVED_EXTENSION_NAMES`). */

@@ -466,6 +466,13 @@ describe("chat from the event log (react-pi reducer + projection)", () => {
     expect(toolTarget("ls", null)).toBe("");
   });
 
+  test("toolTarget writes hidden characters out, so the header matches the approval card (#167)", () => {
+    expect(toolTarget("bash", { command: "X=1\u00A0# a;touch EX" })).toBe(
+      "X=1⟨U+00A0⟩# a;touch EX",
+    );
+    expect(toolTarget("bash", { command: "a\u2028b \u202E" })).toBe("a⟨U+2028⟩b ⟨U+202E⟩");
+  });
+
   test("readNewEvents reads every page from the cursor, then stops", async () => {
     const events = turn();
     const asked: number[] = [];

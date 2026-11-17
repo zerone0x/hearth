@@ -5,9 +5,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { escapeHidden, hasHidden, hasHiddenEscape } from "@hearth/core";
 import { gateVerdict, shownVerdict } from "./access";
 import type { CommandRule } from "./bash-policy";
-import { escapeHidden, hasHidden, hasHiddenEscape } from "./hidden-chars";
 
 const PUSH: CommandRule = {
   name: "git-push",
@@ -113,27 +113,42 @@ describe("the card's text", () => {
 });
 
 describe("hidden characters on the card (#165)", () => {
-  test("escapeHidden writes bidi, zero-width and control characters out; tab and newline stay", () => {
-    const all = [
-      ..."\u202A\u202B\u202C\u202D\u202E",
-      ..."\u2066\u2067\u2068\u2069",
-      ..."\u200E\u200F\u061C",
-      ..."\u200B\u200C\u200D\u2060\uFEFF",
-      "\u0000",
-      "\u001B",
-      "\u007F",
-      "\u0085",
-      "\u009F",
-    ];
-    for (const ch of all) {
-      const hex = ch.codePointAt(0)?.toString(16).toUpperCase().padStart(4, "0");
-      expect(escapeHidden(`a${ch}b`)).toBe(`a⟨U+${hex}⟩b`);
-      expect(hasHidden(ch)).toBe(true);
+  test("escapeHidden writes out every hidden class by property, astral as one escape; tab, newline and ASCII space stay", () => {
+    const classes: Record<string, string[]> = {
+      bidi: [..."\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\u200E\u200F\u061C"],
+      zeroWidth: [..."\u200B\u200C\u200D\u2060\uFEFF"],
+      c0c1: ["\u0000", "\u001B", "\r", "\u007F", "\u0085", "\u009F"],
+      spaceLookalikes: [..."\u00A0\u1680\u2000\u2003\u200A\u202F\u205F\u3000", "\u2028", "\u2029"],
+      blankLetters: [..."\u3164\u115F\u1160\uFFA0"],
+      ignorable: [..."\u00AD\u034F\u180E\u2061\u2064\uFE00\uFE0F\uFFF9\uFFFB"],
+      astral: ["\u{E0100}", "\u{E01EF}", "\u{E0000}", "\u{E0001}", "\u{E007F}"],
+    };
+    for (const [name, chars] of Object.entries(classes)) {
+      for (const ch of chars) {
+        const cp = ch.codePointAt(0) ?? 0;
+        const hex = cp.toString(16).toUpperCase().padStart(4, "0");
+        const label = `${name} U+${hex}`;
+        expect({ label, out: escapeHidden(`a${ch}b`) }).toEqual({ label, out: `a⟨U+${hex}⟩b` });
+        expect({ label, hidden: hasHidden(ch) }).toEqual({ label, hidden: true });
+      }
     }
-    expect(escapeHidden("a\tb\nc é 日本 🙂")).toBe("a\tb\nc é 日本 🙂");
-    expect(hasHidden("a\tb\nc é 日本 🙂")).toBe(false);
+    const kept = "a b\tc\nd é 日本 🙂 \u200Dx".replace("\u200D", "");
+    expect(escapeHidden(kept)).toBe(kept);
+    expect(hasHidden(kept)).toBe(false);
     expect(hasHiddenEscape(escapeHidden("x\u202Ey"))).toBe(true);
+    expect(hasHiddenEscape(escapeHidden("x\u{E0001}y"))).toBe(true);
     expect(hasHiddenEscape("plain")).toBe(false);
+  });
+
+  test("a space look-alike does not turn code into a comment on the card", () => {
+    for (const [ch, esc] of [
+      ["\u00A0", "⟨U+00A0⟩"],
+      ["\u2028", "⟨U+2028⟩"],
+    ] as const) {
+      const { shown: card } = shown(`git push origin main; X=1${ch}# a note;touch EX`);
+      expect(card.command).toBe(`git push origin main; X=1${esc}# a note;touch EX`);
+      expect(card.hiddenChars).toBe(true);
+    }
   });
 
   test("the card shows the RLO example in reading order and says it has hidden characters", () => {
