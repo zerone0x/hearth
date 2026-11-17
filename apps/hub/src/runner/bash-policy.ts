@@ -850,7 +850,15 @@ interface Context {
   readonly depth: number;
   readonly budget: Budget;
   /** Collects every simple command read, as written (`commandSteps`). */
-  readonly steps?: string[];
+  readonly steps?: StepEntry[];
+}
+
+/** One simple command the parser read, with what the policy decided about it (#171). */
+export interface StepEntry {
+  readonly text: string;
+  readonly action: BashAction;
+  /** The rule that decided (`none` when nothing matched; `unclear:*` when the parser cannot see). */
+  readonly rule: string;
 }
 
 function unclear(why: string, reason: string, command?: string): BashVerdict {
@@ -870,6 +878,12 @@ const OVER_BUDGET = unclear(
 function judgeScript(source: string, ctx: Context): BashVerdict {
   const parsed = parseBash(source, undefined, ctx.budget);
   let verdict = ALLOW;
+  const tail = (verdict: BashVerdict) =>
+    ctx.steps?.push({
+      text: "(the rest of the script could not be read)",
+      action: verdict.action,
+      rule: verdict.rule,
+    });
   if (parsed.exhausted === true) {
     // Out of budget: still judge the commands already read, so a readable
     // `git push` keeps its deny instead of becoming an `ask`.
@@ -878,6 +892,7 @@ function judgeScript(source: string, ctx: Context): BashVerdict {
     for (const command of parsed.commands) {
       verdict = stricter(verdict, judgeCommand(command, ctx, partial));
     }
+    tail(OVER_BUDGET);
     return verdict;
   }
   if (parsed.errors.length > 0) {
@@ -886,8 +901,12 @@ function judgeScript(source: string, ctx: Context): BashVerdict {
   const scope = new Scope(parsed);
   for (const command of parsed.commands) {
     verdict = stricter(verdict, judgeCommand(command, ctx, scope));
-    if (ctx.budget.steps < 0) return stricter(verdict, OVER_BUDGET);
+    if (ctx.budget.steps < 0) {
+      tail(OVER_BUDGET);
+      return stricter(verdict, OVER_BUDGET);
+    }
   }
+  if (parsed.errors.length > 0) tail(verdict);
   return verdict;
 }
 
@@ -920,8 +939,18 @@ function gitInlineAlias(args: readonly BashWord[]): boolean {
 }
 
 function judgeCommand(command: SimpleCommand, ctx: Context, scope: Scope): BashVerdict {
+  const steps = ctx.steps;
+  if (steps === undefined) return judgeOne(command, ctx, scope);
+  // The entry goes in first, so a nested script's steps come after it.
+  const entry = { text: display(command.words), action: "allow" as BashAction, rule: "none" };
+  steps.push(entry);
+  const verdict = judgeOne(command, ctx, scope);
+  Object.assign(entry, { action: verdict.action, rule: verdict.rule });
+  return verdict;
+}
+
+function judgeOne(command: SimpleCommand, ctx: Context, scope: Scope): BashVerdict {
   ctx.budget.steps -= command.words.length + ctx.rules.length;
-  ctx.steps?.push(display(command.words));
   // The command as written, before unwrapping, also meets the raw patterns.
   let verdict = rawDeny(command.words, ctx) ?? ALLOW;
   const inner = unwrap(command.words);
@@ -1061,8 +1090,8 @@ export function commandSteps(
   command: string,
   rules: readonly CommandRule[],
   raw: readonly CompiledDenyRule[] = [],
-): string[] {
-  const steps: string[] = [];
+): StepEntry[] {
+  const steps: StepEntry[] = [];
   judgeScript(command, { rules, raw, depth: 0, budget: { steps: MAX_POLICY_STEPS }, steps });
   return steps;
 }

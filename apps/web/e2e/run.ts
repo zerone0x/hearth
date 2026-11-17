@@ -466,6 +466,8 @@ try {
   const lsep = "git push -q origin HEAD:main; X=1\u2028# a note, nothing runs here;touch LSMARK";
   // A fullwidth number sign reads as a comment start, bash runs it as a word (#169).
   const fwhash = "git push -q origin HEAD:main; \uFF03 a note, nothing runs here;touch LKMARK";
+  // 60 harmless steps, then a real one, and a script the parser cannot see (#171).
+  const padded = `git push -q origin HEAD:main; ${Array.from({ length: 60 }, (_, i) => `echo ${i}`).join("; ")}; sh <<'EOF'\ntouch HDMARK\nEOF\ntouch CAPMARK`;
   const spoof = (command: string, id: string) =>
     fauxAssistantMessage([fauxToolCall("bash", { command }, { id })], { stopReason: "toolUse" });
   await sessionAccess.selectOption("ask");
@@ -476,6 +478,7 @@ try {
     spoof(rlo, "call_spoof3"),
     spoof(lsep, "call_spoof4"),
     spoof(fwhash, "call_spoof5"),
+    spoof(padded, "call_spoof6"),
     fauxAssistantMessage("Neither held command ran."),
   ]);
   await page.getByLabel("Message").fill("Push and tidy up");
@@ -552,11 +555,28 @@ try {
   await approval.getByTestId("approval-non-ascii").waitFor();
   await shot(page, "2g-approval-steps");
   await approval.getByRole("button", { name: "Deny" }).click();
+  step("S3: past the step cap the card keeps the last and the opaque step and counts the rest");
+  const lines = approval.getByTestId("approval-steps").locator("li");
+  await approval.getByTestId("approval-steps-omitted").waitFor();
+  const listedSteps = await lines.allTextContents();
+  if (
+    listedSteps.length !== 50 ||
+    !listedSteps.includes("touch CAPMARK") ||
+    !listedSteps.includes("sh [runs a script the parser cannot see]")
+  ) {
+    throw new Error(`the capped steps are ${JSON.stringify(listedSteps)}`);
+  }
+  const omittedText = await approval.getByTestId("approval-steps-omitted").textContent();
+  if (omittedText !== "and 13 more steps not listed")
+    throw new Error(`the note says ${omittedText}`);
+  await shot(page, "2h-approval-steps-capped");
+  await approval.getByRole("button", { name: "Deny" }).click();
   await page.getByText("Neither held command ran.").waitFor();
   if (existsSync(join(e2e.workspace, "MARKER"))) throw new Error("a denied command ran");
   if (existsSync(join(e2e.workspace, "VMARK"))) throw new Error("a denied command ran (VMARK)");
   if (existsSync(join(e2e.workspace, "LSMARK"))) throw new Error("a denied command ran (LSMARK)");
   if (existsSync(join(e2e.workspace, "LKMARK"))) throw new Error("a denied command ran (LKMARK)");
+  if (existsSync(join(e2e.workspace, "CAPMARK"))) throw new Error("a denied command ran (CAPMARK)");
   await sessionAccess.selectOption("default");
   await accessMode.and(page.locator('[data-mode="yolo"]')).waitFor();
 
@@ -603,14 +623,14 @@ try {
   step("reload: the chat is rebuilt from the event log and the session continues");
   await page.reload();
   await page.getByText("I wrote hello.txt in the workspace.").waitFor();
-  // hello.txt, the three S3 pushes and the five denied full-command cards.
+  // hello.txt, the three S3 pushes and the six denied full-command cards.
   await page.getByText("Neither held command ran.").waitFor();
-  if ((await page.getByTestId("tool-card").count()) !== 9) {
-    throw new Error("after a reload the chat should show the nine tool cards again");
+  if ((await page.getByTestId("tool-card").count()) !== 10) {
+    throw new Error("after a reload the chat should show the ten tool cards again");
   }
   // The ended approvals are rebuilt from the log too.
-  if ((await page.getByTestId("approval-ended").count()) !== 7) {
-    throw new Error("after a reload the seven ended approvals should say how they ended");
+  if ((await page.getByTestId("approval-ended").count()) !== 8) {
+    throw new Error("after a reload the eight ended approvals should say how they ended");
   }
   e2e.faux.setResponses([fauxAssistantMessage("Still here: hello.txt says hello from the box.")]);
   await page.getByLabel("Message").fill("Are you still there?");
@@ -645,8 +665,8 @@ try {
   const cut = page.getByTestId("tool-card").and(page.locator('[data-status="interrupted"]'));
   await cut.getByRole("button", { name: "Tool call bash: interrupted" }).waitFor();
   await page.getByRole("button", { name: "Send" }).waitFor();
-  // The error cards are the S3 calls that were blocked, not run: one expired, five denied.
-  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 6) {
+  // The error cards are the S3 calls that were blocked, not run: one expired, six denied.
+  if ((await page.locator('[data-testid="tool-card"][data-status="error"]').count()) !== 7) {
     throw new Error("an interrupted tool call should not show as an error");
   }
   // The composer floats over the bottom of the thread: centre the card for the shot

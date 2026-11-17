@@ -574,6 +574,7 @@ describe("approval cards in a DOM (decision 0048)", () => {
     hiddenChars = false,
     steps: string[] = [],
     nonAscii = false,
+    stepsOmitted = 0,
   ) {
     let seq = 0;
     const ev = (type: string, payload: unknown) => ({ seq: ++seq, ts: 0, type, payload });
@@ -598,6 +599,7 @@ describe("approval cards in a DOM (decision 0048)", () => {
         hidden_chars: hiddenChars,
         steps,
         non_ascii: nonAscii,
+        steps_omitted: stepsOmitted,
         expiresAt: Date.now() + 90_000,
       }),
     ];
@@ -690,11 +692,29 @@ describe("approval cards in a DOM (decision 0048)", () => {
     expect(within(panel).getByTestId("approval-non-ascii").textContent).toContain("non-ASCII");
   });
 
+  test("a capped steps list says how many steps are not listed (#171)", async () => {
+    approvalHub(
+      [],
+      "git push; touch CAPMARK",
+      "git push",
+      false,
+      ["git push", "touch CAPMARK"],
+      false,
+      13,
+    );
+    renderApp("#/s/se_1");
+    const panel = await screen.findByRole("region", { name: "Approval needed" });
+    expect(within(panel).getByTestId("approval-steps-omitted").textContent).toBe(
+      "and 13 more steps not listed",
+    );
+  });
+
   test("no steps list and no non-ASCII warning on a plain card", async () => {
     approvalHub([]);
     renderApp("#/s/se_1");
     const panel = await screen.findByRole("region", { name: "Approval needed" });
     expect(within(panel).queryByTestId("approval-steps")).toBeNull();
+    expect(within(panel).queryByTestId("approval-steps-omitted")).toBeNull();
     expect(within(panel).queryByTestId("approval-non-ascii")).toBeNull();
   });
 

@@ -186,6 +186,11 @@ function ApprovalPanel({ card }: { card: ApprovalCard }) {
               </li>
             ))}
           </ol>
+          {card.stepsOmitted > 0 ? (
+            <p className="font-medium text-amber-600 text-xs" data-testid="approval-steps-omitted">
+              and {card.stepsOmitted} more steps not listed
+            </p>
+          ) : null}
         </div>
       )}
       <p className="text-muted-foreground text-xs">

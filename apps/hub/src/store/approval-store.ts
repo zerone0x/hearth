@@ -27,6 +27,8 @@ export interface ApprovalRow {
   readonly command: string;
   /** Each simple command the parser found (escaped), for the card (#169). */
   readonly steps: readonly string[];
+  /** How many steps the card's cap left out (#171). */
+  readonly stepsOmitted: number;
   readonly rule: string;
   readonly mode: "yolo" | "ask";
   readonly status: ApprovalStatus;
@@ -45,6 +47,7 @@ interface Raw {
   summary: string;
   command: string;
   steps: string;
+  steps_omitted: number;
   rule: string;
   mode: "yolo" | "ask";
   status: ApprovalStatus;
@@ -73,6 +76,7 @@ function rowOf(raw: Raw): ApprovalRow {
     summary: raw.summary,
     command: raw.command,
     steps: stepsOf(raw.steps),
+    stepsOmitted: raw.steps_omitted,
     rule: raw.rule,
     mode: raw.mode,
     status: raw.status,
@@ -103,9 +107,9 @@ export class SqliteApprovalStore {
     row: Omit<ApprovalRow, "status" | "decidedAt" | "decidedBy" | "reason">,
   ): void {
     this.#db.run(
-      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, command, steps, rule,
+      `INSERT INTO approval (id, workspace_id, session_id, tool_call_id, tool, summary, command, steps, steps_omitted, rule,
          mode, status, requested_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       [
         row.id,
         scope.workspaceId,
@@ -115,6 +119,7 @@ export class SqliteApprovalStore {
         row.summary,
         row.command,
         JSON.stringify(row.steps),
+        row.stepsOmitted,
         row.rule,
         row.mode,
         row.requestedAt,

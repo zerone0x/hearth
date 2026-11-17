@@ -1307,6 +1307,30 @@ describe("the access gate (decisions 0043, 0048)", () => {
     expect(listed.map((r) => r.non_ascii)).toEqual([true, true, true, false]);
   });
 
+  test("past the cap the stored and listed card keeps ruled and opaque steps and counts the rest (#171)", async () => {
+    const h = await harness({ commandRules: [PUSH_RULE] });
+    const { approvals } = approvalsFor(h.events, { timeoutMs: 30 });
+    h.runners = h.make({}, { accessMode: () => "ask", approvals });
+    const echoes = Array.from({ length: 60 }, (_, i) => `echo ${i}`).join("; ");
+    const padded = `git push origin main; ${echoes}; sh <<'EOF'\ntouch HD\nEOF`;
+    h.faux.setResponses([call("bash", { command: padded }, "c_pad"), fauxAssistantMessage("x")]);
+    await h.runners.send(LOCAL_PRINCIPAL, "se_a", "go");
+    const id = await pendingId(h);
+    const listed = await approvals.list(LOCAL_PRINCIPAL);
+    await approvals.decide(LOCAL_PRINCIPAL, "se_a", id, { decision: "deny" });
+    await (await h.runners.runner("se_a")).settled();
+    const [requested] = h.events
+      .of("se_a", "approval.requested")
+      .map((e) => e.payload as { steps: string[]; steps_omitted: number; reason: string });
+    const opaque = "sh [runs a script the parser cannot see]";
+    expect(requested?.steps).toHaveLength(50);
+    expect(requested?.steps).toContain(opaque);
+    expect(requested?.steps_omitted).toBe(12);
+    expect(requested?.reason).toContain("Also matched: unclear:script.");
+    expect(listed).toMatchObject([{ steps_omitted: 12 }]);
+    expect(listed[0]?.steps).toContain(opaque);
+  });
+
   test("a stop while the request is still being recorded cancels it at once; interrupt returns", async () => {
     const h = await harness({ commandRules: [PUSH_RULE] });
     const recording = Promise.withResolvers<void>();
