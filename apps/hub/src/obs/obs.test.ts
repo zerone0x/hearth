@@ -45,6 +45,7 @@ import { ToolExecutor } from "../../../box-agent/src/tools/executor";
 import type { HubEnv } from "../auth";
 import type { BoxConnectionListener } from "../box/connections";
 import { ToolRpcClient } from "../box/tool-rpc";
+import type { CommandRule } from "../runner/bash-policy";
 import { type CompiledDenyRule, compileDenyList } from "../runner/policy";
 import { redactSecrets, SessionRunner } from "../runner/runner";
 import { capJson, capText, MAX_TEXT_BYTES, utf8Head } from "./cap";
@@ -273,6 +274,7 @@ interface Setup {
 interface SetupOptions {
   exportTo?: string;
   denyList?: CompiledDenyRule[];
+  commandRules?: CommandRule[];
   /** Box start or wake latency: the test clock moves this far during each lease. */
   leaseWaitMs?: number;
   /** Runs after each lease (the AGENTS.md refresh); a throw fails the runner. */
@@ -331,6 +333,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     modelRuntime: runtime,
     model: faux.getModel(),
     denyList: options.denyList ?? [],
+    ...(options.commandRules === undefined ? {} : { commandRules: options.commandRules }),
     ...(options.entries === undefined ? {} : { entries: options.entries }),
     ...(options.contextFiles === undefined
       ? {}
@@ -605,6 +608,7 @@ describe("trajectory numbers (review of #82)", () => {
     expect(byId("c_deny")).toMatchObject({
       outcome: "denied",
       denied_reason: "no rm -rf here",
+      bash_policy: { action: "deny", rule: "raw:0", reason: "no rm -rf here" },
       is_error: true,
       rpcs: [],
     });
@@ -618,6 +622,47 @@ describe("trajectory numbers (review of #82)", () => {
       tool_failures_by_class: { denied: 1, timeout: 1 },
     });
     expect(records.find((r) => r.kind === "turn_end")).toMatchObject({ tool_failures: 2 });
+  });
+});
+
+describe("bash calls record the command rules' verdict (#69)", () => {
+  test("deny, ask and allow, with the rule that decided and the command it saw", async () => {
+    const s = await setup({
+      commandRules: [
+        { name: "no-push", command: ["git"], subcommand: "push", action: "deny" },
+        { name: "rm-rf", command: ["rm"], flags: [["-r"], ["-f"]], action: "ask" },
+      ],
+    });
+    await turn(s, "go", [
+      call("bash", { command: "nice git push origin" }, "c_push"),
+      call("bash", { command: "rm -fr gone" }, "c_rm"),
+      call("bash", { command: "echo hi" }, "c_echo"),
+      call("read", { path: "a.txt" }, "c_read"),
+      fauxAssistantMessage("ok"),
+    ]);
+    const records = trajectory(s);
+    const byId = (id: string) =>
+      records.find((r) => r.kind === "tool_call" && r["tool_call_id"] === id);
+    expect(byId("c_push")).toMatchObject({
+      outcome: "denied",
+      bash_policy: {
+        action: "deny",
+        rule: "no-push",
+        reason: "blocked by the hub's command rule no-push: git push origin",
+        command: "git push origin",
+      },
+      rpcs: [],
+    });
+    // `ask` is recorded and, with no approval gate yet, the command runs.
+    expect(byId("c_rm")).toMatchObject({
+      outcome: "ok",
+      bash_policy: { action: "ask", rule: "rm-rf", command: "rm -fr gone" },
+    });
+    expect((byId("c_rm")?.["rpcs"] as unknown[]).length).toBe(1);
+    expect(byId("c_echo")).toMatchObject({
+      bash_policy: { action: "allow", rule: "none", reason: "no rule matched" },
+    });
+    expect(byId("c_read")).not.toHaveProperty("bash_policy");
   });
 });
 

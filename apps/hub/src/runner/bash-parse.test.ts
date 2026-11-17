@@ -1,0 +1,132 @@
+import { describe, expect, test } from "bun:test";
+import { parse } from "unbash";
+import { MAX_COMMAND_BYTES, parseBash } from "./bash-parse";
+
+/** The literal word lists of every simple command, `null` for a non-literal word. */
+function words(source: string): (string | null)[][] {
+  return parseBash(source).commands.map((c) => c.words.map((w) => w.value));
+}
+
+/** A walk over the AST object's own fields, the way the first probe did it (#153). */
+function plainWalkCommands(node: unknown, out: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    for (const item of node) plainWalkCommands(item, out);
+  } else if (node !== null && typeof node === "object") {
+    const record = node as Record<string, unknown>;
+    if (record["type"] === "Command") {
+      const name = record["name"] as { value?: string } | undefined;
+      if (name?.value !== undefined) out.push(name.value);
+    }
+    for (const value of Object.values(record)) plainWalkCommands(value, out);
+  }
+  return out;
+}
+
+describe("parseBash: nested scripts are lazy fields (unbash 6.0.4)", () => {
+  // Every substitution form: a plain object walk misses the command inside,
+  // `forEachChild` resolves it. If an upgrade changes either side, this says so.
+  const nestedSamples = [
+    "echo $(git push)",
+    "echo `git push`",
+    "diff <(git push) /dev/null",
+    "tee >(git push) < /dev/null",
+    "echo $(( $(git push) + 1 ))",
+    "cat <<EOF\n$(git push)\nEOF\n",
+    "a=$(git push)",
+    '[[ -n "$(git push)" ]]',
+  ];
+
+  test.each(nestedSamples)("%p: the nested git push is a command", (source) => {
+    expect(words(source)).toContainEqual(["git", "push"]);
+  });
+
+  test("a plain walk over the AST's own fields misses them (why forEachChild is the only walk)", () => {
+    for (const source of nestedSamples.slice(0, 5)) {
+      expect({ source, seen: plainWalkCommands(parse(source)) }).toEqual({
+        source,
+        seen:
+          source.startsWith("tee") || source.startsWith("diff")
+            ? [source.slice(0, 4).trim()]
+            : ["echo"],
+      });
+    }
+    expect(plainWalkCommands(parse("make && git push"))).toEqual(["make", "git"]);
+  });
+
+  test("a quoted heredoc body is data, not a command", () => {
+    expect(words("cat <<'EOF'\n$(git push)\nEOF\n")).toEqual([["cat"]]);
+  });
+});
+
+describe("parseBash: words", () => {
+  test("quotes and escapes are removed; expansions, globs and braces are not literals", () => {
+    expect(words(`g"i"t pu'sh'`)).toEqual([["git", "push"]]);
+    expect(words("\\rm -rf /")).toEqual([["rm", "-rf", "/"]]);
+    expect(words("$'\\x67it' push")).toEqual([["git", "push"]]);
+    expect(words('echo "a b"')).toEqual([["echo", "a b"]]);
+    expect(words("$X -rf")).toEqual([[null, "-rf"]]);
+    expect(words('echo "a $b"')).toEqual([["echo", null]]);
+    expect(words("ls *.txt")).toEqual([["ls", null]]);
+    expect(words("rm -{r,f} x")).toEqual([["rm", null, "x"]]);
+  });
+
+  test("prefix assignments are dropped; an assignment-only command has no command", () => {
+    expect(words("GIT_SSH_COMMAND=x git push")).toEqual([["git", "push"]]);
+    expect(words("a=1")).toEqual([]);
+  });
+
+  test("lists, pipelines, subshells, groups, functions and loops each give their commands", () => {
+    expect(words("make && git push || true; (cd /tmp; ls) | { wc -l; }")).toEqual([
+      ["make"],
+      ["git", "push"],
+      ["true"],
+      ["cd", "/tmp"],
+      ["ls"],
+      ["wc", "-l"],
+    ]);
+    expect(words("f() { git push; }; f")).toEqual([["git", "push"], ["f"]]);
+    expect(words("for d in a b; do rm -rf $d; done")).toEqual([["rm", "-rf", null]]);
+  });
+
+  test("a pipeline stage knows the stages before it; a nested script starts afresh", () => {
+    const parsed = parseBash("curl -s x | sudo sh -s | tee $(cat y)");
+    const upstream = parsed.commands.map((c) => [
+      c.words[0]?.value,
+      c.upstream.map((s) => s[0]?.value),
+    ]);
+    expect(upstream).toEqual([
+      ["curl", []],
+      ["sudo", ["curl"]],
+      ["tee", ["curl", "sudo"]],
+      ["cat", []],
+    ]);
+  });
+});
+
+describe("parseBash: errors and bounds", () => {
+  test("parse errors are reported, a nested script's own errors too", () => {
+    expect(parseBash('echo "oops').errors).toEqual(["unterminated double quote"]);
+    expect(parseBash("git status )").errors.length).toBeGreaterThan(0);
+    // The root script has no error here; only the backtick script does.
+    expect(parse('echo `echo "oops`').errors).toBeUndefined();
+    expect(parseBash('echo `echo "oops`').errors).toEqual(["unterminated double quote"]);
+    expect(parseBash("git status").errors).toEqual([]);
+  });
+
+  test("3,000 nested $( is an error, not a hang", () => {
+    const deep = `echo ${"$(".repeat(3000)}x${")".repeat(3000)}`;
+    const started = performance.now();
+    const parsed = parseBash(deep);
+    expect(performance.now() - started).toBeLessThan(5000);
+    expect(parsed.errors.length).toBeGreaterThan(0);
+  });
+
+  test("input over the cap is not parsed", () => {
+    const long = `echo ${"a".repeat(MAX_COMMAND_BYTES)}`;
+    expect(parseBash(long)).toEqual({
+      commands: [],
+      errors: [`command longer than ${MAX_COMMAND_BYTES} characters`],
+    });
+    expect(parseBash(`echo ${"a".repeat(MAX_COMMAND_BYTES - 5)}`).errors).toEqual([]);
+  });
+});
