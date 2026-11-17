@@ -102,10 +102,14 @@ describe.skipIf(!BIN)("Bifrost service against the Bifrost binary", () => {
 
   const handoff = (name: string) => readFileSync(join(dir, "handoff", name), "utf8");
 
-  async function chat(vk: string): Promise<number> {
+  /** A model call with virtual key `vk`, or with no Authorization header at all. */
+  async function chat(vk: string | undefined): Promise<number> {
     const res = await fetch(`${bifrostUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${vk}`, "Content-Type": "application/json" },
+      headers: {
+        ...(vk === undefined ? {} : { Authorization: `Bearer ${vk}` }),
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         model: "openai/gpt-4o-mini",
         messages: [{ role: "user", content: "hi" }],
@@ -214,6 +218,18 @@ describe.skipIf(!BIN)("Bifrost service against the Bifrost binary", () => {
     ).json()) as { keys: { name: string; value: { value: string } }[] };
     expect(keys.keys.map((k) => k.name)).toEqual(["model-key-openai"]);
     expect(keys.keys[0]?.value.value).not.toContain(KEY_1);
+  });
+
+  // `enforce_auth_on_inference` (deploy/bifrost/config.json): without it, a
+  // call with no key reaches the provider with the vault's key. Runs while
+  // that key is pushed, so a fail-open would show at the fake provider.
+  test("a model call with no key or an unknown one is 401 and reaches no provider", async () => {
+    await hub.bifrost?.syncKeys();
+    seen.length = 0;
+    expect(await chat(undefined)).toBe(401);
+    expect(await chat("sk-bf-not-a-virtual-key")).toBe(401);
+    expect(await chat("bogus")).toBe(401);
+    expect(seen.filter((s) => s.startsWith("POST /v1/chat/completions"))).toEqual([]);
   });
 
   test("a model call through a virtual key reaches the provider with the vault's key", async () => {

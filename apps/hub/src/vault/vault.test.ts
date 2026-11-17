@@ -18,6 +18,7 @@ import {
   type Principal,
   type SecretError,
   type SecretStore,
+  SYSTEM_PRINCIPAL,
   VaultSecretResolver,
 } from "@hearth/core";
 import { Hono } from "hono";
@@ -78,6 +79,7 @@ interface Start {
   readonly nextKeyRef?: string;
   readonly audit?: (db: Database) => AuditSink;
   readonly midRotation?: () => void;
+  readonly systemEntries?: readonly string[];
 }
 
 /** A hub start: a new connection, store and vault on the same database file. */
@@ -103,6 +105,7 @@ async function start(options: Start = {}): Promise<Harness> {
     ...(options.nextKeyRef === undefined ? {} : { nextKeyRef: options.nextKeyRef }),
     log: (line) => logs.push(line),
     register: (value) => registered.push(value),
+    ...(options.systemEntries === undefined ? {} : { systemEntries: options.systemEntries }),
   });
   const secrets = createDefaultSecretStore({
     env,
@@ -1306,6 +1309,70 @@ describe("data key rotation", () => {
   });
 });
 
+describe("system entries (decision 0046)", () => {
+  test("the API refuses to add, rotate, re-use or delete a hub-managed entry: 409, no change audited", async () => {
+    const h = await start({ env: { VAULT_KEY: KEY_A }, systemEntries: ["hub-made"] });
+    const app = new Hono<HubEnv>();
+    app.use("*", async (c, next) => {
+      c.set("principal", LOCAL_PRINCIPAL);
+      await next();
+    });
+    mountVaultRoutes(app, h.vault);
+    const call = async (method: string, url: string, body?: unknown) => {
+      const res = await app.request(url, {
+        method,
+        ...(body === undefined
+          ? {}
+          : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
+      });
+      const text = await res.text();
+      return { status: res.status, json: text === "" ? undefined : JSON.parse(text) };
+    };
+    const byHand = await call("POST", "/v1/secrets", {
+      name: "hub-made",
+      kind: "token",
+      fields: { value: "typed-by-hand" },
+    });
+    expect(byHand.status).toBe(409);
+    expect(byHand.json.error.code).toBe("secret.system-managed");
+    const { id } = await h.vault.create(SYSTEM_PRINCIPAL, {
+      name: "hub-made",
+      kind: "token",
+      policy: { use: "hub" },
+      fields: { value: "generated-by-the-hub" },
+    });
+    const listed = await call("GET", "/v1/secrets");
+    expect(listed.json.secrets.map((e: { system: boolean }) => e.system)).toEqual([true]);
+    for (const [method, url, body] of [
+      ["PUT", `/v1/secrets/${id}/value`, { fields: { value: "x" } }],
+      ["PUT", `/v1/secrets/${id}/value`, { fields: { value: "x" }, use: "box-env" }],
+      ["DELETE", `/v1/secrets/${id}`, undefined],
+    ] as const) {
+      const res = await call(method, url, body);
+      expect({ method, status: res.status, code: res.json.error.code }).toEqual({
+        method,
+        status: 409,
+        code: "secret.system-managed",
+      });
+      expect(res.json.error.message).toContain("hub-made is managed by the hub");
+    }
+    // The authorize rows (no detail) only: no rotate or delete was recorded.
+    for (const action of ["secret.rotate", "secret.delete"]) {
+      expect(auditRows(h.db, action).filter((r) => r.detail_json !== null)).toEqual([]);
+    }
+    expect((await h.secrets.resolve("vault:hub-made")).reveal()).toBe("generated-by-the-hub");
+    // An entry with the name that is not a hub token (a box-env one) is not protected.
+    const other = await start({ env: { VAULT_KEY: KEY_A }, systemEntries: ["hub-made", "odd"] });
+    const odd = await other.vault.create(SYSTEM_PRINCIPAL, {
+      name: "odd",
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: "odd-value" },
+    });
+    await other.vault.remove(LOCAL_PRINCIPAL, odd.id);
+  });
+});
+
 describe("the API never returns a value", () => {
   test("create, list, rotate, uses, status and delete answer with fingerprints only", async () => {
     const h = await start({ env: { VAULT_KEY: KEY_A } });
@@ -1358,6 +1425,7 @@ describe("the API never returns a value", () => {
         "name",
         "policy",
         "scope",
+        "system",
         "updatedAt",
         "version",
       ].sort(),

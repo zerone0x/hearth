@@ -7,15 +7,22 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createDefaultSecretStore, LOCAL_PRINCIPAL } from "@hearth/core";
+import {
+  createDefaultSecretStore,
+  HearthError,
+  LOCAL_PRINCIPAL,
+  SYSTEM_PRINCIPAL,
+} from "@hearth/core";
+import { egressAllowFromMarker } from "../main";
 import { type Hub, startHub } from "../server";
 import {
   allowEntriesCovering,
   BIFROST_ADMIN_ENTRY,
   BIFROST_ENCRYPTION_ENTRY,
+  BIFROST_SYSTEM_ENTRIES,
   BifrostClient,
   bifrostConfigFromEnv,
   cidrCovers,
@@ -198,7 +205,7 @@ describe("Bifrost service", () => {
     expect(statSync(join(dir, "handoff", "admin_password")).mode & 0o777).toBe(0o440);
     expect(statSync(join(dir, "handoff", "encryption_key")).mode & 0o777).toBe(0o440);
     expect(hub.bifrost?.status.state).toBe("ok");
-    expect((await healthz(hub))["bifrost"]).toBe("ok");
+    expect(await healthz(hub)).toMatchObject({ bifrost: "ok", bifrostState: "ok" });
     expect(logs).toContain("bifrost: ok");
     // No value in any log line.
     for (const line of logs) {
@@ -278,7 +285,11 @@ describe("Bifrost service", () => {
     fake.setHealthy(false);
     await hub.bifrostReady;
     expect(hub.bifrost?.status.state).toBe("unreachable");
-    expect((await healthz(hub))["bifrost"]).toBe("unreachable");
+    expect(await healthz(hub)).toMatchObject({
+      status: "ok",
+      bifrost: "unavailable",
+      bifrostState: "unreachable",
+    });
     await addOpenAiKey(hub);
     await Bun.sleep(50);
     expect(fake.providers.size).toBe(0);
@@ -306,7 +317,10 @@ describe("Bifrost service", () => {
     const { hub, fake } = start({ vaultKey: false });
     await hub.bifrostReady;
     expect(hub.bifrost?.status.state).toBe("vault-disabled");
-    expect((await healthz(hub))["bifrost"]).toBe("vault-disabled");
+    expect(await healthz(hub)).toMatchObject({
+      bifrost: "unavailable",
+      bifrostState: "vault-disabled",
+    });
     expect(() => handoff("admin_password")).toThrow();
     expect(fake.calls).toEqual([]);
   });
@@ -318,9 +332,168 @@ describe("Bifrost service", () => {
     });
     await hub.bifrostReady;
     expect(hub.bifrost?.status.state).toBe("box-reachable");
+    expect(await healthz(hub)).toMatchObject({
+      status: "ok",
+      bifrost: "unavailable",
+      bifrostState: "box-reachable",
+    });
     expect(logs.some((l) => l.includes("covers Bifrost's address"))).toBe(true);
     expect(await hub.vault.list(LOCAL_PRINCIPAL)).toEqual([]);
     expect(fake.calls).toEqual([]);
+  });
+
+  test("a session-scoped model key is never pushed: only global keys go to Bifrost", async () => {
+    const { hub, fake } = start();
+    await hub.bifrostReady;
+    const session = await hub.sessions.create(LOCAL_PRINCIPAL, { title: "scoped" });
+    await hub.vault.create(LOCAL_PRINCIPAL, {
+      name: "model-key-openai-session",
+      kind: "model-key",
+      scope: { sessionId: session.id },
+      meta: { provider: "openai" },
+      fields: { value: "sk-bifrost-test-session-scoped-77d1" },
+    });
+    await hub.bifrost?.syncKeys();
+    expect([...fake.providers.keys()]).toEqual([]);
+    await addOpenAiKey(hub);
+    await hub.bifrost?.syncKeys();
+    expect(fake.providers.get("openai")?.map((k) => k.name)).toEqual(["model-key-openai"]);
+  });
+
+  test("the start reads the firewall marker's allow list and refuses a list that covers Bifrost", async () => {
+    const marker = join(dir, "box-egress.applied");
+    writeFileSync(
+      marker,
+      "applied 2026-11-17T00:00:00Z port=8788 allow=1.1.1.1/32,172.29.249.0/29\n",
+    );
+    expect(egressAllowFromMarker(marker)).toEqual(["1.1.1.1/32", "172.29.249.0/29"]);
+    expect(egressAllowFromMarker(join(dir, "no-marker"))).toEqual([]);
+    const { hub, fake } = start({
+      url: "http://172.29.249.2:8080",
+      egressAllow: egressAllowFromMarker(marker),
+    });
+    await hub.bifrostReady;
+    expect(hub.bifrost?.status.state).toBe("box-reachable");
+    expect(fake.calls).toEqual([]);
+  });
+
+  async function refusal(call: Promise<unknown>): Promise<string> {
+    try {
+      await call;
+    } catch (error) {
+      if (error instanceof HearthError) return `${error.code}: ${error.message}`;
+      throw error;
+    }
+    return "not refused";
+  }
+
+  test("Bifrost's two vault entries are the hub's: no rotate, use change, delete or hand-made copy", async () => {
+    const { hub, logs } = start();
+    await hub.bifrostReady;
+    const pw = handoff("admin_password");
+    const enc = handoff("encryption_key");
+    const listed = (await hub.vault.list(LOCAL_PRINCIPAL)).filter((e) =>
+      BIFROST_SYSTEM_ENTRIES.includes(e.name),
+    );
+    expect(listed.map((e) => [e.name, e.system]).sort()).toEqual([
+      [BIFROST_ADMIN_ENTRY, true],
+      [BIFROST_ENCRYPTION_ENTRY, true],
+    ]);
+    for (const entry of listed) {
+      for (const call of [
+        hub.vault.rotate(LOCAL_PRINCIPAL, entry.id, { fields: { value: "x".repeat(43) } }),
+        hub.vault.rotate(LOCAL_PRINCIPAL, entry.id, {
+          fields: { value: "x".repeat(43) },
+          use: "box-env",
+        }),
+        hub.vault.remove(LOCAL_PRINCIPAL, entry.id),
+      ]) {
+        const refused = await refusal(call);
+        expect(refused).toStartWith(`secret.system-managed: ${entry.name} is managed by the hub`);
+      }
+    }
+    // Nothing changed: same entries, same version, same values handed over.
+    const after = (await hub.vault.list(LOCAL_PRINCIPAL)).filter((e) =>
+      BIFROST_SYSTEM_ENTRIES.includes(e.name),
+    );
+    expect(after.map((e) => [e.name, e.version, e.policy])).toEqual(
+      listed.map((e) => [e.name, 1, { hosts: [], use: "hub" }]),
+    );
+    expect(logs.some((l) => l.includes("rotated") || l.includes("deleted"))).toBe(false);
+    rmSync(join(dir, "handoff"), { recursive: true, force: true });
+    await hub.stop();
+    hubs = [];
+    const again = start();
+    await again.hub.bifrostReady;
+    expect(handoff("admin_password")).toBe(pw);
+    expect(handoff("encryption_key")).toBe(enc);
+    // A user cannot create one under a reserved name either.
+    const plain = startHub({
+      dbPath: join(dir, "other.db"),
+      port: 0,
+      boxPort: 0,
+      log: () => {},
+      vault: {
+        keyRef: "env:VAULT_KEY",
+        keySecrets: createDefaultSecretStore({ env: { VAULT_KEY } }),
+      },
+    });
+    hubs.push(plain);
+    await plain.vaultReady;
+    expect(
+      await refusal(
+        plain.vault.create(LOCAL_PRINCIPAL, {
+          name: BIFROST_ENCRYPTION_ENTRY,
+          kind: "token",
+          fields: { value: "owner-typed-encryption-key" },
+        }),
+      ),
+    ).toStartWith(`secret.system-managed: ${BIFROST_ENCRYPTION_ENTRY} is managed by the hub`);
+  });
+
+  test("an existing entry under a Bifrost name that is not a hub token is refused, not handed over", async () => {
+    // Made before Bifrost was configured (only the hub may create one now): a box-env token.
+    const before = startHub({
+      dbPath: join(dir, "hub.db"),
+      port: 0,
+      boxPort: 0,
+      log: () => {},
+      vault: {
+        keyRef: "env:VAULT_KEY",
+        keySecrets: createDefaultSecretStore({ env: { VAULT_KEY } }),
+      },
+    });
+    await before.vaultReady;
+    const made = await before.vault.create(SYSTEM_PRINCIPAL, {
+      name: BIFROST_ENCRYPTION_ENTRY,
+      kind: "token",
+      policy: { use: "box-env" },
+      fields: { value: "owner-typed-box-env-value-1d3f" },
+    });
+    await before.stop();
+    const { hub, fake, logs } = start();
+    await hub.bifrostReady;
+    expect(hub.bifrost?.status.state).toBe("secrets-unusable");
+    expect(hub.bifrost?.status.detail).toContain(
+      `vault:${BIFROST_ENCRYPTION_ENTRY} is not a global token with use hub`,
+    );
+    expect(await healthz(hub)).toMatchObject({
+      bifrost: "unavailable",
+      bifrostState: "secrets-unusable",
+    });
+    expect(() => handoff("encryption_key")).toThrow();
+    expect(fake.calls).toEqual([]);
+    expect(logs.join("\n")).not.toContain("owner-typed-box-env-value-1d3f");
+    // It is not the hub's, so the owner may delete it; the next start makes the hub's own.
+    const view = (await hub.vault.list(LOCAL_PRINCIPAL)).find((e) => e.id === made.id);
+    expect(view?.system).toBe(false);
+    await hub.vault.remove(LOCAL_PRINCIPAL, made.id);
+    await hub.stop();
+    hubs = [];
+    const again = start();
+    await again.hub.bifrostReady;
+    expect(again.hub.bifrost?.status.state).toBe("ok");
+    expect(handoff("encryption_key")).not.toBe("owner-typed-box-env-value-1d3f");
   });
 
   test("without Bifrost configured /healthz has no bifrost field", async () => {
@@ -402,6 +575,17 @@ describe("Bifrost config and box egress (decisions 0012, 0023, 0046)", () => {
     )?.[1];
     return { addrs, subnet, url };
   }
+
+  test("compose: the hub does not depend on Bifrost (model calls do not use it yet)", () => {
+    const compose = Bun.YAML.parse(readFileSync(join(REPO, "deploy/compose.yaml"), "utf8")) as {
+      services: Record<string, { depends_on?: Record<string, unknown> }>;
+    };
+    expect(compose.services["bifrost"]).toBeDefined();
+    expect(Object.keys(compose.services["hub"]?.depends_on ?? {}).sort()).toEqual([
+      "box-firewall",
+      "box-image",
+    ]);
+  });
 
   test("compose: one Bifrost address everywhere, inside its subnet, given to the firewall and the hub", () => {
     const { addrs, subnet, url } = composeDefaults();

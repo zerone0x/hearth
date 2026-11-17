@@ -91,10 +91,11 @@ services:
         condition: service_completed_successfully
       box-firewall:
         condition: service_completed_successfully
-      # Started first so `up --wait hub` brings it up too; it waits for the
-      # secrets the hub hands over once its vault is open.
-      bifrost:
-        condition: service_started
+    # No dependency on bifrost (decision 0046): model calls do not go through
+    # it yet, so the hub starts and stays healthy when Bifrost cannot (no
+    # access to getbifrost.ai, the vault disabled, an allow list covering it).
+    # docs/install.md starts it with `docker compose up -d bifrost`; /healthz
+    # reports it as `bifrost`.
     environment:
       HEARTH_HOST: ${HEARTH_HOST:-127.0.0.1}
       HEARTH_PORT: ${HEARTH_PORT:-8787}

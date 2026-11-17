@@ -13,9 +13,14 @@
  *   key in Bifrost under a managed provider that is not in the vault is
  *   deleted (the vault is the source, decision 0031). Pushed at start, after
  *   Bifrost comes back, and after a key is added, rotated or deleted.
+ * - **Hub-managed.** The two entries are `systemEntries` of the vault: the
+ *   API refuses to rotate, re-use or delete them, since Bifrost's store cannot
+ *   be read with another encryption key. An existing entry under those names
+ *   that is not a global `use: hub` token is never handed over.
  * - **Health.** `GET /health` and an authorized admin call every
  *   `checkEveryMs`; each change of state is one log line, and `/healthz`
- *   reports the state.
+ *   reports it (`unavailable` and the state). The hub never depends on
+ *   Bifrost being up: no model call uses it yet.
  * - **Never reachable from a box.** At start the hub checks that the box
  *   egress allow list (decisions 0012, 0023) does not cover Bifrost's
  *   address; `scripts/box-firewall.sh` refuses such a list as well.
@@ -36,6 +41,11 @@ import { BifrostClient } from "./client";
 export const BIFROST_ADMIN_ENTRY = "bifrost-admin-password";
 /** The vault entry holding Bifrost's `encryption_key`. */
 export const BIFROST_ENCRYPTION_ENTRY = "bifrost-encryption-key";
+/** The vault entries the hub manages for Bifrost: never rotated, re-used or deleted through the API. */
+export const BIFROST_SYSTEM_ENTRIES: readonly string[] = [
+  BIFROST_ADMIN_ENTRY,
+  BIFROST_ENCRYPTION_ENTRY,
+];
 /** The file names in the handoff directory, read by `deploy/bifrost/start.sh`. */
 export const HANDOFF_FILES = {
   [BIFROST_ADMIN_ENTRY]: "admin_password",
@@ -58,6 +68,7 @@ export const BIFROST_PROVIDERS: Readonly<Record<string, string>> = {
 export type BifrostState =
   | "starting"
   | "vault-disabled"
+  | "secrets-unusable"
   | "unreachable"
   | "unauthorized"
   | "box-reachable"
@@ -191,7 +202,7 @@ export class BifrostService {
         });
       }
     } catch (error) {
-      this.#set("vault-disabled", `could not prepare Bifrost's secrets: ${String(error)}`);
+      this.#set("secrets-unusable", `could not prepare Bifrost's secrets: ${String(error)}`);
       return;
     }
     this.#client = new BifrostClient({
@@ -316,9 +327,24 @@ export class BifrostService {
     }
   }
 
-  /** The entry's value; generated (32 random bytes, base64url) and stored on first use. */
+  /**
+   * The entry's value; generated (32 random bytes, base64url) and stored on
+   * first use. An existing entry is used only when it is what the hub made: a
+   * global `token` with `use: hub`. Anything else (an entry made by hand
+   * under this name before Bifrost was configured, or a `box-env` token) is
+   * refused, never handed to Bifrost.
+   */
   async #secret(name: string): Promise<string> {
-    if (this.#o.vaultStore.byName(DEFAULT_WORKSPACE_ID, name) === undefined) {
+    const row = this.#o.vaultStore.byName(DEFAULT_WORKSPACE_ID, name);
+    if (row !== undefined) {
+      const policy: unknown = JSON.parse(row.policyJson);
+      const use = isRecord(policy) ? policy["use"] : undefined;
+      if (row.kind !== "token" || use !== "hub" || row.scopeSessionId !== null) {
+        throw new Error(
+          `vault:${name} is not a global token with use hub (kind ${row.kind}, use ${String(use)}); delete it so the hub can generate it`,
+        );
+      }
+    } else {
       await this.#o.vault.create(SYSTEM_PRINCIPAL, {
         name,
         kind: "token",

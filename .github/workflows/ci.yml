@@ -351,21 +351,67 @@ jobs:
           curl -fsS http://172.29.249.2:8080/health
           test "$(curl -s -o /dev/null -w '%{http_code}' http://172.29.249.2:8080/api/providers)" = 401
       # A box-like network (an hbx bridge, as DockerBoxProvider names them)
-      # under the box firewall: Bifrost's address is refused. The same probe
-      # from the host's network (the hub's) gets an answer, so the refusal is
-      # not Bifrost being down.
+      # under the box firewall. Each probe prints how its TCP connect ended.
+      # - An unused address in Bifrost's subnet (172.29.249.3): no container
+      #   has it, so none of Docker's own rules apply, and the only thing that
+      #   can answer is HEARTH-BOX-FWD's tcp-reset REJECT: the connect must be
+      #   refused (not time out), and that rule's counter must move.
+      # - Bifrost's own address: never connected. Docker's own rules (its
+      #   isolation or direct-routing drops for a container's address) can
+      #   drop this one first, so it may time out instead of being refused
+      #   (the first CI run did); the first probe is what shows the firewall
+      #   covers the subnet. On a timeout the step prints Docker's raw rules
+      #   for the address and checks our chain is still first in DOCKER-USER.
+      # - From the host's network (the hub's), Bifrost answers, so neither
+      #   result is Bifrost being down.
       - name: A box cannot reach Bifrost (decisions 0012, 0023, 0046)
         run: |
+          set -euo pipefail
           docker network create -o com.docker.network.bridge.name=hbx0000000bf156 hearth-e2e-bifrost-probe
+          trap 'docker network rm hearth-e2e-bifrost-probe >/dev/null' EXIT
           # The box image has python3, not curl.
-          probe=(python3 -c "import urllib.request; urllib.request.urlopen('http://172.29.249.2:8080/health', timeout=5)")
-          if docker run --rm --network hearth-e2e-bifrost-probe --entrypoint "${probe[0]}" hearth-box:local "${probe[@]:1}"; then
-            echo "a box network reached Bifrost" >&2
-            docker network rm hearth-e2e-bifrost-probe
-            exit 1
-          fi
-          docker network rm hearth-e2e-bifrost-probe
-          docker run --rm --network host --entrypoint "${probe[0]}" hearth-box:local "${probe[@]:1}"
+          probe() {
+            docker run --rm --network "$1" --entrypoint python3 hearth-box:local -c '
+          import socket, sys
+          s = socket.socket()
+          s.settimeout(5)
+          try:
+              s.connect((sys.argv[1], 8080))
+              print("connected")
+          except ConnectionRefusedError:
+              print("refused")
+          except ConnectionResetError:
+              print("reset")
+          except TimeoutError:
+              print("timeout")
+          except OSError as e:
+              print("oserror", e.errno)
+          ' "$2"
+          }
+          # pkts of the tcp-reset rule for 172.16.0.0/12 (Bifrost's subnet is in it).
+          resets() {
+            sudo iptables -w -v -x -n -L HEARTH-BOX-FWD | awk '/REJECT/ && / 172\.16\.0\.0\/12/ && /tcp-reset/ {print $1}'
+          }
+          sudo iptables -w -v -x -n -L HEARTH-BOX-FWD
+          before="$(resets)"
+          test -n "$before"
+          got="$(probe hearth-e2e-bifrost-probe 172.29.249.3)"
+          after="$(resets)"
+          echo "unused address in Bifrost's subnet: $got (tcp-reset rule: $before -> $after packets)"
+          case "$got" in refused | reset) ;; *) echo "not refused by the box firewall" >&2; exit 1 ;; esac
+          test "$after" -gt "$before"
+          got="$(probe hearth-e2e-bifrost-probe 172.29.249.2)"
+          echo "Bifrost's address: $got"
+          case "$got" in
+            refused | reset) ;;
+            timeout)
+              # Not ours: show the Docker rule that dropped it, and that our chain still precedes Docker's in FORWARD.
+              sudo iptables -w -t raw -S PREROUTING | grep -F 172.29.249.2 || true
+              sudo iptables -w -S DOCKER-USER | grep -m1 -- '^-A' | grep -F -- '-i hbx+ -j HEARTH-BOX-FWD'
+              ;;
+            *) echo "a box network reached Bifrost" >&2; exit 1 ;;
+          esac
+          test "$(probe host 172.29.249.2)" = connected
       - name: The hub reports the build install.md stamped (not 0.0.0)
         working-directory: deploy
         run: |
@@ -409,6 +455,18 @@ jobs:
         run: timeout 300 "$RUN_BLOCK" "$DOC" install:bifrost
       - name: After the upgrade the session continues
         run: timeout 300 bun deploy/e2e/prototype.ts upgrade
+      # Decision 0046: no model call uses Bifrost yet, so the hub must start
+      # and stay healthy without it, and say so in /healthz.
+      - name: The hub starts and is healthy while Bifrost is down
+        working-directory: deploy
+        run: |
+          docker compose stop bifrost
+          timeout 300 docker compose up -d --force-recreate --wait hub
+          test -z "$(docker compose ps -q --status running bifrost)"
+          curl -fsS http://127.0.0.1:8787/healthz | tee /dev/stderr | jq -e '.status == "ok" and .bifrost == "unavailable" and .bifrostState == "unreachable"'
+          docker compose logs hub | grep -F 'bifrost: unreachable'
+          docker compose up -d bifrost
+          timeout 300 "$RUN_BLOCK" "$DOC" install:bifrost
       - name: "install.md: uninstall"
         working-directory: deploy
         run: |

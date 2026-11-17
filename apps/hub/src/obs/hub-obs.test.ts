@@ -76,6 +76,11 @@ describe("hub log lines: level, component and ids", () => {
     expect(lineLevel("bifrost: vault-disabled (the secrets live in the vault)")).toBe("warn");
     expect(lineLevel("bifrost: unauthorized (the admin password was refused)")).toBe("error");
     expect(lineLevel("bifrost: box-reachable (the allow list covers it)")).toBe("error");
+    expect(
+      lineLevel(
+        "bifrost: secrets-unusable (vault:bifrost-encryption-key is not a global token with use hub)",
+      ),
+    ).toBe("error");
     expect(lineLevel("bifrost: could not push the provider keys: HTTP 500")).toBe("error");
     expect(lineFields("bifrost: ok")).toEqual({ component: "bifrost" });
   });

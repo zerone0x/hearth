@@ -3,7 +3,7 @@ import { formatVersion, PROTOCOL_VERSION } from "@hearth/protocol";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
 import { type AuthService, authRoutes, type HubEnv, OPEN_ROUTES, SESSION_COOKIE } from "./auth";
-import type { BifrostStatus } from "./bifrost";
+import type { BifrostState, BifrostStatus } from "./bifrost";
 import type { BoxConnections } from "./box/connections";
 import type { BoxEgressCheck } from "./box/egress";
 import { HUB_VERSION } from "./obs/version";
@@ -101,6 +101,12 @@ function statusFor(error: HearthError): 400 | 403 | 409 | 500 | 502 | 504 {
  * Builds the hub's HTTP app. Kept free of listening and process concerns so
  * tests can drive it with `app.request()`.
  */
+/** `/healthz`'s Bifrost fields: the summary and the state behind it. */
+function bifrostHealth(state: BifrostState): { bifrost: string; bifrostState: BifrostState } {
+  const bifrost = state === "ok" || state === "starting" ? state : "unavailable";
+  return { bifrost, bifrostState: state };
+}
+
 export function createApp(deps?: AppDeps, options: AppOptions = {}) {
   const app = new Hono<HubEnv>();
   const publicOrigin = options.publicOrigin;
@@ -182,7 +188,9 @@ export function createApp(deps?: AppDeps, options: AppOptions = {}) {
         // The build, as stamped on trajectories (decision 0021).
         version: HUB_VERSION,
         ...(boxEgress === undefined ? {} : { boxEgress: boxEgress().state }),
-        ...(bifrost === undefined ? {} : { bifrost: bifrost().state }),
+        // `ok`, `starting` or `unavailable`, and why (decision 0046). Model
+        // traffic does not need Bifrost yet, so the hub is healthy either way.
+        ...(bifrost === undefined ? {} : bifrostHealth(bifrost().state)),
       },
       200,
     ),

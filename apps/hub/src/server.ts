@@ -14,7 +14,7 @@ import {
 } from "@hearth/core";
 import { createApp, hostKey, LOOPBACK_HOSTS } from "./app";
 import { AuthService } from "./auth";
-import { BifrostService, type BifrostServiceOptions } from "./bifrost";
+import { BIFROST_SYSTEM_ENTRIES, BifrostService, type BifrostServiceOptions } from "./bifrost";
 import {
   type AppliedDelivery,
   BOX_SOCKET_PATH,
@@ -307,6 +307,9 @@ export function startHub(options: HubOptions) {
       bifrost?.entryChanged(name);
     },
     onEntryAdded: (name) => bifrost?.entryChanged(name),
+    // Bifrost's two secrets are the hub's to manage (decision 0046): a changed
+    // encryption key leaves Bifrost's store unreadable.
+    systemEntries: BIFROST_SYSTEM_ENTRIES,
   });
   const vaultReady = vault.open();
   // Bifrost (decision 0046): its secrets come from the vault, so it starts once the vault opened.

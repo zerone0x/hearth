@@ -18,6 +18,7 @@ const { createQueryClient } = await import("./queries");
 const { ChatRuntime, Thread } = await import("./Thread");
 const { applyHubEvents, emptyChat, isRunning, projectChat } = await import("./hearthPi");
 const { DesktopPanel, loadNoVnc } = await import("./Desktop");
+const { SYSTEM_SECRET_NOTE } = await import("./SettingsPage");
 
 type Route = (method: string, path: string, body: unknown) => Response | undefined;
 
@@ -338,6 +339,27 @@ describe("settings page in a DOM", () => {
     await waitFor(() =>
       expect(sent.at(-1)).toEqual({ method: "DELETE", path: "/v1/secrets/sec_1", body: undefined }),
     );
+  });
+
+  test("a hub-managed entry (Bifrost's secrets, 0046) shows no Rotate or Delete", async () => {
+    const SYSTEM = {
+      ...TOKEN,
+      id: "sec_9",
+      name: "bifrost-encryption-key",
+      fingerprint: "hmac:5e5e00aa11bb",
+      system: true,
+    };
+    settingsHub(NONE, undefined, [KEY, SYSTEM]);
+    renderApp("#/settings");
+    const table = await screen.findByRole("table", { name: "Secrets" });
+    const rows = within(table).getAllByTestId("secret-row");
+    const managed = rows[1] as HTMLElement;
+    expect(managed.textContent).toContain("bifrost-encryption-key");
+    expect(managed.textContent).toContain(SYSTEM_SECRET_NOTE);
+    expect(within(managed).queryByRole("button")).toBeNull();
+    // An ordinary entry keeps both.
+    expect(within(rows[0] as HTMLElement).getByRole("button", { name: "Rotate" })).toBeTruthy();
+    expect(within(rows[0] as HTMLElement).getByRole("button", { name: "Delete" })).toBeTruthy();
   });
 
   // Non-modal (0038), so nothing else stops a stray click from dismissing it (#142).
