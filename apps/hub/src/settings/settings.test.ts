@@ -314,6 +314,7 @@ describe("saving the model", () => {
       source: "env",
       provider: "faux",
       model: "env-model",
+      keyRef: "vault:anthropic-key",
       updatedAt: null,
     });
     const code = await codeOf(
@@ -520,6 +521,33 @@ describe("the hub", () => {
       });
       await hub.vault.remove(LOCAL_PRINCIPAL, keyId ?? "");
       expect(setModel).toHaveBeenCalledTimes(2);
+    } finally {
+      await hub.stop();
+    }
+  });
+
+  // A raw provider key, and an `env:` name that is really a pasted token.
+  test.each([
+    ["a raw key", "sk-ant-api03-settingsLeakProbe-9f3c1d7a2b"],
+    ["a token-shaped env: name", "env:ghp_SettingsLeakProbe4c81e0b2a9d7f3"],
+  ])("%s as HEARTH_MODEL_KEY_REF is never read back", async (_label, apiKeyRef) => {
+    const hub = startHub({
+      port: 0,
+      dbPath: join(dir, "leak.db"),
+      runner: { config: { provider: "faux", model: "m", apiKeyRef } },
+      log: () => {},
+    });
+    try {
+      await hub.settingsReady;
+      const res = await fetch(new URL("/v1/settings/model", hub.url), {
+        headers: { cookie: `${SESSION_COOKIE}=${hub.auth.issueSession(LOCAL_PRINCIPAL).token}` },
+      });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain(apiKeyRef.replace(/^env:/, ""));
+      const view = JSON.parse(text) as { source: string; keyRef: string | null };
+      expect(view.source).toBe("env");
+      expect(view.keyRef).toMatch(/^<unrecognized reference [^>]+>$/);
     } finally {
       await hub.stop();
     }

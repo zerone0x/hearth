@@ -45,6 +45,7 @@ export interface ModelSettingsView {
   readonly source: "env" | "settings" | "none";
   readonly provider: string | null;
   readonly model: string | null;
+  /** The key reference as `displayRef` shows it: a pasted value is only a fingerprint. */
   readonly keyRef: string | null;
   /** The keyed fingerprint of a `vault:` key; null for others or a deleted entry. */
   readonly keyFingerprint: string | null;
@@ -150,7 +151,9 @@ export class ModelSettings {
       source: this.#o.env !== undefined ? "env" : saved === undefined ? "none" : "settings",
       provider: choice?.provider ?? null,
       model: choice?.model ?? null,
-      keyRef: choice?.apiKeyRef ?? null,
+      // `HEARTH_MODEL_KEY_REF` may hold a value pasted where a reference
+      // belongs: the browser sees it only as `displayRef` shows it.
+      keyRef: choice?.apiKeyRef === undefined ? null : displayRef(choice.apiKeyRef),
       keyFingerprint: this.#fingerprint(choice?.apiKeyRef),
       updatedAt: this.#o.env === undefined ? (saved?.updatedAt ?? null) : null,
     };
